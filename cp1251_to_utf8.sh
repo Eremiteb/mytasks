@@ -2,11 +2,38 @@
 
 set -euo pipefail
 
+usage() {
+    cat <<EOF
+Использование: $(basename "$0") <каталог> [--dry-run] [-h|--help]
+
+Рекурсивно перекодирует текстовые файлы из Windows-1251 в UTF-8.
+
+Аргументы:
+  <каталог>   Путь к каталогу для обработки
+  --dry-run   Только показать файлы, которые будут перекодированы (без изменений)
+  -h, --help  Показать эту справку и выйти
+
+Примеры:
+  $(basename "$0") /path/to/dir
+  $(basename "$0") /path/to/dir --dry-run
+EOF
+}
+
 DIR="${1:-}"
 MODE="${2:-}"
 
-if [ -z "$DIR" ] || [ ! -d "$DIR" ]; then
-    echo "Использование: $0 <каталог> [--dry-run]"
+if [ "$DIR" = "-h" ] || [ "$DIR" = "--help" ]; then
+    usage
+    exit 0
+fi
+
+if [ -z "$DIR" ]; then
+    usage
+    exit 1
+fi
+
+if [ ! -d "$DIR" ]; then
+    echo "Ошибка: каталог не найден: $DIR" >&2
     exit 1
 fi
 
