@@ -138,10 +138,25 @@
 Определяет текущий внешний IP-адрес и ведёт его историю.
 
 **Возможности:**
-- Сохраняет текущий IP в файл через `icanhazip.com`
+- Запрашивает внешний IP у настраиваемого URL-сервиса через `curl`
+- Сохраняет текущий IP в файл
 - Добавляет запись в файл истории с временной меткой — только если IP изменился
+- Все пути и URL задаются через конфиг-файл `getip.conf`
 
-**Требует настройки** путей к файлам хранения непосредственно в скрипте.
+**Конфигурация** (`getip.conf`):
+
+| Параметр          | По умолчанию                                              |
+|-------------------|-----------------------------------------------------------|
+| `IP_SERVICE_URL`  | `https://icanhazip.com`                                   |
+| `IP_FILE`         | `/var/downloads/clouddata/nextcloud/work/ip.txt`          |
+| `IP_HISTORY_FILE` | `/var/downloads/clouddata/nextcloud/work/ip_history.txt`  |
+
+Примеры совместимых сервисов: `https://api.ipify.org`, `https://ifconfig.me/ip`, `https://checkip.amazonaws.com`
+
+**Использование:**
+```sh
+./getip.sh
+```
 
 ---
 
@@ -396,7 +411,7 @@ sudo ./wireguard-install.sh
 | `cp1251_to_utf8.sh`                | `iconv`, `file`                               |
 | `delete_by_ext.sh`                 | `find`                                        |
 | `doc2fb2.sh`                       | `pandoc`, `libreoffice`; опц.: `unrtf`, `antiword`, `catdoc`, `wvText` |
-| `getip.sh`                         | `wget`, `curl`                                |
+| `getip.sh`                         | `curl`                                        |
 | `hp_p1005_garuda.sh`               | `pacman`, `systemctl` (Arch/Garuda)           |
 | `lowercase_ext.sh`                 | `find`, `mv`                                  |
 | `mht_to_fb2.py`                    | Python 3, `pandoc`                            |
