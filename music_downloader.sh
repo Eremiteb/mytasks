@@ -52,5 +52,6 @@ else
     log_json "ERROR" "Загрузчик завершился с ошибкой $PYTHON_EXIT_CODE"
 fi
 
+log_json "INFO" "Завершение работы music_downloader (код: $PYTHON_EXIT_CODE)"
 cleanup_logs
 exit $PYTHON_EXIT_CODE
