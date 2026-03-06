@@ -10,7 +10,9 @@ SCRIPT_BASE=${SCRIPT_NAME%.*}
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P)
 [ -z "$SCRIPT_DIR" ] && SCRIPT_DIR="."
 
-DEFAULT_CONFIG="${SCRIPT_DIR}/${SCRIPT_BASE}.conf"
+CONFIG_DIR="${SCRIPT_DIR}/conf"
+mkdir -p "$CONFIG_DIR" 2>/dev/null
+DEFAULT_CONFIG="${CONFIG_DIR}/${SCRIPT_BASE}.conf"
 TODAY="$(date '+%Y-%m-%d')"
 # Указываем расширение .jsonl для соответствия формату
 LOG_DIR="${SCRIPT_DIR}/logs"

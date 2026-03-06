@@ -1,7 +1,10 @@
 #!/bin/sh
 
 # ====== Автопоиск конфигурации ======
-CONFIG_FILE="./audio_to_mp3.conf"
+SCRIPT_DIR="$( cd "$( dirname "$0" )" && pwd )"
+CONFIG_DIR="${SCRIPT_DIR}/conf"
+mkdir -p "$CONFIG_DIR"
+CONFIG_FILE="${CONFIG_DIR}/audio_to_mp3.conf"
 if [ -f "$CONFIG_FILE" ]; then
   . "$CONFIG_FILE"
   echo "Загружен конфиг: $CONFIG_FILE"

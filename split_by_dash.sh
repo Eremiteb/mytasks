@@ -7,9 +7,11 @@ TIMESTAMP=$(date +"%Y-%m-%d-%H-%M-%S")
 
 # Конфиг и лог именуются строго по имени скрипта
 LOG_DIR="${SCRIPT_PATH}/logs"
+CONFIG_DIR="${SCRIPT_PATH}/conf"
 mkdir -p "$LOG_DIR"
+mkdir -p "$CONFIG_DIR"
 LOG_FILE="${LOG_DIR}/${SCRIPT_NAME_BASE}-${TIMESTAMP}.jsonl"
-CONF_FILE="${SCRIPT_PATH}/${SCRIPT_NAME_BASE}.conf"
+CONF_FILE="${CONFIG_DIR}/${SCRIPT_NAME_BASE}.conf"
 
 log_json() {
   _level="$1"

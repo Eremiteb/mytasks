@@ -39,10 +39,14 @@ Thumbs.db
 *.log
 logs/
 
+# Configuration files (keep directory structure)
+conf/*
+!conf/.gitkeep
+
 # Local project directories (exclude from GitHub)
 /music_downloader/
 /music_downloader-dev/
-*.conf
+/newline_to_space/
 .sources.err*
 .sources.out*
 *.sync-conflict

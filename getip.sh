@@ -3,7 +3,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}" .sh)"
-CONF_FILE="${SCRIPT_DIR}/${SCRIPT_NAME}.conf"
+CONFIG_DIR="${SCRIPT_DIR}/conf"
+mkdir -p "$CONFIG_DIR"
+CONF_FILE="${CONFIG_DIR}/${SCRIPT_NAME}.conf"
 
 # Значения по умолчанию
 IP_SERVICE_URL="https://icanhazip.com"
