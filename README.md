@@ -423,3 +423,19 @@ sudo ./wireguard-install.sh
 | `split_by_dash.sh`                 | `find`, `mv`, `sed`                           |
 | `unpack-fb2zip.sh`                 | `find`, `unzip`                               |
 | `wireguard-install.sh`             | `root`, поддерживаемый дистрибутив Linux      |
+
+---
+
+## Тесты (bats-core)
+
+В репозитории добавлены shell-тесты на `bats-core` в каталоге `tests/`.
+
+**Локальный запуск:**
+```sh
+git clone --depth 1 https://github.com/bats-core/bats-core.git /tmp/bats-core
+/tmp/bats-core/bin/bats --print-output-on-failure tests
+```
+
+**GitHub CI:**
+- Workflow: `.github/workflows/bats-tests.yml`
+- Запускается автоматически на `push` и `pull_request`

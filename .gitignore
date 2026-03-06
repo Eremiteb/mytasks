@@ -39,7 +39,10 @@ Thumbs.db
 *.log
 logs/
 
-# Local config/secrets
-/music_downloader
-/music_downloader-dev
+# Local project directories (exclude from GitHub)
+/music_downloader/
+/music_downloader-dev/
 *.conf
+.sources.err*
+.sources.out*
+*.sync-conflict

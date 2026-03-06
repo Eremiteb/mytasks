@@ -1,0 +1,26 @@
+name: Bats tests
+
+on:
+    push:
+    pull_request:
+
+jobs:
+    bats:
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Install dependencies
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y file
+
+            - name: Install bats-core
+              run: |
+                  git clone --depth 1 https://github.com/bats-core/bats-core.git /tmp/bats-core
+                  sudo /tmp/bats-core/install.sh /usr/local
+
+            - name: Run bats tests
+              run: bats --print-output-on-failure tests
