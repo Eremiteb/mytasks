@@ -55,6 +55,51 @@
 
 ---
 
+### `cloud_backup.sh`
+
+Резервное копирование `/opt/esimych-cloud` с удалённого сервера через WireGuard VPN.
+
+**Порядок работы:**
+1. Поднимает WireGuard-соединение (`wg-quick up`), если оно не активно
+2. Подключается к удалённому серверу по SSH (`sshpass`)
+3. Создаёт tar.gz-архив удалённой папки и сохраняет его в `BACKUP_DIR`
+4. Опускает WireGuard (если был поднят скриптом) — управляется параметром `WG_KEEP_UP`
+
+**Зависимости:** `wg-quick`, `sshpass`
+
+**Конфигурация** (`conf/cloud_backup.conf`):
+
+| Параметр          | По умолчанию            | Описание                                       |
+|-------------------|-------------------------|------------------------------------------------|
+| `WG_INTERFACE`    | *(обязательно)*         | Имя WireGuard-интерфейса (напр. `wg0`)         |
+| `REMOTE_HOST`     | *(обязательно)*         | IP-адрес удалённого сервера                    |
+| `REMOTE_USER`     | *(обязательно)*         | Логин SSH                                      |
+| `REMOTE_PASSWORD` | *(обязательно)*         | Пароль SSH                                     |
+| `REMOTE_SSH_PORT` | `22`                    | Порт SSH                                       |
+| `REMOTE_PATH`     | `/opt/esimych-cloud`    | Путь к папке на удалённой системе              |
+| `BACKUP_DIR`      | *(обязательно)*         | Локальная папка для резервных копий            |
+| `WG_KEEP_UP`      | `0`                     | Оставить WireGuard активным после завершения   |
+
+**Логи:** JSONL-файл `logs/cloud_backup-YYYY-MM-DD-HH-MM-SS.jsonl`. Хранится 5 последних файлов.
+
+**Имя архива:** `cloud_backup-YYYY-MM-DD.tar.gz`
+
+**Использование:**
+```sh
+sudo ./cloud_backup.sh
+```
+
+**Cron (каждый день в 21:30):**
+```cron
+30 21 * * * root /path/to/mytasks/cloud_backup.sh >> /dev/null 2>&1
+```
+Или через `sudo crontab -e`:
+```cron
+30 21 * * * /home/esimych/esimych-docs/mytasks/cloud_backup.sh
+```
+
+---
+
 ### `check-store-mount.sh`
 
 Проверяет, смонтированы ли все точки монтирования из `/etc/fstab`.
