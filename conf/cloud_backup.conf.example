@@ -1,0 +1,26 @@
+# Конфигурация cloud_backup.sh
+# Скопируйте этот файл в cloud_backup.conf и заполните своими значениями.
+
+# Имя WireGuard-интерфейса (из /etc/wireguard/)
+WG_INTERFACE="wg0"
+
+# IP-адрес удалённого сервера
+REMOTE_HOST="192.168.x.x"
+
+# Логин SSH
+REMOTE_USER="username"
+
+# Пароль SSH
+REMOTE_PASSWORD="password"
+
+# Порт SSH (необязательно, по умолчанию 22)
+REMOTE_SSH_PORT="22"
+
+# Путь к папке на удалённой системе (необязательно, по умолчанию /opt/esimych-cloud)
+REMOTE_PATH="/opt/esimych-cloud"
+
+# Локальная папка для резервных копий
+BACKUP_DIR="/mnt/store/backups"
+
+# Оставить WireGuard активным после завершения скрипта: 1 — да, 0 — нет (по умолчанию)
+WG_KEEP_UP="0"

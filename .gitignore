@@ -42,6 +42,7 @@ logs/
 # Configuration files (keep directory structure)
 conf/*
 !conf/.gitkeep
+!conf/*.conf.example
 
 # Local project directories (exclude from GitHub)
 /music_downloader/

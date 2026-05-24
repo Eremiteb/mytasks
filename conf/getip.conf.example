@@ -1,0 +1,16 @@
+# Конфигурация getip.sh
+# Скопируйте этот файл в getip.conf и заполните своими значениями.
+
+# URL сервиса, возвращающего внешний IP (одной строкой)
+# Варианты:
+#   https://icanhazip.com
+#   https://api.ipify.org
+#   https://ifconfig.me/ip
+#   https://checkip.amazonaws.com
+IP_SERVICE_URL="https://icanhazip.com"
+
+# Файл для хранения текущего IP
+IP_FILE="/path/to/ip.txt"
+
+# Файл истории IP-адресов
+IP_HISTORY_FILE="/path/to/ip_history.txt"
