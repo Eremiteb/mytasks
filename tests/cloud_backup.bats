@@ -228,12 +228,26 @@ EOF
 # ---------------------------------------------------------------------------
 
 @test "завершается с ошибкой если sshpass не установлен" {
-  rm "$STUB_DIR/sshpass"
+  # Строим изолированный PATH: только нужные системные утилиты + стабы, без sshpass.
+  # Нельзя просто удалить стаб — системный sshpass может быть установлен или
+  # стать видимым при параллельном запуске всего набора тестов.
+  local iso="$TMP_DIR/iso_no_sshpass"
+  mkdir -p "$iso"
 
-  run env PATH="$STUB_DIR:$PATH" bash "$TMP_DIR/cloud_backup.sh"
+  # Копируем стабы (wg, wg-quick, ping), sshpass намеренно пропускаем
+  for _s in wg wg-quick ping; do cp "$STUB_DIR/$_s" "$iso/$_s"; done
+
+  # Симлинки на системные утилиты, нужные скрипту до/после sshpass-проверки.
+  # bash и env нужны, чтобы стабы со своим шебангом #!/usr/bin/env bash запустились.
+  for _cmd in bash env date mkdir ls tail rm sed grep sleep basename dirname; do
+    _bin="$(command -v "$_cmd" 2>/dev/null)"
+    [ -n "$_bin" ] && ln -sf "$_bin" "$iso/$_cmd" || true
+  done
+
+  run env PATH="$iso" bash "$TMP_DIR/cloud_backup.sh"
 
   [ "$status" -ne 0 ]
-  log_file=$(ls "$TMP_DIR/logs"/cloud_backup-*.jsonl 2>/dev/null | head -1)
+  log_file=$(ls -1t "$TMP_DIR/logs"/cloud_backup-*.jsonl 2>/dev/null | head -1)
   run grep -q '"event":"sshpass_missing"' "$log_file"
   [ "$status" -eq 0 ]
 }
