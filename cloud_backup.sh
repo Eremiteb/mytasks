@@ -77,7 +77,7 @@ WG_BROUGHT_UP=0
 wg_down_if_needed() {
   if [ "$WG_BROUGHT_UP" -eq 1 ] && [ "${WG_KEEP_UP:-0}" -ne 1 ]; then
     log_json "INFO" "wg_down" "Опускаем WireGuard ${WG_INTERFACE}..."
-    wg-quick down "$WG_INTERFACE" 2>/dev/null && \
+    sudo wg-quick down "$WG_INTERFACE" 2>/dev/null && \
       log_json "INFO" "wg_down_ok" "WireGuard ${WG_INTERFACE} опущен" || \
       log_json "WARN" "wg_down_fail" "Не удалось опустить WireGuard ${WG_INTERFACE}"
   fi
@@ -91,11 +91,11 @@ trap cleanup EXIT INT TERM
 
 log_json "INFO" "start" "Запуск резервного копирования"
 
-if wg show "$WG_INTERFACE" >/dev/null 2>&1; then
+if ip link show "$WG_INTERFACE" >/dev/null 2>&1; then
   log_json "INFO" "wg_status" "WireGuard ${WG_INTERFACE} уже активен"
 else
   log_json "INFO" "wg_up" "Поднимаем WireGuard ${WG_INTERFACE}..."
-  wg_err=$(wg-quick up "$WG_INTERFACE" 2>&1)
+  wg_err=$(sudo wg-quick up "$WG_INTERFACE" 2>&1)
   wg_rc=$?
   if [ $wg_rc -ne 0 ]; then
     log_json "ERROR" "wg_up_failed" "Не удалось поднять WireGuard ${WG_INTERFACE}" "$wg_err" $wg_rc
@@ -129,8 +129,8 @@ log_json "INFO" "wg_connected" "Соединение с ${REMOTE_HOST} подт�
 # PREFLIGHT
 ###############################################################################
 if ! command -v sshpass >/dev/null 2>&1; then
-  log_json "ERROR" "sshpass_missing" "sshpass не установлен" "sudo apt install sshpass"
-  echo "Ошибка: sshpass не найден. Установите: sudo apt install sshpass" >&2
+  log_json "ERROR" "sshpass_missing" "sshpass не установлен" "sudo pacman -S sshpass"
+  echo "Ошибка: sshpass не найден. Установите: sudo pacman -S sshpass" >&2
   exit 1
 fi
 
@@ -154,12 +154,12 @@ REMOTE_DIR="$(basename "$REMOTE_PATH")"
 log_json "INFO" "backup_start" "Начало резервного копирования" \
   "remote=${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH} -> ${BACKUP_PATH}"
 
-SSH_OPTS="-p ${REMOTE_SSH_PORT} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 -o BatchMode=no"
+SSH_OPTS="-p ${REMOTE_SSH_PORT} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 -o BatchMode=no -o Compression=no -c aes128-gcm@openssh.com,chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-ctr"
 export SSHPASS="${REMOTE_PASSWORD}"
 
 err_tmp=$(mktemp)
 sshpass -e ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
-  "tar --create --gzip --file=- --directory='${REMOTE_PARENT}' '${REMOTE_DIR}'" \
+  "set -o pipefail; tar --create --file=- --directory='${REMOTE_PARENT}' '${REMOTE_DIR}' | gzip -1" \
   > "$BACKUP_PATH" 2>"$err_tmp"
 backup_rc=$?
 err_out=$(cat "$err_tmp"); rm -f "$err_tmp"
