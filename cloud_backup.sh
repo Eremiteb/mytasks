@@ -73,17 +73,36 @@ WG_KEEP_UP="${WG_KEEP_UP:-0}"
 # WireGuard
 ###############################################################################
 WG_BROUGHT_UP=0
+SERVICES_STOPPED=0
 
 wg_down_if_needed() {
   if [ "$WG_BROUGHT_UP" -eq 1 ] && [ "${WG_KEEP_UP:-0}" -ne 1 ]; then
     log_json "INFO" "wg_down" "Опускаем WireGuard ${WG_INTERFACE}..."
-    sudo wg-quick down "$WG_INTERFACE" 2>/dev/null && \
+    wg-quick down "$WG_INTERFACE" 2>/dev/null && \
       log_json "INFO" "wg_down_ok" "WireGuard ${WG_INTERFACE} опущен" || \
       log_json "WARN" "wg_down_fail" "Не удалось опустить WireGuard ${WG_INTERFACE}"
   fi
 }
 
+services_start_if_needed() {
+  if [ "$SERVICES_STOPPED" -eq 1 ]; then
+    SERVICES_STOPPED=0
+    log_json "INFO" "services_start" "Запускаем сервисы на ${REMOTE_HOST}..."
+    export SSHPASS="${REMOTE_PASSWORD}"
+    start_err=$(sshpass -e ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
+      "cd '${REMOTE_PATH}' && docker compose start" 2>&1)
+    start_rc=$?
+    unset SSHPASS
+    if [ $start_rc -ne 0 ]; then
+      log_json "WARN" "services_start_failed" "Не удалось запустить сервисы" "$start_err" $start_rc
+    else
+      log_json "INFO" "services_start_ok" "Сервисы запущены" "" $start_rc
+    fi
+  fi
+}
+
 cleanup() {
+  services_start_if_needed
   wg_down_if_needed
   cleanup_logs
 }
@@ -91,11 +110,11 @@ trap cleanup EXIT INT TERM
 
 log_json "INFO" "start" "Запуск резервного копирования"
 
-if ip link show "$WG_INTERFACE" >/dev/null 2>&1; then
+if wg show "$WG_INTERFACE" >/dev/null 2>&1; then
   log_json "INFO" "wg_status" "WireGuard ${WG_INTERFACE} уже активен"
 else
   log_json "INFO" "wg_up" "Поднимаем WireGuard ${WG_INTERFACE}..."
-  wg_err=$(sudo wg-quick up "$WG_INTERFACE" 2>&1)
+  wg_err=$(wg-quick up "$WG_INTERFACE" 2>&1)
   wg_rc=$?
   if [ $wg_rc -ne 0 ]; then
     log_json "ERROR" "wg_up_failed" "Не удалось поднять WireGuard ${WG_INTERFACE}" "$wg_err" $wg_rc
@@ -145,25 +164,67 @@ fi
 # BACKUP
 ###############################################################################
 BACKUP_DATE="$(date '+%Y-%m-%d')"
-BACKUP_FILENAME="${SCRIPT_BASE}-${BACKUP_DATE}.tar.gz"
-BACKUP_PATH="${BACKUP_DIR}/${BACKUP_FILENAME}"
-
 REMOTE_PARENT="$(dirname "$REMOTE_PATH")"
 REMOTE_DIR="$(basename "$REMOTE_PATH")"
 
-log_json "INFO" "backup_start" "Начало резервного копирования" \
-  "remote=${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH} -> ${BACKUP_PATH}"
-
 SSH_OPTS="-p ${REMOTE_SSH_PORT} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 -o BatchMode=no -o Compression=no -c aes128-gcm@openssh.com,chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-ctr"
+
+# Выбираем быстрейший доступный компрессор на удалённом сервере:
+# zstd --fast=1 --threads=0 > pigz -1 > gzip -1
 export SSHPASS="${REMOTE_PASSWORD}"
+REMOTE_COMP=$(sshpass -e ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
+  "if command -v zstd >/dev/null 2>&1; then echo zstd; elif command -v pigz >/dev/null 2>&1; then echo pigz; else echo gzip; fi" 2>/dev/null)
+unset SSHPASS
+case "$REMOTE_COMP" in
+  zstd) COMP_CMD="zstd --fast=1 --threads=0 -c"; BACKUP_EXT="tar.zst" ;;
+  pigz) COMP_CMD="pigz -1";                       BACKUP_EXT="tar.gz"  ;;
+  *)    COMP_CMD="gzip -1";                        BACKUP_EXT="tar.gz"  ;;
+esac
+
+BACKUP_FILENAME="${SCRIPT_BASE}-${BACKUP_DATE}.${BACKUP_EXT}"
+BACKUP_PATH="${BACKUP_DIR}/${BACKUP_FILENAME}"
+
+log_json "INFO" "backup_start" "Начало резервного копирования" \
+  "remote=${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH} -> ${BACKUP_PATH}, comp=${REMOTE_COMP:-gzip}"
+
+log_json "INFO" "services_stop" "Останавливаем сервисы на ${REMOTE_HOST}..."
+export SSHPASS="${REMOTE_PASSWORD}"
+stop_err=$(sshpass -e ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
+  "cd '${REMOTE_PATH}' && docker compose stop" 2>&1)
+stop_rc=$?
+unset SSHPASS
+if [ $stop_rc -ne 0 ]; then
+  log_json "WARN" "services_stop_failed" "Не удалось остановить сервисы" "$stop_err" $stop_rc
+  echo "Предупреждение: не удалось остановить сервисы (код $stop_rc): $stop_err" >&2
+else
+  SERVICES_STOPPED=1
+  log_json "INFO" "services_stop_ok" "Сервисы остановлены" "" $stop_rc
+fi
+
+export SSHPASS="${REMOTE_PASSWORD}"
+
+# Фоновый монитор: пишет размер файла в лог каждые 60 сек
+_progress_monitor() {
+  while sleep 60; do
+    [ -f "$BACKUP_PATH" ] || break
+    local sz
+    sz=$(du -sh "$BACKUP_PATH" 2>/dev/null | cut -f1)
+    [ -n "$sz" ] && log_json "INFO" "backup_progress" "Прогресс архивирования" "size=${sz}"
+  done
+}
+_progress_monitor >/dev/null 2>&1 &
+_PROGRESS_PID=$!
 
 err_tmp=$(mktemp)
 sshpass -e ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
-  "set -o pipefail; tar --create --file=- --directory='${REMOTE_PARENT}' '${REMOTE_DIR}' | gzip -1" \
+  "set -o pipefail; tar --create --file=- --sparse --directory='${REMOTE_PARENT}' '${REMOTE_DIR}' | ${COMP_CMD}" \
   > "$BACKUP_PATH" 2>"$err_tmp"
 backup_rc=$?
 err_out=$(cat "$err_tmp"); rm -f "$err_tmp"
 unset SSHPASS
+
+kill "$_PROGRESS_PID" 2>/dev/null
+wait "$_PROGRESS_PID" 2>/dev/null
 
 if [ $backup_rc -eq 0 ]; then
   backup_size=$(du -sh "$BACKUP_PATH" 2>/dev/null | cut -f1)
