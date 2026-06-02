@@ -12,11 +12,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 CONFIG_DIR="${SCRIPT_DIR}/conf"
 CONFIG_FILE="${CONFIG_DIR}/${SCRIPT_BASE}.conf"
+LOG_TEMPLATE_FILE="${CONFIG_DIR}/log_template.conf"
 LOG_DIR="${SCRIPT_DIR}/logs"
 TIMESTAMP="$(date '+%Y-%m-%d-%H-%M-%S')"
 LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}-${TIMESTAMP}.jsonl"
 
 mkdir -p "$LOG_DIR"
+
+if [ -r "$LOG_TEMPLATE_FILE" ]; then
+  # shellcheck source=/dev/null
+  source "$LOG_TEMPLATE_FILE"
+fi
+LOG_SCHEMA_VERSION="${LOG_SCHEMA_VERSION:-1.0}"
+LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
 
 ###############################################################################
 # HELPERS
@@ -33,12 +41,13 @@ log_json() {
   local msg="$3"
   local detail="${4:-}"
   local rc="${5:-null}"
-  local ts_val msg_esc detail_esc
+  local ts_val msg_esc detail_esc level_norm
   ts_val="$(ts)"
   msg_esc="$(json_escape "$msg")"
   detail_esc="$(json_escape "$detail")"
-  printf '{"ts":"%s","level":"%s","script":"%s","event":"%s","msg":"%s","detail":"%s","rc":%s}\n' \
-    "$ts_val" "$level" "$SCRIPT_NAME" "$event" "$msg_esc" "$detail_esc" "$rc" >> "$LOG_FILE"
+  level_norm="$(printf '%s' "$level" | tr '[:upper:]' '[:lower:]')"
+  printf '{"@timestamp":"%s","schema.version":"%s","compat.targets":"%s","log.level":"%s","message":"%s","event.action":"%s","service.name":"%s","script":"%s","event":"%s","level":"%s","msg":"%s","detail":"%s","rc":%s}\n' \
+    "$ts_val" "$LOG_SCHEMA_VERSION" "$LOG_COMPAT_TARGETS" "$level_norm" "$msg_esc" "$event" "$SCRIPT_BASE" "$SCRIPT_NAME" "$event" "$level_norm" "$msg_esc" "$detail_esc" "$rc" >> "$LOG_FILE"
 }
 
 cleanup_logs() {
@@ -58,7 +67,7 @@ fi
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
 
-for var in WG_INTERFACE REMOTE_HOST REMOTE_USER REMOTE_PASSWORD BACKUP_DIR; do
+for var in WG_INTERFACE REMOTE_HOST REMOTE_USER REMOTE_PASSWORD SUDO_PASSWORD BACKUP_DIR; do
   if [ -z "${!var:-}" ]; then
     echo "Ошибка: переменная $var не задана в $CONFIG_FILE" >&2
     exit 1
@@ -78,7 +87,7 @@ SERVICES_STOPPED=0
 wg_down_if_needed() {
   if [ "$WG_BROUGHT_UP" -eq 1 ] && [ "${WG_KEEP_UP:-0}" -ne 1 ]; then
     log_json "INFO" "wg_down" "Опускаем WireGuard ${WG_INTERFACE}..."
-    wg-quick down "$WG_INTERFACE" 2>/dev/null && \
+    echo "$SUDO_PASSWORD" | sudo -S wg-quick down "$WG_INTERFACE" 2>/dev/null && \
       log_json "INFO" "wg_down_ok" "WireGuard ${WG_INTERFACE} опущен" || \
       log_json "WARN" "wg_down_fail" "Не удалось опустить WireGuard ${WG_INTERFACE}"
   fi
@@ -114,7 +123,7 @@ if wg show "$WG_INTERFACE" >/dev/null 2>&1; then
   log_json "INFO" "wg_status" "WireGuard ${WG_INTERFACE} уже активен"
 else
   log_json "INFO" "wg_up" "Поднимаем WireGuard ${WG_INTERFACE}..."
-  wg_err=$(wg-quick up "$WG_INTERFACE" 2>&1)
+  wg_err=$(echo "$SUDO_PASSWORD" | sudo -S wg-quick up "$WG_INTERFACE" 2>&1)
   wg_rc=$?
   if [ $wg_rc -ne 0 ]; then
     log_json "ERROR" "wg_up_failed" "Не удалось поднять WireGuard ${WG_INTERFACE}" "$wg_err" $wg_rc

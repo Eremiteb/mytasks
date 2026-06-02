@@ -1,73 +1,107 @@
 #!/bin/sh
 
-# Определение путей и имен
-SCRIPT_PATH="$( cd "$( dirname "$0" )" && pwd )"
-SCRIPT_NAME_BASE=$(basename "$0" .sh)
-TIMESTAMP=$(date +"%Y-%m-%d-%H-%M-%S")
+set -eu
 
-# Конфиг и лог именуются строго по имени скрипта
-LOG_DIR="${SCRIPT_PATH}/logs"
-CONFIG_DIR="${SCRIPT_PATH}/conf"
-mkdir -p "$LOG_DIR"
-mkdir -p "$CONFIG_DIR"
-LOG_FILE="${LOG_DIR}/${SCRIPT_NAME_BASE}-${TIMESTAMP}.jsonl"
-CONF_FILE="${CONFIG_DIR}/${SCRIPT_NAME_BASE}.conf"
+###############################################################################
+# SCRIPT ID / PATHS
+###############################################################################
+SCRIPT_NAME=$(basename -- "$0")
+SCRIPT_BASE=${SCRIPT_NAME%.*}
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P)
+
+LOG_DIR="${SCRIPT_DIR}/logs"
+CONFIG_DIR="${SCRIPT_DIR}/conf"
+CONFIG_FILE="${CONFIG_DIR}/${SCRIPT_BASE}.conf"
+LOG_TEMPLATE_FILE="${CONFIG_DIR}/log_template.conf"
+TIMESTAMP="$(date '+%Y-%m-%d-%H-%M-%S')"
+LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}-${TIMESTAMP}.jsonl"
+mkdir -p "$LOG_DIR" "$CONFIG_DIR"
+
+if [ -r "$LOG_TEMPLATE_FILE" ]; then
+  # shellcheck source=/dev/null
+  . "$LOG_TEMPLATE_FILE"
+fi
+LOG_SCHEMA_VERSION="${LOG_SCHEMA_VERSION:-1.0}"
+LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
+
+###############################################################################
+# HELPERS
+###############################################################################
+ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }
+
+json_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\r//g'
+}
 
 log_json() {
-  _level="$1"
-  _msg="$2"
-  _time=$(date +"%Y-%m-%dT%H:%M:%S%z")
-  printf '{"timestamp": "%s", "level": "%s", "message": "%s"}\n' "$_time" "$_level" "$_msg" >> "$LOG_FILE"
+  level="$1"
+  event="$2"
+  msg="$3"
+  detail="${4:-}"
+  level_norm="$(printf '%s' "$level" | tr '[:upper:]' '[:lower:]')"
+  msg_esc="$(json_escape "$msg")"
+  detail_esc="$(json_escape "$detail")"
+  printf '{"@timestamp":"%s","schema.version":"%s","compat.targets":"%s","log.level":"%s","message":"%s","event.action":"%s","service.name":"%s","script":"%s","event":"%s","level":"%s","msg":"%s","detail":"%s"}\n' \
+    "$(ts)" "$LOG_SCHEMA_VERSION" "$LOG_COMPAT_TARGETS" "$level_norm" "$msg_esc" "$event" "$SCRIPT_BASE" "$SCRIPT_NAME" "$event" "$level_norm" "$msg_esc" "$detail_esc" >> "$LOG_FILE"
 }
 
 cleanup_logs() {
-  _old_logs=$(ls -1t "${LOG_DIR}/${SCRIPT_NAME_BASE}-"*.jsonl 2>/dev/null | tail -n +6)
-  [ -n "$_old_logs" ] && rm $_old_logs
+  old_logs=$(ls -1t "${LOG_DIR}/${SCRIPT_BASE}-"*.jsonl 2>/dev/null | tail -n +11 || true)
+  if [ -n "${old_logs:-}" ]; then
+    rm -f $old_logs
+  fi
+}
+
+trim() {
+  printf '%s' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
 }
 
 process_directory() {
-  _current_dir="$1"
-  if [ ! -d "$_current_dir" ]; then
-    log_json "ERROR" "Каталог не существует: $_current_dir"
+  current_dir="$1"
+  if [ ! -d "$current_dir" ]; then
+    log_json "ERROR" "dir_missing" "Каталог не существует" "$current_dir"
     return
   fi
 
-  log_json "INFO" "Обработка директории: $_current_dir"
-  
-  find "$_current_dir" -maxdepth 1 -type f | while IFS= read -r file; do
-    name=$(basename "$file")
+  log_json "INFO" "dir_start" "Обработка директории" "$current_dir"
+  find "$current_dir" -maxdepth 1 -type f | while IFS= read -r file; do
+    name=$(basename -- "$file")
     folder=$(printf '%s\n' "$name" | sed -n 's/^\(.*\)[[:space:]][-–—][[:space:]].*/\1/p' | sed 's/[[:space:]]*$//' | sed -n '1p')
-
     [ -z "$folder" ] && continue
 
-    target_dir="$_current_dir/$folder"
+    target_dir="$current_dir/$folder"
     mkdir -p "$target_dir"
-    
+
     dst="$target_dir/$name"
     if [ -e "$dst" ]; then
-      i=1; while [ -e "$target_dir/$name.$i" ]; do i=$((i+1)); done
+      i=1
+      while [ -e "$target_dir/$name.$i" ]; do i=$((i+1)); done
       dst="$target_dir/$name.$i"
     fi
 
-    mv "$file" "$dst" && log_json "INFO" "Moved: $name -> $folder/"
+    if mv -- "$file" "$dst"; then
+      log_json "INFO" "moved" "Файл перемещен" "$name -> $dst"
+    fi
   done
 }
 
-# --- Основная логика ---
-# 1. Если передан аргумент — работаем с ним
-# 2. Если нет — ищем конфиг рядом со скриптом
-if [ -n "$1" ] && [ -d "$1" ]; then
+###############################################################################
+# MAIN
+###############################################################################
+if [ -n "${1:-}" ] && [ -d "$1" ]; then
   process_directory "$1"
-elif [ -f "$CONF_FILE" ]; then
-  log_json "INFO" "Использование конфига: $CONF_FILE"
+elif [ -r "$CONFIG_FILE" ]; then
+  log_json "INFO" "config_used" "Использование конфига" "$CONFIG_FILE"
   while IFS= read -r line || [ -n "$line" ]; do
-    target=$(echo "$line" | sed 's/#.*//' | xargs)
+    case "$line" in ""|\#*) continue ;; esac
+    target=$(trim "$(printf '%s' "$line" | sed 's/#.*//')")
     [ -n "$target" ] && process_directory "$target"
-  done < "$CONF_FILE"
+  done < "$CONFIG_FILE"
 else
-  _err="Ошибка: Каталог не указан и конфиг $CONF_FILE не найден."
-  echo "$_err" >&2
-  log_json "ERROR" "$_err"
+  err="Ошибка: каталог не указан и конфиг $CONFIG_FILE не найден."
+  echo "$err" >&2
+  log_json "ERROR" "config_missing" "$err"
+  cleanup_logs
   exit 1
 fi
 

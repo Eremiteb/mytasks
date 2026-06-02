@@ -1,57 +1,101 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-SCRIPT_PATH="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-PROJECT_DIR_NAME="music_downloader"
-PROJECT_PATH="$SCRIPT_PATH/$PROJECT_DIR_NAME"
-VENV_PATH="$PROJECT_PATH/venv"
+set -euo pipefail
 
-SCRIPT_NAME_BASE=$(basename "$0" .sh)
-TIMESTAMP=$(date +"%Y-%m-%d-%H-%M-%S")
-LOG_DIR="${SCRIPT_PATH}/logs"
+###############################################################################
+# SCRIPT ID / PATHS
+###############################################################################
+SCRIPT_NAME="$(basename -- "$0")"
+SCRIPT_BASE="${SCRIPT_NAME%.*}"
+SCRIPT_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+PROJECT_PATH="${SCRIPT_DIR}/music_downloader"
+VENV_PATH="${PROJECT_PATH}/venv"
+LOG_DIR="${SCRIPT_DIR}/logs"
+TIMESTAMP="$(date '+%Y-%m-%d-%H-%M-%S')"
+LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}-${TIMESTAMP}.jsonl"
+LOG_TEMPLATE_FILE="${SCRIPT_DIR}/conf/log_template.conf"
+CRON_LOG="${PROJECT_PATH}/cron_execution.log"
 mkdir -p "$LOG_DIR"
-LOG_FILE="${LOG_DIR}/${SCRIPT_NAME_BASE}-${TIMESTAMP}.jsonl"
+
+if [[ -r "$LOG_TEMPLATE_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$LOG_TEMPLATE_FILE"
+fi
+LOG_SCHEMA_VERSION="${LOG_SCHEMA_VERSION:-1.0}"
+LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
+
+###############################################################################
+# HELPERS
+###############################################################################
+ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }
+
+json_escape() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\r//g'
+}
 
 log_json() {
-  _level="$1"
-  _msg="$2"
-  _time=$(date +"%Y-%m-%dT%H:%M:%S%z")
-  printf '{"timestamp": "%s", "level": "%s", "message": "%s"}\n' "$_time" "$_level" "$_msg" >> "$LOG_FILE"
+    local level="$1"
+    local event="$2"
+    local msg="$3"
+    local detail="${4:-}"
+    local level_norm msg_esc detail_esc
+    level_norm="$(printf '%s' "$level" | tr '[:upper:]' '[:lower:]')"
+    msg_esc="$(json_escape "$msg")"
+    detail_esc="$(json_escape "$detail")"
+    printf '{"@timestamp":"%s","schema.version":"%s","compat.targets":"%s","log.level":"%s","message":"%s","event.action":"%s","service.name":"%s","script":"%s","event":"%s","level":"%s","msg":"%s","detail":"%s"}\n' \
+        "$(ts)" "$LOG_SCHEMA_VERSION" "$LOG_COMPAT_TARGETS" "$level_norm" "$msg_esc" "$event" "$SCRIPT_BASE" "$SCRIPT_NAME" "$event" "$level_norm" "$msg_esc" "$detail_esc" >> "$LOG_FILE"
 }
 
 cleanup_logs() {
-  _old_logs=$(ls -1t "${LOG_DIR}/${SCRIPT_NAME_BASE}-"*.jsonl 2>/dev/null | tail -n +6)
-  [ -n "$_old_logs" ] && rm $_old_logs
+    local old_logs
+    old_logs=$(ls -1t "${LOG_DIR}/${SCRIPT_BASE}-"*.jsonl 2>/dev/null | tail -n +11 || true)
+    if [[ -n "${old_logs:-}" ]]; then
+        rm -f $old_logs
+    fi
 }
 
-log_json "INFO" "Запуск music_downloader"
+###############################################################################
+# MAIN
+###############################################################################
+log_json "INFO" "start" "Запуск music_downloader"
 
-if [ ! -d "$PROJECT_PATH" ]; then
-    log_json "ERROR" "Проект не найден."
-    cleanup_logs; exit 1
+if [[ ! -d "$PROJECT_PATH" ]]; then
+    log_json "ERROR" "project_missing" "Проект не найден" "$PROJECT_PATH"
+    cleanup_logs
+    exit 1
 fi
 
 cd "$PROJECT_PATH"
-[ -f "$VENV_PATH/bin/activate" ] && source "$VENV_PATH/bin/activate"
-
-# 1. Запуск Python
-python3 music_downloader.py >> cron_execution.log 2>&1
-PYTHON_EXIT_CODE=$?
-
-[ -f "$VENV_PATH/bin/activate" ] && deactivate
-
-# 2. Запуск сортировки при успехе
-if [ $PYTHON_EXIT_CODE -eq 0 ]; then
-    SPLIT_SCRIPT="$SCRIPT_PATH/split_by_dash.sh"
-    if [ -f "$SPLIT_SCRIPT" ]; then
-        log_json "INFO" "Запуск сортировщика (авто-поиск конфига)."
-        /bin/sh "$SPLIT_SCRIPT" >> cron_execution.log 2>&1
-    else
-        log_json "ERROR" "Сортировщик не найден."
-    fi
-else
-    log_json "ERROR" "Загрузчик завершился с ошибкой $PYTHON_EXIT_CODE"
+VENV_ACTIVE=0
+if [[ -f "$VENV_PATH/bin/activate" ]]; then
+    # shellcheck source=/dev/null
+    source "$VENV_PATH/bin/activate"
+    VENV_ACTIVE=1
+    log_json "INFO" "venv_activated" "Активировано виртуальное окружение" "$VENV_PATH"
 fi
 
-log_json "INFO" "Завершение работы music_downloader (код: $PYTHON_EXIT_CODE)"
+set +e
+python3 music_downloader.py >> "$CRON_LOG" 2>&1
+PYTHON_EXIT_CODE=$?
+set -e
+
+if [[ "$VENV_ACTIVE" -eq 1 ]]; then
+    deactivate
+fi
+
+if [[ $PYTHON_EXIT_CODE -eq 0 ]]; then
+    SPLIT_SCRIPT="${SCRIPT_DIR}/split_by_dash.sh"
+    if [[ -f "$SPLIT_SCRIPT" ]]; then
+        log_json "INFO" "split_start" "Запуск сортировщика" "$SPLIT_SCRIPT"
+        /bin/sh "$SPLIT_SCRIPT" >> "$CRON_LOG" 2>&1 || log_json "WARN" "split_failed" "Сортировщик завершился с ошибкой"
+    else
+        log_json "ERROR" "split_missing" "Сортировщик не найден" "$SPLIT_SCRIPT"
+    fi
+else
+    log_json "ERROR" "downloader_failed" "Загрузчик завершился с ошибкой" "rc=${PYTHON_EXIT_CODE}"
+fi
+
+log_json "INFO" "done" "Завершение работы" "rc=${PYTHON_EXIT_CODE}"
 cleanup_logs
-exit $PYTHON_EXIT_CODE
+exit "$PYTHON_EXIT_CODE"

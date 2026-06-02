@@ -13,6 +13,7 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P)
 CONFIG_DIR="${SCRIPT_DIR}/conf"
 mkdir -p "$CONFIG_DIR" 2>/dev/null
 DEFAULT_CONFIG="${CONFIG_DIR}/${SCRIPT_BASE}.conf"
+LOG_TEMPLATE_FILE="${CONFIG_DIR}/log_template.conf"
 TODAY="$(date '+%Y-%m-%d')"
 # Указываем расширение .jsonl для соответствия формату
 LOG_DIR="${SCRIPT_DIR}/logs"
@@ -20,6 +21,13 @@ LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}_${TODAY}-report.jsonl"
 
 # Создаем папку для логов, если её нет
 mkdir -p "$LOG_DIR"
+
+if [ -r "$LOG_TEMPLATE_FILE" ]; then
+  # shellcheck source=/dev/null
+  . "$LOG_TEMPLATE_FILE"
+fi
+LOG_SCHEMA_VERSION="${LOG_SCHEMA_VERSION:-1.0}"
+LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
 
 # Автоочистка старых логов (старше 10 дней)
 find "$LOG_DIR" -maxdepth 1 -type f \
@@ -55,13 +63,14 @@ log_json() {
   _dry_run="$( [ "$DRY_RUN" -eq 1 ] && echo true || echo false )"
   _rc="${9:-null}"
   _itemize="${10-}"
+  _level_norm="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
 
   _msg="$(printf '%s' "$5" | json_escape)"
   _detail="$(printf '%s' "$6" | json_escape)"
   _itemize_esc="$(printf '%s' "$_itemize" | json_escape)"
 
-  printf '{"ts":"%s","level":"%s","script":"%s","event":"%s","file":"%s","dst_file":"%s","src":"%s","dst":"%s","dry_run":%s,"rc":%s,"itemize":"%s","msg":"%s","detail":"%s"}\n' \
-    "$_ts" "$1" "$SCRIPT_NAME" "$2" "$3" "$4" "$7" "$8" "$_dry_run" "$_rc" "$_itemize_esc" "$_msg" "$_detail" >> "$LOG_FILE"
+  printf '{"@timestamp":"%s","schema.version":"%s","compat.targets":"%s","log.level":"%s","message":"%s","event.action":"%s","service.name":"%s","script":"%s","event":"%s","file":"%s","dst_file":"%s","src":"%s","dst":"%s","dry_run":%s,"rc":%s,"itemize":"%s","msg":"%s","detail":"%s"}\n' \
+    "$_ts" "$LOG_SCHEMA_VERSION" "$LOG_COMPAT_TARGETS" "$_level_norm" "$_msg" "$2" "$SCRIPT_BASE" "$SCRIPT_NAME" "$2" "$3" "$4" "$7" "$8" "$_dry_run" "$_rc" "$_itemize_esc" "$_msg" "$_detail" >> "$LOG_FILE"
 }
 
 ###############################################################################

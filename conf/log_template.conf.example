@@ -1,0 +1,13 @@
+# Единый шаблон JSONL-логов для shell-скриптов
+# Совместимость: ELK/OpenSearch, Loki, Graylog, Splunk
+
+LOG_SCHEMA_VERSION="1.0"
+LOG_COMPAT_TARGETS="elk,opensearch,loki,graylog,splunk"
+
+# Базовые поля
+LOG_FIELD_TS="@timestamp"
+LOG_FIELD_LEVEL="log.level"
+LOG_FIELD_MESSAGE="message"
+LOG_FIELD_EVENT_ACTION="event.action"
+LOG_FIELD_SERVICE_NAME="service.name"
+LOG_FIELD_SCHEMA_VERSION="schema.version"

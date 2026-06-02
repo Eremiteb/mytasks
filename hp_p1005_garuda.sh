@@ -17,10 +17,26 @@
 
 set -euo pipefail
 
-SCRIPT_NAME="$(basename "$0")"
+###############################################################################
+# SCRIPT ID / PATHS
+###############################################################################
+SCRIPT_NAME="$(basename -- "$0")"
+SCRIPT_BASE="${SCRIPT_NAME%.*}"
+SCRIPT_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+LOG_DIR="${SCRIPT_DIR}/logs"
+LOG_TEMPLATE_FILE="${SCRIPT_DIR}/conf/log_template.conf"
+mkdir -p "$LOG_DIR"
+
+if [[ -r "$LOG_TEMPLATE_FILE" ]]; then
+  # shellcheck source=/dev/null
+  source "$LOG_TEMPLATE_FILE"
+fi
+LOG_SCHEMA_VERSION="${LOG_SCHEMA_VERSION:-1.0}"
+LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
+
 HOSTNAME_SHORT="$(hostname -s 2>/dev/null || hostname)"
 TS_NOW="$(date '+%Y-%m-%d-%H-%M-%S')"
-LOG_FILE="./hp_p1005_garuda_${TS_NOW}.jsonl"
+LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}-${TS_NOW}.jsonl"
 LOG_FD=3
 
 # -------------------------
@@ -65,12 +81,20 @@ log_write() {
     shift
   done
 
-  printf '{"ts":"%s","host":"%s","script":"%s","level":"%s","event":"%s","msg":"%s"%s}\n' \
+  local level_norm
+  level_norm="$(printf '%s' "$level" | tr '[:upper:]' '[:lower:]')"
+  printf '{"@timestamp":"%s","schema.version":"%s","compat.targets":"%s","log.level":"%s","message":"%s","event.action":"%s","service.name":"%s","host.name":"%s","script":"%s","event":"%s","level":"%s","msg":"%s"%s}\n' \
     "$(date -Iseconds)" \
+    "$(json_escape "$LOG_SCHEMA_VERSION")" \
+    "$(json_escape "$LOG_COMPAT_TARGETS")" \
+    "$(json_escape "$level_norm")" \
+    "$(json_escape "$msg")" \
+    "$(json_escape "$event")" \
+    "$(json_escape "$SCRIPT_BASE")" \
     "$(json_escape "$HOSTNAME_SHORT")" \
     "$(json_escape "$SCRIPT_NAME")" \
-    "$(json_escape "$level")" \
     "$(json_escape "$event")" \
+    "$(json_escape "$level_norm")" \
     "$(json_escape "$msg")" \
     "$extras" >&$LOG_FD
 }

@@ -3,7 +3,24 @@
 # Лог: один JSONL-файл (по одной JSON-записи на строку)
 # Требования: bash, find, unzip
 
-set -u
+set -uo pipefail
+
+###############################################################################
+# SCRIPT ID / PATHS
+###############################################################################
+SCRIPT_NAME="$(basename -- "$0")"
+SCRIPT_BASE="${SCRIPT_NAME%.*}"
+SCRIPT_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+LOG_DIR="${SCRIPT_DIR}/logs"
+LOG_TEMPLATE_FILE="${SCRIPT_DIR}/conf/log_template.conf"
+mkdir -p "$LOG_DIR"
+
+if [[ -r "$LOG_TEMPLATE_FILE" ]]; then
+  # shellcheck source=/dev/null
+  source "$LOG_TEMPLATE_FILE"
+fi
+LOG_SCHEMA_VERSION="${LOG_SCHEMA_VERSION:-1.0}"
+LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
 
 DRY_RUN=0
 ROOT_DIR=""
@@ -26,8 +43,10 @@ log_json() {
   # level event msg src dst rc extra_json
   local level="${1-}" event="${2-}" msg="${3-}" src="${4-}" dst="${5-}" rc="${6-}" extra="${7-}"
   local t; t="$(ts_now)"
-  local j="{\"ts\":\"$(json_escape "$t")\",\"level\":\"$(json_escape "$level")\",\"event\":\"$(json_escape "$event")\""
+  local level_norm; level_norm="$(printf '%s' "$level" | tr '[:upper:]' '[:lower:]')"
+  local j="{\"@timestamp\":\"$(json_escape "$t")\",\"schema.version\":\"$(json_escape "$LOG_SCHEMA_VERSION")\",\"compat.targets\":\"$(json_escape "$LOG_COMPAT_TARGETS")\",\"log.level\":\"$(json_escape "$level_norm")\",\"event.action\":\"$(json_escape "$event")\",\"service.name\":\"$(json_escape "$SCRIPT_BASE")\",\"script\":\"$(json_escape "$SCRIPT_NAME")\",\"event\":\"$(json_escape "$event")\",\"level\":\"$(json_escape "$level_norm")\""
   [ -n "$msg" ] && j+=",\"msg\":\"$(json_escape "$msg")\""
+  [ -n "$msg" ] && j+=",\"message\":\"$(json_escape "$msg")\""
   [ -n "$src" ] && j+=",\"src\":\"$(json_escape "$src")\""
   [ -n "$dst" ] && j+=",\"dst\":\"$(json_escape "$dst")\""
   j+=",\"rc\":$rc"
@@ -55,6 +74,14 @@ usage() {
 Формат лога:
   JSON Lines (каждая строка — отдельный JSON-объект)
 EOF
+}
+
+cleanup_logs() {
+  local old_logs
+  old_logs=$(ls -1t "${LOG_DIR}/${SCRIPT_BASE}_"*.jsonl 2>/dev/null | tail -n +11 || true)
+  if [[ -n "${old_logs:-}" ]]; then
+    rm -f $old_logs
+  fi
 }
 
 need_cmd() {
@@ -98,10 +125,7 @@ done
 [ -d "$ROOT_DIR" ] || { echo "Ошибка: нет такой папки: $ROOT_DIR" >&2; exit 2; }
 
 if [ -z "${LOG_FILE}" ]; then
-  SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-  LOG_DIR="${SCRIPT_DIR}/logs"
-  mkdir -p "$LOG_DIR"
-  LOG_FILE="${LOG_DIR}/unpack-fb2zip_$(date '+%Y-%m-%d').jsonl"
+  LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}_$(date '+%Y-%m-%d').jsonl"
 fi
 
 need_cmd find
@@ -153,4 +177,5 @@ done
 log_json "info" "finish" "Готово" "$ROOT_DIR" "" 0 "\"log\":\"$(json_escape "$LOG_FILE")\""
 
 echo "OK. Лог: $LOG_FILE"
+cleanup_logs
 exit 0

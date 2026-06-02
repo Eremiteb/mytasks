@@ -22,5 +22,8 @@ REMOTE_PATH="/opt/esimych-cloud"
 # Локальная папка для резервных копий
 BACKUP_DIR="/mnt/store/backups"
 
+# Пароль sudo (для wg-quick up/down без интерактивного терминала)
+SUDO_PASSWORD="your_sudo_password"
+
 # Оставить WireGuard активным после завершения скрипта: 1 — да, 0 — нет (по умолчанию)
 WG_KEEP_UP="0"

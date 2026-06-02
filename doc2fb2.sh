@@ -4,6 +4,21 @@
 
 set -u
 
+###############################################################################
+# SCRIPT ID / PATHS
+###############################################################################
+SCRIPT_NAME="$(basename -- "$0")"
+SCRIPT_BASE="${SCRIPT_NAME%.*}"
+SCRIPT_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+LOG_TEMPLATE_FILE="${SCRIPT_DIR}/conf/log_template.conf"
+
+if [ -r "$LOG_TEMPLATE_FILE" ]; then
+  # shellcheck source=/dev/null
+  source "$LOG_TEMPLATE_FILE"
+fi
+LOG_SCHEMA_VERSION="${LOG_SCHEMA_VERSION:-1.0}"
+LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
+
 usage() {
 cat <<'EOF'
 doc2fb2.sh — конвертация DOC/DOCX/RTF/ODT -> FB2 (рекурсивно), ОДНОПОТОЧНО
@@ -68,8 +83,10 @@ json_escape() {
 
 log_json() {
   local level="$1" event="$2" src="${3:-}" out="${4:-}" msg="${5:-}" detail="${6:-}"
-  printf '{"ts":"%s","level":"%s","event":"%s","src":"%s","out":"%s","msg":"%s","detail":"%s","pid":%s}\n' \
-    "$(ts)" "$level" "$event" \
+  local level_norm
+  level_norm="$(printf '%s' "$level" | tr '[:upper:]' '[:lower:]')"
+  printf '{"@timestamp":"%s","schema.version":"%s","compat.targets":"%s","log.level":"%s","message":"%s","event.action":"%s","service.name":"%s","script":"%s","event":"%s","level":"%s","src":"%s","out":"%s","msg":"%s","detail":"%s","pid":%s}\n' \
+    "$(ts)" "$LOG_SCHEMA_VERSION" "$LOG_COMPAT_TARGETS" "$level_norm" "$(printf '%s' "$msg" | json_escape)" "$event" "$SCRIPT_BASE" "$SCRIPT_NAME" "$event" "$level_norm" \
     "$(printf '%s' "$src" | json_escape)" \
     "$(printf '%s' "$out" | json_escape)" \
     "$(printf '%s' "$msg" | json_escape)" \
