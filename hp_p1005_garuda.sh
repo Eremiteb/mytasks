@@ -23,9 +23,7 @@ set -euo pipefail
 SCRIPT_NAME="$(basename -- "$0")"
 SCRIPT_BASE="${SCRIPT_NAME%.*}"
 SCRIPT_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-LOG_DIR="${SCRIPT_DIR}/logs"
 LOG_TEMPLATE_FILE="${SCRIPT_DIR}/conf/log_template.conf"
-mkdir -p "$LOG_DIR"
 
 if [[ -r "$LOG_TEMPLATE_FILE" ]]; then
   # shellcheck source=/dev/null
@@ -36,7 +34,7 @@ LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
 
 HOSTNAME_SHORT="$(hostname -s 2>/dev/null || hostname)"
 TS_NOW="$(date '+%Y-%m-%d-%H-%M-%S')"
-LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}-${TS_NOW}.jsonl"
+LOG_FILE="${SCRIPT_DIR}/${SCRIPT_BASE}_${TS_NOW}.jsonl"
 LOG_FD=3
 
 # -------------------------

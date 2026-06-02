@@ -46,8 +46,8 @@ log_json() {
   msg_esc="$(json_escape "$msg")"
   detail_esc="$(json_escape "$detail")"
   level_norm="$(printf '%s' "$level" | tr '[:upper:]' '[:lower:]')"
-  printf '{"@timestamp":"%s","schema.version":"%s","compat.targets":"%s","log.level":"%s","message":"%s","event.action":"%s","service.name":"%s","script":"%s","event":"%s","level":"%s","msg":"%s","detail":"%s","rc":%s}\n' \
-    "$ts_val" "$LOG_SCHEMA_VERSION" "$LOG_COMPAT_TARGETS" "$level_norm" "$msg_esc" "$event" "$SCRIPT_BASE" "$SCRIPT_NAME" "$event" "$level_norm" "$msg_esc" "$detail_esc" "$rc" >> "$LOG_FILE"
+  printf '{"@timestamp":"%s","ts":"%s","schema.version":"%s","compat.targets":"%s","log.level":"%s","message":"%s","event.action":"%s","service.name":"%s","script":"%s","event":"%s","level":"%s","msg":"%s","detail":"%s","rc":%s}\n' \
+    "$ts_val" "$ts_val" "$LOG_SCHEMA_VERSION" "$LOG_COMPAT_TARGETS" "$level_norm" "$msg_esc" "$event" "$SCRIPT_BASE" "$SCRIPT_NAME" "$event" "$level_norm" "$msg_esc" "$detail_esc" "$rc" >> "$LOG_FILE"
 }
 
 cleanup_logs() {
@@ -67,12 +67,14 @@ fi
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
 
-for var in WG_INTERFACE REMOTE_HOST REMOTE_USER REMOTE_PASSWORD SUDO_PASSWORD BACKUP_DIR; do
+for var in WG_INTERFACE REMOTE_HOST REMOTE_USER REMOTE_PASSWORD BACKUP_DIR; do
   if [ -z "${!var:-}" ]; then
     echo "Ошибка: переменная $var не задана в $CONFIG_FILE" >&2
     exit 1
   fi
 done
+
+SUDO_PASSWORD="${SUDO_PASSWORD:-}"
 
 REMOTE_PATH="${REMOTE_PATH:-/opt/esimych-cloud}"
 REMOTE_SSH_PORT="${REMOTE_SSH_PORT:-22}"
@@ -87,9 +89,15 @@ SERVICES_STOPPED=0
 wg_down_if_needed() {
   if [ "$WG_BROUGHT_UP" -eq 1 ] && [ "${WG_KEEP_UP:-0}" -ne 1 ]; then
     log_json "INFO" "wg_down" "Опускаем WireGuard ${WG_INTERFACE}..."
-    echo "$SUDO_PASSWORD" | sudo -S wg-quick down "$WG_INTERFACE" 2>/dev/null && \
-      log_json "INFO" "wg_down_ok" "WireGuard ${WG_INTERFACE} опущен" || \
-      log_json "WARN" "wg_down_fail" "Не удалось опустить WireGuard ${WG_INTERFACE}"
+    if [ -n "$SUDO_PASSWORD" ]; then
+      echo "$SUDO_PASSWORD" | sudo -S wg-quick down "$WG_INTERFACE" 2>/dev/null && \
+        log_json "INFO" "wg_down_ok" "WireGuard ${WG_INTERFACE} опущен" || \
+        log_json "WARN" "wg_down_fail" "Не удалось опустить WireGuard ${WG_INTERFACE}"
+    else
+      wg-quick down "$WG_INTERFACE" 2>/dev/null && \
+        log_json "INFO" "wg_down_ok" "WireGuard ${WG_INTERFACE} опущен" || \
+        log_json "WARN" "wg_down_fail" "Не удалось опустить WireGuard ${WG_INTERFACE}"
+    fi
   fi
 }
 
@@ -123,7 +131,11 @@ if wg show "$WG_INTERFACE" >/dev/null 2>&1; then
   log_json "INFO" "wg_status" "WireGuard ${WG_INTERFACE} уже активен"
 else
   log_json "INFO" "wg_up" "Поднимаем WireGuard ${WG_INTERFACE}..."
-  wg_err=$(echo "$SUDO_PASSWORD" | sudo -S wg-quick up "$WG_INTERFACE" 2>&1)
+  if [ -n "$SUDO_PASSWORD" ]; then
+    wg_err=$(echo "$SUDO_PASSWORD" | sudo -S wg-quick up "$WG_INTERFACE" 2>&1)
+  else
+    wg_err=$(wg-quick up "$WG_INTERFACE" 2>&1)
+  fi
   wg_rc=$?
   if [ $wg_rc -ne 0 ]; then
     log_json "ERROR" "wg_up_failed" "Не удалось поднять WireGuard ${WG_INTERFACE}" "$wg_err" $wg_rc
