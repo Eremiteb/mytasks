@@ -570,3 +570,11 @@ git clone --depth 1 https://github.com/bats-core/bats-core.git /tmp/bats-core
 **GitHub CI:**
 - Workflow: `.github/workflows/bats-tests.yml`
 - Запускается автоматически на `push` и `pull_request`
+
+## Статический анализ (ShellCheck)
+
+Для всех shell-скриптов, описанных в данном README, настроен статический анализ кода (линтер) с помощью `ShellCheck`.
+
+**GitHub CI:**
+- Workflow: `.github/workflows/shellcheck.yml`
+- Запускается автоматически на `push` и `pull_request` при изменении файлов `*.sh`
