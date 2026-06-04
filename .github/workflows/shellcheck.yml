@@ -16,8 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Run ShellCheck
-        uses: ludeeus/action-shellcheck@master
-        with:
-          scandir: './'
-          format: tty
+        run: shellcheck all_to_mp3.sh auto_delete_old_files.sh check-store-mount.sh cloud_backup.sh cp1251_to_utf8.sh delete_by_ext.sh doc2fb2.sh getip.sh hp_p1005_garuda.sh lowercase_ext.sh music_downloader.sh replace_encoding.sh sources.sh split_by_dash.sh unpack-fb2zip.sh wireguard-install.sh
