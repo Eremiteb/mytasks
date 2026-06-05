@@ -107,7 +107,7 @@ services_start_if_needed() {
     log_json "INFO" "services_start" "Запускаем сервисы на ${REMOTE_HOST}..."
     export SSHPASS="${REMOTE_PASSWORD}"
     start_err=$(sshpass -e ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
-      "cd '${REMOTE_PATH}' && docker compose start" 2>&1)
+      "cd '${REMOTE_PATH}' && docker compose up -d" 2>&1)
     start_rc=$?
     unset SSHPASS
     if [ $start_rc -ne 0 ]; then
@@ -211,7 +211,7 @@ log_json "INFO" "backup_start" "Начало резервного копиров
 log_json "INFO" "services_stop" "Останавливаем сервисы на ${REMOTE_HOST}..."
 export SSHPASS="${REMOTE_PASSWORD}"
 stop_err=$(sshpass -e ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
-  "cd '${REMOTE_PATH}' && docker compose stop" 2>&1)
+  "cd '${REMOTE_PATH}' && docker compose down" 2>&1)
 stop_rc=$?
 unset SSHPASS
 if [ $stop_rc -ne 0 ]; then
