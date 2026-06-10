@@ -88,15 +88,15 @@ SERVICES_STOPPED=0
 
 wg_down_if_needed() {
   if [ "$WG_BROUGHT_UP" -eq 1 ] && [ "${WG_KEEP_UP:-0}" -ne 1 ]; then
-    log_json "INFO" "wg_down" "Опускаем WireGuard ${WG_INTERFACE}..."
+    log_json "INFO" "wg_down" "Останавливаем WireGuard ${WG_INTERFACE}..."
     if [ -n "$SUDO_PASSWORD" ]; then
       echo "$SUDO_PASSWORD" | sudo -S wg-quick down "$WG_INTERFACE" 2>/dev/null && \
-        log_json "INFO" "wg_down_ok" "WireGuard ${WG_INTERFACE} опущен" || \
-        log_json "WARN" "wg_down_fail" "Не удалось опустить WireGuard ${WG_INTERFACE}"
+        log_json "INFO" "wg_down_ok" "WireGuard ${WG_INTERFACE} остановлен" || \
+        log_json "WARN" "wg_down_fail" "Не удалось остановить WireGuard ${WG_INTERFACE}"
     else
       wg-quick down "$WG_INTERFACE" 2>/dev/null && \
-        log_json "INFO" "wg_down_ok" "WireGuard ${WG_INTERFACE} опущен" || \
-        log_json "WARN" "wg_down_fail" "Не удалось опустить WireGuard ${WG_INTERFACE}"
+        log_json "INFO" "wg_down_ok" "WireGuard ${WG_INTERFACE} остановлен" || \
+        log_json "WARN" "wg_down_fail" "Не удалось остановить WireGuard ${WG_INTERFACE}"
     fi
   fi
 }
