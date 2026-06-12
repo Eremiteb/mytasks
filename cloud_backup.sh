@@ -208,6 +208,33 @@ BACKUP_PATH="${BACKUP_DIR}/${BACKUP_FILENAME}"
 log_json "INFO" "backup_start" "Начало резервного копирования" \
   "remote=${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH} -> ${BACKUP_PATH}, comp=${REMOTE_COMP:-gzip}"
 
+###############################################################################
+# NEXTCLOUD CLEANUP (occ)
+###############################################################################
+log_json "INFO" "occ_cleanup_start" "Очистка корзин пользователей (occ trashbin:cleanup)..."
+export SSHPASS="${REMOTE_PASSWORD}"
+occ_trash_err=$(sshpass -e ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
+  "docker exec -u www-data esimych-cloud-app php occ trashbin:cleanup --all-users" 2>&1)
+occ_trash_rc=$?
+unset SSHPASS
+if [ $occ_trash_rc -ne 0 ]; then
+  log_json "WARN" "occ_cleanup_trash_failed" "Не удалось очистить корзины" "$occ_trash_err" $occ_trash_rc
+else
+  log_json "INFO" "occ_cleanup_trash_ok" "Корзины очищены" "$occ_trash_err" $occ_trash_rc
+fi
+
+log_json "INFO" "occ_versions_start" "Очистка версий файлов (occ versions:cleanup)..."
+export SSHPASS="${REMOTE_PASSWORD}"
+occ_ver_err=$(sshpass -e ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
+  "docker exec -u www-data esimych-cloud-app php occ versions:cleanup" 2>&1)
+occ_ver_rc=$?
+unset SSHPASS
+if [ $occ_ver_rc -ne 0 ]; then
+  log_json "WARN" "occ_cleanup_versions_failed" "Не удалось очистить версии файлов" "$occ_ver_err" $occ_ver_rc
+else
+  log_json "INFO" "occ_cleanup_versions_ok" "Версии файлов очищены" "$occ_ver_err" $occ_ver_rc
+fi
+
 log_json "INFO" "services_stop" "Останавливаем сервисы на ${REMOTE_HOST}..."
 export SSHPASS="${REMOTE_PASSWORD}"
 stop_err=$(sshpass -e ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
