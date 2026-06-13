@@ -15,7 +15,7 @@ LOG_DIR="${SCRIPT_DIR}/logs"
 TIMESTAMP="$(date '+%Y-%m-%d-%H-%M-%S')"
 LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}-${TIMESTAMP}.jsonl"
 LOG_TEMPLATE_FILE="${SCRIPT_DIR}/conf/log_template.conf"
-CRON_LOG="${PROJECT_PATH}/cron_execution.log"
+CRON_LOG="${LOG_DIR}/cron_execution.log"
 mkdir -p "$LOG_DIR"
 
 if [[ -r "$LOG_TEMPLATE_FILE" ]]; then
