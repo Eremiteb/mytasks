@@ -279,6 +279,13 @@ if [ $backup_rc -eq 0 ]; then
   log_json "INFO" "backup_done" "Резервная копия создана успешно" \
     "file=${BACKUP_PATH}, size=${backup_size}" $backup_rc
   echo "Готово: ${BACKUP_PATH} (${backup_size})"
+
+  # Очистка старых бэкапов, оставляем только 5 последних
+  old_backups=$(ls -1t "${BACKUP_DIR}/${SCRIPT_BASE}-"*.tar.* 2>/dev/null | tail -n +6)
+  if [ -n "$old_backups" ]; then
+    log_json "INFO" "backup_cleanup" "Удаление старых резервных копий (оставляем 5)"
+    echo "$old_backups" | tr '\n' '\0' | xargs -0 -r rm -f
+  fi
 else
   log_json "ERROR" "backup_failed" "Ошибка при создании резервной копии" "$err_out" $backup_rc
   echo "Ошибка резервного копирования (код $backup_rc): $err_out" >&2
