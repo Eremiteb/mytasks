@@ -58,6 +58,10 @@ cleanup_logs() {
 ###############################################################################
 # MAIN
 ###############################################################################
+# Максимальное время ожидания монтирования (должно совпадать с
+# x-systemd.mount-timeout в /etc/fstab)
+MOUNT_WAIT_SECS=30
+
 FAILED_MOUNTS=()
 log_json "INFO" "start" "Проверка точек монтирования" "/etc/fstab"
 
@@ -67,6 +71,18 @@ while read -r device mount_point type options dump pass; do
     [[ "$type" == "swap" || "$type" == "none" ]] && continue
 
     MP_CLEAN=$(printf '%b' "${mount_point//\\/\\\\}")
+
+    # Для точек с x-systemd.automount: доступ к директории инициирует монтирование.
+    # Повторяем до MOUNT_WAIT_SECS секунд — сеть может стать доступной чуть позже.
+    ELAPSED=0
+    while true; do
+        timeout 5 ls -- "$MP_CLEAN" >/dev/null 2>&1 || true
+        mountpoint -q -- "$MP_CLEAN" && break
+        [[ $ELAPSED -ge $MOUNT_WAIT_SECS ]] && break
+        sleep 3
+        ELAPSED=$(( ELAPSED + 3 ))
+    done
+
     if ! mountpoint -q -- "$MP_CLEAN"; then
         FAILED_MOUNTS+=("$MP_CLEAN")
         log_json "WARN" "mount_missing" "Точка не смонтирована" "$MP_CLEAN"
