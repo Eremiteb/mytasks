@@ -587,6 +587,25 @@ sudo ./wireguard-install.sh
 
 В репозитории добавлены shell-тесты на `bats-core` в каталоге `tests/`.
 
+### Тесты для `btrfs_monitor.sh`
+
+Файл тестов: `tests/btrfs_monitor.bats`.
+
+Покрываемые сценарии:
+- проверки зависимостей и типа ФС (ошибки для отсутствующего `btrfs` и не-Btrfs точки)
+- инициализация baseline/state на первом запуске
+- отсутствие изменений счётчиков (успешный выход)
+- рост счётчиков (alert, код выхода `1`, вызов `notify-send`)
+- уменьшение счётчиков после сброса (`counter_reset` без alert)
+- обновление state-файла после срабатывания
+- создание JSONL-лога и обязательные поля
+- ротация логов по `KEEP_LOGS`
+
+**Запуск только тестов `btrfs_monitor.sh`:**
+```sh
+/tmp/bats-core/bin/bats --print-output-on-failure tests/btrfs_monitor.bats
+```
+
 **Локальный запуск:**
 ```sh
 git clone --depth 1 https://github.com/bats-core/bats-core.git /tmp/bats-core
