@@ -1,0 +1,13 @@
+# Точка монтирования Btrfs (обычно корень)
+ROOT_PATH="/"
+
+# Файл состояния для сравнения счетчиков между запусками
+STATE_FILE="/home/esimych/esimych-docs/mytasks/state/btrfs_monitor.state"
+
+# Сколько последних JSONL-логов хранить
+KEEP_LOGS=10
+
+# Параметры desktop-уведомления (если есть notify-send)
+APP_NAME="BtrfsMonitor"
+ICON_NAME="drive-harddisk"
+URGENCY="critical"

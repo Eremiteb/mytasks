@@ -187,6 +187,32 @@ sudo ./cloud_backup.sh
 
 ---
 
+### `btrfs_monitor.sh`
+
+Мониторинг счётчиков ошибок Btrfs на корневом разделе (или другой точке монтирования).
+
+**Что делает:**
+- Читает `btrfs device stats` для `ROOT_PATH`
+- Сравнивает с прошлым запуском (state-файл)
+- При росте счётчиков выводит alert, пишет `ERROR` в JSONL-лог и завершает работу с кодом `1`
+- На первом запуске только инициализирует baseline
+
+**Конфигурация:**
+- `conf/btrfs_monitor.conf`
+- пример: `conf/btrfs_monitor.conf.example`
+
+**Использование:**
+```sh
+./btrfs_monitor.sh
+```
+
+**Cron (каждые 6 часов):**
+```cron
+0 */6 * * * /home/esimych/esimych-docs/mytasks/btrfs_monitor.sh >/dev/null 2>&1
+```
+
+---
+
 ### `cp1251_to_utf8.sh`
 
 Рекурсивная перекодировка текстовых файлов из Windows-1251 в UTF-8.
