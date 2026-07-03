@@ -30,6 +30,7 @@ htmlcov/
 .vscode/
 .idea/
 *.swp
+.claude/
 
 # OS files
 .DS_Store
