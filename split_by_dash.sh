@@ -17,6 +17,9 @@ TIMESTAMP="$(date '+%Y-%m-%d-%H-%M-%S')"
 LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}-${TIMESTAMP}.jsonl"
 mkdir -p "$LOG_DIR" "$CONFIG_DIR"
 
+CREATED_DIRS_FILE="$(mktemp)"
+trap 'rm -f "$CREATED_DIRS_FILE"' EXIT
+
 if [ -r "$LOG_TEMPLATE_FILE" ]; then
   # shellcheck source=/dev/null
   . "$LOG_TEMPLATE_FILE"
@@ -71,6 +74,7 @@ process_directory() {
 
     target_dir="$current_dir/$folder"
     mkdir -p "$target_dir"
+    echo "$target_dir" >> "$CREATED_DIRS_FILE"
 
     dst="$target_dir/$name"
     if [ -e "$dst" ]; then
@@ -79,8 +83,51 @@ process_directory() {
       dst="$target_dir/$name.$i"
     fi
 
-    if mv -- "$file" "$dst"; then
+    if mv -f -- "$file" "$dst"; then
       log_json "INFO" "moved" "Файл перемещен" "$name -> $dst"
+    fi
+  done
+}
+
+move_created_dirs() {
+  dest_dir="$1"
+  mkdir -p "$dest_dir" 2>/dev/null || true
+  if [ ! -d "$dest_dir" ]; then
+    log_json "ERROR" "dest_missing" "Целевой каталог для переноса недоступен" "$dest_dir"
+    return
+  fi
+
+  log_json "INFO" "move_start" "Перенос получившихся папок в целевой каталог" "$dest_dir"
+  sort -u "$CREATED_DIRS_FILE" | while IFS= read -r dir; do
+    [ -d "$dir" ] || continue
+    dir_name=$(basename -- "$dir")
+    dir_dst="$dest_dir/$dir_name"
+
+    if [ "$dir" = "$dir_dst" ]; then
+      continue
+    fi
+
+    if [ -e "$dir_dst" ]; then
+      find "$dir" -mindepth 1 -maxdepth 1 | while IFS= read -r item; do
+        item_name=$(basename -- "$item")
+        item_dst="$dir_dst/$item_name"
+        if [ -e "$item_dst" ]; then
+          i=1
+          while [ -e "$dir_dst/$item_name.$i" ]; do i=$((i+1)); done
+          item_dst="$dir_dst/$item_name.$i"
+        fi
+        if mv -f -- "$item" "$item_dst"; then
+          log_json "INFO" "moved_item" "Файл перемещен при объединении папок" "$item -> $item_dst"
+        fi
+      done
+      rmdir "$dir" 2>/dev/null || true
+      log_json "INFO" "merged_dir" "Папка объединена с существующей в целевом каталоге" "$dir -> $dir_dst"
+    else
+      if mv -f -- "$dir" "$dir_dst"; then
+        log_json "INFO" "moved_dir" "Папка перемещена в целевой каталог" "$dir -> $dir_dst"
+      else
+        log_json "ERROR" "move_dir_failed" "Не удалось переместить папку в целевой каталог" "$dir -> $dir_dst"
+      fi
     fi
   done
 }
@@ -88,12 +135,19 @@ process_directory() {
 ###############################################################################
 # MAIN
 ###############################################################################
+DEST_DIR=""
+if [ -r "$CONFIG_FILE" ]; then
+  DEST_DIR=$(sed -n 's/^[[:space:]]*DEST_DIR[[:space:]]*=[[:space:]]*//p' "$CONFIG_FILE" | sed 's/#.*//' | tail -n1)
+  DEST_DIR=$(trim "$DEST_DIR")
+fi
+
 if [ -n "${1:-}" ] && [ -d "$1" ]; then
   process_directory "$1"
 elif [ -r "$CONFIG_FILE" ]; then
   log_json "INFO" "config_used" "Использование конфига" "$CONFIG_FILE"
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in ""|\#*) continue ;; esac
+    case "$line" in *DEST_DIR=*) continue ;; esac
     target=$(trim "$(printf '%s' "$line" | sed 's/#.*//')")
     [ -n "$target" ] && process_directory "$target"
   done < "$CONFIG_FILE"
@@ -103,6 +157,10 @@ else
   log_json "ERROR" "config_missing" "$err"
   cleanup_logs
   exit 1
+fi
+
+if [ -n "$DEST_DIR" ]; then
+  move_created_dirs "$DEST_DIR"
 fi
 
 cleanup_logs
