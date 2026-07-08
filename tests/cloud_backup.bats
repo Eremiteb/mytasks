@@ -324,6 +324,62 @@ EOF
   [ "$status" -eq 0 ]
 }
 
+@test "в tar-команду передаются встроенные excludes для cache preview tmp" {
+  ssh_cmd_file="$TMP_DIR/ssh_cmd.txt"
+  cat > "$STUB_DIR/ssh" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$ssh_cmd_file"
+printf '\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+exit 0
+EOF
+  chmod +x "$STUB_DIR/ssh"
+
+  run env PATH="$STUB_DIR:$PATH" bash "$TMP_DIR/cloud_backup.sh"
+
+  [ "$status" -eq 0 ]
+  run grep -F -- "--exclude='esimych-cloud/tmp/*'" "$ssh_cmd_file"
+  [ "$status" -eq 0 ]
+  run grep -F -- "--exclude='esimych-cloud/cache/*'" "$ssh_cmd_file"
+  [ "$status" -eq 0 ]
+  run grep -F -- "--exclude='esimych-cloud/data/appdata_*/preview/*'" "$ssh_cmd_file"
+  [ "$status" -eq 0 ]
+  run grep -F -- "--exclude='esimych-cloud/data/*/uploads/*'" "$ssh_cmd_file"
+  [ "$status" -eq 0 ]
+  run grep -F -- "--exclude='esimych-cloud/data/*/files_trashbin/uploads/*'" "$ssh_cmd_file"
+  [ "$status" -eq 0 ]
+}
+
+@test "логирует событие backup_excludes" {
+  run env PATH="$STUB_DIR:$PATH" bash "$TMP_DIR/cloud_backup.sh"
+
+  [ "$status" -eq 0 ]
+  log_file=$(ls "$TMP_DIR/logs"/cloud_backup-*.jsonl 2>/dev/null | head -1)
+  run grep -q '"event":"backup_excludes"' "$log_file"
+  [ "$status" -eq 0 ]
+}
+
+@test "логирует метрики архивирования в backup_metrics" {
+  run env PATH="$STUB_DIR:$PATH" bash "$TMP_DIR/cloud_backup.sh"
+
+  [ "$status" -eq 0 ]
+  log_file=$(ls "$TMP_DIR/logs"/cloud_backup-*.jsonl 2>/dev/null | head -1)
+  run grep -q '"event":"backup_metrics"' "$log_file"
+  [ "$status" -eq 0 ]
+}
+
+@test "при низком пороге скорости логирует backup_degradation" {
+  cat >> "$TMP_DIR/conf/cloud_backup.conf" <<'EOF'
+BACKUP_DEGRADATION_MIBS_THRESHOLD="100000"
+EOF
+
+  run env PATH="$STUB_DIR:$PATH" bash "$TMP_DIR/cloud_backup.sh"
+
+  [ "$status" -eq 0 ]
+  log_file=$(ls "$TMP_DIR/logs"/cloud_backup-*.jsonl 2>/dev/null | head -1)
+  run grep -q '"event":"backup_degradation"' "$log_file"
+  [ "$status" -eq 0 ]
+}
+
 @test "при ошибке SSH архив не остаётся на диске" {
   cat > "$STUB_DIR/ssh" <<'EOF'
 #!/usr/bin/env bash

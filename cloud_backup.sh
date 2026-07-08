@@ -16,6 +16,7 @@ LOG_TEMPLATE_FILE="${CONFIG_DIR}/log_template.conf"
 LOG_DIR="${SCRIPT_DIR}/logs"
 TIMESTAMP="$(date '+%Y-%m-%d-%H-%M-%S')"
 LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}-${TIMESTAMP}.jsonl"
+PROGRESS_METRICS_FILE=""
 
 mkdir -p "$LOG_DIR"
 
@@ -32,7 +33,12 @@ LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
 ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }
 
 json_escape() {
-  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\r//g'
+  # Удаляем/нормализуем управляющие символы, чтобы каждая запись оставалась
+  # корректной одной строкой JSONL даже при шумном stderr внешних команд.
+  printf '%s' "$1" \
+    | tr '\n\t' '  ' \
+    | tr -d '\000-\010\013\014\016-\037' \
+    | sed 's/\\/\\\\/g; s/"/\\"/g; s/\r//g'
 }
 
 log_json() {
@@ -120,6 +126,7 @@ SUDO_PASSWORD="${SUDO_PASSWORD:-}"
 REMOTE_PATH="${REMOTE_PATH:-/opt/esimych-cloud}"
 REMOTE_SSH_PORT="${REMOTE_SSH_PORT:-22}"
 WG_KEEP_UP="${WG_KEEP_UP:-0}"
+BACKUP_DEGRADATION_MIBS_THRESHOLD="${BACKUP_DEGRADATION_MIBS_THRESHOLD:-6}"
 
 ###############################################################################
 # WireGuard
@@ -162,6 +169,7 @@ services_start_if_needed() {
 cleanup() {
   services_start_if_needed
   wg_down_if_needed
+  [ -n "$PROGRESS_METRICS_FILE" ] && rm -f "$PROGRESS_METRICS_FILE" 2>/dev/null
   cleanup_logs
 }
 trap cleanup EXIT INT TERM
@@ -229,6 +237,25 @@ BACKUP_DATE="$(date '+%Y-%m-%d')"
 REMOTE_PARENT="$(dirname "$REMOTE_PATH")"
 REMOTE_DIR="$(basename "$REMOTE_PATH")"
 
+# Встроенные исключения для явно восстановимых данных (кэши/preview/tmp).
+# Эти пути исключаются всегда и не настраиваются через conf.
+REMOTE_EXCLUDES=(
+  "${REMOTE_DIR}/tmp/*"
+  "${REMOTE_DIR}/cache/*"
+  "${REMOTE_DIR}/.cache/*"
+  "${REMOTE_DIR}/data/*/uploads/*"
+  "${REMOTE_DIR}/data/*/files_trashbin/uploads/*"
+  "${REMOTE_DIR}/data/*/cache/*"
+  "${REMOTE_DIR}/data/appdata_*/preview/*"
+  "${REMOTE_DIR}/data/appdata_*/thumbnails/*"
+  "${REMOTE_DIR}/data/appdata_*/css/*"
+  "${REMOTE_DIR}/data/appdata_*/js/*"
+)
+REMOTE_TAR_EXCLUDE_ARGS=""
+for _ex in "${REMOTE_EXCLUDES[@]}"; do
+  REMOTE_TAR_EXCLUDE_ARGS+=" --exclude='${_ex}'"
+done
+
 SSH_OPTS="-p ${REMOTE_SSH_PORT} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 -o BatchMode=no -o Compression=no -c aes128-gcm@openssh.com,chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-ctr"
 
 # Выбираем быстрейший доступный компрессор на удалённом сервере:
@@ -273,6 +300,7 @@ fi
 
 log_json "INFO" "backup_start" "Начало резервного копирования" \
   "remote=${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH} -> ${BACKUP_PATH}, comp=${REMOTE_COMP:-gzip}, append=${BACKUP_APPEND}"
+log_json "INFO" "backup_excludes" "Применены встроенные исключения tar" "count=${#REMOTE_EXCLUDES[@]}, list=${REMOTE_EXCLUDES[*]}"
 
 ###############################################################################
 # NEXTCLOUD CLEANUP (occ)
@@ -316,37 +344,81 @@ else
 fi
 
 export SSHPASS="${REMOTE_PASSWORD}"
+PROGRESS_METRICS_FILE="$(mktemp)"
 
 # Фоновый монитор: пишет размер файла в лог каждые 60 сек
 _progress_monitor() {
   while sleep 60; do
     [ -f "$BACKUP_PATH" ] || break
-    local sz
+    local sz size_bytes now_epoch
     sz=$(du -sh "$BACKUP_PATH" 2>/dev/null | cut -f1)
-    [ -n "$sz" ] && log_json "INFO" "backup_progress" "Прогресс архивирования" "size=${sz}"
+    size_bytes=$(stat -c%s "$BACKUP_PATH" 2>/dev/null || printf '0')
+    now_epoch=$(date +%s)
+    printf '%s\t%s\n' "$now_epoch" "$size_bytes" >> "$PROGRESS_METRICS_FILE"
+    [ -n "$sz" ] && log_json "INFO" "backup_progress" "Прогресс архивирования" "size=${sz}, bytes=${size_bytes}"
   done
 }
 _progress_monitor >/dev/null 2>&1 &
 _PROGRESS_PID=$!
 
+ARCHIVE_START_EPOCH=$(date +%s)
 err_tmp=$(mktemp)
+REMOTE_TAR_CMD="set -o pipefail; tar --create --file=- --sparse${REMOTE_TAR_EXCLUDE_ARGS} --directory='${REMOTE_PARENT}' '${REMOTE_DIR}' | ${COMP_CMD}"
 if [ "$BACKUP_APPEND" -eq 1 ]; then
   sshpass -e ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
-    "set -o pipefail; tar --create --file=- --sparse --directory='${REMOTE_PARENT}' '${REMOTE_DIR}' | ${COMP_CMD}" \
+    "$REMOTE_TAR_CMD" \
     >> "$BACKUP_PATH" 2>"$err_tmp"
 else
   sshpass -e ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
-    "set -o pipefail; tar --create --file=- --sparse --directory='${REMOTE_PARENT}' '${REMOTE_DIR}' | ${COMP_CMD}" \
+    "$REMOTE_TAR_CMD" \
     > "$BACKUP_PATH" 2>"$err_tmp"
 fi
 backup_rc=$?
 err_out=$(cat "$err_tmp"); rm -f "$err_tmp"
 unset SSHPASS
+ARCHIVE_END_EPOCH=$(date +%s)
 
 kill "$_PROGRESS_PID" 2>/dev/null
 wait "$_PROGRESS_PID" 2>/dev/null
 
 if [ $backup_rc -eq 0 ]; then
+  archive_duration=$((ARCHIVE_END_EPOCH - ARCHIVE_START_EPOCH))
+  [ "$archive_duration" -lt 1 ] && archive_duration=1
+
+  backup_bytes=$(stat -c%s "$BACKUP_PATH" 2>/dev/null || printf '0')
+  backup_size=$(du -sh "$BACKUP_PATH" 2>/dev/null | cut -f1)
+  avg_mib_s=$(awk -v b="$backup_bytes" -v d="$archive_duration" 'BEGIN { printf "%.2f", (b/1048576)/d }')
+
+  progress_samples=$(wc -l < "$PROGRESS_METRICS_FILE" 2>/dev/null || printf '0')
+  window_mib_s="n/a"
+  if [ "$progress_samples" -ge 2 ]; then
+    first_sample=$(head -n1 "$PROGRESS_METRICS_FILE")
+    last_sample=$(tail -n1 "$PROGRESS_METRICS_FILE")
+    first_ts=$(printf '%s' "$first_sample" | awk -F '\t' '{print $1}')
+    first_bytes=$(printf '%s' "$first_sample" | awk -F '\t' '{print $2}')
+    last_ts=$(printf '%s' "$last_sample" | awk -F '\t' '{print $1}')
+    last_bytes=$(printf '%s' "$last_sample" | awk -F '\t' '{print $2}')
+    window_dt=$((last_ts - first_ts))
+    if [ "$window_dt" -gt 0 ]; then
+      window_mib_s=$(awk -v b1="$first_bytes" -v b2="$last_bytes" -v d="$window_dt" 'BEGIN { printf "%.2f", ((b2-b1)/1048576)/d }')
+    fi
+  fi
+
+  metrics_detail="file=${BACKUP_PATH}, size=${backup_size}, bytes=${backup_bytes}, duration_s=${archive_duration}, avg_mib_s=${avg_mib_s}, window_mib_s=${window_mib_s}, progress_samples=${progress_samples}, comp=${REMOTE_COMP:-gzip}, append=${BACKUP_APPEND}"
+  log_json "INFO" "backup_metrics" "Метрики этапа архивирования" "$metrics_detail" 0
+
+  if awk -v s="$avg_mib_s" -v t="$BACKUP_DEGRADATION_MIBS_THRESHOLD" 'BEGIN { exit !(s < t) }'; then
+    probable_cause="network_or_remote_io"
+    if [ "${REMOTE_COMP:-gzip}" = "zstd" ]; then
+      probable_cause="network_or_remote_io_or_zstd_cpu"
+    fi
+    if [ "$progress_samples" -lt 2 ]; then
+      probable_cause="insufficient_progress_samples"
+    fi
+    log_json "WARN" "backup_degradation" "Обнаружена деградация скорости бэкапа" \
+      "threshold_mib_s=${BACKUP_DEGRADATION_MIBS_THRESHOLD}, probable_cause=${probable_cause}, ${metrics_detail}" 0
+  fi
+
   backup_size=$(du -sh "$BACKUP_PATH" 2>/dev/null | cut -f1)
   log_json "INFO" "backup_done" "Резервная копия создана успешно" \
     "file=${BACKUP_PATH}, size=${backup_size}" $backup_rc
@@ -364,5 +436,7 @@ else
   rm -f "$BACKUP_PATH" 2>/dev/null
   exit $backup_rc
 fi
+
+rm -f "$PROGRESS_METRICS_FILE" 2>/dev/null
 
 exit 0
