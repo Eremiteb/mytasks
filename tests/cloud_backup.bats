@@ -295,6 +295,35 @@ EOF
   [[ "$backup_file" =~ cloud_backup-[0-9]{4}-[0-9]{2}-[0-9]{2}\.tar\.gz ]]
 }
 
+@test "дозаписывает в существующий валидный архив за текущую дату" {
+  backup_file="$BACKUP_DIR/cloud_backup-$(date '+%Y-%m-%d').tar.gz"
+  printf '\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00' > "$backup_file"
+  size_before=$(wc -c < "$backup_file")
+
+  run env PATH="$STUB_DIR:$PATH" bash "$TMP_DIR/cloud_backup.sh"
+
+  [ "$status" -eq 0 ]
+  size_after=$(wc -c < "$backup_file")
+  [ "$size_after" -gt "$size_before" ]
+  log_file=$(ls "$TMP_DIR/logs"/cloud_backup-*.jsonl 2>/dev/null | head -1)
+  run grep -q '"event":"backup_append_mode"' "$log_file"
+  [ "$status" -eq 0 ]
+}
+
+@test "удаляет битый архив за текущую дату и создаёт новый" {
+  backup_file="$BACKUP_DIR/cloud_backup-$(date '+%Y-%m-%d').tar.gz"
+  printf 'broken-backup' > "$backup_file"
+
+  run env PATH="$STUB_DIR:$PATH" bash "$TMP_DIR/cloud_backup.sh"
+
+  [ "$status" -eq 0 ]
+  run gzip -t "$backup_file"
+  [ "$status" -eq 0 ]
+  log_file=$(ls "$TMP_DIR/logs"/cloud_backup-*.jsonl 2>/dev/null | head -1)
+  run grep -q '"event":"backup_existing_invalid"' "$log_file"
+  [ "$status" -eq 0 ]
+}
+
 @test "при ошибке SSH архив не остаётся на диске" {
   cat > "$STUB_DIR/ssh" <<'EOF'
 #!/usr/bin/env bash

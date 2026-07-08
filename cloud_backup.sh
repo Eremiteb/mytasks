@@ -56,6 +56,47 @@ cleanup_logs() {
   [ -n "$old_logs" ] && rm -f $old_logs
 }
 
+VALIDATE_BACKUP_DETAIL=""
+
+validate_backup_file() {
+  local backup_path="$1"
+  local validate_out rc
+
+  VALIDATE_BACKUP_DETAIL=""
+
+  if [ ! -s "$backup_path" ]; then
+    VALIDATE_BACKUP_DETAIL="file is empty"
+    return 1
+  fi
+
+  case "$backup_path" in
+    *.tar.gz)
+      if ! command -v gzip >/dev/null 2>&1; then
+        VALIDATE_BACKUP_DETAIL="gzip not found"
+        return 2
+      fi
+      validate_out=$(gzip -t "$backup_path" 2>&1)
+      rc=$?
+      VALIDATE_BACKUP_DETAIL="$validate_out"
+      return $rc
+      ;;
+    *.tar.zst)
+      if ! command -v zstd >/dev/null 2>&1; then
+        VALIDATE_BACKUP_DETAIL="zstd not found"
+        return 2
+      fi
+      validate_out=$(zstd -t "$backup_path" 2>&1)
+      rc=$?
+      VALIDATE_BACKUP_DETAIL="$validate_out"
+      return $rc
+      ;;
+    *)
+      VALIDATE_BACKUP_DETAIL="unsupported backup extension"
+      return 2
+      ;;
+  esac
+}
+
 ###############################################################################
 # CONFIG
 ###############################################################################
@@ -205,8 +246,33 @@ esac
 BACKUP_FILENAME="${SCRIPT_BASE}-${BACKUP_DATE}.${BACKUP_EXT}"
 BACKUP_PATH="${BACKUP_DIR}/${BACKUP_FILENAME}"
 
+if [ -f "$BACKUP_PATH" ]; then
+  if validate_backup_file "$BACKUP_PATH"; then
+    BACKUP_APPEND=1
+    log_json "INFO" "backup_append_mode" "Файл бэкапа за ${BACKUP_DATE} уже существует и прошёл проверку — дозапись" \
+      "file=${BACKUP_PATH}"
+  else
+    validate_rc=$?
+    BACKUP_APPEND=0
+    validate_detail="file=${BACKUP_PATH}"
+    if [ -n "$VALIDATE_BACKUP_DETAIL" ]; then
+      validate_detail="${validate_detail}, reason=${VALIDATE_BACKUP_DETAIL}"
+    fi
+    if [ $validate_rc -eq 1 ]; then
+      log_json "WARN" "backup_existing_invalid" "Существующий файл бэкапа повреждён — удаляем и создаём заново" \
+        "$validate_detail" $validate_rc
+      rm -f "$BACKUP_PATH"
+    else
+      log_json "WARN" "backup_existing_unchecked" "Не удалось проверить существующий файл бэкапа — создаём заново без дозаписи" \
+        "$validate_detail" $validate_rc
+    fi
+  fi
+else
+  BACKUP_APPEND=0
+fi
+
 log_json "INFO" "backup_start" "Начало резервного копирования" \
-  "remote=${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH} -> ${BACKUP_PATH}, comp=${REMOTE_COMP:-gzip}"
+  "remote=${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH} -> ${BACKUP_PATH}, comp=${REMOTE_COMP:-gzip}, append=${BACKUP_APPEND}"
 
 ###############################################################################
 # NEXTCLOUD CLEANUP (occ)
@@ -264,9 +330,15 @@ _progress_monitor >/dev/null 2>&1 &
 _PROGRESS_PID=$!
 
 err_tmp=$(mktemp)
-sshpass -e ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
-  "set -o pipefail; tar --create --file=- --sparse --directory='${REMOTE_PARENT}' '${REMOTE_DIR}' | ${COMP_CMD}" \
-  > "$BACKUP_PATH" 2>"$err_tmp"
+if [ "$BACKUP_APPEND" -eq 1 ]; then
+  sshpass -e ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
+    "set -o pipefail; tar --create --file=- --sparse --directory='${REMOTE_PARENT}' '${REMOTE_DIR}' | ${COMP_CMD}" \
+    >> "$BACKUP_PATH" 2>"$err_tmp"
+else
+  sshpass -e ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
+    "set -o pipefail; tar --create --file=- --sparse --directory='${REMOTE_PARENT}' '${REMOTE_DIR}' | ${COMP_CMD}" \
+    > "$BACKUP_PATH" 2>"$err_tmp"
+fi
 backup_rc=$?
 err_out=$(cat "$err_tmp"); rm -f "$err_tmp"
 unset SSHPASS
