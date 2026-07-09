@@ -178,7 +178,7 @@ log_json "INFO" "start" "Запуск резервного копировани�
 
 if wg show "$WG_INTERFACE" >/dev/null 2>&1; then
   log_json "INFO" "wg_status" "WireGuard ${WG_INTERFACE} уже активен"
-else2
+else
   log_json "INFO" "wg_up" "Поднимаем WireGuard ${WG_INTERFACE}..."
   if [ -n "$SUDO_PASSWORD" ]; then
     wg_err=$(echo "$SUDO_PASSWORD" | sudo -S wg-quick up "$WG_INTERFACE" 2>&1)
