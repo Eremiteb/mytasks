@@ -95,12 +95,15 @@
 1. Поднимает WireGuard-соединение (`wg-quick up`), если оно не активно
 2. Подключается к удалённому серверу по SSH (`sshpass`)
 3. Выбирает компрессор на удалённом сервере: `zstd`, `pigz` или `gzip`
-4. Создаёт архив удалённой папки и сохраняет его в `BACKUP_DIR`
-5. Если архив за текущую дату уже существует и проходит проверку целостности, дозаписывает новый поток в тот же файл
-6. Если существующий архив пустой или повреждённый, удаляет его и создаёт заново
-4. Опускает WireGuard (если был поднят скриптом) — управляется параметром `WG_KEEP_UP`
+4. (Опционально) оптимизирует MariaDB (`mariadb-check --optimize`, очистка `general.log`, опционально purge binlogs)
+5. (Опционально) оптимизирует Redis AOF (`BGREWRITEAOF`)
+6. (Опционально) оптимизирует SQLite-базы (`PRAGMA optimize; VACUUM;`) перед архивированием
+7. Создаёт архив удалённой папки и сохраняет его в `BACKUP_DIR`
+8. Если архив за текущую дату уже существует и проходит проверку целостности, дозаписывает новый поток в тот же файл
+9. Если существующий архив пустой или повреждённый, удаляет его и создаёт заново
+10. Опускает WireGuard (если был поднят скриптом) — управляется параметром `WG_KEEP_UP`
 
-**Зависимости:** `wg-quick`, `sshpass`
+**Зависимости:** `wg-quick`, `sshpass` (для опциональной оптимизации: `sqlite3` и `redis-cli` в соответствующих контейнерах)
 
 **Конфигурация** (`conf/cloud_backup.conf`):
 
@@ -114,6 +117,15 @@
 | `REMOTE_PATH`     | `/opt/esimych-cloud`    | Путь к папке на удалённой системе              |
 | `BACKUP_DIR`      | *(обязательно)*         | Локальная папка для резервных копий            |
 | `WG_KEEP_UP`      | `0`                     | Оставить WireGuard активным после завершения   |
+| `OPTIMIZE_MARIADB_BEFORE_BACKUP` | `0`       | Выполнить оптимизацию MariaDB перед архивом    |
+| `MARIADB_SERVICE_NAME`           | `mariadb` | Имя MariaDB-сервиса в `docker compose`         |
+| `MARIADB_PURGE_BINLOGS`          | `0`       | Очистить старые binary logs (`PURGE BINARY LOGS`) |
+| `MARIADB_TRUNCATE_GENERAL_LOG`   | `1`       | Очистить `general.log` перед архивом           |
+| `OPTIMIZE_REDIS_BEFORE_BACKUP`   | `0`       | Выполнить `BGREWRITEAOF` для Redis             |
+| `REDIS_SERVICE_NAME`             | `redis`   | Имя Redis-сервиса в `docker compose`           |
+| `REDIS_REWRITE_WAIT_SEC`         | `180`     | Ожидание завершения `BGREWRITEAOF`             |
+| `OPTIMIZE_SQLITE_BEFORE_BACKUP` | `0`        | Перед архивированием выполнить `VACUUM` для `*.db` |
+| `SQLITE_OPTIMIZE_TIMEOUT_SEC`   | `1800`     | Таймаут на одну SQLite-базу в секундах         |
 
 **Логи:** JSONL-файл `logs/cloud_backup-YYYY-MM-DD-HH-MM-SS.jsonl`. Хранится 5 последних файлов.
 

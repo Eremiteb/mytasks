@@ -27,3 +27,30 @@ SUDO_PASSWORD="your_sudo_password"
 
 # Оставить WireGuard активным после завершения скрипта: 1 — да, 0 — нет (по умолчанию)
 WG_KEEP_UP="0"
+
+# Оптимизировать SQLite-базы перед архивированием: 1 — да, 0 — нет (по умолчанию)
+OPTIMIZE_SQLITE_BEFORE_BACKUP="0"
+
+# Таймаут на обработку одной SQLite-базы (сек)
+SQLITE_OPTIMIZE_TIMEOUT_SEC="1800"
+
+# Оптимизировать MariaDB перед архивированием: 1 — да, 0 — нет (по умолчанию)
+OPTIMIZE_MARIADB_BEFORE_BACKUP="0"
+
+# Имя сервиса MariaDB в docker compose
+MARIADB_SERVICE_NAME="mariadb"
+
+# Очистить старые binary logs перед бэкапом (может повлиять на репликацию): 1 — да, 0 — нет
+MARIADB_PURGE_BINLOGS="0"
+
+# Очистить файл general.log перед бэкапом: 1 — да, 0 — нет
+MARIADB_TRUNCATE_GENERAL_LOG="1"
+
+# Оптимизировать Redis AOF перед архивированием: 1 — да, 0 — нет (по умолчанию)
+OPTIMIZE_REDIS_BEFORE_BACKUP="0"
+
+# Имя сервиса Redis в docker compose
+REDIS_SERVICE_NAME="redis"
+
+# Максимальное ожидание завершения BGREWRITEAOF (сек)
+REDIS_REWRITE_WAIT_SEC="180"

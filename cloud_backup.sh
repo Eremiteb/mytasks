@@ -127,6 +127,15 @@ REMOTE_PATH="${REMOTE_PATH:-/opt/esimych-cloud}"
 REMOTE_SSH_PORT="${REMOTE_SSH_PORT:-22}"
 WG_KEEP_UP="${WG_KEEP_UP:-0}"
 BACKUP_DEGRADATION_MIBS_THRESHOLD="${BACKUP_DEGRADATION_MIBS_THRESHOLD:-6}"
+OPTIMIZE_SQLITE_BEFORE_BACKUP="${OPTIMIZE_SQLITE_BEFORE_BACKUP:-0}"
+SQLITE_OPTIMIZE_TIMEOUT_SEC="${SQLITE_OPTIMIZE_TIMEOUT_SEC:-1800}"
+OPTIMIZE_MARIADB_BEFORE_BACKUP="${OPTIMIZE_MARIADB_BEFORE_BACKUP:-0}"
+MARIADB_SERVICE_NAME="${MARIADB_SERVICE_NAME:-mariadb}"
+MARIADB_PURGE_BINLOGS="${MARIADB_PURGE_BINLOGS:-0}"
+MARIADB_TRUNCATE_GENERAL_LOG="${MARIADB_TRUNCATE_GENERAL_LOG:-1}"
+OPTIMIZE_REDIS_BEFORE_BACKUP="${OPTIMIZE_REDIS_BEFORE_BACKUP:-0}"
+REDIS_SERVICE_NAME="${REDIS_SERVICE_NAME:-redis}"
+REDIS_REWRITE_WAIT_SEC="${REDIS_REWRITE_WAIT_SEC:-180}"
 
 ###############################################################################
 # WireGuard
@@ -329,6 +338,63 @@ else
   log_json "INFO" "occ_cleanup_versions_ok" "Версии файлов очищены" "$occ_ver_err" $occ_ver_rc
 fi
 
+###############################################################################
+# DATABASE OPTIMIZATION (before services down)
+###############################################################################
+if [ "$OPTIMIZE_MARIADB_BEFORE_BACKUP" -eq 1 ]; then
+  log_json "INFO" "mariadb_optimize_start" "Оптимизация MariaDB перед архивированием"
+  export SSHPASS="${REMOTE_PASSWORD}"
+  mariadb_opt_err=$(sshpass -e ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
+    "cd '${REMOTE_PATH}' && docker compose exec -T \
+      -e PURGE_BINLOGS='${MARIADB_PURGE_BINLOGS}' \
+      -e TRUNCATE_GENERAL_LOG='${MARIADB_TRUNCATE_GENERAL_LOG}' \
+      '${MARIADB_SERVICE_NAME}' sh -lc 'set -e; \
+        mariadb-check -uroot -p\"\$MARIADB_ROOT_PASSWORD\" --optimize --all-databases --skip-database=information_schema --skip-database=performance_schema --skip-database=mysql --skip-database=sys; \
+        if [ \"\$PURGE_BINLOGS\" = \"1\" ]; then \
+          mariadb -uroot -p\"\$MARIADB_ROOT_PASSWORD\" -e \"PURGE BINARY LOGS BEFORE NOW();\"; \
+        fi; \
+        if [ \"\$TRUNCATE_GENERAL_LOG\" = \"1\" ]; then \
+          : > /var/lib/mysql/general.log || true; \
+        fi'" 2>&1)
+  mariadb_opt_rc=$?
+  unset SSHPASS
+  if [ $mariadb_opt_rc -ne 0 ]; then
+    log_json "WARN" "mariadb_optimize_failed" "Оптимизация MariaDB завершилась с предупреждениями" "$mariadb_opt_err" $mariadb_opt_rc
+  else
+    log_json "INFO" "mariadb_optimize_ok" "Оптимизация MariaDB завершена" "$mariadb_opt_err" $mariadb_opt_rc
+  fi
+else
+  log_json "INFO" "mariadb_optimize_skip" "Оптимизация MariaDB отключена (OPTIMIZE_MARIADB_BEFORE_BACKUP=0)"
+fi
+
+if [ "$OPTIMIZE_REDIS_BEFORE_BACKUP" -eq 1 ]; then
+  log_json "INFO" "redis_optimize_start" "Оптимизация Redis AOF перед архивированием"
+  export SSHPASS="${REMOTE_PASSWORD}"
+  redis_opt_err=$(sshpass -e ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
+    "cd '${REMOTE_PATH}' && docker compose exec -T \
+      -e REDIS_WAIT='${REDIS_REWRITE_WAIT_SEC}' \
+      '${REDIS_SERVICE_NAME}' sh -lc 'set -e; \
+        redis-cli BGREWRITEAOF >/dev/null; \
+        i=0; \
+        while [ \$i -lt \$REDIS_WAIT ]; do \
+          in_progress=\$(redis-cli INFO persistence | sed -n \"s/^aof_rewrite_in_progress:\\([0-9]\\+\\)$/\\1/p\"); \
+          [ \"\$in_progress\" = \"0\" ] && exit 0; \
+          i=\$((i + 1)); \
+          sleep 1; \
+        done; \
+        echo \"AOF rewrite did not finish within \$REDIS_WAIT seconds\"; \
+        exit 1'" 2>&1)
+  redis_opt_rc=$?
+  unset SSHPASS
+  if [ $redis_opt_rc -ne 0 ]; then
+    log_json "WARN" "redis_optimize_failed" "Оптимизация Redis завершилась с предупреждениями" "$redis_opt_err" $redis_opt_rc
+  else
+    log_json "INFO" "redis_optimize_ok" "Оптимизация Redis завершена" "$redis_opt_err" $redis_opt_rc
+  fi
+else
+  log_json "INFO" "redis_optimize_skip" "Оптимизация Redis отключена (OPTIMIZE_REDIS_BEFORE_BACKUP=0)"
+fi
+
 log_json "INFO" "services_stop" "Останавливаем сервисы на ${REMOTE_HOST}..."
 export SSHPASS="${REMOTE_PASSWORD}"
 stop_err=$(sshpass -e ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
@@ -341,6 +407,26 @@ if [ $stop_rc -ne 0 ]; then
 else
   SERVICES_STOPPED=1
   log_json "INFO" "services_stop_ok" "Сервисы остановлены" "" $stop_rc
+fi
+
+###############################################################################
+# SQLITE OPTIMIZATION (optional)
+###############################################################################
+if [ "$OPTIMIZE_SQLITE_BEFORE_BACKUP" -eq 1 ]; then
+  log_json "INFO" "sqlite_optimize_start" "Оптимизация SQLite-баз перед архивированием"
+  export SSHPASS="${REMOTE_PASSWORD}"
+  sqlite_opt_err=$(sshpass -e ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
+    "set -o pipefail; find '${REMOTE_PATH}' -type f -name '*.db' -print0 \
+      | xargs -0 -r -I{} timeout ${SQLITE_OPTIMIZE_TIMEOUT_SEC}s sqlite3 \"{}\" 'PRAGMA optimize; VACUUM;'" 2>&1)
+  sqlite_opt_rc=$?
+  unset SSHPASS
+  if [ $sqlite_opt_rc -ne 0 ]; then
+    log_json "WARN" "sqlite_optimize_failed" "Оптимизация SQLite завершилась с предупреждениями" "$sqlite_opt_err" $sqlite_opt_rc
+  else
+    log_json "INFO" "sqlite_optimize_ok" "Оптимизация SQLite завершена" "$sqlite_opt_err" $sqlite_opt_rc
+  fi
+else
+  log_json "INFO" "sqlite_optimize_skip" "Оптимизация SQLite отключена (OPTIMIZE_SQLITE_BEFORE_BACKUP=0)"
 fi
 
 export SSHPASS="${REMOTE_PASSWORD}"
