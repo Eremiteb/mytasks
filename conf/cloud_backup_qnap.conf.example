@@ -1,0 +1,66 @@
+# Конфигурация cloud_backup_qnap.sh (QNAP NAS)
+# Скопируйте этот файл в cloud_backup_qnap.conf и заполните своими значениями.
+#
+# ВАЖНО: этот QNAP — отдельный WireGuard-клиент. Нельзя использовать те же
+# приватный ключ/IP, что и у десктопного клиента (wg0-client) — на сервере
+# должен быть заведён отдельный peer с уникальным ключом и адресом
+# (например, 10.66.66.3/32), иначе будет конфликт адресов в туннеле.
+
+# Имя WireGuard-интерфейса на QNAP (файл конфига: /opt/etc/wireguard/<имя>.conf)
+WG_INTERFACE="wg0-qnap"
+
+# IP-адрес удалённого сервера (тот же сервер, что и в cloud_backup.conf)
+REMOTE_HOST="10.66.66.1"
+
+# Логин SSH
+REMOTE_USER="root"
+
+# Пароль SSH (необязательно). В репозитории Entware для aarch64-k3.10 нет
+# пакета sshpass, поэтому на QNAP рекомендуется оставить это поле пустым и
+# использовать вместо пароля SSH-ключ (см. REMOTE_SSH_KEY ниже и инструкцию
+# в шаге 2 заголовка cloud_backup_qnap.sh).
+REMOTE_PASSWORD=""
+
+# Путь к приватному SSH-ключу (рекомендуется для QNAP вместо REMOTE_PASSWORD)
+REMOTE_SSH_KEY="/share/Public/entware/ssh-qnap/id_ed25519"
+
+# Порт SSH (необязательно, по умолчанию 22)
+REMOTE_SSH_PORT="22"
+
+# Путь к папке на удалённой системе (необязательно, по умолчанию /opt/esimych-cloud)
+REMOTE_PATH="/opt/esimych-cloud"
+
+# Локальная папка на QNAP для резервных копий
+# (типовой путь на QTS для общей папки "Public" — /share/Public/backups;
+# /Public/backups обычно тоже работает как симлинк на тот же путь)
+BACKUP_DIR="/share/Public/backups"
+
+# Оставить WireGuard активным после завершения скрипта: 1 — да, 0 — нет (по умолчанию)
+WG_KEEP_UP="0"
+
+# Оптимизировать SQLite-базы перед архивированием: 1 — да, 0 — нет (по умолчанию)
+OPTIMIZE_SQLITE_BEFORE_BACKUP="0"
+
+# Таймаут на обработку одной SQLite-базы (сек)
+SQLITE_OPTIMIZE_TIMEOUT_SEC="1800"
+
+# Оптимизировать MariaDB перед архивированием: 1 — да, 0 — нет (по умолчанию)
+OPTIMIZE_MARIADB_BEFORE_BACKUP="0"
+
+# Имя сервиса MariaDB в docker compose
+MARIADB_SERVICE_NAME="mariadb"
+
+# Очистить старые binary logs перед бэкапом (может повлиять на репликацию): 1 — да, 0 — нет
+MARIADB_PURGE_BINLOGS="0"
+
+# Очистить файл general.log перед бэкапом: 1 — да, 0 — нет
+MARIADB_TRUNCATE_GENERAL_LOG="1"
+
+# Оптимизировать Redis AOF перед архивированием: 1 — да, 0 — нет (по умолчанию)
+OPTIMIZE_REDIS_BEFORE_BACKUP="0"
+
+# Имя сервиса Redis в docker compose
+REDIS_SERVICE_NAME="redis"
+
+# Максимальное ожидание завершения BGREWRITEAOF (сек)
+REDIS_REWRITE_WAIT_SEC="180"

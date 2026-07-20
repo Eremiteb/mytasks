@@ -180,6 +180,61 @@ sudo ./cloud_backup.sh
 
 ---
 
+### `cloud_backup_qnap.sh`
+
+QNAP-версия `cloud_backup.sh` — то же резервное копирование `/opt/esimych-cloud` через WireGuard VPN, но запускается **на самом QNAP NAS** (Entware cron / Task Scheduler), а не на десктопе.
+
+**Отличия от `cloud_backup.sh`:**
+- Shebang `#!/opt/bin/bash` — Entware bash напрямую (штатный `/bin/sh` на QTS не поддерживает массивы/`local`/`${!var}`)
+- `PATH` дополняется `/opt/sbin:/opt/bin` (Entware), т.к. QTS не содержит `wg-quick`, `wg`, `zstd`, `sqlite3`
+- Нет sudo-кода — Task Scheduler/cron на QNAP и так выполняют скрипт от root
+- **WireGuard поднимается в обход `wg`/`wg-quick`** — на части моделей QTS (проверено на ядре 4.2.8 aarch64) консольная утилита `wg(8)` не работает в принципе (`Protocol not supported`), поэтому туннель поднимается напрямую через userspace UAPI-сокет `wireguard-go` (см. `wg_up_userspace`/`wg_conf_get` в коде)
+- Аутентификация на удалённом сервере только по SSH-ключу (`REMOTE_SSH_KEY`) — пакета `sshpass` для архитектуры `aarch64-k3.10` в Entware нет
+- Автоматически переподключает bind-mount `/opt` → `ENTWARE_DATA_DIR`, если он слетел после перезагрузки NAS (`ensure_entware_mount`)
+- Перед остановкой сервисов дополнительно чистит корзину и версии файлов Nextcloud (`occ trashbin:cleanup --all-users`, `occ versions:cleanup`)
+
+**Предварительная настройка на QNAP** (разово, вручную) подробно описана в шапке самого скрипта: установка Entware, пакетов (`opkg install bash wireguard-tools wireguard-go ncat xxd zstd sqlite3-cli coreutils-stat`), создание конфига WireGuard-клиента с отдельным peer/IP, проверка userspace UAPI-сокета, копирование SSH-ключа на сервер, заполнение `conf/cloud_backup_qnap.conf`.
+
+**Конфигурация** (`conf/cloud_backup_qnap.conf`, см. `.example`):
+
+| Параметр          | По умолчанию               | Описание                                       |
+|-------------------|-----------------------------|------------------------------------------------|
+| `WG_INTERFACE`    | *(обязательно)*             | Имя WireGuard-интерфейса (напр. `wg0-qnap`)    |
+| `REMOTE_HOST`     | *(обязательно)*             | IP-адрес удалённого сервера                    |
+| `REMOTE_USER`     | *(обязательно)*             | Логин SSH                                      |
+| `REMOTE_PASSWORD` | *(необязательно, пусто)*    | Пароль SSH (используется только если найден `sshpass`) |
+| `REMOTE_SSH_KEY`  | *(рекомендуется)*           | Путь к приватному SSH-ключу                    |
+| `REMOTE_SSH_PORT` | `22`                        | Порт SSH                                       |
+| `REMOTE_PATH`     | `/opt/esimych-cloud`        | Путь к папке на удалённой системе              |
+| `BACKUP_DIR`      | *(обязательно)*             | Папка на QNAP для резервных копий (напр. `/share/Public/backups`) |
+| `WG_KEEP_UP`      | `0`                         | Оставить WireGuard активным после завершения   |
+| `OPTIMIZE_SQLITE_BEFORE_BACKUP`  | `0`       | Перед архивированием выполнить `VACUUM` для `*.db` |
+| `SQLITE_OPTIMIZE_TIMEOUT_SEC`    | `1800`    | Таймаут на одну SQLite-базу в секундах         |
+| `OPTIMIZE_MARIADB_BEFORE_BACKUP` | `0`       | Выполнить оптимизацию MariaDB перед архивом    |
+| `MARIADB_SERVICE_NAME`           | `mariadb` | Имя MariaDB-сервиса в `docker compose`         |
+| `MARIADB_PURGE_BINLOGS`          | `0`       | Очистить старые binary logs                    |
+| `MARIADB_TRUNCATE_GENERAL_LOG`   | `1`       | Очистить `general.log` перед архивом           |
+| `OPTIMIZE_REDIS_BEFORE_BACKUP`   | `0`       | Выполнить `BGREWRITEAOF` для Redis             |
+| `REDIS_SERVICE_NAME`             | `redis`   | Имя Redis-сервиса в `docker compose`           |
+| `REDIS_REWRITE_WAIT_SEC`         | `180`     | Ожидание завершения `BGREWRITEAOF`             |
+
+**Логи:** JSONL-файл `logs/cloud_backup_qnap-YYYY-MM-DD-HH-MM-SS.jsonl` на QNAP. Хранится 5 последних файлов (см. `cleanup_logs`).
+
+**Имя архива и поведение при дозаписи** — идентично `cloud_backup.sh` (см. выше): `cloud_backup_qnap-YYYY-MM-DD.tar.zst`/`.tar.gz`, проверка целостности и дозапись валидного архива за текущую дату, встроенные excludes для кэшей/preview/tmp.
+
+**Планирование запуска на QNAP** — Планировщик задач QTS (если доступен) либо персистентный `crontab` (в отличие от обычного Linux, `/etc/config/crontab` переживает перезагрузку NAS, т.к. хранится в конфигурации прошивки):
+```sh
+vi /etc/config/crontab
+# добавить строку (например, каждый день в 01:00):
+0 1 * * * /share/Public/tasks/cloud_backup_qnap.sh >/dev/null 2>&1
+crontab /etc/config/crontab
+/etc/init.d/crond.sh restart
+```
+
+**Важно:** не запускайте `cloud_backup.sh` (десктоп) и `cloud_backup_qnap.sh` одновременно против одного и того же `REMOTE_HOST` — оба скрипта независимо управляют `docker compose down`/`up -d` на удалённом сервере, и параллельный запуск может привести к преждевременному перезапуску сервисов или конфликту жизненного цикла контейнеров.
+
+---
+
 ### `auto_delete_old_files.sh`
 
 Автоматически удаляет старые файлы по сроку хранения из указанной папки.
