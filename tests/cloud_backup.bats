@@ -412,6 +412,74 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# Nextcloud trashbin cleanup
+# ---------------------------------------------------------------------------
+
+@test "после occ trashbin:cleanup пересоздаёт папку files_trashbin для каждого пользователя" {
+  ssh_cmd_file="$TMP_DIR/ssh_cmd.txt"
+  cat > "$STUB_DIR/ssh" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$ssh_cmd_file"
+case "\$*" in
+  *"occ config:system:get datadirectory"*)
+    echo "/var/www/html/data"
+    exit 0
+    ;;
+  *"occ user:list"*)
+    printf '  - clouduser: Cloud User\n  - cloudadmin: Cloud Admin\n'
+    exit 0
+    ;;
+  *"mkdir -p"*)
+    exit 0
+    ;;
+  *)
+    printf '\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+    exit 0
+    ;;
+esac
+EOF
+  chmod +x "$STUB_DIR/ssh"
+
+  run env PATH="$STUB_DIR:$PATH" bash "$TMP_DIR/cloud_backup.sh"
+
+  [ "$status" -eq 0 ]
+  run grep -F "mkdir -p '/var/www/html/data/clouduser/files_trashbin'" "$ssh_cmd_file"
+  [ "$status" -eq 0 ]
+  run grep -F "mkdir -p '/var/www/html/data/cloudadmin/files_trashbin'" "$ssh_cmd_file"
+  [ "$status" -eq 0 ]
+  log_file=$(ls "$TMP_DIR/logs"/cloud_backup-*.jsonl 2>/dev/null | head -1)
+  run grep -q '"event":"occ_trashbin_repair_ok"' "$log_file"
+  [ "$status" -eq 0 ]
+}
+
+@test "если не удалось получить datadirectory, логирует occ_trashbin_repair_failed" {
+  cat > "$STUB_DIR/ssh" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  *"occ config:system:get datadirectory"*)
+    exit 1
+    ;;
+  *"occ user:list"*)
+    printf '  - clouduser: Cloud User\n'
+    exit 0
+    ;;
+  *)
+    printf '\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+    exit 0
+    ;;
+esac
+EOF
+  chmod +x "$STUB_DIR/ssh"
+
+  run env PATH="$STUB_DIR:$PATH" bash "$TMP_DIR/cloud_backup.sh"
+
+  [ "$status" -eq 0 ]
+  log_file=$(ls "$TMP_DIR/logs"/cloud_backup-*.jsonl 2>/dev/null | head -1)
+  run grep -q '"event":"occ_trashbin_repair_failed"' "$log_file"
+  [ "$status" -eq 0 ]
+}
+
+# ---------------------------------------------------------------------------
 # Логирование
 # ---------------------------------------------------------------------------
 
