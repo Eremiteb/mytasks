@@ -326,6 +326,44 @@ else
   log_json "INFO" "occ_cleanup_trash_ok" "Корзины очищены" "$occ_trash_err" $occ_trash_rc
 fi
 
+# "occ trashbin:cleanup --all-users" при полной очистке физически удаляет
+# саму папку data/<user>/files_trashbin (не только её содержимое), если она
+# опустела. Из-за этого встроенный фоновый джоб Nextcloud ExpireTrash (он
+# запускается через cron.php независимо от расписания этого скрипта) затем
+# падает с "NotFoundException.../files_trashbin" при каждом своём запуске,
+# пока папка не появится снова. Пересоздаём её для каждого пользователя сразу
+# после очистки — mkdir -p идемпотентен и безопасен.
+occ_trash_repair_detail=""
+occ_trash_repair_rc=0
+export SSHPASS="${REMOTE_PASSWORD}"
+remote_datadir=$(sshpass -e ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
+  "docker exec -u www-data esimych-cloud-app php occ config:system:get datadirectory" 2>/dev/null | tr -d '\r\n')
+remote_users=$(sshpass -e ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
+  "docker exec -u www-data esimych-cloud-app php occ user:list" 2>/dev/null)
+unset SSHPASS
+if [ -z "$remote_datadir" ] || [ -z "$remote_users" ]; then
+  occ_trash_repair_rc=1
+  occ_trash_repair_detail="не удалось получить datadirectory или список пользователей"
+else
+  while IFS= read -r _uid; do
+    [ -z "$_uid" ] && continue
+    export SSHPASS="${REMOTE_PASSWORD}"
+    _repair_err=$(sshpass -e ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
+      "docker exec -u www-data esimych-cloud-app mkdir -p '${remote_datadir}/${_uid}/files_trashbin'" 2>&1)
+    _repair_rc=$?
+    unset SSHPASS
+    if [ $_repair_rc -ne 0 ]; then
+      occ_trash_repair_rc=1
+      occ_trash_repair_detail="${occ_trash_repair_detail}${_uid}: ${_repair_err}; "
+    fi
+  done <<< "$(printf '%s\n' "$remote_users" | sed -nE 's/^[[:space:]]*-[[:space:]]*([^:]+):.*/\1/p')"
+fi
+if [ $occ_trash_repair_rc -ne 0 ]; then
+  log_json "WARN" "occ_trashbin_repair_failed" "Не удалось пересоздать папки files_trashbin" "$occ_trash_repair_detail" $occ_trash_repair_rc
+else
+  log_json "INFO" "occ_trashbin_repair_ok" "Папки files_trashbin пересозданы для всех пользователей" "" 0
+fi
+
 log_json "INFO" "occ_versions_start" "Очистка версий файлов (occ versions:cleanup)..."
 export SSHPASS="${REMOTE_PASSWORD}"
 occ_ver_err=$(sshpass -e ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
