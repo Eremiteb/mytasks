@@ -341,6 +341,7 @@ remote_datadir=$(sshpass -e ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
 remote_users=$(sshpass -e ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
   "docker exec -u www-data esimych-cloud-app php occ user:list" 2>/dev/null)
 unset SSHPASS
+log_json "INFO" "occ_user_list" "Получен список пользователей Nextcloud (occ user:list)" "${remote_users:-<пусто>}"
 if [ -z "$remote_datadir" ] || [ -z "$remote_users" ]; then
   occ_trash_repair_rc=1
   occ_trash_repair_detail="не удалось получить datadirectory или список пользователей"
@@ -355,13 +356,29 @@ else
     if [ $_repair_rc -ne 0 ]; then
       occ_trash_repair_rc=1
       occ_trash_repair_detail="${occ_trash_repair_detail}${_uid}: ${_repair_err}; "
+      continue
+    fi
+    # Проверяем, что папка реально существует после mkdir -p (а не просто
+    # команда молча ничего не сделала из-за проблем с docker exec/SSH) —
+    # результат логируется отдельно для каждого пользователя.
+    export SSHPASS="${REMOTE_PASSWORD}"
+    sshpass -e ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" \
+      "docker exec -u www-data esimych-cloud-app test -d '${remote_datadir}/${_uid}/files_trashbin'" >/dev/null 2>&1
+    _verify_rc=$?
+    unset SSHPASS
+    if [ $_verify_rc -eq 0 ]; then
+      log_json "INFO" "occ_trashbin_verify_ok" "Папка files_trashbin подтверждена после пересоздания" "user=${_uid}, path=${remote_datadir}/${_uid}/files_trashbin" 0
+    else
+      occ_trash_repair_rc=1
+      occ_trash_repair_detail="${occ_trash_repair_detail}${_uid}: папка не найдена после mkdir -p; "
+      log_json "ERROR" "occ_trashbin_verify_failed" "Папка files_trashbin отсутствует после попытки пересоздания" "user=${_uid}, path=${remote_datadir}/${_uid}/files_trashbin" $_verify_rc
     fi
   done <<< "$(printf '%s\n' "$remote_users" | sed -nE 's/^[[:space:]]*-[[:space:]]*([^:]+):.*/\1/p')"
 fi
 if [ $occ_trash_repair_rc -ne 0 ]; then
-  log_json "WARN" "occ_trashbin_repair_failed" "Не удалось пересоздать папки files_trashbin" "$occ_trash_repair_detail" $occ_trash_repair_rc
+  log_json "WARN" "occ_trashbin_repair_failed" "Не удалось пересоздать/подтвердить папки files_trashbin" "$occ_trash_repair_detail" $occ_trash_repair_rc
 else
-  log_json "INFO" "occ_trashbin_repair_ok" "Папки files_trashbin пересозданы для всех пользователей" "" 0
+  log_json "INFO" "occ_trashbin_repair_ok" "Папки files_trashbin пересозданы и проверены для всех пользователей" "" 0
 fi
 
 log_json "INFO" "occ_versions_start" "Очистка версий файлов (occ versions:cleanup)..."
