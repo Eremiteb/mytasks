@@ -655,7 +655,14 @@ if [ -z "$remote_datadir" ] || [ -z "$remote_users" ]; then
   occ_trash_repair_rc=1
   occ_trash_repair_detail="не удалось получить datadirectory или список пользователей"
 else
-  while IFS= read -r _uid; do
+  # Читаем список пользователей из отдельного файлового дескриптора (3), а не
+  # из stdin (0): ssh_remote() внутри тела цикла вызывает ssh без "-n", и он
+  # по умолчанию читает stdin. Если список подавать через <<< на стандартный
+  # ввод цикла, первый же вызов ssh внутри тела "съедает" из stdin остаток
+  # списка пользователей, из-за чего while read получает EOF и обрабатывает
+  # только первого пользователя — остальные (например, clouduser) молча
+  # пропускаются без пересоздания files_trashbin и без записи в лог.
+  while IFS= read -r _uid <&3; do
     [ -z "$_uid" ] && continue
     _repair_err=$(ssh_remote \
       "docker exec -u www-data esimych-cloud-app mkdir -p '${remote_datadir}/${_uid}/files_trashbin'" 2>&1)
@@ -677,7 +684,7 @@ else
       occ_trash_repair_detail="${occ_trash_repair_detail}${_uid}: папка не найдена после mkdir -p; "
       log_json "ERROR" "occ_trashbin_verify_failed" "Папка files_trashbin отсутствует после попытки пересоздания" "user=${_uid}, path=${remote_datadir}/${_uid}/files_trashbin" $_verify_rc
     fi
-  done <<< "$(printf '%s\n' "$remote_users" | sed -nE 's/^[[:space:]]*-[[:space:]]*([^:]+):.*/\1/p')"
+  done 3<<< "$(printf '%s\n' "$remote_users" | sed -nE 's/^[[:space:]]*-[[:space:]]*([^:]+):.*/\1/p')"
 fi
 if [ $occ_trash_repair_rc -ne 0 ]; then
   log_json "WARN" "occ_trashbin_repair_failed" "Не удалось пересоздать/подтвердить папки files_trashbin" "$occ_trash_repair_detail" $occ_trash_repair_rc
