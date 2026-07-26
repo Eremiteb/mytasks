@@ -771,15 +771,20 @@ fi
 # SQLITE OPTIMIZATION (optional)
 ###############################################################################
 if [ "$OPTIMIZE_SQLITE_BEFORE_BACKUP" -eq 1 ]; then
-  log_json "INFO" "sqlite_optimize_start" "Оптимизация SQLite-баз перед архивированием"
-  sqlite_opt_err=$(ssh_remote \
-    "set -o pipefail; find '${REMOTE_PATH}' -type f -name '*.db' -print0 \
-      | xargs -0 -r -I{} timeout ${SQLITE_OPTIMIZE_TIMEOUT_SEC}s sqlite3 \"{}\" 'PRAGMA optimize; VACUUM;'" 2>&1)
-  sqlite_opt_rc=$?
-  if [ $sqlite_opt_rc -ne 0 ]; then
-    log_json "WARN" "sqlite_optimize_failed" "Оптимизация SQLite завершилась с предупреждениями" "$sqlite_opt_err" $sqlite_opt_rc
+  if ! ssh_remote "command -v sqlite3 >/dev/null 2>&1"; then
+    log_json "WARN" "sqlite_optimize_skip_no_binary" "sqlite3 не найден на удалённом сервере — оптимизация SQLite пропущена" \
+      "Установите sqlite3 на ${REMOTE_HOST} (например: apt install sqlite3) или отключите OPTIMIZE_SQLITE_BEFORE_BACKUP"
   else
-    log_json "INFO" "sqlite_optimize_ok" "Оптимизация SQLite завершена" "$sqlite_opt_err" $sqlite_opt_rc
+    log_json "INFO" "sqlite_optimize_start" "Оптимизация SQLite-баз перед архивированием"
+    sqlite_opt_err=$(ssh_remote \
+      "set -o pipefail; find '${REMOTE_PATH}' -type f -name '*.db' -print0 \
+        | xargs -0 -r -I{} timeout ${SQLITE_OPTIMIZE_TIMEOUT_SEC}s sqlite3 \"{}\" 'PRAGMA optimize; VACUUM;'" 2>&1)
+    sqlite_opt_rc=$?
+    if [ $sqlite_opt_rc -ne 0 ]; then
+      log_json "WARN" "sqlite_optimize_failed" "Оптимизация SQLite завершилась с предупреждениями" "$sqlite_opt_err" $sqlite_opt_rc
+    else
+      log_json "INFO" "sqlite_optimize_ok" "Оптимизация SQLite завершена" "$sqlite_opt_err" $sqlite_opt_rc
+    fi
   fi
 else
   log_json "INFO" "sqlite_optimize_skip" "Оптимизация SQLite отключена (OPTIMIZE_SQLITE_BEFORE_BACKUP=0)"
