@@ -196,6 +196,7 @@ LOG_DIR="${SCRIPT_DIR}/logs"
 TIMESTAMP="$(date '+%Y-%m-%d-%H-%M-%S')"
 LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}-${TIMESTAMP}.jsonl"
 PROGRESS_METRICS_FILE=""
+DIAG_METRICS_FILE=""
 
 mkdir -p "$LOG_DIR"
 
@@ -480,6 +481,7 @@ cleanup() {
   services_start_if_needed
   wg_down_if_needed
   [ -n "$PROGRESS_METRICS_FILE" ] && rm -f "$PROGRESS_METRICS_FILE" 2>/dev/null
+  [ -n "$DIAG_METRICS_FILE" ] && rm -f "$DIAG_METRICS_FILE" 2>/dev/null
   cleanup_logs
 }
 trap cleanup EXIT INT TERM
@@ -582,6 +584,36 @@ ssh_remote() {
   fi
 }
 
+###############################################################################
+# ДИАГНОСТИКА НАГРУЗКИ (для расследования деградации скорости бэкапа)
+#
+# Наблюдение по логам за 2026-07-24..28: скорость архивирования почти
+# постоянна В ПРЕДЕЛАХ одного запуска (не снижается плавно к концу), но
+# отличается в ~2 раза МЕЖДУ разными запусками (~5 МиБ/с в одни дни,
+# ~2.4-2.6 МиБ/с в другие) — это указывает на внешний фактор, действующий
+# на весь запуск целиком (загрузка CPU/сети на одной из сторон), а не на
+# деградацию из-за роста файла/буферов/температуры в процессе архивирования.
+# Функции ниже дают факты (loadavg, свободная память, RTT) вместо догадки
+# "probable_cause" по одной лишь средней скорости.
+###############################################################################
+get_local_load1() { awk '{print $1}' /proc/loadavg 2>/dev/null; }
+get_local_mem_avail_mb() { awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo 2>/dev/null; }
+get_local_nproc() { nproc 2>/dev/null || echo 1; }
+
+# Печатает 3 строки: loadavg(1мин), доступная память (МиБ), число ядер
+# удалённого сервера — используется и как разовый baseline, и периодически.
+get_remote_diag() {
+  ssh_remote "awk '{print \$1}' /proc/loadavg 2>/dev/null; awk '/MemAvailable/{print int(\$2/1024)}' /proc/meminfo 2>/dev/null; nproc 2>/dev/null || echo 1" 2>/dev/null
+}
+
+# Среднее значение RTT (мс) до REMOTE_HOST по 3 пакетам; работает как с
+# busybox ping ("round-trip min/avg/max = a/b/c ms"), так и с iputils
+# ("rtt min/avg/max/mdev = a/b/c/d ms") — в обоих форматах avg второе число
+# после "=".
+get_rtt_ms() {
+  ping -c 3 -W 2 "$REMOTE_HOST" 2>/dev/null | tail -n1 | sed -nE 's#.*= *[0-9.]+/([0-9.]+)/[0-9.]+.*#\1#p'
+}
+
 # Выбираем быстрейший доступный компрессор на удалённом сервере:
 # zstd --fast=1 --threads=0 > pigz -1 > gzip -1
 REMOTE_COMP=$(ssh_remote \
@@ -591,6 +623,22 @@ case "$REMOTE_COMP" in
   pigz) COMP_CMD="pigz -1";                       BACKUP_EXT="tar.gz"  ;;
   *)    COMP_CMD="gzip -1";                        BACKUP_EXT="tar.gz"  ;;
 esac
+
+# Снимок нагрузки ДО начала архивирования — baseline для сравнения с
+# показателями во время передачи (см. backup_progress/backup_metrics ниже)
+# и для расчёта probable_cause в backup_degradation.
+LOCAL_NPROC="$(get_local_nproc)"
+_local_load1_baseline="$(get_local_load1)"
+_local_mem_avail_mb_baseline="$(get_local_mem_avail_mb)"
+_remote_diag_baseline="$(get_remote_diag)"
+_remote_load1_baseline=$(printf '%s\n' "$_remote_diag_baseline" | sed -n '1p')
+_remote_mem_avail_mb_baseline=$(printf '%s\n' "$_remote_diag_baseline" | sed -n '2p')
+REMOTE_NPROC=$(printf '%s\n' "$_remote_diag_baseline" | sed -n '3p')
+REMOTE_NPROC="${REMOTE_NPROC:-1}"
+RTT_BASELINE_MS="$(get_rtt_ms)"
+RTT_BASELINE_MS="${RTT_BASELINE_MS:-n/a}"
+log_json "INFO" "backup_env_diag" "Снимок нагрузки перед архивированием" \
+  "local_nproc=${LOCAL_NPROC}, local_load1=${_local_load1_baseline:-n/a}, local_mem_avail_mb=${_local_mem_avail_mb_baseline:-n/a}, remote_nproc=${REMOTE_NPROC}, remote_load1=${_remote_load1_baseline:-n/a}, remote_mem_avail_mb=${_remote_mem_avail_mb_baseline:-n/a}, rtt_baseline_ms=${RTT_BASELINE_MS}"
 
 BACKUP_FILENAME="${SCRIPT_BASE}-${BACKUP_DATE}.${BACKUP_EXT}"
 BACKUP_PATH="${BACKUP_DIR}/${BACKUP_FILENAME}"
@@ -791,17 +839,51 @@ else
 fi
 
 PROGRESS_METRICS_FILE="$(mktemp)"
+DIAG_METRICS_FILE="$(mktemp)"
 
-# Фоновый монитор: пишет размер файла в лог каждые 60 сек
+# Фоновый монитор: каждые 60 сек пишет в лог размер файла, мгновенную
+# скорость с прошлого замера (inst_mib_s — по ней видно, деградирует ли
+# скорость ПЛАВНО в течение самого запуска, или она стабильна с начала до
+# конца, а разница только между запусками) и локальную нагрузку (дёшево,
+# без сети). Раз в ~5 минут (каждый 5-й тик) дополнительно снимает нагрузку
+# и свободную память на удалённом сервере и RTT до него — это отдельное
+# SSH-соединение и 3 ping-пакета, поэтому не на каждом тике, чтобы не грузить
+# слабое железо QNAP лишними TCP-хендшейками во время самой передачи.
 _progress_monitor() {
+  local tick=0 prev_epoch="" prev_bytes=""
   while sleep 60; do
     [ -f "$BACKUP_PATH" ] || break
-    local sz size_bytes now_epoch
+    tick=$((tick + 1))
+    local sz size_bytes now_epoch dt inst_mib_s local_load1 local_mem_avail_mb diag_extra
     sz=$(du -sh "$BACKUP_PATH" 2>/dev/null | cut -f1)
     size_bytes=$(stat -c%s "$BACKUP_PATH" 2>/dev/null || wc -c < "$BACKUP_PATH" 2>/dev/null || printf '0')
     now_epoch=$(date +%s)
+
+    inst_mib_s="n/a"
+    if [ -n "$prev_epoch" ]; then
+      dt=$((now_epoch - prev_epoch))
+      [ "$dt" -gt 0 ] && inst_mib_s=$(awk -v b1="$prev_bytes" -v b2="$size_bytes" -v d="$dt" 'BEGIN { printf "%.2f", ((b2-b1)/1048576)/d }')
+    fi
+    prev_epoch="$now_epoch"
+    prev_bytes="$size_bytes"
+
+    local_load1="$(get_local_load1)"
+    local_mem_avail_mb="$(get_local_mem_avail_mb)"
+
+    diag_extra=""
+    if [ $((tick % 5)) -eq 0 ]; then
+      local remote_diag remote_load1 remote_mem_avail_mb rtt_ms
+      remote_diag="$(get_remote_diag)"
+      remote_load1=$(printf '%s\n' "$remote_diag" | sed -n '1p')
+      remote_mem_avail_mb=$(printf '%s\n' "$remote_diag" | sed -n '2p')
+      rtt_ms="$(get_rtt_ms)"
+      diag_extra=", remote_load1=${remote_load1:-n/a}, remote_mem_avail_mb=${remote_mem_avail_mb:-n/a}, rtt_ms=${rtt_ms:-n/a}"
+      printf '%s\t%s\t%s\t%s\n' "$now_epoch" "${remote_load1:-}" "${local_load1:-}" "${rtt_ms:-}" >> "$DIAG_METRICS_FILE"
+    fi
+
     printf '%s\t%s\n' "$now_epoch" "$size_bytes" >> "$PROGRESS_METRICS_FILE"
-    [ -n "$sz" ] && log_json "INFO" "backup_progress" "Прогресс архивирования" "size=${sz}, bytes=${size_bytes}"
+    [ -n "$sz" ] && log_json "INFO" "backup_progress" "Прогресс архивирования" \
+      "size=${sz}, bytes=${size_bytes}, inst_mib_s=${inst_mib_s}, local_load1=${local_load1:-n/a}, local_mem_avail_mb=${local_mem_avail_mb:-n/a}${diag_extra}"
   done
 }
 _progress_monitor >/dev/null 2>&1 &
@@ -847,16 +929,35 @@ if [ $backup_rc -eq 0 ]; then
     fi
   fi
 
-  metrics_detail="file=${BACKUP_PATH}, size=${backup_size}, bytes=${backup_bytes}, duration_s=${archive_duration}, avg_mib_s=${avg_mib_s}, window_mib_s=${window_mib_s}, progress_samples=${progress_samples}, comp=${REMOTE_COMP:-gzip}, append=${BACKUP_APPEND}"
+  # Средние значения нагрузки/RTT за весь запуск (из DIAG_METRICS_FILE,
+  # который заполняется в _progress_monitor раз в ~5 минут) — фактические
+  # данные для probable_cause ниже, вместо угадывания по одной лишь
+  # средней скорости.
+  diag_samples=$(wc -l < "$DIAG_METRICS_FILE" 2>/dev/null || printf '0')
+  avg_remote_load1="n/a"; avg_local_load1="n/a"; avg_rtt_ms="n/a"
+  if [ "$diag_samples" -ge 1 ]; then
+    avg_remote_load1=$(awk -F'\t' '$2!=""{s+=$2; c++} END{if (c>0) printf "%.2f", s/c; else print "n/a"}' "$DIAG_METRICS_FILE")
+    avg_local_load1=$(awk -F'\t' '$3!=""{s+=$3; c++} END{if (c>0) printf "%.2f", s/c; else print "n/a"}' "$DIAG_METRICS_FILE")
+    avg_rtt_ms=$(awk -F'\t' '$4!=""{s+=$4; c++} END{if (c>0) printf "%.2f", s/c; else print "n/a"}' "$DIAG_METRICS_FILE")
+  fi
+
+  metrics_detail="file=${BACKUP_PATH}, size=${backup_size}, bytes=${backup_bytes}, duration_s=${archive_duration}, avg_mib_s=${avg_mib_s}, window_mib_s=${window_mib_s}, progress_samples=${progress_samples}, comp=${REMOTE_COMP:-gzip}, append=${BACKUP_APPEND}, local_nproc=${LOCAL_NPROC}, remote_nproc=${REMOTE_NPROC}, avg_local_load1=${avg_local_load1}, avg_remote_load1=${avg_remote_load1}, avg_rtt_ms=${avg_rtt_ms}, rtt_baseline_ms=${RTT_BASELINE_MS}"
   log_json "INFO" "backup_metrics" "Метрики этапа архивирования" "$metrics_detail" 0
 
   if awk -v s="$avg_mib_s" -v t="$BACKUP_DEGRADATION_MIBS_THRESHOLD" 'BEGIN { exit !(s < t) }'; then
-    probable_cause="network_or_remote_io"
-    if [ "${REMOTE_COMP:-gzip}" = "zstd" ]; then
-      probable_cause="network_or_remote_io_or_zstd_cpu"
-    fi
+    probable_cause="unknown"
     if [ "$progress_samples" -lt 2 ]; then
       probable_cause="insufficient_progress_samples"
+    elif [ "$avg_remote_load1" != "n/a" ] && awk -v l="$avg_remote_load1" -v n="$REMOTE_NPROC" 'BEGIN { exit !(l >= n) }'; then
+      probable_cause="remote_cpu_contention"
+    elif [ "$avg_local_load1" != "n/a" ] && awk -v l="$avg_local_load1" -v n="$LOCAL_NPROC" 'BEGIN { exit !(l >= n) }'; then
+      probable_cause="local_cpu_or_io_contention"
+    elif [ "$avg_rtt_ms" != "n/a" ] && [ "$RTT_BASELINE_MS" != "n/a" ] && awk -v r="$avg_rtt_ms" -v b="$RTT_BASELINE_MS" 'BEGIN { exit !(r > b * 1.5) }'; then
+      probable_cause="network_latency_increase"
+    elif [ "${REMOTE_COMP:-gzip}" = "zstd" ]; then
+      probable_cause="network_or_remote_io_or_zstd_cpu"
+    else
+      probable_cause="network_or_remote_io"
     fi
     log_json "WARN" "backup_degradation" "Обнаружена деградация скорости бэкапа" \
       "threshold_mib_s=${BACKUP_DEGRADATION_MIBS_THRESHOLD}, probable_cause=${probable_cause}, ${metrics_detail}" 0
@@ -880,6 +981,6 @@ else
   exit $backup_rc
 fi
 
-rm -f "$PROGRESS_METRICS_FILE" 2>/dev/null
+rm -f "$PROGRESS_METRICS_FILE" "$DIAG_METRICS_FILE" 2>/dev/null
 
 exit 0
