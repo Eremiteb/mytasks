@@ -101,9 +101,11 @@ fi
 ###############################################################################
 OUT_TMP=""
 ERR_TMP=""
+OPTS_TMP=""
 cleanup() {
   [ -n "$OUT_TMP" ] && rm -f -- "$OUT_TMP" 2>/dev/null
   [ -n "$ERR_TMP" ] && rm -f -- "$ERR_TMP" 2>/dev/null
+  [ -n "$OPTS_TMP" ] && rm -f -- "$OPTS_TMP" 2>/dev/null
 }
 trap cleanup EXIT INT TERM
 
@@ -133,7 +135,18 @@ while IFS= read -r LINE || [ -n "$LINE" ]; do
   log_json "info" "task_start" "$SRC" "$DST" "task started" "" "$SRC" "$DST" null ""
 
   if [ "$EVAL_MODE" -eq 1 ]; then
-    eval "set -- $OPTS"
+    # Разбиваем $OPTS на позиционные параметры с учётом кавычек, но без eval:
+    # xargs использует свой парсер кавычек/экранирования, а не shell, поэтому
+    # $()/`` ``/;/&&/| внутри OPTS не выполняются как код, только как текст.
+    # Читаем из файла, а не из пайпа — иначе POSIX sh (dash) запускает while
+    # в сабшелле, и накопленные через "set --" параметры терялись бы снаружи.
+    OPTS_TMP="$(mktemp)"
+    printf '%s\n' "$OPTS" | xargs -n1 -- printf '%s\n' >"$OPTS_TMP"
+    set --
+    while IFS= read -r OPT; do
+      set -- "$@" "$OPT"
+    done <"$OPTS_TMP"
+    rm -f -- "$OPTS_TMP"
   else
     set -- $OPTS
   fi

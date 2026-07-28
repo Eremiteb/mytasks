@@ -110,15 +110,12 @@ $RECURSIVE && echo "Режим: рекурсивный" || echo "Режим: т�
 $DRY_RUN && echo "=== СУХОЙ ЗАПУСК ===" || echo "=== РЕАЛЬНАЯ ЗАМЕНА ==="
 echo
 
-# Формируем команду поиска
-if $RECURSIVE; then
-    SEARCH_CMD="grep -rlI -- \"$FROM_STR\" \"$TARGET_DIR\""
-else
-    SEARCH_CMD="grep -lI -- \"$FROM_STR\" \"$TARGET_DIR\"/* 2>/dev/null || true"
-fi
-
 # Сначала собираем все файлы в массив и считаем общее количество
-mapfile -t files < <(eval "$SEARCH_CMD")
+if $RECURSIVE; then
+    mapfile -t files < <(grep -rlI -- "$FROM_STR" "$TARGET_DIR" 2>/dev/null)
+else
+    mapfile -t files < <(grep -lI -- "$FROM_STR" "$TARGET_DIR"/* 2>/dev/null)
+fi
 total=${#files[@]}
 
 if (( total == 0 )); then
