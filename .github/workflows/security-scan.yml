@@ -1,0 +1,106 @@
+name: Security scan
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # каждый понедельник в 04:00 UTC — чтобы ловить новые CVE даже без изменений в коде
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  semgrep:
+    name: Semgrep (SAST)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Установить semgrep
+        run: pip install --user semgrep
+
+      - name: Запустить semgrep
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          semgrep scan \
+            --config p/security-audit --config p/secrets --config p/python \
+            --sarif --sarif-output=semgrep.sarif \
+            --metrics=off .
+
+      - name: Загрузить SARIF в Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+  trivy:
+    name: Trivy (SCA / misconfig)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Запустить Trivy (fs scan)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy.sarif
+
+      - name: Загрузить SARIF в Security tab
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy.sarif
+          category: trivy
+
+  osv-scanner:
+    name: OSV-Scanner (SCA)
+    permissions:
+      actions: read
+      security-events: write
+      contents: read
+    uses: "google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v2.3.8"
+    with:
+      # не валим сборку из-за находок — только репортим в Security tab;
+      # смените на true, если нужен жёсткий гейт
+      fail-on-vuln: false
+
+  gitleaks:
+    name: Gitleaks (секреты)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0 # нужна полная история, а не только последний коммит
+
+      - uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GITLEAKS_LICENSE не нужен — репозиторий личный, не организационный
+
+  codeql:
+    name: CodeQL (SAST, Python)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: python
+
+      - uses: github/codeql-action/analyze@v4
