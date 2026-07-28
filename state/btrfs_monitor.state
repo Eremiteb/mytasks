@@ -1,5 +1,0 @@
-/dev/nvme0n1p1	write_io_errs	0
-/dev/nvme0n1p1	read_io_errs	0
-/dev/nvme0n1p1	flush_io_errs	0
-/dev/nvme0n1p1	corruption_errs	0
-/dev/nvme0n1p1	generation_errs	0
