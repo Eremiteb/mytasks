@@ -321,6 +321,46 @@ OPTIMIZE_REDIS_BEFORE_BACKUP="${OPTIMIZE_REDIS_BEFORE_BACKUP:-0}"
 REDIS_SERVICE_NAME="${REDIS_SERVICE_NAME:-redis}"
 REDIS_REWRITE_WAIT_SEC="${REDIS_REWRITE_WAIT_SEC:-180}"
 
+# Раз в сколько дней реально выполнять оптимизацию БД (MariaDB/Redis/SQLite),
+# даже если сам бэкап запускается ежедневно. Обоснование по логам за
+# 2026-07-24..29: узкое место скорости архивирования — локальный CPU QNAP
+# (nproc=1, avg_load1 во время передачи ~1.5-1.8, см. probable_cause в
+# backup_degradation), а не состояние удалённых БД, т.е. ежедневная
+# оптимизация НЕ помогает со скоростью бэкапа. При этом сама оптимизация не
+# бесплатна: MariaDB для части таблиц вместо OPTIMIZE делает recreate+analyze
+# (полная перезапись таблицы), а Redis BGREWRITEAOF 2026-07-29 не уложился в
+# REDIS_REWRITE_WAIT_SEC=600 и провалился — т.е. ежедневно тратится время
+# впустую. Раз в неделю достаточно для типичной нагрузки Nextcloud.
+DB_OPTIMIZE_INTERVAL_DAYS="${DB_OPTIMIZE_INTERVAL_DAYS:-7}"
+STATE_DIR="${SCRIPT_DIR}/state"
+DB_OPTIMIZE_STATE_FILE="${STATE_DIR}/${SCRIPT_BASE}-db-optimize.state"
+
+# true (0), если с последней оптимизации БД прошло >= DB_OPTIMIZE_INTERVAL_DAYS
+# дней, либо оптимизация ещё ни разу не запускалась (нет state-файла/битое
+# содержимое) — в этом случае тоже считаем, что пора.
+db_optimize_due() {
+  local last_epoch now_epoch elapsed_days
+  [ -r "$DB_OPTIMIZE_STATE_FILE" ] || return 0
+  last_epoch=$(cat "$DB_OPTIMIZE_STATE_FILE" 2>/dev/null)
+  case "$last_epoch" in ''|*[!0-9]*) return 0 ;; esac
+  now_epoch=$(date +%s)
+  elapsed_days=$(( (now_epoch - last_epoch) / 86400 ))
+  [ "$elapsed_days" -ge "$DB_OPTIMIZE_INTERVAL_DAYS" ]
+}
+
+db_optimize_mark_done() {
+  mkdir -p "$STATE_DIR"
+  date +%s > "$DB_OPTIMIZE_STATE_FILE"
+}
+
+if db_optimize_due; then
+  DB_OPTIMIZE_DUE=1
+  log_json "INFO" "db_optimize_due" "Плановая оптимизация БД (раз в ${DB_OPTIMIZE_INTERVAL_DAYS} дн.) выполняется в этом запуске"
+else
+  DB_OPTIMIZE_DUE=0
+  log_json "INFO" "db_optimize_not_due" "Оптимизация БД пропущена в этом запуске — интервал ${DB_OPTIMIZE_INTERVAL_DAYS} дн. ещё не истёк" "state_file=${DB_OPTIMIZE_STATE_FILE}"
+fi
+
 ###############################################################################
 # WireGuard
 # (На QNAP скрипт всегда выполняется от root — через Task Scheduler или
@@ -569,7 +609,20 @@ for _ex in "${REMOTE_EXCLUDES[@]}"; do
   REMOTE_TAR_EXCLUDE_ARGS+=" --exclude='${_ex}'"
 done
 
-SSH_OPTS="-p ${REMOTE_SSH_PORT} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 -o BatchMode=no -o Compression=no -c aes128-gcm@openssh.com,chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-ctr"
+# Порядок шифров SSH важен: он же и приоритет. chacha20-poly1305 стоит первым
+# не просто так — на слабых ARM-чипах без аппаратных инструкций AES (типично
+# для QNAP такого класса) программный AES-GCM/CTR заметно медленнее, чем
+# chacha20-poly1305 (он спроектирован под быстрое ПРОГРАММНОЕ исполнение).
+# Расшифровку входящего потока бэкапа выполняет SSH-клиент — он же и работает
+# на QNAP (единственное ядро, см. backup_env_diag/local_load1 в логах), тогда
+# как WireGuard-туннель добавляет СВОЙ отдельный слой шифрования (ChaCha20-
+# Poly1305, зафиксирован протоколом WG, не настраивается) — то есть на QNAP
+# каждый байт бэкапа расшифровывается ДВАЖДЫ на одном ядре. Смена приоритета
+# шифра SSH не убирает этот двойной слой, но снижает долю CPU, которая уходит
+# именно на SSH-часть, если до этого негociировался медленный на данном чипе
+# AES. Можно переопределить через conf, если тесты покажут другой шифр быстрее.
+SSH_CIPHERS="${SSH_CIPHERS:-chacha20-poly1305@openssh.com,aes128-gcm@openssh.com,aes256-gcm@openssh.com,aes128-ctr}"
+SSH_OPTS="-p ${REMOTE_SSH_PORT} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 -o BatchMode=no -o Compression=no -c ${SSH_CIPHERS}"
 [ -n "$REMOTE_SSH_KEY" ] && SSH_OPTS="${SSH_OPTS} -i ${REMOTE_SSH_KEY}"
 
 # Выполняет команду на удалённом хосте: sshpass+пароль, если sshpass найден и
@@ -753,7 +806,7 @@ fi
 ###############################################################################
 # DATABASE OPTIMIZATION (before services down)
 ###############################################################################
-if [ "$OPTIMIZE_MARIADB_BEFORE_BACKUP" -eq 1 ]; then
+if [ "$OPTIMIZE_MARIADB_BEFORE_BACKUP" -eq 1 ] && [ "$DB_OPTIMIZE_DUE" -eq 1 ]; then
   log_json "INFO" "mariadb_optimize_start" "Оптимизация MariaDB перед архивированием"
   mariadb_opt_err=$(ssh_remote \
     "cd '${REMOTE_PATH}' && docker compose exec -T \
@@ -773,11 +826,13 @@ if [ "$OPTIMIZE_MARIADB_BEFORE_BACKUP" -eq 1 ]; then
   else
     log_json "INFO" "mariadb_optimize_ok" "Оптимизация MariaDB завершена" "$mariadb_opt_err" $mariadb_opt_rc
   fi
+elif [ "$OPTIMIZE_MARIADB_BEFORE_BACKUP" -eq 1 ]; then
+  log_json "INFO" "mariadb_optimize_skip_not_due" "Оптимизация MariaDB пропущена — не настал плановый интервал (раз в ${DB_OPTIMIZE_INTERVAL_DAYS} дн.)"
 else
   log_json "INFO" "mariadb_optimize_skip" "Оптимизация MariaDB отключена (OPTIMIZE_MARIADB_BEFORE_BACKUP=0)"
 fi
 
-if [ "$OPTIMIZE_REDIS_BEFORE_BACKUP" -eq 1 ]; then
+if [ "$OPTIMIZE_REDIS_BEFORE_BACKUP" -eq 1 ] && [ "$DB_OPTIMIZE_DUE" -eq 1 ]; then
   log_json "INFO" "redis_optimize_start" "Оптимизация Redis AOF перед архивированием"
   redis_opt_err=$(ssh_remote \
     "cd '${REMOTE_PATH}' && docker compose exec -T \
@@ -799,6 +854,8 @@ if [ "$OPTIMIZE_REDIS_BEFORE_BACKUP" -eq 1 ]; then
   else
     log_json "INFO" "redis_optimize_ok" "Оптимизация Redis завершена" "$redis_opt_err" $redis_opt_rc
   fi
+elif [ "$OPTIMIZE_REDIS_BEFORE_BACKUP" -eq 1 ]; then
+  log_json "INFO" "redis_optimize_skip_not_due" "Оптимизация Redis пропущена — не настал плановый интервал (раз в ${DB_OPTIMIZE_INTERVAL_DAYS} дн.)"
 else
   log_json "INFO" "redis_optimize_skip" "Оптимизация Redis отключена (OPTIMIZE_REDIS_BEFORE_BACKUP=0)"
 fi
@@ -818,7 +875,7 @@ fi
 ###############################################################################
 # SQLITE OPTIMIZATION (optional)
 ###############################################################################
-if [ "$OPTIMIZE_SQLITE_BEFORE_BACKUP" -eq 1 ]; then
+if [ "$OPTIMIZE_SQLITE_BEFORE_BACKUP" -eq 1 ] && [ "$DB_OPTIMIZE_DUE" -eq 1 ]; then
   if ! ssh_remote "command -v sqlite3 >/dev/null 2>&1"; then
     log_json "WARN" "sqlite_optimize_skip_no_binary" "sqlite3 не найден на удалённом сервере — оптимизация SQLite пропущена" \
       "Установите sqlite3 на ${REMOTE_HOST} (например: apt install sqlite3) или отключите OPTIMIZE_SQLITE_BEFORE_BACKUP"
@@ -834,8 +891,15 @@ if [ "$OPTIMIZE_SQLITE_BEFORE_BACKUP" -eq 1 ]; then
       log_json "INFO" "sqlite_optimize_ok" "Оптимизация SQLite завершена" "$sqlite_opt_err" $sqlite_opt_rc
     fi
   fi
+elif [ "$OPTIMIZE_SQLITE_BEFORE_BACKUP" -eq 1 ]; then
+  log_json "INFO" "sqlite_optimize_skip_not_due" "Оптимизация SQLite пропущена — не настал плановый интервал (раз в ${DB_OPTIMIZE_INTERVAL_DAYS} дн.)"
 else
   log_json "INFO" "sqlite_optimize_skip" "Оптимизация SQLite отключена (OPTIMIZE_SQLITE_BEFORE_BACKUP=0)"
+fi
+
+if [ "$DB_OPTIMIZE_DUE" -eq 1 ]; then
+  db_optimize_mark_done
+  log_json "INFO" "db_optimize_mark_done" "Плановая оптимизация БД отмечена выполненной — следующая через ${DB_OPTIMIZE_INTERVAL_DAYS} дн."
 fi
 
 PROGRESS_METRICS_FILE="$(mktemp)"
