@@ -75,6 +75,19 @@ REDIS_REWRITE_WAIT_SEC="180"
 # лёгкого OPTIMIZE, Redis BGREWRITEAOF может не укладываться в таймаут).
 DB_OPTIMIZE_INTERVAL_DAYS="7"
 
+# Передача потока бэкапа через сырой TCP-сокет (nc/ncat) внутри уже
+# зашифрованного WireGuard-туннеля, в обход дополнительного слоя SSH-шифрования
+# (см. подробное обоснование в шапке cloud_backup_qnap.sh, шаг 8, и у
+# SSH_CIPHERS ниже — двойное шифрование на единственном ядре CPU QNAP).
+# По умолчанию выключено: 0 — сегодняшняя SSH-передача (без риска), 1 — новый
+# способ. Перед включением на постоянку один раз откройте порт
+# RAW_TRANSFER_PORT в фаерволе удалённого сервера (см. шаг 8 в шапке скрипта).
+RAW_TRANSFER_ENABLED="0"
+RAW_TRANSFER_PORT="8873"
+#RAW_TRANSFER_CONNECT_RETRIES="10"
+#RAW_TRANSFER_REMOTE_TIMEOUT_SEC="21600"
+#RAW_TRANSFER_STATUS_POLL_RETRIES="5"
+
 # Приоритет шифров SSH (см. комментарий у SSH_OPTS в скрипте). По умолчанию
 # первым идёт chacha20-poly1305 — на слабых ARM-чипах без аппаратного AES он
 # обычно быстрее программного AES-GCM/CTR, а расшифровку входящего потока

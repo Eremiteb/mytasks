@@ -124,7 +124,7 @@
 | `MARIADB_TRUNCATE_GENERAL_LOG`   | `1`       | Очистить `general.log` перед архивом           |
 | `OPTIMIZE_REDIS_BEFORE_BACKUP`   | `0`       | Выполнить `BGREWRITEAOF` для Redis             |
 | `REDIS_SERVICE_NAME`             | `redis`   | Имя Redis-сервиса в `docker compose`           |
-| `REDIS_REWRITE_WAIT_SEC`         | `180`     | Ожидание завершения `BGREWRITEAOF`             |
+| `REDIS_REWRITE_WAIT_SEC`         | `180`     | Верхний предел ожидания `BGREWRITEAOF` (сек) — не типичная длительность: определение завершения устойчиво к CRLF в выводе `redis-cli INFO`, поэтому при штатной работе rewrite завершается за секунды, значение — лишь потолок на случай реальной проблемы |
 | `OPTIMIZE_SQLITE_BEFORE_BACKUP` | `0`        | Перед архивированием выполнить `VACUUM` для `*.db` |
 | `SQLITE_OPTIMIZE_TIMEOUT_SEC`   | `1800`     | Таймаут на одну SQLite-базу в секундах         |
 
@@ -199,7 +199,7 @@ QNAP-версия `cloud_backup.sh` — то же резервное копир�
 - Автоматически переподключает bind-mount `/opt` → `ENTWARE_DATA_DIR`, если он слетел после перезагрузки NAS (`ensure_entware_mount`)
 - Как и десктопная версия, чистит корзину и версии файлов Nextcloud (`occ trashbin:cleanup --all-users`, `occ versions:cleanup`) и пересоздаёт папку `files_trashbin` для каждого пользователя после очистки (см. подробности в разделе `cloud_backup.sh` выше — код идентичен)
 
-**Предварительная настройка на QNAP** (разово, вручную) подробно описана в шапке самого скрипта: установка Entware, пакетов (`opkg install bash wireguard-tools wireguard-go ncat xxd zstd sqlite3-cli coreutils-stat`), создание конфига WireGuard-клиента с отдельным peer/IP, проверка userspace UAPI-сокета, копирование SSH-ключа на сервер, заполнение `conf/cloud_backup_qnap.conf`.
+**Предварительная настройка на QNAP** (разово, вручную) подробно описана в шапке самого скрипта: установка Entware, пакетов (`opkg install bash wireguard-tools wireguard-go ncat xxd zstd sqlite3-cli coreutils-stat`), создание конфига WireGuard-клиента с отдельным peer/IP, проверка userspace UAPI-сокета, копирование SSH-ключа на сервер, заполнение `conf/cloud_backup_qnap.conf` и (опционально, только для `RAW_TRANSFER_ENABLED="1"`) открытие порта передачи в фаерволе удалённого сервера — см. шаг 8 в шапке скрипта.
 
 **Конфигурация** (`conf/cloud_backup_qnap.conf`, см. `.example`):
 
@@ -222,9 +222,20 @@ QNAP-версия `cloud_backup.sh` — то же резервное копир�
 | `MARIADB_TRUNCATE_GENERAL_LOG`   | `1`       | Очистить `general.log` перед архивом           |
 | `OPTIMIZE_REDIS_BEFORE_BACKUP`   | `0`       | Выполнить `BGREWRITEAOF` для Redis             |
 | `REDIS_SERVICE_NAME`             | `redis`   | Имя Redis-сервиса в `docker compose`           |
-| `REDIS_REWRITE_WAIT_SEC`         | `180`     | Ожидание завершения `BGREWRITEAOF`             |
+| `REDIS_REWRITE_WAIT_SEC`         | `180`     | Верхний предел ожидания `BGREWRITEAOF` (сек), не типичная длительность (см. пояснение в разделе `cloud_backup.sh` выше) |
+| `DB_OPTIMIZE_INTERVAL_DAYS`      | `7`       | Раз в сколько дней реально выполнять включённые выше оптимизации БД (MariaDB/Redis/SQLite), даже если сам бэкап запускается ежедневно — между запусками, где интервал ещё не истёк, оптимизация пропускается (отметка хранится в `state/cloud_backup_qnap-db-optimize.state`); узкое место скорости архивирования — локальный CPU QNAP, а не состояние удалённых БД, поэтому ежедневная оптимизация не нужна |
+| `SSH_CIPHERS`                    | `chacha20-poly1305@openssh.com,aes128-gcm@openssh.com,aes256-gcm@openssh.com,aes128-ctr` | Приоритет SSH-шифров; `chacha20-poly1305` первым, т.к. на слабых ARM-чипах без аппаратного AES он обычно быстрее программного AES-GCM/CTR, а расшифровку входящего потока бэкапа выполняет именно QNAP |
+| `RAW_TRANSFER_ENABLED`           | `0`       | Передавать поток бэкапа через сырой TCP (`nc`/`ncat`) внутри WireGuard-туннеля в обход дополнительного слоя SSH-шифрования — см. раздел «Передача в обход SSH-шифрования» ниже. `0` — обычная передача через SSH (без изменений) |
+| `RAW_TRANSFER_PORT`              | `8873`    | TCP-порт для приёма потока на удалённом сервере (нужно один раз открыть в фаерволе, см. шаг 8 в шапке скрипта) |
+| `RAW_TRANSFER_CONNECT_RETRIES`   | `10`      | Число попыток подключения к листенеру (по 2 сек между попытками) |
+| `RAW_TRANSFER_REMOTE_TIMEOUT_SEC`| `21600`   | Потолок времени жизни удалённого листенера (защита от зависшего процесса, если QNAP так и не подключился) |
+| `RAW_TRANSFER_STATUS_POLL_RETRIES` | `5`     | Число попыток получить статус завершения удалённого пайплайна после приёма данных |
 
 **Логи:** JSONL-файл `logs/cloud_backup_qnap-YYYY-MM-DD-HH-MM-SS.jsonl` на QNAP. Хранится 5 последних файлов (см. `cleanup_logs`).
+
+**Диагностика деградации скорости:** перед началом и каждые ~5 минут во время передачи скрипт снимает `loadavg`/свободную память на QNAP и на удалённом сервере, а также RTT между ними (события `backup_env_diag`, `backup_progress`). После завершения в `backup_metrics` пишутся средние значения (`avg_local_load1`, `avg_remote_load1`, `avg_rtt_ms`), а при скорости ниже `BACKUP_DEGRADATION_MIBS_THRESHOLD` — `backup_degradation` с вероятной причиной (`probable_cause`: `local_cpu_or_io_contention`, `remote_cpu_contention`, `network_latency_increase` и т.д.), определённой по фактическим метрикам, а не по одной лишь средней скорости.
+
+**Передача в обход SSH-шифрования (`RAW_TRANSFER_ENABLED`):** на QNAP с одним ядром CPU поток `tar|zstd`, передаваемый через SSH поверх уже зашифрованного WireGuard-туннеля, расшифровывается дважды на одном ядре (WireGuard ChaCha20-Poly1305 + SSH-шифр) — это и есть основная причина деградации скорости бэкапа (диагностировано через `backup_env_diag`/`backup_metrics`). При `RAW_TRANSFER_ENABLED="1"` поток передаётся через сырой TCP (`nc` на удалённой стороне, `ncat` на QNAP) внутри того же туннеля, минуя дополнительный слой SSH-шифрования — конфиденциальность и целостность по-прежнему обеспечивает WireGuard. SSH остаётся для служебных команд (occ cleanup, optimize БД, `docker compose down`/`up -d`) и для запуска/остановки самого TCP-листенера. Требует один раз открыть `RAW_TRANSFER_PORT` в фаерволе удалённого сервера (шаг 8 в шапке скрипта). По умолчанию выключено — это единственный feature-флаг в скрипте, сделан намеренно для безопасного A/B-сравнения и мгновенного отката без редеплоя. При недоступности `nc` на удалённой стороне или исчерпании попыток подключения скрипт автоматически откатывается на обычную SSH-передачу с предупреждением в логе (`raw_transfer_nc_missing`/`raw_transfer_connect_exhausted`).
 
 **Имя архива и поведение при дозаписи** — идентично `cloud_backup.sh` (см. выше): `cloud_backup_qnap-YYYY-MM-DD.tar.zst`/`.tar.gz`, проверка целостности и дозапись валидного архива за текущую дату, встроенные excludes для кэшей/preview/tmp.
 
@@ -715,6 +726,12 @@ sudo ./wireguard-install.sh
 git clone --depth 1 https://github.com/bats-core/bats-core.git /tmp/bats-core
 /tmp/bats-core/bin/bats --print-output-on-failure tests
 ```
+
+### Тесты для `cloud_backup_qnap.sh`
+
+Файл тестов: `tests/cloud_backup_qnap.bats`.
+
+Покрывает логику `RAW_TRANSFER_ENABLED` (передача в обход SSH-шифрования): поведение при выключенном флаге (без изменений), повторные попытки подключения до успеха, обнаружение ошибки удалённого пайплайна при внешне чистом приёме данных, автоматический откат на SSH-передачу при отсутствии `nc` на удалённой стороне. Подъём WireGuard в тестах обходится через `WG_SOCK_OVERRIDE` (реальный `/var/run/wireguard` недоступен без root).
 
 **GitHub CI:**
 - Workflow: `.github/workflows/bats-tests.yml`

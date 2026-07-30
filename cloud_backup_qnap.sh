@@ -160,6 +160,18 @@
 #             0 21 * * * /ПОЛНЫЙ/ПУТЬ/cloud_backup_qnap.sh
 #             crontab /etc/config/crontab
 #             /etc/init.d/crond.sh restart
+#   8. (Опционально, только если включаете RAW_TRANSFER_ENABLED="1" в conf —
+#      передача потока бэкапа в обход SSH-шифрования, см. комментарий у
+#      RAW_TRANSFER_ENABLED ниже) Один раз открыть порт RAW_TRANSFER_PORT
+#      (по умолчанию 8873/tcp) в фаерволе удалённого сервера, ограничив его
+#      той же подсетью, что и SSH. На этом сервере `ufw` управляется не с
+#      хоста, а из контейнера esimych-cloud-fail2ban (см. docker-compose.yml,
+#      network_mode: host + cap_add NET_ADMIN, том ufw_data:/etc/ufw) —
+#      выполнить на самом REMOTE_HOST:
+#        docker exec esimych-cloud-fail2ban ufw allow from 10.66.66.0/24 to any port 8873 proto tcp comment 'raw backup transfer (10.66.66.0/24)'
+#      Проверить: docker exec esimych-cloud-fail2ban ufw show added
+#      (у "ufw status" на этом сервере известная безобидная ошибка "problem
+#      running sysctl" — на добавление/применение правил не влияет).
 ###############################################################################
 
 set -uo pipefail
@@ -321,6 +333,23 @@ OPTIMIZE_REDIS_BEFORE_BACKUP="${OPTIMIZE_REDIS_BEFORE_BACKUP:-0}"
 REDIS_SERVICE_NAME="${REDIS_SERVICE_NAME:-redis}"
 REDIS_REWRITE_WAIT_SEC="${REDIS_REWRITE_WAIT_SEC:-180}"
 
+# Передача потока бэкапа через сырой TCP-сокет (nc/ncat) внутри уже
+# зашифрованного WireGuard-туннеля, минуя дополнительный слой SSH-шифрования —
+# см. обоснование у SSH_CIPHERS ниже (двойное шифрование на единственном ядре
+# CPU QNAP). Конфиденциальность/целостность не теряются — их обеспечивает AEAD
+# самого WireGuard; SSH по-прежнему используется для служебных команд
+# (occ cleanup, optimize БД, docker compose down/up) и для запуска/остановки
+# самого TCP-листенера на удалённой стороне.
+# По умолчанию выключено (0) — это единственный feature-флаг в этом скрипте,
+# сделан намеренно: новый путь передачи непроверен на проде, откат должен
+# быть мгновенным (без редеплоя) на случай проблем в необслуживаемом ночном
+# запуске. Включить после проверки: RAW_TRANSFER_ENABLED="1" в conf.
+RAW_TRANSFER_ENABLED="${RAW_TRANSFER_ENABLED:-0}"
+RAW_TRANSFER_PORT="${RAW_TRANSFER_PORT:-8873}"
+RAW_TRANSFER_CONNECT_RETRIES="${RAW_TRANSFER_CONNECT_RETRIES:-10}"
+RAW_TRANSFER_REMOTE_TIMEOUT_SEC="${RAW_TRANSFER_REMOTE_TIMEOUT_SEC:-21600}"
+RAW_TRANSFER_STATUS_POLL_RETRIES="${RAW_TRANSFER_STATUS_POLL_RETRIES:-5}"
+
 # Раз в сколько дней реально выполнять оптимизацию БД (MariaDB/Redis/SQLite),
 # даже если сам бэкап запускается ежедневно. Обоснование по логам за
 # 2026-07-24..29: узкое место скорости архивирования — локальный CPU QNAP
@@ -375,7 +404,10 @@ fi
 # это не влияет, используется намеренно только REMOTE_HOST.
 ###############################################################################
 WG_CONF_FILE="/opt/etc/wireguard/${WG_INTERFACE:-wg0-qnap}.conf"
-WG_SOCK="/var/run/wireguard/${WG_INTERFACE:-wg0-qnap}.sock"
+# WG_SOCK_OVERRIDE существует только для тестов (bats не может создавать
+# сокет-файлы под /var/run без root) — в проде переменная не задаётся, путь
+# всегда фактический.
+WG_SOCK="${WG_SOCK_OVERRIDE:-/var/run/wireguard/${WG_INTERFACE:-wg0-qnap}.sock}"
 WG_BROUGHT_UP=0
 SERVICES_STOPPED=0
 
@@ -841,7 +873,7 @@ if [ "$OPTIMIZE_REDIS_BEFORE_BACKUP" -eq 1 ] && [ "$DB_OPTIMIZE_DUE" -eq 1 ]; th
         redis-cli BGREWRITEAOF >/dev/null; \
         i=0; \
         while [ \$i -lt \$REDIS_WAIT ]; do \
-          in_progress=\$(redis-cli INFO persistence | sed -n \"s/^aof_rewrite_in_progress:\\([0-9]\\+\\)$/\\1/p\"); \
+          in_progress=\$(redis-cli INFO persistence | tr -d '\\r' | sed -n \"s/^aof_rewrite_in_progress:\\([0-9]\\+\\)$/\\1/p\"); \
           [ \"\$in_progress\" = \"0\" ] && exit 0; \
           i=\$((i + 1)); \
           sleep 1; \
@@ -956,15 +988,129 @@ _PROGRESS_PID=$!
 ARCHIVE_START_EPOCH=$(date +%s)
 err_tmp=$(mktemp)
 REMOTE_TAR_CMD="set -o pipefail; tar --create --file=- --sparse${REMOTE_TAR_EXCLUDE_ARGS} --directory='${REMOTE_PARENT}' '${REMOTE_DIR}' | ${COMP_CMD}"
-if [ "$BACKUP_APPEND" -eq 1 ]; then
-  ssh_remote "$REMOTE_TAR_CMD" \
-    >> "$BACKUP_PATH" 2>"$err_tmp"
-else
-  ssh_remote "$REMOTE_TAR_CMD" \
-    > "$BACKUP_PATH" 2>"$err_tmp"
+
+# Решаем, доступна ли передача в обход SSH-шифрования (см. RAW_TRANSFER_ENABLED
+# выше) — только если включена в conf И на удалённой стороне есть nc.
+USE_RAW_TRANSFER=0
+if [ "$RAW_TRANSFER_ENABLED" -eq 1 ]; then
+  if [ "$(ssh_remote "command -v nc >/dev/null 2>&1 && echo yes" 2>/dev/null)" = "yes" ]; then
+    USE_RAW_TRANSFER=1
+  else
+    log_json "WARN" "raw_transfer_nc_missing" "На удалённом сервере не найден nc — используется передача через SSH" ""
+  fi
 fi
-backup_rc=$?
-err_out=$(cat "$err_tmp"); rm -f "$err_tmp"
+
+if [ "$USE_RAW_TRANSFER" -eq 1 ]; then
+  # Раздельные каналы: SSH запускает и останавливает удалённый листенер
+  # (служебная команда), а сами байты бэкапа идут напрямую по TCP поверх
+  # WireGuard, без дополнительного слоя SSH-шифрования поверх него.
+  REMOTE_STATUS_FILE="/tmp/.${SCRIPT_BASE}-raw-status-$$"
+  REMOTE_ERR_FILE="/tmp/.${SCRIPT_BASE}-raw-err-$$"
+  # nohup + явный "bash -c" (а не логин-шелл, который может оказаться dash и
+  # не понимать "set -o pipefail") запускает пайплайн в фоне на удалённой
+  # стороне и переживает завершение этой SSH-сессии — ssh_remote() ниже
+  # возвращается почти сразу, не дожидаясь всей передачи.
+  RAW_LAUNCH_CMD="rm -f '${REMOTE_STATUS_FILE}' '${REMOTE_ERR_FILE}'; \
+nohup bash -c 'set -o pipefail; tar --create --file=- --sparse${REMOTE_TAR_EXCLUDE_ARGS} \
+  --directory=\"${REMOTE_PARENT}\" \"${REMOTE_DIR}\" | ${COMP_CMD} | \
+  timeout ${RAW_TRANSFER_REMOTE_TIMEOUT_SEC} nc -l ${REMOTE_HOST} ${RAW_TRANSFER_PORT}; \
+  echo \$? > \"${REMOTE_STATUS_FILE}\"' </dev/null >/dev/null 2>\"${REMOTE_ERR_FILE}\" &"
+  ssh_remote "$RAW_LAUNCH_CMD" >/dev/null 2>&1
+  log_json "INFO" "raw_transfer_listener_launch" "Запущен приём бэкапа через raw TCP (порт ${RAW_TRANSFER_PORT}) в обход SSH-шифрования" ""
+
+  raw_prev_size=0
+  [ "$BACKUP_APPEND" -eq 1 ] && raw_prev_size=$(stat -c%s "$BACKUP_PATH" 2>/dev/null || printf '0')
+
+  RAW_CONNECT_OK=0
+  RAW_MID_STREAM_FAILURE=0
+  for _raw_attempt in $(seq 1 "$RAW_TRANSFER_CONNECT_RETRIES"); do
+    # </dev/null обязателен: ncat (в отличие от OpenBSD nc) ждёт закрытия
+    # СВОЕГО stdin в обе стороны и не завершается по одному лишь EOF от
+    # сервера, если stdin унаследован открытым (проверено вживую — без этого
+    # клиент зависает после успешного приёма всех данных).
+    if [ "$BACKUP_APPEND" -eq 1 ]; then
+      ncat "$REMOTE_HOST" "$RAW_TRANSFER_PORT" >> "$BACKUP_PATH" 2>"$err_tmp" < /dev/null
+    else
+      ncat "$REMOTE_HOST" "$RAW_TRANSFER_PORT" > "$BACKUP_PATH" 2>"$err_tmp" < /dev/null
+    fi
+    _raw_rc=$?
+    _raw_cur_size=$(stat -c%s "$BACKUP_PATH" 2>/dev/null || printf '0')
+
+    if [ "$_raw_rc" -eq 0 ]; then
+      RAW_CONNECT_OK=1
+      break
+    fi
+    if [ "$_raw_cur_size" -gt "$raw_prev_size" ]; then
+      # Байты уже пошли — листенер (он одноразовый, без -k) больше не
+      # существует, повторное подключение невозможно в принципе. Это не
+      # повод падать обратно на SSH-передачу (файл уже частично перезаписан
+      # новыми данными) — это прямая ошибка бэкапа.
+      RAW_MID_STREAM_FAILURE=1
+      log_json "WARN" "raw_transfer_mid_stream_failure" "Соединение разорвано в середине передачи — повтор невозможен" \
+        "attempt=${_raw_attempt}, bytes=${_raw_cur_size}, ncat_rc=${_raw_rc}, stderr=$(cat "$err_tmp")" $_raw_rc
+      break
+    fi
+    log_json "WARN" "raw_transfer_connect_retry" "Повтор подключения к порту передачи" \
+      "attempt=${_raw_attempt}/${RAW_TRANSFER_CONNECT_RETRIES}, ncat_rc=${_raw_rc}" $_raw_rc
+    sleep 2
+  done
+
+  if [ "$RAW_CONNECT_OK" -eq 1 ]; then
+    # Чистый локальный EOF не доказывает, что tar|${COMP_CMD} на удалённой
+    # стороне отработали успешно — nc просто ретранслирует байты до EOF,
+    # ему неизвестен exit-код вышестоящих команд пайпа. Забираем реальный
+    # статус из файла, который фоновый процесс пишет по завершении пайпа.
+    raw_status=""
+    for _raw_poll in $(seq 1 "$RAW_TRANSFER_STATUS_POLL_RETRIES"); do
+      raw_status=$(ssh_remote "cat '${REMOTE_STATUS_FILE}' 2>/dev/null")
+      [ -n "$raw_status" ] && break
+      sleep 2
+    done
+    case "$raw_status" in
+      ''|*[!0-9]*)
+        backup_rc=1
+        err_out="raw transfer: remote status file missing/unreadable"
+        log_json "WARN" "raw_transfer_status_missing" "Не удалось получить статус удалённого пайплайна" "$err_out"
+        ;;
+      0)
+        backup_rc=0
+        err_out=""
+        log_json "INFO" "raw_transfer_status_fetch" "Удалённый пайплайн (tar|${REMOTE_COMP:-gzip}) завершился успешно" "" 0
+        ;;
+      *)
+        backup_rc="$raw_status"
+        err_out="remote pipeline failed rc=${raw_status}: $(ssh_remote "cat '${REMOTE_ERR_FILE}' 2>/dev/null")"
+        log_json "WARN" "raw_transfer_status_fetch" "Удалённый пайплайн завершился с ошибкой" "$err_out" "$backup_rc"
+        ;;
+    esac
+    ssh_remote "rm -f '${REMOTE_STATUS_FILE}' '${REMOTE_ERR_FILE}'" >/dev/null 2>&1
+  elif [ "$RAW_MID_STREAM_FAILURE" -eq 1 ]; then
+    backup_rc=1
+    err_out="raw transfer: connection dropped mid-stream after ${_raw_cur_size} bytes"
+    ssh_remote "rm -f '${REMOTE_STATUS_FILE}' '${REMOTE_ERR_FILE}'" >/dev/null 2>&1
+  else
+    # Листенер так и не стал доступен ни разу за все попытки — в BACKUP_PATH
+    # ничего нового не записано, безопасно вернуться к SSH-передаче.
+    err_out=$(cat "$err_tmp")
+    log_json "WARN" "raw_transfer_connect_exhausted" "Не удалось подключиться к листенеру после ${RAW_TRANSFER_CONNECT_RETRIES} попыток — переход на передачу через SSH" "$err_out"
+    ssh_remote "rm -f '${REMOTE_STATUS_FILE}' '${REMOTE_ERR_FILE}'" >/dev/null 2>&1
+    USE_RAW_TRANSFER=0
+  fi
+fi
+
+if [ "$USE_RAW_TRANSFER" -eq 0 ]; then
+  [ "$RAW_TRANSFER_ENABLED" -eq 1 ] && log_json "INFO" "raw_transfer_fallback_ssh" "Передача выполняется через SSH-туннель" ""
+  if [ "$BACKUP_APPEND" -eq 1 ]; then
+    ssh_remote "$REMOTE_TAR_CMD" \
+      >> "$BACKUP_PATH" 2>"$err_tmp"
+  else
+    ssh_remote "$REMOTE_TAR_CMD" \
+      > "$BACKUP_PATH" 2>"$err_tmp"
+  fi
+  backup_rc=$?
+  err_out=$(cat "$err_tmp")
+fi
+rm -f "$err_tmp"
 ARCHIVE_END_EPOCH=$(date +%s)
 
 kill "$_PROGRESS_PID" 2>/dev/null

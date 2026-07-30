@@ -432,7 +432,7 @@ if [ "$OPTIMIZE_REDIS_BEFORE_BACKUP" -eq 1 ]; then
         redis-cli BGREWRITEAOF >/dev/null; \
         i=0; \
         while [ \$i -lt \$REDIS_WAIT ]; do \
-          in_progress=\$(redis-cli INFO persistence | sed -n \"s/^aof_rewrite_in_progress:\\([0-9]\\+\\)$/\\1/p\"); \
+          in_progress=\$(redis-cli INFO persistence | tr -d '\\r' | sed -n \"s/^aof_rewrite_in_progress:\\([0-9]\\+\\)$/\\1/p\"); \
           [ \"\$in_progress\" = \"0\" ] && exit 0; \
           i=\$((i + 1)); \
           sleep 1; \
