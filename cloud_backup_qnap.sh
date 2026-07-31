@@ -699,6 +699,19 @@ get_rtt_ms() {
   ping -c 3 -W 2 "$REMOTE_HOST" 2>/dev/null | tail -n1 | sed -nE 's#.*= *[0-9.]+/([0-9.]+)/[0-9.]+.*#\1#p'
 }
 
+# Снимок на удалённой стороне сразу после сбоя raw-transfer: loadavg,
+# свободная память, свежие OOM-килы из dmesg (последние 3 мин) и место на
+# диске REMOTE_PATH — чтобы не гонять это вручную по SSH после каждого
+# падения, как пришлось делать при разборе инцидента 2026-07-31 (OOM убивал
+# clamd прямо во время окна остановки/запуска сервисов вокруг бэкапа).
+get_remote_failure_diag() {
+  ssh_remote "echo loadavg=\$(awk '{print \$1}' /proc/loadavg 2>/dev/null); \
+echo mem_avail_mb=\$(awk '/MemAvailable/{print int(\$2/1024)}' /proc/meminfo 2>/dev/null); \
+echo disk_avail=\$(df -h '${REMOTE_PATH}' 2>/dev/null | awk 'NR==2{print \$4}'); \
+oom=\$(dmesg -T 2>/dev/null | grep -i 'oom-kill\|out of memory' | tail -3 | tr '\n' ';'); \
+echo oom_recent=\"\${oom:-none}\"" 2>/dev/null | tr '\n' ', '
+}
+
 # Выбираем быстрейший доступный компрессор на удалённом сервере:
 # zstd --fast=1 --threads=0 > pigz -1 > gzip -1
 REMOTE_COMP=$(ssh_remote \
@@ -902,6 +915,13 @@ if [ $stop_rc -ne 0 ]; then
 else
   SERVICES_STOPPED=1
   log_json "INFO" "services_stop_ok" "Сервисы остановлены" "" $stop_rc
+  # Пауза перед стартом передачи: массовая остановка ~15 контейнеров (docker
+  # compose down) на слабом железе ещё несколько секунд донастраивает сеть/DNS
+  # на удалённой стороне после того, как сама команда уже вернула управление
+  # (наблюдалось: raw-transfer падал с SIGPIPE через ~2с после запуска
+  # листенера сразу после docker compose down). Даём хосту стабилизироваться.
+  sleep 5
+  log_json "INFO" "post_services_stop_settle" "Пауза после остановки сервисов для стабилизации сети хоста" "sleep_sec=5"
 fi
 
 ###############################################################################
@@ -1015,6 +1035,7 @@ nohup bash -c 'set -o pipefail; tar --create --file=- --sparse${REMOTE_TAR_EXCLU
   --directory=\"${REMOTE_PARENT}\" \"${REMOTE_DIR}\" | ${COMP_CMD} | \
   timeout ${RAW_TRANSFER_REMOTE_TIMEOUT_SEC} nc -l ${REMOTE_HOST} ${RAW_TRANSFER_PORT}; \
   echo \$? > \"${REMOTE_STATUS_FILE}\"' </dev/null >/dev/null 2>\"${REMOTE_ERR_FILE}\" &"
+  RAW_LAUNCH_EPOCH=$(date +%s)
   ssh_remote "$RAW_LAUNCH_CMD" >/dev/null 2>&1
   log_json "INFO" "raw_transfer_listener_launch" "Запущен приём бэкапа через raw TCP (порт ${RAW_TRANSFER_PORT}) в обход SSH-шифрования" ""
 
@@ -1046,8 +1067,9 @@ nohup bash -c 'set -o pipefail; tar --create --file=- --sparse${REMOTE_TAR_EXCLU
       # повод падать обратно на SSH-передачу (файл уже частично перезаписан
       # новыми данными) — это прямая ошибка бэкапа.
       RAW_MID_STREAM_FAILURE=1
+      RAW_CONNECT_ELAPSED_S=$(( $(date +%s) - RAW_LAUNCH_EPOCH ))
       log_json "WARN" "raw_transfer_mid_stream_failure" "Соединение разорвано в середине передачи — повтор невозможен" \
-        "attempt=${_raw_attempt}, bytes=${_raw_cur_size}, ncat_rc=${_raw_rc}, stderr=$(cat "$err_tmp")" $_raw_rc
+        "attempt=${_raw_attempt}, bytes=${_raw_cur_size}, elapsed_since_launch_s=${RAW_CONNECT_ELAPSED_S}, ncat_rc=${_raw_rc}, stderr=$(cat "$err_tmp"), remote_diag=[$(get_remote_failure_diag)]" $_raw_rc
       break
     fi
     log_json "WARN" "raw_transfer_connect_retry" "Повтор подключения к порту передачи" \
@@ -1060,6 +1082,7 @@ nohup bash -c 'set -o pipefail; tar --create --file=- --sparse${REMOTE_TAR_EXCLU
     # стороне отработали успешно — nc просто ретранслирует байты до EOF,
     # ему неизвестен exit-код вышестоящих команд пайпа. Забираем реальный
     # статус из файла, который фоновый процесс пишет по завершении пайпа.
+    RAW_CONNECT_ELAPSED_S=$(( $(date +%s) - RAW_LAUNCH_EPOCH ))
     raw_status=""
     for _raw_poll in $(seq 1 "$RAW_TRANSFER_STATUS_POLL_RETRIES"); do
       raw_status=$(ssh_remote "cat '${REMOTE_STATUS_FILE}' 2>/dev/null")
@@ -1070,17 +1093,20 @@ nohup bash -c 'set -o pipefail; tar --create --file=- --sparse${REMOTE_TAR_EXCLU
       ''|*[!0-9]*)
         backup_rc=1
         err_out="raw transfer: remote status file missing/unreadable"
-        log_json "WARN" "raw_transfer_status_missing" "Не удалось получить статус удалённого пайплайна" "$err_out"
+        log_json "WARN" "raw_transfer_status_missing" "Не удалось получить статус удалённого пайплайна" \
+          "${err_out}, bytes=${_raw_cur_size}, elapsed_since_launch_s=${RAW_CONNECT_ELAPSED_S}, remote_diag=[$(get_remote_failure_diag)]"
         ;;
       0)
         backup_rc=0
         err_out=""
-        log_json "INFO" "raw_transfer_status_fetch" "Удалённый пайплайн (tar|${REMOTE_COMP:-gzip}) завершился успешно" "" 0
+        log_json "INFO" "raw_transfer_status_fetch" "Удалённый пайплайн (tar|${REMOTE_COMP:-gzip}) завершился успешно" \
+          "bytes=${_raw_cur_size}, elapsed_since_launch_s=${RAW_CONNECT_ELAPSED_S}" 0
         ;;
       *)
         backup_rc="$raw_status"
         err_out="remote pipeline failed rc=${raw_status}: $(ssh_remote "cat '${REMOTE_ERR_FILE}' 2>/dev/null")"
-        log_json "WARN" "raw_transfer_status_fetch" "Удалённый пайплайн завершился с ошибкой" "$err_out" "$backup_rc"
+        log_json "WARN" "raw_transfer_status_fetch" "Удалённый пайплайн завершился с ошибкой" \
+          "${err_out}, bytes=${_raw_cur_size}, elapsed_since_launch_s=${RAW_CONNECT_ELAPSED_S}, remote_diag=[$(get_remote_failure_diag)]" "$backup_rc"
         ;;
     esac
     ssh_remote "rm -f '${REMOTE_STATUS_FILE}' '${REMOTE_ERR_FILE}'" >/dev/null 2>&1
@@ -1092,7 +1118,8 @@ nohup bash -c 'set -o pipefail; tar --create --file=- --sparse${REMOTE_TAR_EXCLU
     # Листенер так и не стал доступен ни разу за все попытки — в BACKUP_PATH
     # ничего нового не записано, безопасно вернуться к SSH-передаче.
     err_out=$(cat "$err_tmp")
-    log_json "WARN" "raw_transfer_connect_exhausted" "Не удалось подключиться к листенеру после ${RAW_TRANSFER_CONNECT_RETRIES} попыток — переход на передачу через SSH" "$err_out"
+    log_json "WARN" "raw_transfer_connect_exhausted" "Не удалось подключиться к листенеру после ${RAW_TRANSFER_CONNECT_RETRIES} попыток — переход на передачу через SSH" \
+      "${err_out}, remote_diag=[$(get_remote_failure_diag)]"
     ssh_remote "rm -f '${REMOTE_STATUS_FILE}' '${REMOTE_ERR_FILE}'" >/dev/null 2>&1
     USE_RAW_TRANSFER=0
   fi
