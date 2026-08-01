@@ -1033,7 +1033,7 @@ if [ "$USE_RAW_TRANSFER" -eq 1 ]; then
   RAW_LAUNCH_CMD="rm -f '${REMOTE_STATUS_FILE}' '${REMOTE_ERR_FILE}'; \
 nohup bash -c 'set -o pipefail; tar --create --file=- --sparse${REMOTE_TAR_EXCLUDE_ARGS} \
   --directory=\"${REMOTE_PARENT}\" \"${REMOTE_DIR}\" | ${COMP_CMD} | \
-  timeout ${RAW_TRANSFER_REMOTE_TIMEOUT_SEC} nc -l ${REMOTE_HOST} ${RAW_TRANSFER_PORT}; \
+  timeout ${RAW_TRANSFER_REMOTE_TIMEOUT_SEC} nc -N -l ${REMOTE_HOST} ${RAW_TRANSFER_PORT}; \
   echo \$? > \"${REMOTE_STATUS_FILE}\"' </dev/null >/dev/null 2>\"${REMOTE_ERR_FILE}\" &"
   RAW_LAUNCH_EPOCH=$(date +%s)
   ssh_remote "$RAW_LAUNCH_CMD" >/dev/null 2>&1
@@ -1045,14 +1045,23 @@ nohup bash -c 'set -o pipefail; tar --create --file=- --sparse${REMOTE_TAR_EXCLU
   RAW_CONNECT_OK=0
   RAW_MID_STREAM_FAILURE=0
   for _raw_attempt in $(seq 1 "$RAW_TRANSFER_CONNECT_RETRIES"); do
-    # </dev/null обязателен: ncat (в отличие от OpenBSD nc) ждёт закрытия
-    # СВОЕГО stdin в обе стороны и не завершается по одному лишь EOF от
-    # сервера, если stdin унаследован открытым (проверено вживую — без этого
-    # клиент зависает после успешного приёма всех данных).
+    # --recv-only обязателен: без него ncat ведёт себя как двунаправленный
+    # прокси и, увидев мгновенный EOF на СВОЁМ stdin (из /dev/null), рвёт
+    # приём почти сразу (воспроизведено вживую — обрыв на 16-48 КБ вместо
+    # десятков гигабайт). --recv-only полностью отключает попытку читать/
+    # слать stdin, приём при этом идёт до конца потока корректно.
+    # На удалённой стороне "nc -N" (см. RAW_LAUNCH_CMD) обязателен по той же
+    # причине с другой стороны: без -N OpenBSD nc не закрывает сокет по EOF
+    # своего stdin и висит до RAW_TRANSFER_REMOTE_TIMEOUT_SEC (часы) — без
+    # -N клиент с --recv-only корректно получает все данные, но не может
+    # вовремя дождаться закрытия соединения. Комбинация nc-N + ncat
+    # --recv-only проверена вживую на 50 и 100 МБ по несколько раз подряд —
+    # каждый раз точный побайтовый результат и мгновенное завершение обеих
+    # сторон.
     if [ "$BACKUP_APPEND" -eq 1 ]; then
-      ncat "$REMOTE_HOST" "$RAW_TRANSFER_PORT" >> "$BACKUP_PATH" 2>"$err_tmp" < /dev/null
+      ncat --recv-only "$REMOTE_HOST" "$RAW_TRANSFER_PORT" >> "$BACKUP_PATH" 2>"$err_tmp" < /dev/null
     else
-      ncat "$REMOTE_HOST" "$RAW_TRANSFER_PORT" > "$BACKUP_PATH" 2>"$err_tmp" < /dev/null
+      ncat --recv-only "$REMOTE_HOST" "$RAW_TRANSFER_PORT" > "$BACKUP_PATH" 2>"$err_tmp" < /dev/null
     fi
     _raw_rc=$?
     _raw_cur_size=$(stat -c%s "$BACKUP_PATH" 2>/dev/null || printf '0')
