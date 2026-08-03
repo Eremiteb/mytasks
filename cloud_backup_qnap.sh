@@ -350,6 +350,16 @@ RAW_TRANSFER_CONNECT_RETRIES="${RAW_TRANSFER_CONNECT_RETRIES:-10}"
 RAW_TRANSFER_REMOTE_TIMEOUT_SEC="${RAW_TRANSFER_REMOTE_TIMEOUT_SEC:-21600}"
 RAW_TRANSFER_STATUS_POLL_RETRIES="${RAW_TRANSFER_STATUS_POLL_RETRIES:-5}"
 
+# Замер реальной скорости сети QNAP<->REMOTE_HOST перед началом бэкапа —
+# тем же способом (nc -N + ncat --recv-only), что и сама передача, поэтому
+# число напрямую сравнимо с avg_mib_s в backup_metrics: если замер и реальная
+# скорость близки — узкое место на стороне QNAP (CPU/диск), если замер
+# гораздо выше реальной скорости — узкое место где-то в процессе архивации
+# (remote CPU/IO), а не в самой сети. См. анализ логов 07-30..08-03: скорость
+# самого бэкапа скакала от 2.51 до 5.01 МиБ/с без явной корреляции с
+# local_load1 — этот замер даёт третью точку данных для разбора таких случаев.
+NETWORK_SPEED_TEST_MB="${NETWORK_SPEED_TEST_MB:-50}"
+
 # Раз в сколько дней реально выполнять оптимизацию БД (MariaDB/Redis/SQLite),
 # даже если сам бэкап запускается ежедневно. Обоснование по логам за
 # 2026-07-24..29: узкое место скорости архивирования — локальный CPU QNAP
@@ -685,6 +695,30 @@ get_local_load1() { awk '{print $1}' /proc/loadavg 2>/dev/null; }
 get_local_mem_avail_mb() { awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo 2>/dev/null; }
 get_local_nproc() { nproc 2>/dev/null || echo 1; }
 
+# Блочное устройство под BACKUP_DIR (для чтения его счётчиков из
+# /proc/diskstats). На Entware этой сборки нет iostat/vmstat (минимальный
+# набор пакетов aarch64-k3.10 — только ash/bash/ncat/ssh/wg/zstd и т.п.),
+# поэтому IO читаем напрямую из ядра тем же способом, что loadavg/meminfo
+# выше — без установки дополнительных opkg-пакетов. Пусто, если df не смог
+# определить устройство или в diskstats нет строки с таким именем (например,
+# необычное имя mapper-устройства на некоторых прошивках QTS) — тогда IO
+# просто не измеряется (n/a в логах), а не гадаем по несвязанному диску.
+get_local_io_device() {
+  local dev
+  dev=$(df "$BACKUP_DIR" 2>/dev/null | awk 'NR==2{print $1}' | sed 's#^/dev/##')
+  [ -n "$dev" ] || return
+  awk -v d="$dev" '$3==d{f=1} END{exit !f}' /proc/diskstats 2>/dev/null && printf '%s' "$dev"
+}
+
+# Печатает "sectors_read sectors_written io_ms" для устройства $1 из
+# /proc/diskstats (поля 6, 10, 13 — см. Documentation/iostats.txt в ядре).
+# io_ms ("time spent doing I/Os") — та же величина, на которой iostat считает
+# %util: доля времени за интервал, когда на устройстве была хотя бы одна
+# незавершённая операция.
+get_local_io_raw() {
+  awk -v d="$1" '$3==d{print $6, $10, $13}' /proc/diskstats 2>/dev/null
+}
+
 # Печатает 3 строки: loadavg(1мин), доступная память (МиБ), число ядер
 # удалённого сервера — используется и как разовый baseline, и периодически.
 get_remote_diag() {
@@ -712,6 +746,50 @@ oom=\$(dmesg -T 2>/dev/null | grep -i 'oom-kill\|out of memory' | tail -3 | tr '
 echo oom_recent=\"\${oom:-none}\"" 2>/dev/null | tr '\n' ', '
 }
 
+# Замер реальной скорости сети QNAP<->REMOTE_HOST перед архивированием — тем
+# же способом (nc -N на удалённой стороне + ncat --recv-only на QNAP), что и
+# сама передача бэкапа, так что результат напрямую сравним с avg_mib_s из
+# backup_metrics. Best-effort: любая ошибка (нет nc, порт занят, таймаут)
+# просто логируется предупреждением и не прерывает бэкап — сеть уже проверена
+# раньше через wg_check, это только диагностика скорости, а не связности.
+measure_network_speed() {
+  if [ "$(ssh_remote "command -v nc >/dev/null 2>&1 && echo yes" 2>/dev/null)" != "yes" ]; then
+    log_json "WARN" "network_speed_test_skip_no_nc" "На удалённой стороне нет nc — замер скорости сети пропущен" ""
+    return
+  fi
+
+  local test_status_file test_out test_launch test_start test_end test_dur test_bytes test_mib_s test_rc
+  test_status_file="/tmp/.${SCRIPT_BASE}-speedtest-status-$$"
+  test_out="$(mktemp)"
+
+  test_launch="rm -f '${test_status_file}'; \
+nohup bash -c 'dd if=/dev/zero bs=1M count=${NETWORK_SPEED_TEST_MB} 2>/dev/null | timeout 60 nc -N -l ${REMOTE_HOST} ${RAW_TRANSFER_PORT}; \
+  echo \$? > \"${test_status_file}\"' </dev/null >/dev/null 2>&1 &"
+  ssh_remote "$test_launch" >/dev/null 2>&1
+  sleep 1
+
+  test_start=$(date +%s)
+  timeout 60 ncat --recv-only "$REMOTE_HOST" "$RAW_TRANSFER_PORT" > "$test_out" 2>/dev/null < /dev/null
+  test_rc=$?
+  test_end=$(date +%s)
+
+  test_bytes=$(stat -c%s "$test_out" 2>/dev/null || printf '0')
+  rm -f "$test_out"
+  ssh_remote "cat '${test_status_file}' 2>/dev/null; rm -f '${test_status_file}'" >/dev/null 2>&1
+
+  test_dur=$(( test_end - test_start ))
+  [ "$test_dur" -lt 1 ] && test_dur=1
+
+  if [ "$test_rc" -eq 0 ] && [ "$test_bytes" -gt 0 ]; then
+    test_mib_s=$(awk -v b="$test_bytes" -v d="$test_dur" 'BEGIN { printf "%.2f", (b/1048576)/d }')
+    log_json "INFO" "network_speed_test" "Замер скорости сети перед началом бэкапа" \
+      "bytes=${test_bytes}, duration_s=${test_dur}, mib_s=${test_mib_s}"
+  else
+    log_json "WARN" "network_speed_test_failed" "Не удалось измерить скорость сети (не влияет на сам бэкап)" \
+      "bytes=${test_bytes}, duration_s=${test_dur}, ncat_rc=${test_rc}"
+  fi
+}
+
 # Выбираем быстрейший доступный компрессор на удалённом сервере:
 # zstd --fast=1 --threads=0 > pigz -1 > gzip -1
 REMOTE_COMP=$(ssh_remote \
@@ -735,8 +813,14 @@ REMOTE_NPROC=$(printf '%s\n' "$_remote_diag_baseline" | sed -n '3p')
 REMOTE_NPROC="${REMOTE_NPROC:-1}"
 RTT_BASELINE_MS="$(get_rtt_ms)"
 RTT_BASELINE_MS="${RTT_BASELINE_MS:-n/a}"
+IO_DEVICE="$(get_local_io_device)"
 log_json "INFO" "backup_env_diag" "Снимок нагрузки перед архивированием" \
-  "local_nproc=${LOCAL_NPROC}, local_load1=${_local_load1_baseline:-n/a}, local_mem_avail_mb=${_local_mem_avail_mb_baseline:-n/a}, remote_nproc=${REMOTE_NPROC}, remote_load1=${_remote_load1_baseline:-n/a}, remote_mem_avail_mb=${_remote_mem_avail_mb_baseline:-n/a}, rtt_baseline_ms=${RTT_BASELINE_MS}"
+  "local_nproc=${LOCAL_NPROC}, local_load1=${_local_load1_baseline:-n/a}, local_mem_avail_mb=${_local_mem_avail_mb_baseline:-n/a}, remote_nproc=${REMOTE_NPROC}, remote_load1=${_remote_load1_baseline:-n/a}, remote_mem_avail_mb=${_remote_mem_avail_mb_baseline:-n/a}, rtt_baseline_ms=${RTT_BASELINE_MS}, io_device=${IO_DEVICE:-n/a}"
+if [ -z "$IO_DEVICE" ]; then
+  log_json "WARN" "io_diag_unavailable" "Не удалось определить блочное устройство под BACKUP_DIR — замер IO (backup_io_diag) пропущен" "backup_dir=${BACKUP_DIR}"
+fi
+
+measure_network_speed
 
 BACKUP_FILENAME="${SCRIPT_BASE}-${BACKUP_DATE}.${BACKUP_EXT}"
 BACKUP_PATH="${BACKUP_DIR}/${BACKUP_FILENAME}"
@@ -957,20 +1041,24 @@ fi
 PROGRESS_METRICS_FILE="$(mktemp)"
 DIAG_METRICS_FILE="$(mktemp)"
 
-# Фоновый монитор: каждые 60 сек пишет в лог размер файла, мгновенную
+# Фоновый монитор: каждые 60 сек пишет в лог размер файла и мгновенную
 # скорость с прошлого замера (inst_mib_s — по ней видно, деградирует ли
 # скорость ПЛАВНО в течение самого запуска, или она стабильна с начала до
-# конца, а разница только между запусками) и локальную нагрузку (дёшево,
-# без сети). Раз в ~5 минут (каждый 5-й тик) дополнительно снимает нагрузку
-# и свободную память на удалённом сервере и RTT до него — это отдельное
-# SSH-соединение и 3 ping-пакета, поэтому не на каждом тике, чтобы не грузить
-# слабое железо QNAP лишними TCP-хендшейками во время самой передачи.
+# конца, а разница только между запусками). Раз в ~5 минут (каждый 5-й тик)
+# дополнительно снимает нагрузку и свободную память на удалённом сервере и
+# RTT до него — это отдельное SSH-соединение и 3 ping-пакета, поэтому не на
+# каждом тике, чтобы не грузить слабое железо QNAP лишними TCP-хендшейками
+# во время самой передачи. Раз в ~10 минут (каждый 10-й тик, подмножество
+# 5-минутных) CPU/RAM/IO самого QNAP снимаются вместе одним замером
+# (backup_resource_diag) — совместно, а не вразнобой, чтобы значения
+# относились к одному и тому же моменту времени.
 _progress_monitor() {
   local tick=0 prev_epoch="" prev_bytes=""
+  local io_prev_epoch="" io_prev_read="" io_prev_write="" io_prev_ms=""
   while sleep 60; do
     [ -f "$BACKUP_PATH" ] || break
     tick=$((tick + 1))
-    local sz size_bytes now_epoch dt inst_mib_s local_load1 local_mem_avail_mb diag_extra
+    local sz size_bytes now_epoch dt inst_mib_s diag_extra
     sz=$(du -sh "$BACKUP_PATH" 2>/dev/null | cut -f1)
     size_bytes=$(stat -c%s "$BACKUP_PATH" 2>/dev/null || wc -c < "$BACKUP_PATH" 2>/dev/null || printf '0')
     now_epoch=$(date +%s)
@@ -983,23 +1071,48 @@ _progress_monitor() {
     prev_epoch="$now_epoch"
     prev_bytes="$size_bytes"
 
-    local_load1="$(get_local_load1)"
-    local_mem_avail_mb="$(get_local_mem_avail_mb)"
-
     diag_extra=""
     if [ $((tick % 5)) -eq 0 ]; then
-      local remote_diag remote_load1 remote_mem_avail_mb rtt_ms
+      local remote_diag remote_load1 remote_mem_avail_mb rtt_ms local_load1 io_util_pct_field=""
       remote_diag="$(get_remote_diag)"
       remote_load1=$(printf '%s\n' "$remote_diag" | sed -n '1p')
       remote_mem_avail_mb=$(printf '%s\n' "$remote_diag" | sed -n '2p')
       rtt_ms="$(get_rtt_ms)"
+      local_load1="$(get_local_load1)"
       diag_extra=", remote_load1=${remote_load1:-n/a}, remote_mem_avail_mb=${remote_mem_avail_mb:-n/a}, rtt_ms=${rtt_ms:-n/a}"
-      printf '%s\t%s\t%s\t%s\n' "$now_epoch" "${remote_load1:-}" "${local_load1:-}" "${rtt_ms:-}" >> "$DIAG_METRICS_FILE"
+
+      if [ $((tick % 10)) -eq 0 ]; then
+        local local_mem_avail_mb io_read_kib_s="n/a" io_write_kib_s="n/a" io_util_pct="n/a"
+        local_mem_avail_mb="$(get_local_mem_avail_mb)"
+
+        if [ -n "$IO_DEVICE" ]; then
+          local io_raw io_read io_write io_ms io_dt
+          io_raw="$(get_local_io_raw "$IO_DEVICE")"
+          io_read=$(printf '%s' "$io_raw" | awk '{print $1}')
+          io_write=$(printf '%s' "$io_raw" | awk '{print $2}')
+          io_ms=$(printf '%s' "$io_raw" | awk '{print $3}')
+          if [ -n "$io_prev_epoch" ] && [ -n "$io_read" ]; then
+            io_dt=$((now_epoch - io_prev_epoch))
+            if [ "$io_dt" -gt 0 ]; then
+              io_read_kib_s=$(awk -v a="$io_prev_read" -v b="$io_read" -v d="$io_dt" 'BEGIN { printf "%.1f", ((b-a)*512/1024)/d }')
+              io_write_kib_s=$(awk -v a="$io_prev_write" -v b="$io_write" -v d="$io_dt" 'BEGIN { printf "%.1f", ((b-a)*512/1024)/d }')
+              io_util_pct=$(awk -v a="$io_prev_ms" -v b="$io_ms" -v d="$io_dt" 'BEGIN { printf "%.1f", ((b-a)/(d*1000))*100 }')
+              io_util_pct_field="$io_util_pct"
+            fi
+          fi
+          io_prev_epoch="$now_epoch"; io_prev_read="$io_read"; io_prev_write="$io_write"; io_prev_ms="$io_ms"
+        fi
+
+        log_json "INFO" "backup_resource_diag" "Совместный замер CPU/RAM/IO на QNAP" \
+          "local_load1=${local_load1:-n/a}, local_mem_avail_mb=${local_mem_avail_mb:-n/a}, io_device=${IO_DEVICE:-n/a}, io_read_kib_s=${io_read_kib_s}, io_write_kib_s=${io_write_kib_s}, io_util_pct=${io_util_pct}"
+      fi
+
+      printf '%s\t%s\t%s\t%s\t%s\n' "$now_epoch" "${remote_load1:-}" "${local_load1:-}" "${rtt_ms:-}" "$io_util_pct_field" >> "$DIAG_METRICS_FILE"
     fi
 
     printf '%s\t%s\n' "$now_epoch" "$size_bytes" >> "$PROGRESS_METRICS_FILE"
     [ -n "$sz" ] && log_json "INFO" "backup_progress" "Прогресс архивирования" \
-      "size=${sz}, bytes=${size_bytes}, inst_mib_s=${inst_mib_s}, local_load1=${local_load1:-n/a}, local_mem_avail_mb=${local_mem_avail_mb:-n/a}${diag_extra}"
+      "size=${sz}, bytes=${size_bytes}, inst_mib_s=${inst_mib_s}${diag_extra}"
   done
 }
 _progress_monitor >/dev/null 2>&1 &
@@ -1180,14 +1293,15 @@ if [ $backup_rc -eq 0 ]; then
   # данные для probable_cause ниже, вместо угадывания по одной лишь
   # средней скорости.
   diag_samples=$(wc -l < "$DIAG_METRICS_FILE" 2>/dev/null || printf '0')
-  avg_remote_load1="n/a"; avg_local_load1="n/a"; avg_rtt_ms="n/a"
+  avg_remote_load1="n/a"; avg_local_load1="n/a"; avg_rtt_ms="n/a"; avg_io_util_pct="n/a"
   if [ "$diag_samples" -ge 1 ]; then
     avg_remote_load1=$(awk -F'\t' '$2!=""{s+=$2; c++} END{if (c>0) printf "%.2f", s/c; else print "n/a"}' "$DIAG_METRICS_FILE")
     avg_local_load1=$(awk -F'\t' '$3!=""{s+=$3; c++} END{if (c>0) printf "%.2f", s/c; else print "n/a"}' "$DIAG_METRICS_FILE")
     avg_rtt_ms=$(awk -F'\t' '$4!=""{s+=$4; c++} END{if (c>0) printf "%.2f", s/c; else print "n/a"}' "$DIAG_METRICS_FILE")
+    avg_io_util_pct=$(awk -F'\t' '$5!=""{s+=$5; c++} END{if (c>0) printf "%.1f", s/c; else print "n/a"}' "$DIAG_METRICS_FILE")
   fi
 
-  metrics_detail="file=${BACKUP_PATH}, size=${backup_size}, bytes=${backup_bytes}, duration_s=${archive_duration}, avg_mib_s=${avg_mib_s}, window_mib_s=${window_mib_s}, progress_samples=${progress_samples}, comp=${REMOTE_COMP:-gzip}, append=${BACKUP_APPEND}, local_nproc=${LOCAL_NPROC}, remote_nproc=${REMOTE_NPROC}, avg_local_load1=${avg_local_load1}, avg_remote_load1=${avg_remote_load1}, avg_rtt_ms=${avg_rtt_ms}, rtt_baseline_ms=${RTT_BASELINE_MS}"
+  metrics_detail="file=${BACKUP_PATH}, size=${backup_size}, bytes=${backup_bytes}, duration_s=${archive_duration}, avg_mib_s=${avg_mib_s}, window_mib_s=${window_mib_s}, progress_samples=${progress_samples}, comp=${REMOTE_COMP:-gzip}, append=${BACKUP_APPEND}, local_nproc=${LOCAL_NPROC}, remote_nproc=${REMOTE_NPROC}, avg_local_load1=${avg_local_load1}, avg_remote_load1=${avg_remote_load1}, avg_rtt_ms=${avg_rtt_ms}, rtt_baseline_ms=${RTT_BASELINE_MS}, io_device=${IO_DEVICE:-n/a}, avg_io_util_pct=${avg_io_util_pct}"
   log_json "INFO" "backup_metrics" "Метрики этапа архивирования" "$metrics_detail" 0
 
   if awk -v s="$avg_mib_s" -v t="$BACKUP_DEGRADATION_MIBS_THRESHOLD" 'BEGIN { exit !(s < t) }'; then

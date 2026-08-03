@@ -88,6 +88,20 @@ RAW_TRANSFER_PORT="8873"
 #RAW_TRANSFER_REMOTE_TIMEOUT_SEC="21600"
 #RAW_TRANSFER_STATUS_POLL_RETRIES="5"
 
+# Размер тестовой передачи (МБ) для замера реальной скорости сети
+# QNAP<->REMOTE_HOST перед началом бэкапа (событие network_speed_test в логе,
+# best-effort — при ошибке только предупреждение, бэкап не прерывается).
+# Использует тот же nc -N + ncat --recv-only, что и сама передача, поэтому
+# результат напрямую сравним с avg_mib_s в backup_metrics.
+#NETWORK_SPEED_TEST_MB="50"
+
+# Дополнительных переменных не требуется: во время передачи скрипт сам, раз в
+# ~10 минут, совместно снимает CPU (loadavg), RAM (MemAvailable) и IO
+# (/proc/diskstats устройства под BACKUP_DIR) на самом QNAP — событие
+# backup_resource_diag в логе, среднее значение IO-загрузки за весь запуск —
+# avg_io_util_pct в backup_metrics. Читается напрямую из ядра, без установки
+# iostat/vmstat (в минимальной Entware-сборке этого QNAP таких пакетов нет).
+
 # Приоритет шифров SSH (см. комментарий у SSH_OPTS в скрипте). По умолчанию
 # первым идёт chacha20-poly1305 — на слабых ARM-чипах без аппаратного AES он
 # обычно быстрее программного AES-GCM/CTR, а расшифровку входящего потока
