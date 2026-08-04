@@ -7,7 +7,7 @@ set -eu
 ###############################################################################
 SCRIPT_NAME=$(basename -- "$0")
 SCRIPT_BASE=${SCRIPT_NAME%.*}
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P)
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P)
 
 CONFIG_DIR="${SCRIPT_DIR}/conf"
 CONFIG_FILE="${CONFIG_DIR}/${SCRIPT_BASE}.conf"
@@ -50,10 +50,12 @@ log_json() {
 }
 
 cleanup_logs() {
-    old_logs=$(ls -1t "${LOG_DIR}/${SCRIPT_BASE}-"*.jsonl 2>/dev/null | tail -n +11 || true)
-    if [ -n "${old_logs:-}" ]; then
-        rm -f $old_logs
-    fi
+    find "${LOG_DIR}" -maxdepth 1 -type f -name "${SCRIPT_BASE}-*.jsonl" -printf '%T@|%p\n' 2>/dev/null \
+        | sort -nr \
+        | awk -F'|' 'NR > 10 { print $2 }' \
+        | while IFS= read -r old_log; do
+                [ -n "$old_log" ] && rm -f -- "$old_log"
+            done
 }
 
 ###############################################################################

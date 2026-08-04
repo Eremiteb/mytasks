@@ -12,9 +12,9 @@ SCRIPT_BASE="${SCRIPT_NAME%.*}"
 SCRIPT_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 LOG_TEMPLATE_FILE="${SCRIPT_DIR}/conf/log_template.conf"
 
-if [ -r "$LOG_TEMPLATE_FILE" ]; then
+if [ -r "${LOG_TEMPLATE_FILE}" ]; then
   # shellcheck source=/dev/null
-  source "$LOG_TEMPLATE_FILE"
+  source "${LOG_TEMPLATE_FILE}"
 fi
 LOG_SCHEMA_VERSION="${LOG_SCHEMA_VERSION:-1.0}"
 LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
@@ -84,14 +84,14 @@ json_escape() {
 log_json() {
   local level="$1" event="$2" src="${3:-}" out="${4:-}" msg="${5:-}" detail="${6:-}"
   local level_norm
-  level_norm="$(printf '%s' "$level" | tr '[:upper:]' '[:lower:]')"
+  level_norm="$(printf '%s' "${level}" | tr '[:upper:]' '[:lower:]')"
   printf '{"@timestamp":"%s","schema.version":"%s","compat.targets":"%s","log.level":"%s","message":"%s","event.action":"%s","service.name":"%s","script":"%s","event":"%s","level":"%s","src":"%s","out":"%s","msg":"%s","detail":"%s","pid":%s}\n' \
-    "$(ts)" "$LOG_SCHEMA_VERSION" "$LOG_COMPAT_TARGETS" "$level_norm" "$(printf '%s' "$msg" | json_escape)" "$event" "$SCRIPT_BASE" "$SCRIPT_NAME" "$event" "$level_norm" \
-    "$(printf '%s' "$src" | json_escape)" \
-    "$(printf '%s' "$out" | json_escape)" \
-    "$(printf '%s' "$msg" | json_escape)" \
-    "$(printf '%s' "$detail" | json_escape)" \
-    "$$" >> "$LOGFILE"
+    "$(ts)" "${LOG_SCHEMA_VERSION}" "${LOG_COMPAT_TARGETS}" "${level_norm}" "$(printf '%s' "${msg}" | json_escape)" "${event}" "${SCRIPT_BASE}" "${SCRIPT_NAME}" "${event}" "${level_norm}" \
+    "$(printf '%s' "${src}" | json_escape)" \
+    "$(printf '%s' "${out}" | json_escape)" \
+    "$(printf '%s' "${msg}" | json_escape)" \
+    "$(printf '%s' "${detail}" | json_escape)" \
+    "$$" >> "${LOGFILE}"
 }
 
 # log-level filtering:
@@ -156,17 +156,17 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-if [ "$DEBUG" -eq 1 ]; then
+if [ "${DEBUG}" -eq 1 ]; then
   echo "DEBUG:"
   echo "  script: $0"
   echo "  orig args count: ${#ORIG_ARGS[@]}"
-  for i in "${!ORIG_ARGS[@]}"; do printf '  arg[%d]=<%s>\n' "$i" "${ORIG_ARGS[$i]}"; done
+  for i in "${!ORIG_ARGS[@]}"; do printf '  arg[%d]=<%s>\n' "${i}" "${ORIG_ARGS[${i}]}"; done
   echo "  parsed DIR=<${DIR}>"
   echo "  parsed OUTDIR=<${OUTDIR}>"
   echo "  parsed LOGFILE=<${LOGFILE}>"
-  echo "  DRYRUN=$DRYRUN OVERWRITE=$OVERWRITE SKIP_NEWER=$SKIP_NEWER"
-  echo "  ONLY=$ONLY TITLE_MODE=$TITLE_MODE TOC=$TOC TOC_DEPTH=$TOC_DEPTH"
-  echo "  LOG_LEVEL=$LOG_LEVEL"
+  echo "  DRYRUN=${DRYRUN} OVERWRITE=${OVERWRITE} SKIP_NEWER=${SKIP_NEWER}"
+  echo "  ONLY=${ONLY} TITLE_MODE=${TITLE_MODE} TOC=${TOC} TOC_DEPTH=${TOC_DEPTH}"
+  echo "  LOG_LEVEL=${LOG_LEVEL}"
   echo "  EXCLUDES count=${#EXCLUDES[@]}"
   exit 0
 fi
@@ -175,15 +175,15 @@ fi
 # Validate / deps
 ###############################################################################
 [ -n "${DIR:-}" ] || { echo "Ошибка: не указан -d/--dir" >&2; usage; exit 2; }
-[ -d "$DIR" ] || { echo "Ошибка: DIR не каталог: $DIR" >&2; exit 2; }
+[ -d "${DIR}" ] || { echo "Ошибка: DIR не каталог: ${DIR}" >&2; exit 2; }
 
-case "$ONLY" in all|doc|docx|rtf|odt) ;; *) echo "Ошибка: --only all|doc|docx|rtf|odt" >&2; exit 2 ;; esac
-if [ "$SKIP_NEWER" -eq 1 ] && [ "$OVERWRITE" -eq 0 ]; then
+case "${ONLY}" in all|doc|docx|rtf|odt) ;; *) echo "Ошибка: --only all|doc|docx|rtf|odt" >&2; exit 2 ;; esac
+if [ "${SKIP_NEWER}" -eq 1 ] && [ "${OVERWRITE}" -eq 0 ]; then
   echo "Ошибка: --skip-newer работает только вместе с --overwrite" >&2
   exit 2
 fi
 
-case "$LOG_LEVEL" in
+case "${LOG_LEVEL}" in
   info|error) ;;
   *) echo "Ошибка: --log-level должен быть info или error" >&2; exit 2 ;;
 esac
@@ -198,17 +198,17 @@ elif have_cmd libreoffice; then LO_CMD="libreoffice"
 else LO_CMD=""
 fi
 
-DIR="$(cd "$DIR" 2>/dev/null && pwd)" || { echo "Ошибка: не могу открыть каталог: $DIR" >&2; exit 2; }
+DIR="$(cd "${DIR}" 2>/dev/null && pwd)" || { echo "Ошибка: не могу открыть каталог: ${DIR}" >&2; exit 2; }
 
 if [ -n "${OUTDIR:-}" ]; then
-  mkdir -p "$OUTDIR" 2>/dev/null || { echo "Ошибка: не могу создать OUTDIR: $OUTDIR" >&2; exit 2; }
-  OUTDIR="$(cd "$OUTDIR" 2>/dev/null && pwd)" || { echo "Ошибка: не могу открыть OUTDIR: $OUTDIR" >&2; exit 2; }
+  mkdir -p "${OUTDIR}" 2>/dev/null || { echo "Ошибка: не могу создать OUTDIR: ${OUTDIR}" >&2; exit 2; }
+  OUTDIR="$(cd "${OUTDIR}" 2>/dev/null && pwd)" || { echo "Ошибка: не могу открыть OUTDIR: ${OUTDIR}" >&2; exit 2; }
 fi
 
 if [ -z "${LOGFILE:-}" ]; then
   LOGFILE="./doc2fb2_$(date '+%Y-%m-%d').jsonl"
 fi
-mkdir -p "$(dirname "$LOGFILE")" 2>/dev/null || { echo "Ошибка: не могу создать каталог лога" >&2; exit 2; }
+mkdir -p "$(dirname "${LOGFILE}")" 2>/dev/null || { echo "Ошибка: не могу создать каталог лога" >&2; exit 2; }
 
 ###############################################################################
 # Auto-delete old logs (keep 10 days)
@@ -216,19 +216,19 @@ mkdir -p "$(dirname "$LOGFILE")" 2>/dev/null || { echo "Ошибка: не мо�
 cleanup_old_logs() {
   local keep_days=10
   local logdir cur pattern
-  logdir="$(cd "$(dirname "$LOGFILE")" 2>/dev/null && pwd)" || return 0
-  cur="$logdir/$(basename "$LOGFILE")"
+  logdir="$(cd "$(dirname "${LOGFILE}")" 2>/dev/null && pwd)" || return 0
+  cur="${logdir}/$(basename "${LOGFILE}")"
   pattern="doc2fb2_*.jsonl"
 
-  log_info "log_cleanup_start" "" "" "Очистка логов старше 10 дней" "dir=$logdir pattern=$pattern keep_days=$keep_days"
+  log_info "log_cleanup_start" "" "" "Очистка логов старше 10 дней" "dir=${logdir} pattern=${pattern} keep_days=${keep_days}"
 
-  find "$logdir" -maxdepth 1 -type f -name "$pattern" -mtime +"$keep_days" -print0 2>/dev/null |
+  find "${logdir}" -maxdepth 1 -type f -name "${pattern}" -mtime +"${keep_days}" -print0 2>/dev/null |
   while IFS= read -r -d '' f; do
-    [ "$f" = "$cur" ] && continue
-    if rm -f -- "$f" 2>/dev/null; then
-      log_info "log_cleanup_deleted" "$f" "" "Удалён старый лог" "keep_days=$keep_days"
+    [ "${f}" = "${cur}" ] && continue
+    if rm -f -- "${f}" 2>/dev/null; then
+      log_info "log_cleanup_deleted" "${f}" "" "Удалён старый лог" "keep_days=${keep_days}"
     else
-      log_error "log_cleanup_failed" "$f" "" "Не удалось удалить старый лог" "keep_days=$keep_days"
+      log_error "log_cleanup_failed" "${f}" "" "Не удалось удалить старый лог" "keep_days=${keep_days}"
     fi
   done
 
@@ -243,30 +243,30 @@ cleanup_old_logs
 matches_excludes() {
   local bn="$1" p
   for p in "${EXCLUDES[@]}"; do
-    [[ "$bn" == $p ]] && return 0
+    [[ "${bn}" == "${p}" ]] && return 0
   done
   return 1
 }
 
 only_allows_ext() {
   local ext="${1,,}"
-  [ "$ONLY" = "all" ] && return 0
-  [[ "$ext" == "$ONLY" ]]
+  [ "${ONLY}" = "all" ] && return 0
+  [[ "${ext}" == "${ONLY}" ]]
 }
 
 title_from_filename() {
   local f="$1" b name
-  b="$(basename "$f")"
+  b="$(basename "${f}")"
   name="${b%.*}"
   name="${name//_/ }"
   name="${name//-/ }"
-  name="$(printf '%s' "$name" | awk '{$1=$1;print}')"
-  printf '%s' "$name"
+  name="$(printf '%s' "${name}" | awk '{$1=$1;print}')"
+  printf '%s' "${name}"
 }
 
 extract_docx_meta() {
   local docx="$1"
-  unzip -p "$docx" docProps/core.xml 2>/dev/null | awk '
+  unzip -p "${docx}" docProps/core.xml 2>/dev/null | awk '
     BEGIN{ s=""; }
     { s = s $0 "\n"; }
     END{
@@ -281,16 +281,16 @@ extract_docx_meta() {
 
 make_out_path() {
   local src="$1" base name rel rel_dir
-  base="$(basename "$src")"
+  base="$(basename "${src}")"
   name="${base%.*}"
-  if [ -n "${OUTDIR:-}" ] && [[ "$src" == "$DIR/"* ]]; then
-    rel="${src#"$DIR"/}"
-    rel_dir="$(dirname "$rel")"
-    printf '%s/%s/%s.fb2\n' "$OUTDIR" "$rel_dir" "$name"
+  if [ -n "${OUTDIR:-}" ] && [[ "${src}" == "${DIR}/"* ]]; then
+    rel="${src#"${DIR}"/}"
+    rel_dir="$(dirname "${rel}")"
+    printf '%s/%s/%s.fb2\n' "${OUTDIR}" "${rel_dir}" "${name}"
   elif [ -n "${OUTDIR:-}" ]; then
-    printf '%s/%s.fb2\n' "$OUTDIR" "$name"
+    printf '%s/%s.fb2\n' "${OUTDIR}" "${name}"
   else
-    printf '%s/%s.fb2\n' "$(dirname "$src")" "$name"
+    printf '%s/%s.fb2\n' "$(dirname "${src}")" "${name}"
   fi
 }
 
@@ -301,7 +301,7 @@ url_escape_path() {
   s="${s//%/%25}"
   s="${s//#/%23}"
   s="${s// /%20}"
-  printf '%s' "$s"
+  printf '%s' "${s}"
 }
 
 lo_has_error() { grep -q '^Error:' "$1" 2>/dev/null; }
@@ -318,47 +318,47 @@ run_pandoc_to_fb2() {
   local in="$1" fmt="$2" src="$3" out="$4" errfile="$5"
   local -a meta toc fmtarg
   meta=(); toc=(); fmtarg=()
-  [ "$TOC" -eq 1 ] && toc+=( "--toc" "--toc-depth=${TOC_DEPTH}" )
-  [ -n "$fmt" ] && fmtarg=( -f "$fmt" )
+  [ "${TOC}" -eq 1 ] && toc+=( "--toc" "--toc-depth=${TOC_DEPTH}" )
+  [ -n "${fmt}" ] && fmtarg=( -f "${fmt}" )
 
   local meta_title="" meta_creator="" ttitle="" tauthor=""
 
   if [[ "${in,,}" == *.docx ]]; then
-    IFS=$'\t' read -r meta_title meta_creator < <(extract_docx_meta "$in")
+    IFS=$'\t' read -r meta_title meta_creator < <(extract_docx_meta "${in}")
   fi
 
-  case "$TITLE_MODE" in
+  case "${TITLE_MODE}" in
     auto)
-      if [ -n "$meta_title" ]; then ttitle="$meta_title"; else ttitle="$(title_from_filename "$src")"; fi
-      meta+=( "--metadata" "title=$ttitle" )
+      if [ -n "${meta_title}" ]; then ttitle="${meta_title}"; else ttitle="$(title_from_filename "${src}")"; fi
+      meta+=( "--metadata" "title=${ttitle}" )
       ;;
     filename)
-      ttitle="$(title_from_filename "$src")"
-      meta+=( "--metadata" "title=$ttitle" )
+      ttitle="$(title_from_filename "${src}")"
+      meta+=( "--metadata" "title=${ttitle}" )
       ;;
     keep) ;;
     *)
-      log_error "stage_failed" "$src" "$out" "Некорректный --title-mode" "value=$TITLE_MODE"
+      log_error "stage_failed" "${src}" "${out}" "Некорректный --title-mode" "value=${TITLE_MODE}"
       return 2
       ;;
   esac
 
-  if [ "$AUTHOR_SET" -eq 1 ]; then
-    tauthor="$AUTHOR"
+  if [ "${AUTHOR_SET}" -eq 1 ]; then
+    tauthor="${AUTHOR}"
   else
-    if [ -n "$meta_creator" ]; then tauthor="$meta_creator"
-    elif [ -n "${USER:-}" ]; then tauthor="$USER"
+    if [ -n "${meta_creator}" ]; then tauthor="${meta_creator}"
+    elif [ -n "${USER:-}" ]; then tauthor="${USER}"
     else tauthor=""
     fi
   fi
-  [ -n "$tauthor" ] && meta+=( "--metadata" "author=$tauthor" )
+  [ -n "${tauthor}" ] && meta+=( "--metadata" "author=${tauthor}" )
 
-  if pandoc "${fmtarg[@]}" "$in" -o "$out" "${meta[@]}" "${toc[@]}" >>"$errfile" 2>&1; then
-    log_info "ok" "$src" "$out" "Успешно" ""
+  if pandoc "${fmtarg[@]}" "${in}" -o "${out}" "${meta[@]}" "${toc[@]}" >>"${errfile}" 2>&1; then
+    log_info "ok" "${src}" "${out}" "Успешно" ""
     return 0
   else
-    rm -f "$out" >/dev/null 2>&1 || true
-    log_error "pandoc_failed" "$src" "$out" "Ошибка pandoc" "tail_err=$(tail -n 240 "$errfile" 2>/dev/null || true)"
+    rm -f "${out}" >/dev/null 2>&1 || true
+    log_error "pandoc_failed" "${src}" "${out}" "Ошибка pandoc" "tail_err=$(tail -n 240 "${errfile}" 2>/dev/null || true)"
     return 1
   fi
 }
@@ -367,64 +367,64 @@ fallback_convert() {
   local src="$1" out="$2" ext="$3" workdir="$4" errfile="$5"
   local mime txt
 
-  mime="$(get_mime "$src")"
-  log_info "fallback_start" "$src" "$out" "Пробуем fallback без LibreOffice" "ext=${ext,,} mime=${mime:-unknown}"
+  mime="$(get_mime "${src}")"
+  log_info "fallback_start" "${src}" "${out}" "Пробуем fallback без LibreOffice" "ext=${ext,,} mime=${mime:-unknown}"
 
   if [[ "${ext,,}" == "rtf" ]]; then
-    run_pandoc_to_fb2 "$src" "" "$src" "$out" "$errfile" && return 0
+    run_pandoc_to_fb2 "${src}" "" "${src}" "${out}" "${errfile}" && return 0
     if have_cmd unrtf; then
-      txt="$workdir/fallback.txt"
-      if unrtf --text --nopict --quiet -- "$src" >"$txt" 2>>"$errfile"; then
-        run_pandoc_to_fb2 "$txt" "plain" "$src" "$out" "$errfile" && return 0
+      txt="${workdir}/fallback.txt"
+      if unrtf --text --nopict --quiet -- "${src}" >"${txt}" 2>>"${errfile}"; then
+        run_pandoc_to_fb2 "${txt}" "plain" "${src}" "${out}" "${errfile}" && return 0
       fi
     fi
-    log_error "fallback_failed" "$src" "$out" "Fallback не помог для RTF" "mime=${mime:-unknown}; tail_err=$(tail -n 120 "$errfile" 2>/dev/null || true)"
+    log_error "fallback_failed" "${src}" "${out}" "Fallback не помог для RTF" "mime=${mime:-unknown}; tail_err=$(tail -n 120 "${errfile}" 2>/dev/null || true)"
     return 1
   fi
 
   if [[ "${ext,,}" == "doc" ]]; then
-    if [[ "$mime" == "text/html" || "$mime" == "application/xhtml+xml" ]]; then
-      run_pandoc_to_fb2 "$src" "html" "$src" "$out" "$errfile" && return 0
+    if [[ "${mime}" == "text/html" || "${mime}" == "application/xhtml+xml" ]]; then
+      run_pandoc_to_fb2 "${src}" "html" "${src}" "${out}" "${errfile}" && return 0
     fi
 
-    txt="$workdir/fallback.txt"
+    txt="${workdir}/fallback.txt"
 
     if have_cmd antiword; then
-      if antiword "$src" >"$txt" 2>>"$errfile"; then
-        run_pandoc_to_fb2 "$txt" "plain" "$src" "$out" "$errfile" && return 0
+      if antiword "${src}" >"${txt}" 2>>"${errfile}"; then
+        run_pandoc_to_fb2 "${txt}" "plain" "${src}" "${out}" "${errfile}" && return 0
       fi
     fi
 
     if have_cmd catdoc; then
-      if catdoc "$src" >"$txt" 2>>"$errfile"; then
-        run_pandoc_to_fb2 "$txt" "plain" "$src" "$out" "$errfile" && return 0
+      if catdoc "${src}" >"${txt}" 2>>"${errfile}"; then
+        run_pandoc_to_fb2 "${txt}" "plain" "${src}" "${out}" "${errfile}" && return 0
       fi
-      if catdoc -b "$src" >"$txt" 2>>"$errfile"; then
-        run_pandoc_to_fb2 "$txt" "plain" "$src" "$out" "$errfile" && return 0
+      if catdoc -b "${src}" >"${txt}" 2>>"${errfile}"; then
+        run_pandoc_to_fb2 "${txt}" "plain" "${src}" "${out}" "${errfile}" && return 0
       fi
     fi
 
     if have_cmd wvText; then
-      if wvText "$src" "$txt" >>"$errfile" 2>&1; then
-        [ -s "$txt" ] && run_pandoc_to_fb2 "$txt" "plain" "$src" "$out" "$errfile" && return 0
+      if wvText "${src}" "${txt}" >>"${errfile}" 2>&1; then
+        [ -s "${txt}" ] && run_pandoc_to_fb2 "${txt}" "plain" "${src}" "${out}" "${errfile}" && return 0
       fi
     fi
 
-    log_error "fallback_failed" "$src" "$out" "Fallback не помог для DOC" \
-      "mime=${mime:-unknown}; have_antiword=$(have_cmd antiword && echo 1 || echo 0); have_catdoc=$(have_cmd catdoc && echo 1 || echo 0); have_wvText=$(have_cmd wvText && echo 1 || echo 0); tail_err=$(tail -n 200 "$errfile" 2>/dev/null || true)"
+    log_error "fallback_failed" "${src}" "${out}" "Fallback не помог для DOC" \
+      "mime=${mime:-unknown}; have_antiword=$(have_cmd antiword && echo 1 || echo 0); have_catdoc=$(have_cmd catdoc && echo 1 || echo 0); have_wvText=$(have_cmd wvText && echo 1 || echo 0); tail_err=$(tail -n 200 "${errfile}" 2>/dev/null || true)"
     return 1
   fi
 
-  log_error "fallback_failed" "$src" "$out" "Fallback не настроен для этого типа" "ext=${ext,,} mime=${mime:-unknown}"
+  log_error "fallback_failed" "${src}" "${out}" "Fallback не настроен для этого типа" "ext=${ext,,} mime=${mime:-unknown}"
   return 1
 }
 
 short_fail_reason() {
   local errfile="$1"
   local s
-  s="$(grep -m1 '^Error:' "$errfile" 2>/dev/null || true)"
-  [ -n "$s" ] && printf '%s' "$s" && return 0
-  tail -n 1 "$errfile" 2>/dev/null || true
+  s="$(grep -m1 '^Error:' "${errfile}" 2>/dev/null || true)"
+  [ -n "${s}" ] && printf '%s' "${s}" && return 0
+  tail -n 1 "${errfile}" 2>/dev/null || true
 }
 
 convert_one() {
@@ -434,159 +434,160 @@ convert_one() {
   local tmproot workdir errfile staged_docx staged_odt produced produced2
   local detail=""
 
-  base="$(basename "$src")"
+  base="$(basename "${src}")"
   ext="${src##*.}"
-  out="$(make_out_path "$src")"
+  out="$(make_out_path "${src}")"
 
-  if matches_excludes "$base"; then echo "SKIP|excluded|$src|$out"; return 0; fi
-  if ! only_allows_ext "$ext"; then echo "SKIP|filtered|$src|$out"; return 0; fi
-  case "$base" in "~$"*) echo "SKIP|tempfile|$src|$out"; return 0 ;; esac
+  if matches_excludes "${base}"; then echo "SKIP|excluded|${src}|${out}"; return 0; fi
+  if ! only_allows_ext "${ext}"; then echo "SKIP|filtered|${src}|${out}"; return 0; fi
+  case "${base}" in "~$"*) echo "SKIP|tempfile|${src}|${out}"; return 0 ;; esac
 
-  if [ -e "$out" ]; then
-    if [ "$OVERWRITE" -eq 0 ]; then echo "SKIP|exists|$src|$out"; return 0; fi
-    if [ "$SKIP_NEWER" -eq 1 ] && ! [ "$src" -nt "$out" ]; then echo "SKIP|skip-newer|$src|$out"; return 0; fi
+  if [ -e "${out}" ]; then
+    if [ "${OVERWRITE}" -eq 0 ]; then echo "SKIP|exists|${src}|${out}"; return 0; fi
+    if [ "${SKIP_NEWER}" -eq 1 ] && ! [ "${src}" -nt "${out}" ]; then echo "SKIP|skip-newer|${src}|${out}"; return 0; fi
   fi
 
-  if [ "$DRYRUN" -eq 1 ]; then echo "DRY||$src|$out"; return 0; fi
+  if [ "${DRYRUN}" -eq 1 ]; then echo "DRY||${src}|${out}"; return 0; fi
 
-  ensure_outdir_for "$out"
+  ensure_outdir_for "${out}"
 
-  tmproot="${TMPDIR:-/tmp}/doc2fb2.$$.$RANDOM"
-  workdir="$tmproot/work"
-  mkdir -p "$workdir" 2>/dev/null || {
-    log_error "stage_failed" "$src" "$out" "Не удалось создать временный каталог" "tmp=$workdir"
-    echo "FAIL|tmpdir|$src|$out"
+  tmproot="${TMPDIR:-/tmp}/doc2fb2.$$.${RANDOM}"
+  workdir="${tmproot}/work"
+  mkdir -p "${workdir}" 2>/dev/null || {
+    log_error "stage_failed" "${src}" "${out}" "Не удалось создать временный каталог" "tmp=${workdir}"
+    echo "FAIL|tmpdir|${src}|${out}"
     return 0
   }
-  errfile="$workdir/err.txt"; : > "$errfile"
+  errfile="${workdir}/err.txt"; : > "${errfile}"
 
-  staged_docx="$workdir/staged.docx"
-  staged_odt="$workdir/staged.odt"
+  staged_docx="${workdir}/staged.docx"
+  staged_odt="${workdir}/staged.odt"
 
-  local lo_profile="$tmproot/lo_profile"
-  mkdir -p "$lo_profile" 2>/dev/null || true
-  local lo_uri="file://$(url_escape_path "$lo_profile")"
+  local lo_profile="${tmproot}/lo_profile"
+  mkdir -p "${lo_profile}" 2>/dev/null || true
+  local lo_uri
+  lo_uri="file://$(url_escape_path "${lo_profile}")"
 
   if [[ "${ext,,}" == "docx" ]]; then
-    cp -f "$src" "$staged_docx" >>"$errfile" 2>&1 || {
-      log_error "stage_failed" "$src" "$out" "Не удалось подготовить .docx" "tail_err=$(tail -n 120 "$errfile" 2>/dev/null || true)"
-      echo "FAIL|stage-docx|$src|$out"
-      rm -rf "$tmproot" >/dev/null 2>&1 || true
+    cp -f "${src}" "${staged_docx}" >>"${errfile}" 2>&1 || {
+      log_error "stage_failed" "${src}" "${out}" "Не удалось подготовить .docx" "tail_err=$(tail -n 120 "${errfile}" 2>/dev/null || true)"
+      echo "FAIL|stage-docx|${src}|${out}"
+      rm -rf "${tmproot}" >/dev/null 2>&1 || true
       return 0
     }
-    log_info "docx_to_fb2_start" "$src" "$out" "docx -> fb2 (pandoc)" ""
-    if run_pandoc_to_fb2 "$staged_docx" "" "$src" "$out" "$errfile"; then
-      echo "OK||$src|$out"
+    log_info "docx_to_fb2_start" "${src}" "${out}" "docx -> fb2 (pandoc)" ""
+    if run_pandoc_to_fb2 "${staged_docx}" "" "${src}" "${out}" "${errfile}"; then
+      echo "OK||${src}|${out}"
     else
-      detail="$(short_fail_reason "$errfile")"
-      echo "FAIL|pandoc:${detail:0:140}|$src|$out"
+      detail="$(short_fail_reason "${errfile}")"
+      echo "FAIL|pandoc:${detail:0:140}|${src}|${out}"
     fi
-    rm -rf "$tmproot" >/dev/null 2>&1 || true
+    rm -rf "${tmproot}" >/dev/null 2>&1 || true
     return 0
   fi
 
   if [[ "${ext,,}" == "odt" ]]; then
-    cp -f "$src" "$staged_odt" >>"$errfile" 2>&1 || {
-      log_error "stage_failed" "$src" "$out" "Не удалось подготовить .odt" "tail_err=$(tail -n 120 "$errfile" 2>/dev/null || true)"
-      echo "FAIL|stage-odt|$src|$out"
-      rm -rf "$tmproot" >/dev/null 2>&1 || true
+    cp -f "${src}" "${staged_odt}" >>"${errfile}" 2>&1 || {
+      log_error "stage_failed" "${src}" "${out}" "Не удалось подготовить .odt" "tail_err=$(tail -n 120 "${errfile}" 2>/dev/null || true)"
+      echo "FAIL|stage-odt|${src}|${out}"
+      rm -rf "${tmproot}" >/dev/null 2>&1 || true
       return 0
     }
-    log_info "odt_to_fb2_start" "$src" "$out" "odt -> fb2 (pandoc)" ""
-    if run_pandoc_to_fb2 "$staged_odt" "" "$src" "$out" "$errfile"; then
-      echo "OK||$src|$out"
+    log_info "odt_to_fb2_start" "${src}" "${out}" "odt -> fb2 (pandoc)" ""
+    if run_pandoc_to_fb2 "${staged_odt}" "" "${src}" "${out}" "${errfile}"; then
+      echo "OK||${src}|${out}"
     else
-      detail="$(short_fail_reason "$errfile")"
-      echo "FAIL|pandoc:${detail:0:140}|$src|$out"
+      detail="$(short_fail_reason "${errfile}")"
+      echo "FAIL|pandoc:${detail:0:140}|${src}|${out}"
     fi
-    rm -rf "$tmproot" >/dev/null 2>&1 || true
+    rm -rf "${tmproot}" >/dev/null 2>&1 || true
     return 0
   fi
 
   if [[ "${ext,,}" == "doc" || "${ext,,}" == "rtf" ]]; then
     if [ -z "${LO_CMD:-}" ]; then
-      log_error "to_odt_failed" "$src" "$out" "LibreOffice не найден" "rc=127"
-      if fallback_convert "$src" "$out" "$ext" "$workdir" "$errfile"; then
-        echo "OK|fallback|$src|$out"
+      log_error "to_odt_failed" "${src}" "${out}" "LibreOffice не найден" "rc=127"
+      if fallback_convert "${src}" "${out}" "${ext}" "${workdir}" "${errfile}"; then
+        echo "OK|fallback|${src}|${out}"
       else
-        detail="$(short_fail_reason "$errfile")"
-        echo "FAIL|fallback:${detail:0:140}|$src|$out"
+        detail="$(short_fail_reason "${errfile}")"
+        echo "FAIL|fallback:${detail:0:140}|${src}|${out}"
       fi
-      rm -rf "$tmproot" >/dev/null 2>&1 || true
+      rm -rf "${tmproot}" >/dev/null 2>&1 || true
       return 0
     fi
 
-    log_info "to_odt_start" "$src" "$out" "LO -> odt" "ext=${ext,,}"
-    "$LO_CMD" -env:UserInstallation="$lo_uri" --headless --convert-to odt --outdir "$workdir" "$src" >>"$errfile" 2>&1
+    log_info "to_odt_start" "${src}" "${out}" "LO -> odt" "ext=${ext,,}"
+    "${LO_CMD}" -env:UserInstallation="${lo_uri}" --headless --convert-to odt --outdir "${workdir}" "${src}" >>"${errfile}" 2>&1
     local lo_rc=$?
 
-    produced="$workdir/${base%.*}.odt"
-    [ ! -f "$produced" ] && produced="$(ls -1t "$workdir"/*.odt 2>/dev/null | head -n 1 || true)"
+    produced="${workdir}/${base%.*}.odt"
+    [ ! -f "${produced}" ] && produced="$(find "${workdir}" -maxdepth 1 -type f -name '*.odt' -printf '%T@|%p\n' 2>/dev/null | sort -nr | awk -F'|' 'NR == 1 { print $2 }')"
 
-    if [ -z "${produced:-}" ] || [ ! -f "$produced" ] || lo_has_error "$errfile"; then
-      log_error "to_odt_failed" "$src" "$out" "Не удалось получить .odt" "rc=$lo_rc; tail_err=$(tail -n 160 "$errfile" 2>/dev/null || true)"
+    if [ -z "${produced:-}" ] || [ ! -f "${produced}" ] || lo_has_error "${errfile}"; then
+      log_error "to_odt_failed" "${src}" "${out}" "Не удалось получить .odt" "rc=${lo_rc}; tail_err=$(tail -n 160 "${errfile}" 2>/dev/null || true)"
 
-      : > "$errfile"
-      log_info "to_docx_alt_start" "$src" "$out" "LO -> docx (alt)" ""
-      "$LO_CMD" -env:UserInstallation="$lo_uri" --headless --convert-to docx --outdir "$workdir" "$src" >>"$errfile" 2>&1
-      produced2="$workdir/${base%.*}.docx"
-      [ ! -f "$produced2" ] && produced2="$(ls -1t "$workdir"/*.docx 2>/dev/null | head -n 1 || true)"
+      : > "${errfile}"
+      log_info "to_docx_alt_start" "${src}" "${out}" "LO -> docx (alt)" ""
+      "${LO_CMD}" -env:UserInstallation="${lo_uri}" --headless --convert-to docx --outdir "${workdir}" "${src}" >>"${errfile}" 2>&1
+      produced2="${workdir}/${base%.*}.docx"
+      [ ! -f "${produced2}" ] && produced2="$(find "${workdir}" -maxdepth 1 -type f -name '*.docx' -printf '%T@|%p\n' 2>/dev/null | sort -nr | awk -F'|' 'NR == 1 { print $2 }')"
 
-      if [ -n "${produced2:-}" ] && [ -f "$produced2" ] && ! lo_has_error "$errfile"; then
-        cp -f "$produced2" "$staged_docx" >>"$errfile" 2>&1 || true
-        log_info "to_docx_alt_ok" "$src" "$out" "Получен .docx (alt)" "produced=$produced2"
-        if run_pandoc_to_fb2 "$staged_docx" "" "$src" "$out" "$errfile"; then
-          echo "OK|lo-docx-alt|$src|$out"
+      if [ -n "${produced2:-}" ] && [ -f "${produced2}" ] && ! lo_has_error "${errfile}"; then
+        cp -f "${produced2}" "${staged_docx}" >>"${errfile}" 2>&1 || true
+        log_info "to_docx_alt_ok" "${src}" "${out}" "Получен .docx (alt)" "produced=${produced2}"
+        if run_pandoc_to_fb2 "${staged_docx}" "" "${src}" "${out}" "${errfile}"; then
+          echo "OK|lo-docx-alt|${src}|${out}"
         else
-          detail="$(short_fail_reason "$errfile")"
-          echo "FAIL|pandoc:${detail:0:140}|$src|$out"
+          detail="$(short_fail_reason "${errfile}")"
+          echo "FAIL|pandoc:${detail:0:140}|${src}|${out}"
         fi
-        rm -rf "$tmproot" >/dev/null 2>&1 || true
+        rm -rf "${tmproot}" >/dev/null 2>&1 || true
         return 0
       fi
 
-      if fallback_convert "$src" "$out" "$ext" "$workdir" "$errfile"; then
-        echo "OK|fallback|$src|$out"
+      if fallback_convert "${src}" "${out}" "${ext}" "${workdir}" "${errfile}"; then
+        echo "OK|fallback|${src}|${out}"
       else
-        detail="$(short_fail_reason "$errfile")"
-        echo "FAIL|fallback:${detail:0:140}|$src|$out"
+        detail="$(short_fail_reason "${errfile}")"
+        echo "FAIL|fallback:${detail:0:140}|${src}|${out}"
       fi
-      rm -rf "$tmproot" >/dev/null 2>&1 || true
+      rm -rf "${tmproot}" >/dev/null 2>&1 || true
       return 0
     fi
 
-    cp -f "$produced" "$staged_odt" >>"$errfile" 2>&1 || {
-      log_error "stage_failed" "$src" "$out" "Не удалось подготовить .odt для pandoc" "tail_err=$(tail -n 120 "$errfile" 2>/dev/null || true)"
-      echo "FAIL|stage-odt|$src|$out"
-      rm -rf "$tmproot" >/dev/null 2>&1 || true
+    cp -f "${produced}" "${staged_odt}" >>"${errfile}" 2>&1 || {
+      log_error "stage_failed" "${src}" "${out}" "Не удалось подготовить .odt для pandoc" "tail_err=$(tail -n 120 "${errfile}" 2>/dev/null || true)"
+      echo "FAIL|stage-odt|${src}|${out}"
+      rm -rf "${tmproot}" >/dev/null 2>&1 || true
       return 0
     }
 
-    log_info "to_odt_ok" "$src" "$out" "Получен .odt" "produced=$produced rc=$lo_rc"
-    if run_pandoc_to_fb2 "$staged_odt" "" "$src" "$out" "$errfile"; then
-      echo "OK||$src|$out"
+    log_info "to_odt_ok" "${src}" "${out}" "Получен .odt" "produced=${produced} rc=${lo_rc}"
+    if run_pandoc_to_fb2 "${staged_odt}" "" "${src}" "${out}" "${errfile}"; then
+      echo "OK||${src}|${out}"
     else
-      detail="$(short_fail_reason "$errfile")"
-      echo "FAIL|pandoc:${detail:0:140}|$src|$out"
+      detail="$(short_fail_reason "${errfile}")"
+      echo "FAIL|pandoc:${detail:0:140}|${src}|${out}"
     fi
 
-    rm -rf "$tmproot" >/dev/null 2>&1 || true
+    rm -rf "${tmproot}" >/dev/null 2>&1 || true
     return 0
   fi
 
-  echo "SKIP|unsupported|$src|$out"
-  rm -rf "$tmproot" >/dev/null 2>&1 || true
+  echo "SKIP|unsupported|${src}|${out}"
+  rm -rf "${tmproot}" >/dev/null 2>&1 || true
   return 0
 }
 
 ###############################################################################
 # Main loop (single-thread)
 ###############################################################################
-log_info "scan_start" "$DIR" "" "Старт" "log=$LOGFILE dryrun=$DRYRUN overwrite=$OVERWRITE skip_newer=$SKIP_NEWER only=$ONLY excludes_count=${#EXCLUDES[@]} author_set=$AUTHOR_SET author=$AUTHOR title_mode=$TITLE_MODE toc=$TOC toc_depth=$TOC_DEPTH log_level=$LOG_LEVEL"
+log_info "scan_start" "${DIR}" "" "Старт" "log=${LOGFILE} dryrun=${DRYRUN} overwrite=${OVERWRITE} skip_newer=${SKIP_NEWER} only=${ONLY} excludes_count=${#EXCLUDES[@]} author_set=${AUTHOR_SET} author=${AUTHOR} title_mode=${TITLE_MODE} toc=${TOC} toc_depth=${TOC_DEPTH} log_level=${LOG_LEVEL}"
 
-TOTAL="$(find "$DIR" -type f \( -iname '*.doc' -o -iname '*.docx' -o -iname '*.rtf' -o -iname '*.odt' \) -print | wc -l | awk '{print $1}')"
-case "$TOTAL" in ''|*[!0-9]*) TOTAL=0 ;; esac
-[ "$TOTAL" -gt 0 ] || TOTAL=1
+TOTAL="$(find "${DIR}" -type f \( -iname '*.doc' -o -iname '*.docx' -o -iname '*.rtf' -o -iname '*.odt' \) -print | wc -l | awk '{print $1}')"
+case "${TOTAL}" in ''|*[!0-9]*) TOTAL=0 ;; esac
+[ "${TOTAL}" -gt 0 ] || TOTAL=1
 
 i=0
 
@@ -594,7 +595,7 @@ while IFS= read -r -d '' f; do
   i=$((i+1))
   pct=$(( i * 100 / TOTAL ))
 
-  line="$(convert_one "$f")"
+  line="$(convert_one "${f}")"
   status="${line%%|*}"
   rest="${line#*|}"
   detail="${rest%%|*}"
@@ -602,9 +603,9 @@ while IFS= read -r -d '' f; do
   src="${rest2%%|*}"
   out="${rest2#*|}"
 
-  printf '[%6d/%-6d | %3d%%] %-4s %s -> %s' "$i" "$TOTAL" "$pct" "$status" "$src" "$out"
-  [ -n "$detail" ] && printf ' (%s)' "$detail"
+  printf '[%6d/%-6d | %3d%%] %-4s %s -> %s' "${i}" "${TOTAL}" "${pct}" "${status}" "${src}" "${out}"
+  [ -n "${detail}" ] && printf ' (%s)' "${detail}"
   printf '\n'
-done < <(find "$DIR" -type f \( -iname '*.doc' -o -iname '*.docx' -o -iname '*.rtf' -o -iname '*.odt' \) -print0)
+done < <(find "${DIR}" -type f \( -iname '*.doc' -o -iname '*.docx' -o -iname '*.rtf' -o -iname '*.odt' \) -print0)
 
-echo "Готово. Лог: $LOGFILE"
+echo "Готово. Лог: ${LOGFILE}"

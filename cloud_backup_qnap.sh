@@ -186,11 +186,11 @@ export PATH="/opt/sbin:/opt/bin:${PATH}"
 # для работы скрипта достаточно, чтобы ОН САМ запускался по расписанию.
 ENTWARE_DATA_DIR="${ENTWARE_DATA_DIR:-/share/Public/entware}"
 ensure_entware_mount() {
-  [ -x /opt/bin/opkg ] && return 0
-  [ -d "$ENTWARE_DATA_DIR/etc" ] || return 0
+  [[ -x /opt/bin/opkg ]] && return 0
+  [[ -d "${ENTWARE_DATA_DIR}/etc" ]] || return 0
   mkdir -p /opt
-  mount --bind "$ENTWARE_DATA_DIR" /opt 2>/dev/null
-  [ -x /opt/etc/init.d/rc.unslung ] && /opt/etc/init.d/rc.unslung start >/dev/null 2>&1
+  mount --bind "${ENTWARE_DATA_DIR}" /opt 2>/dev/null
+  [[ -x /opt/etc/init.d/rc.unslung ]] && /opt/etc/init.d/rc.unslung start >/dev/null 2>&1
 }
 ensure_entware_mount
 
@@ -210,11 +210,11 @@ LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}-${TIMESTAMP}.jsonl"
 PROGRESS_METRICS_FILE=""
 DIAG_METRICS_FILE=""
 
-mkdir -p "$LOG_DIR"
+mkdir -p "${LOG_DIR}"
 
-if [ -r "$LOG_TEMPLATE_FILE" ]; then
+if [[ -r "${LOG_TEMPLATE_FILE}" ]]; then
   # shellcheck source=/dev/null
-  source "$LOG_TEMPLATE_FILE"
+  source "${LOG_TEMPLATE_FILE}"
 fi
 LOG_SCHEMA_VERSION="${LOG_SCHEMA_VERSION:-1.0}"
 LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
@@ -241,11 +241,11 @@ log_json() {
   local rc="${5:-null}"
   local ts_val msg_esc detail_esc level_norm
   ts_val="$(ts)"
-  msg_esc="$(json_escape "$msg")"
-  detail_esc="$(json_escape "$detail")"
-  level_norm="$(printf '%s' "$level" | tr '[:upper:]' '[:lower:]')"
+  msg_esc="$(json_escape "${msg}")"
+  detail_esc="$(json_escape "${detail}")"
+  level_norm="$(printf '%s' "${level}" | tr '[:upper:]' '[:lower:]')"
   printf '{"@timestamp":"%s","ts":"%s","schema.version":"%s","compat.targets":"%s","log.level":"%s","message":"%s","event.action":"%s","service.name":"%s","script":"%s","event":"%s","level":"%s","msg":"%s","detail":"%s","rc":%s}\n' \
-    "$ts_val" "$ts_val" "$LOG_SCHEMA_VERSION" "$LOG_COMPAT_TARGETS" "$level_norm" "$msg_esc" "$event" "$SCRIPT_BASE" "$SCRIPT_NAME" "$event" "$level_norm" "$msg_esc" "$detail_esc" "$rc" >> "$LOG_FILE"
+    "${ts_val}" "${ts_val}" "${LOG_SCHEMA_VERSION}" "${LOG_COMPAT_TARGETS}" "${level_norm}" "${msg_esc}" "${event}" "${SCRIPT_BASE}" "${SCRIPT_NAME}" "${event}" "${level_norm}" "${msg_esc}" "${detail_esc}" "${rc}" >> "${LOG_FILE}"
 }
 
 # shellcheck disable=SC2329
@@ -280,7 +280,7 @@ validate_backup_file() {
       validate_out=$(gzip -t "${backup_path}" 2>&1)
       rc=$?
       VALIDATE_BACKUP_DETAIL="${validate_out}"
-      return ${rc}
+      return "${rc}"
       ;;
     *.tar.zst)
       if ! command -v zstd >/dev/null 2>&1; then
@@ -290,7 +290,7 @@ validate_backup_file() {
       validate_out=$(zstd -t "${backup_path}" 2>&1)
       rc=$?
       VALIDATE_BACKUP_DETAIL="${validate_out}"
-      return ${rc}
+      return "${rc}"
       ;;
     *)
       VALIDATE_BACKUP_DETAIL="unsupported backup extension"
@@ -302,15 +302,15 @@ validate_backup_file() {
 ###############################################################################
 # CONFIG
 ###############################################################################
-if [ ! -r "$CONFIG_FILE" ]; then
-  echo "Ошибка: конфигурационный файл не найден: $CONFIG_FILE" >&2
+if [[ ! -r "${CONFIG_FILE}" ]]; then
+  echo "Ошибка: конфигурационный файл не найден: ${CONFIG_FILE}" >&2
   exit 1
 fi
 
 # shellcheck source=/dev/null
-source "$CONFIG_FILE"
+source "${CONFIG_FILE}"
 
-# Значения приходят из source "$CONFIG_FILE", но часть IDE-анализаторов не
+# Значения приходят из source "${CONFIG_FILE}", но часть IDE-анализаторов не
 # умеет отслеживать такие присваивания и помечает переменные как "не заданы".
 # Явно инициализируем пустыми значениями, затем ниже всё равно проверяем
 # обязательность через цикл for var in ...
@@ -319,8 +319,8 @@ REMOTE_USER="${REMOTE_USER:-}"
 BACKUP_DIR="${BACKUP_DIR:-}"
 
 for var in WG_INTERFACE REMOTE_HOST REMOTE_USER BACKUP_DIR; do
-  if [ -z "${!var:-}" ]; then
-    echo "Ошибка: переменная $var не задана в $CONFIG_FILE" >&2
+  if [[ -z "${!var:-}" ]]; then
+    echo "Ошибка: переменная ${var} не задана в ${CONFIG_FILE}" >&2
     exit 1
   fi
 done
@@ -391,17 +391,20 @@ DB_OPTIMIZE_STATE_FILE="${STATE_DIR}/${SCRIPT_BASE}-db-optimize.state"
 # содержимое) — в этом случае тоже считаем, что пора.
 db_optimize_due() {
   local last_epoch now_epoch elapsed_days
-  [ -r "$DB_OPTIMIZE_STATE_FILE" ] || return 0
-  last_epoch=$(cat "$DB_OPTIMIZE_STATE_FILE" 2>/dev/null)
-  case "$last_epoch" in ''|*[!0-9]*) return 0 ;; esac
+  [[ -r "${DB_OPTIMIZE_STATE_FILE}" ]] || return 0
+  last_epoch=$(cat "${DB_OPTIMIZE_STATE_FILE}" 2>/dev/null)
+  case "${last_epoch}" in
+    ''|*[!0-9]*) return 0 ;;
+    *) ;;
+  esac
   now_epoch=$(date +%s)
   elapsed_days=$(( (now_epoch - last_epoch) / 86400 ))
-  [ "$elapsed_days" -ge "$DB_OPTIMIZE_INTERVAL_DAYS" ]
+  [[ "${elapsed_days}" -ge "${DB_OPTIMIZE_INTERVAL_DAYS}" ]]
 }
 
 db_optimize_mark_done() {
-  mkdir -p "$STATE_DIR"
-  date +%s > "$DB_OPTIMIZE_STATE_FILE"
+  mkdir -p "${STATE_DIR}"
+  date +%s > "${DB_OPTIMIZE_STATE_FILE}"
 }
 
 if db_optimize_due; then
@@ -438,7 +441,7 @@ SERVICES_STOPPED=0
 wg_conf_get() {
   local key_lc
   key_lc=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
-  awk -F= -v k="$key_lc" '
+  awk -F= -v k="${key_lc}" '
     {
       line = $0; keypart = $1
       gsub(/^[ \t]+|[ \t]+$/, "", keypart)
@@ -448,7 +451,7 @@ wg_conf_get() {
         print line
         exit
       }
-    }' "$WG_CONF_FILE"
+    }' "${WG_CONF_FILE}"
 }
 
 # Конвертирует base64-ключ WireGuard в hex, как того требует UAPI-протокол
@@ -460,8 +463,8 @@ wg_b64_to_hex() {
 # true, если туннель уже поднят (сокет есть и интерфейс в состоянии UP) —
 # замена сломанного "wg show" (см. ВАЖНО выше).
 wg_is_up() {
-  [ -S "$WG_SOCK" ] || return 1
-  ip link show "$WG_INTERFACE" 2>/dev/null | grep -q "state UP" || return 1
+  [[ -S "${WG_SOCK}" ]] || return 1
+  ip link show "${WG_INTERFACE}" 2>/dev/null | grep -q "state UP" || return 1
   return 0
 }
 
@@ -471,8 +474,8 @@ wg_up_userspace() {
   local priv_b64 addr peer_pub_b64 psk_b64 endpoint keepalive psk_hex
   local priv_hex peer_pub_hex uapi_tmp set_out i
 
-  [ -r "$WG_CONF_FILE" ] || {
-    log_json "ERROR" "wg_conf_missing" "Конфиг WireGuard не найден" "$WG_CONF_FILE"
+  [[ -r "${WG_CONF_FILE}" ]] || {
+    log_json "ERROR" "wg_conf_missing" "Конфиг WireGuard не найден" "${WG_CONF_FILE}"
     return 1
   }
 
@@ -484,17 +487,17 @@ wg_up_userspace() {
   keepalive=$(wg_conf_get PersistentKeepalive)
   keepalive="${keepalive:-25}"
 
-  if [ -z "$priv_b64" ] || [ -z "$addr" ] || [ -z "$peer_pub_b64" ] || [ -z "$endpoint" ]; then
+  if [[ -z "${priv_b64}" || -z "${addr}" || -z "${peer_pub_b64}" || -z "${endpoint}" ]]; then
     log_json "ERROR" "wg_conf_incomplete" "В конфиге отсутствуют обязательные поля" \
       "нужны PrivateKey, Address, PublicKey и Endpoint в ${WG_CONF_FILE}"
     return 1
   fi
 
-  priv_hex=$(wg_b64_to_hex "$priv_b64")
-  peer_pub_hex=$(wg_b64_to_hex "$peer_pub_b64")
+  priv_hex=$(wg_b64_to_hex "${priv_b64}")
+  peer_pub_hex=$(wg_b64_to_hex "${peer_pub_b64}")
 
-  rm -f "$WG_SOCK" 2>/dev/null
-  ip link delete "$WG_INTERFACE" 2>/dev/null
+  rm -f "${WG_SOCK}" 2>/dev/null
+  ip link delete "${WG_INTERFACE}" 2>/dev/null
 
   WG_I_PREFER_BUGGY_USERSPACE_TO_POLISHED_KMOD=1 wireguard-go "${WG_INTERFACE}" >/dev/null 2>&1
   psk_hex=""
@@ -548,14 +551,14 @@ wg_down_userspace() {
   local pid
   # shellcheck disable=SC2009
   pid=$(ps w 2>/dev/null | grep "[w]ireguard-go ${WG_INTERFACE}" | awk '{print $1}')
-  [ -n "$pid" ] && kill "$pid" 2>/dev/null
-  rm -f "$WG_SOCK" 2>/dev/null
+  [[ -n "${pid}" ]] && kill "${pid}" 2>/dev/null
+  rm -f "${WG_SOCK}" 2>/dev/null
   return 0
 }
 
 # shellcheck disable=SC2329
 wg_down_if_needed() {
-  if [ "$WG_BROUGHT_UP" -eq 1 ] && [ "${WG_KEEP_UP:-0}" -ne 1 ]; then
+  if [[ "${WG_BROUGHT_UP}" -eq 1 && "${WG_KEEP_UP:-0}" -ne 1 ]]; then
     log_json "INFO" "wg_down" "Останавливаем WireGuard ${WG_INTERFACE}..."
     if wg_down_userspace; then
       log_json "INFO" "wg_down_ok" "WireGuard ${WG_INTERFACE} остановлен"
@@ -567,16 +570,16 @@ wg_down_if_needed() {
 
 # shellcheck disable=SC2329
 services_start_if_needed() {
-  if [ "$SERVICES_STOPPED" -eq 1 ]; then
+  if [[ "${SERVICES_STOPPED}" -eq 1 ]]; then
     SERVICES_STOPPED=0
     log_json "INFO" "services_start" "Запускаем сервисы на ${REMOTE_HOST}..."
     start_err=$(ssh_remote \
       "cd '${REMOTE_PATH}' && docker compose up -d" 2>&1)
     start_rc=$?
-    if [ "$start_rc" -ne 0 ]; then
-      log_json "WARN" "services_start_failed" "Не удалось запустить сервисы" "$start_err" "$start_rc"
+    if [[ "${start_rc}" -ne 0 ]]; then
+      log_json "WARN" "services_start_failed" "Не удалось запустить сервисы" "${start_err}" "${start_rc}"
     else
-      log_json "INFO" "services_start_ok" "Сервисы запущены" "" "$start_rc"
+      log_json "INFO" "services_start_ok" "Сервисы запущены" "" "${start_rc}"
     fi
   fi
 }
@@ -585,8 +588,8 @@ services_start_if_needed() {
 cleanup() {
   services_start_if_needed
   wg_down_if_needed
-  [ -n "$PROGRESS_METRICS_FILE" ] && rm -f "$PROGRESS_METRICS_FILE" 2>/dev/null
-  [ -n "$DIAG_METRICS_FILE" ] && rm -f "$DIAG_METRICS_FILE" 2>/dev/null
+  [[ -n "${PROGRESS_METRICS_FILE}" ]] && rm -f "${PROGRESS_METRICS_FILE}" 2>/dev/null
+  [[ -n "${DIAG_METRICS_FILE}" ]] && rm -f "${DIAG_METRICS_FILE}" 2>/dev/null
   cleanup_logs
 }
 trap cleanup EXIT INT TERM
@@ -611,14 +614,14 @@ fi
 log_json "INFO" "wg_check" "Проверяем доступность ${REMOTE_HOST} через VPN..."
 _wg_ok=0
 for _attempt in 1 2 3; do
-  if ping -c 1 -W 5 "$REMOTE_HOST" >/dev/null 2>&1; then
+  if ping -c 1 -W 5 "${REMOTE_HOST}" >/dev/null 2>&1; then
     _wg_ok=1
     break
   fi
   log_json "WARN" "wg_ping_retry" "Попытка ${_attempt}/3: хост ${REMOTE_HOST} не отвечает"
-  [ "$_attempt" -lt 3 ] && sleep 5
+  [[ "${_attempt}" -lt 3 ]] && sleep 5
 done
-if [ "$_wg_ok" -eq 0 ]; then
+if [[ "${_wg_ok}" -eq 0 ]]; then
   log_json "ERROR" "wg_no_connection" "Хост ${REMOTE_HOST} недоступен через VPN после 3 попыток" "" 1
   echo "Ошибка: ${REMOTE_HOST} недоступен через VPN" >&2
   exit 1
@@ -629,22 +632,22 @@ log_json "INFO" "wg_connected" "Соединение с ${REMOTE_HOST} подт�
 # PREFLIGHT
 ###############################################################################
 for _wg_dep in wireguard-go ncat xxd; do
-  if ! command -v "$_wg_dep" >/dev/null 2>&1; then
-    log_json "ERROR" "wg_dep_missing" "Не найдена зависимость для подъёма WireGuard" "opkg install $_wg_dep"
-    echo "Ошибка: не найдена команда $_wg_dep. Установите: opkg install $_wg_dep" >&2
+  if ! command -v "${_wg_dep}" >/dev/null 2>&1; then
+    log_json "ERROR" "wg_dep_missing" "Не найдена зависимость для подъёма WireGuard" "opkg install ${_wg_dep}"
+    echo "Ошибка: не найдена команда ${_wg_dep}. Установите: opkg install ${_wg_dep}" >&2
     exit 1
   fi
 done
 
-if [ -n "$REMOTE_PASSWORD" ] && ! command -v sshpass >/dev/null 2>&1; then
+if [[ -n "${REMOTE_PASSWORD}" ]] && ! command -v sshpass >/dev/null 2>&1; then
   log_json "WARN" "sshpass_missing" "REMOTE_PASSWORD задан, но sshpass не найден — будет использован ssh по ключу" \
     "opkg install sshpass недоступен для этой архитектуры; настройте REMOTE_SSH_KEY"
 fi
 
-mkdir -p "$BACKUP_DIR" 2>/dev/null
-if [ ! -d "$BACKUP_DIR" ]; then
-  log_json "ERROR" "backup_dir_missing" "Папка назначения недоступна" "$BACKUP_DIR"
-  echo "Ошибка: папка $BACKUP_DIR недоступна" >&2
+mkdir -p "${BACKUP_DIR}" 2>/dev/null
+if [[ ! -d "${BACKUP_DIR}" ]]; then
+  log_json "ERROR" "backup_dir_missing" "Папка назначения недоступна" "${BACKUP_DIR}"
+  echo "Ошибка: папка ${BACKUP_DIR} недоступна" >&2
   exit 1
 fi
 
@@ -652,8 +655,8 @@ fi
 # BACKUP
 ###############################################################################
 BACKUP_DATE="$(date '+%Y-%m-%d')"
-REMOTE_PARENT="$(dirname "$REMOTE_PATH")"
-REMOTE_DIR="$(basename "$REMOTE_PATH")"
+REMOTE_PARENT="$(dirname "${REMOTE_PATH}")"
+REMOTE_DIR="$(basename "${REMOTE_PATH}")"
 
 # Встроенные исключения для явно восстановимых данных (кэши/preview/tmp).
 # Эти пути исключаются всегда и не настраиваются через conf.
@@ -687,20 +690,26 @@ done
 # именно на SSH-часть, если до этого негociировался медленный на данном чипе
 # AES. Можно переопределить через conf, если тесты покажут другой шифр быстрее.
 SSH_CIPHERS="${SSH_CIPHERS:-chacha20-poly1305@openssh.com,aes128-gcm@openssh.com,aes256-gcm@openssh.com,aes128-ctr}"
-SSH_OPTS="-p ${REMOTE_SSH_PORT} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30 -o BatchMode=no -o Compression=no -c ${SSH_CIPHERS}"
-[ -n "$REMOTE_SSH_KEY" ] && SSH_OPTS="${SSH_OPTS} -i ${REMOTE_SSH_KEY}"
+SSH_OPTS=(
+  -p "${REMOTE_SSH_PORT}"
+  -o StrictHostKeyChecking=accept-new
+  -o ConnectTimeout=30
+  -o BatchMode=no
+  -o Compression=no
+  -c "${SSH_CIPHERS}"
+)
+[[ -n "${REMOTE_SSH_KEY}" ]] && SSH_OPTS+=(-i "${REMOTE_SSH_KEY}")
 
 # Выполняет команду на удалённом хосте: sshpass+пароль, если sshpass найден и
 # задан REMOTE_PASSWORD (как в десктопной версии), иначе обычный ssh по ключу
 # (REMOTE_SSH_KEY / ssh-agent) — основной способ для QNAP, т.к. в Entware для
 # этой архитектуры нет пакета sshpass.
 ssh_remote() {
-  if [ -n "$REMOTE_PASSWORD" ] && command -v sshpass >/dev/null 2>&1; then
-    # shellcheck disable=SC2086
-    SSHPASS="$REMOTE_PASSWORD" sshpass -e ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" "$1"
+  if [[ -n "${REMOTE_PASSWORD}" ]] && command -v sshpass >/dev/null 2>&1; then
+    SSHPASS="${REMOTE_PASSWORD}" sshpass -e ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" "$1"
   else
-    # shellcheck disable=SC2029,SC2086
-    ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" "$1"
+    # shellcheck disable=SC2029
+    ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" "$1"
   fi
 }
 
@@ -739,13 +748,13 @@ get_local_nproc() { nproc 2>/dev/null || echo 1; }
 # по несвязанному диску.
 get_local_io_device() {
   local dev_path mm major minor
-  dev_path=$(df -P "$BACKUP_DIR" 2>/dev/null | awk 'NR==2{print $1}')
-  [ -n "$dev_path" ] || return
-  mm=$(stat -c '%t %T' "$dev_path" 2>/dev/null)
-  [ -n "$mm" ] || return
-  major=$((16#$(printf '%s' "$mm" | awk '{print $1}')))
-  minor=$((16#$(printf '%s' "$mm" | awk '{print $2}')))
-  awk -v maj="$major" -v min="$minor" '$1==maj && $2==min{print $3; f=1} END{exit !f}' /proc/diskstats 2>/dev/null
+  dev_path=$(df -P "${BACKUP_DIR}" 2>/dev/null | awk 'NR==2{print $1}')
+  [[ -n "${dev_path}" ]] || return
+  mm=$(stat -c '%t %T' "${dev_path}" 2>/dev/null)
+  [[ -n "${mm}" ]] || return
+  major=$((16#$(printf '%s' "${mm}" | awk '{print $1}')))
+  minor=$((16#$(printf '%s' "${mm}" | awk '{print $2}')))
+  awk -v maj="${major}" -v min="${minor}" '$1==maj && $2==min{print $3; f=1} END{exit !f}' /proc/diskstats 2>/dev/null
 }
 
 # Печатает "sectors_read sectors_written io_ms" для устройства $1 из
@@ -768,7 +777,7 @@ get_remote_diag() {
 # ("rtt min/avg/max/mdev = a/b/c/d ms") — в обоих форматах avg второе число
 # после "=".
 get_rtt_ms() {
-  ping -c 3 -W 2 "$REMOTE_HOST" 2>/dev/null | tail -n1 | sed -nE 's#.*= *[0-9.]+/([0-9.]+)/[0-9.]+.*#\1#p'
+  ping -c 3 -W 2 "${REMOTE_HOST}" 2>/dev/null | tail -n1 | sed -nE 's#.*= *[0-9.]+/([0-9.]+)/[0-9.]+.*#\1#p'
 }
 
 # Снимок на удалённой стороне сразу после сбоя raw-transfer: loadavg,
@@ -791,7 +800,7 @@ echo oom_recent=\"\${oom:-none}\"" 2>/dev/null | tr '\n' ', '
 # просто логируется предупреждением и не прерывает бэкап — сеть уже проверена
 # раньше через wg_check, это только диагностика скорости, а не связности.
 measure_network_speed() {
-  if [ "$(ssh_remote "command -v nc >/dev/null 2>&1 && echo yes" 2>/dev/null)" != "yes" ]; then
+  if [[ "$(ssh_remote "command -v nc >/dev/null 2>&1 && echo yes" 2>/dev/null)" != "yes" ]]; then
     log_json "WARN" "network_speed_test_skip_no_nc" "На удалённой стороне нет nc — замер скорости сети пропущен" ""
     return
   fi
@@ -803,23 +812,23 @@ measure_network_speed() {
   test_launch="rm -f '${test_status_file}'; \
 nohup bash -c 'dd if=/dev/zero bs=1M count=${NETWORK_SPEED_TEST_MB} 2>/dev/null | timeout 60 nc -N -l ${REMOTE_HOST} ${RAW_TRANSFER_PORT}; \
   echo \$? > \"${test_status_file}\"' </dev/null >/dev/null 2>&1 &"
-  ssh_remote "$test_launch" >/dev/null 2>&1
+  ssh_remote "${test_launch}" >/dev/null 2>&1
   sleep 1
 
   test_start=$(date +%s)
-  timeout 60 ncat --recv-only "$REMOTE_HOST" "$RAW_TRANSFER_PORT" > "$test_out" 2>/dev/null < /dev/null
+  timeout 60 ncat --recv-only "${REMOTE_HOST}" "${RAW_TRANSFER_PORT}" > "${test_out}" 2>/dev/null < /dev/null
   test_rc=$?
   test_end=$(date +%s)
 
-  test_bytes=$(stat -c%s "$test_out" 2>/dev/null || printf '0')
-  rm -f "$test_out"
+  test_bytes=$(stat -c%s "${test_out}" 2>/dev/null || printf '0')
+  rm -f "${test_out}"
   ssh_remote "cat '${test_status_file}' 2>/dev/null; rm -f '${test_status_file}'" >/dev/null 2>&1
 
   test_dur=$(( test_end - test_start ))
-  [ "$test_dur" -lt 1 ] && test_dur=1
+  [[ "${test_dur}" -lt 1 ]] && test_dur=1
 
-  if [ "$test_rc" -eq 0 ] && [ "$test_bytes" -gt 0 ]; then
-    test_mib_s=$(awk -v b="$test_bytes" -v d="$test_dur" 'BEGIN { printf "%.2f", (b/1048576)/d }')
+  if [[ "${test_rc}" -eq 0 && "${test_bytes}" -gt 0 ]]; then
+    test_mib_s=$(awk -v b="${test_bytes}" -v d="${test_dur}" 'BEGIN { printf "%.2f", (b/1048576)/d }')
     log_json "INFO" "network_speed_test" "Замер скорости сети перед началом бэкапа" \
       "bytes=${test_bytes}, duration_s=${test_dur}, mib_s=${test_mib_s}"
   else
@@ -832,7 +841,7 @@ nohup bash -c 'dd if=/dev/zero bs=1M count=${NETWORK_SPEED_TEST_MB} 2>/dev/null 
 # zstd --fast=1 --threads=0 > pigz -1 > gzip -1
 REMOTE_COMP=$(ssh_remote \
   "if command -v zstd >/dev/null 2>&1; then echo zstd; elif command -v pigz >/dev/null 2>&1; then echo pigz; else echo gzip; fi" 2>/dev/null)
-case "$REMOTE_COMP" in
+case "${REMOTE_COMP}" in
   zstd) COMP_CMD="zstd --fast=1 --threads=0 -c"; BACKUP_EXT="tar.zst" ;;
   pigz) COMP_CMD="pigz -1";                       BACKUP_EXT="tar.gz"  ;;
   *)    COMP_CMD="gzip -1";                        BACKUP_EXT="tar.gz"  ;;
@@ -845,22 +854,22 @@ LOCAL_NPROC="$(get_local_nproc)"
 _local_load1_baseline="$(get_local_load1)"
 _local_mem_avail_mb_baseline="$(get_local_mem_avail_mb)"
 _remote_diag_baseline="$(get_remote_diag)"
-_remote_load1_baseline=$(printf '%s\n' "$_remote_diag_baseline" | sed -n '1p')
-_remote_mem_avail_mb_baseline=$(printf '%s\n' "$_remote_diag_baseline" | sed -n '2p')
-REMOTE_NPROC=$(printf '%s\n' "$_remote_diag_baseline" | sed -n '3p')
+_remote_load1_baseline=$(printf '%s\n' "${_remote_diag_baseline}" | sed -n '1p')
+_remote_mem_avail_mb_baseline=$(printf '%s\n' "${_remote_diag_baseline}" | sed -n '2p')
+REMOTE_NPROC=$(printf '%s\n' "${_remote_diag_baseline}" | sed -n '3p')
 REMOTE_NPROC="${REMOTE_NPROC:-1}"
 RTT_BASELINE_MS="$(get_rtt_ms)"
 RTT_BASELINE_MS="${RTT_BASELINE_MS:-n/a}"
 IO_DEVICE="$(get_local_io_device)"
 log_json "INFO" "backup_env_diag" "Снимок нагрузки перед архивированием" \
   "local_nproc=${LOCAL_NPROC}, local_load1=${_local_load1_baseline:-n/a}, local_mem_avail_mb=${_local_mem_avail_mb_baseline:-n/a}, remote_nproc=${REMOTE_NPROC}, remote_load1=${_remote_load1_baseline:-n/a}, remote_mem_avail_mb=${_remote_mem_avail_mb_baseline:-n/a}, rtt_baseline_ms=${RTT_BASELINE_MS}, io_device=${IO_DEVICE:-n/a}"
-if [ -z "$IO_DEVICE" ]; then
+if [[ -z "${IO_DEVICE}" ]]; then
   # На проде (2026-08-04) io_device вышел n/a — причина неизвестна (нет
   # прямого SSH-доступа к QNAP для живой проверки). Пишем сырой вывод df,
   # чтобы по следующему логу понять: df вообще не нашёл BACKUP_DIR, вернул
   # пустую строку, или вернул имя устройства, которого нет в /proc/diskstats
   # (например, длинное имя mapper-устройства на некоторых прошивках QTS).
-  _io_debug_df="$(df "$BACKUP_DIR" 2>&1 | tr '\n' ';')"
+  _io_debug_df="$(df "${BACKUP_DIR}" 2>&1 | tr '\n' ';')"
   log_json "WARN" "io_diag_unavailable" "Не удалось определить блочное устройство под BACKUP_DIR — замер IO (backup_resource_diag) пропущен" \
     "backup_dir=${BACKUP_DIR}, df_output=[${_io_debug_df:-empty}]"
 fi
@@ -870,8 +879,8 @@ measure_network_speed
 BACKUP_FILENAME="${SCRIPT_BASE}-${BACKUP_DATE}.${BACKUP_EXT}"
 BACKUP_PATH="${BACKUP_DIR}/${BACKUP_FILENAME}"
 
-if [ -f "$BACKUP_PATH" ]; then
-  if validate_backup_file "$BACKUP_PATH"; then
+if [[ -f "${BACKUP_PATH}" ]]; then
+  if validate_backup_file "${BACKUP_PATH}"; then
     BACKUP_APPEND=1
     log_json "INFO" "backup_append_mode" "Файл бэкапа за ${BACKUP_DATE} уже существует и прошёл проверку — дозапись" \
       "file=${BACKUP_PATH}"
@@ -879,16 +888,16 @@ if [ -f "$BACKUP_PATH" ]; then
     validate_rc=$?
     BACKUP_APPEND=0
     validate_detail="file=${BACKUP_PATH}"
-    if [ -n "$VALIDATE_BACKUP_DETAIL" ]; then
+    if [[ -n "${VALIDATE_BACKUP_DETAIL}" ]]; then
       validate_detail="${validate_detail}, reason=${VALIDATE_BACKUP_DETAIL}"
     fi
-    if [ $validate_rc -eq 1 ]; then
+    if [[ ${validate_rc} -eq 1 ]]; then
       log_json "WARN" "backup_existing_invalid" "Существующий файл бэкапа повреждён — удаляем и создаём заново" \
-        "$validate_detail" $validate_rc
-      rm -f "$BACKUP_PATH"
+        "${validate_detail}" "${validate_rc}"
+      rm -f "${BACKUP_PATH}"
     else
       log_json "WARN" "backup_existing_unchecked" "Не удалось проверить существующий файл бэкапа — создаём заново без дозаписи" \
-        "$validate_detail" $validate_rc
+        "${validate_detail}" "${validate_rc}"
     fi
   fi
 else
@@ -906,10 +915,10 @@ log_json "INFO" "occ_cleanup_start" "Очистка корзин пользов�
 occ_trash_err=$(ssh_remote \
   "docker exec -u www-data esimych-cloud-app php occ trashbin:cleanup --all-users" 2>&1)
 occ_trash_rc=$?
-if [ $occ_trash_rc -ne 0 ]; then
-  log_json "WARN" "occ_cleanup_trash_failed" "Не удалось очистить корзины" "$occ_trash_err" $occ_trash_rc
+if [[ ${occ_trash_rc} -ne 0 ]]; then
+  log_json "WARN" "occ_cleanup_trash_failed" "Не удалось очистить корзины" "${occ_trash_err}" "${occ_trash_rc}"
 else
-  log_json "INFO" "occ_cleanup_trash_ok" "Корзины очищены" "$occ_trash_err" $occ_trash_rc
+  log_json "INFO" "occ_cleanup_trash_ok" "Корзины очищены" "${occ_trash_err}" "${occ_trash_rc}"
 fi
 
 # "occ trashbin:cleanup --all-users" при полной очистке физически удаляет
@@ -926,7 +935,7 @@ remote_datadir=$(ssh_remote \
 remote_users=$(ssh_remote \
   "docker exec -u www-data esimych-cloud-app php occ user:list" 2>/dev/null)
 log_json "INFO" "occ_user_list" "Получен список пользователей Nextcloud (occ user:list)" "${remote_users:-<пусто>}"
-if [ -z "$remote_datadir" ] || [ -z "$remote_users" ]; then
+if [[ -z "${remote_datadir}" || -z "${remote_users}" ]]; then
   occ_trash_repair_rc=1
   occ_trash_repair_detail="не удалось получить datadirectory или список пользователей"
 else
@@ -938,11 +947,11 @@ else
   # только первого пользователя — остальные (например, clouduser) молча
   # пропускаются без пересоздания files_trashbin и без записи в лог.
   while IFS= read -r _uid <&3; do
-    [ -z "$_uid" ] && continue
+    [[ -z "${_uid}" ]] && continue
     _repair_err=$(ssh_remote \
       "docker exec -u www-data esimych-cloud-app mkdir -p '${remote_datadir}/${_uid}/files_trashbin'" 2>&1)
     _repair_rc=$?
-    if [ $_repair_rc -ne 0 ]; then
+    if [[ ${_repair_rc} -ne 0 ]]; then
       occ_trash_repair_rc=1
       occ_trash_repair_detail="${occ_trash_repair_detail}${_uid}: ${_repair_err}; "
       continue
@@ -952,17 +961,17 @@ else
     # результат логируется отдельно для каждого пользователя.
     ssh_remote "docker exec -u www-data esimych-cloud-app test -d '${remote_datadir}/${_uid}/files_trashbin'" >/dev/null 2>&1
     _verify_rc=$?
-    if [ $_verify_rc -eq 0 ]; then
+    if [[ ${_verify_rc} -eq 0 ]]; then
       log_json "INFO" "occ_trashbin_verify_ok" "Папка files_trashbin подтверждена после пересоздания" "user=${_uid}, path=${remote_datadir}/${_uid}/files_trashbin" 0
     else
       occ_trash_repair_rc=1
       occ_trash_repair_detail="${occ_trash_repair_detail}${_uid}: папка не найдена после mkdir -p; "
-      log_json "ERROR" "occ_trashbin_verify_failed" "Папка files_trashbin отсутствует после попытки пересоздания" "user=${_uid}, path=${remote_datadir}/${_uid}/files_trashbin" $_verify_rc
+      log_json "ERROR" "occ_trashbin_verify_failed" "Папка files_trashbin отсутствует после попытки пересоздания" "user=${_uid}, path=${remote_datadir}/${_uid}/files_trashbin" "${_verify_rc}"
     fi
-  done 3<<< "$(printf '%s\n' "$remote_users" | sed -nE 's/^[[:space:]]*-[[:space:]]*([^:]+):.*/\1/p')"
+  done 3<<< "$(printf '%s\n' "${remote_users}" | sed -nE 's/^[[:space:]]*-[[:space:]]*([^:]+):.*/\1/p')"
 fi
-if [ $occ_trash_repair_rc -ne 0 ]; then
-  log_json "WARN" "occ_trashbin_repair_failed" "Не удалось пересоздать/подтвердить папки files_trashbin" "$occ_trash_repair_detail" $occ_trash_repair_rc
+if [[ ${occ_trash_repair_rc} -ne 0 ]]; then
+  log_json "WARN" "occ_trashbin_repair_failed" "Не удалось пересоздать/подтвердить папки files_trashbin" "${occ_trash_repair_detail}" "${occ_trash_repair_rc}"
 else
   log_json "INFO" "occ_trashbin_repair_ok" "Папки files_trashbin пересозданы и проверены для всех пользователей" "" 0
 fi
@@ -971,16 +980,16 @@ log_json "INFO" "occ_versions_start" "Очистка версий файлов (
 occ_ver_err=$(ssh_remote \
   "docker exec -u www-data esimych-cloud-app php occ versions:cleanup" 2>&1)
 occ_ver_rc=$?
-if [ $occ_ver_rc -ne 0 ]; then
-  log_json "WARN" "occ_cleanup_versions_failed" "Не удалось очистить версии файлов" "$occ_ver_err" $occ_ver_rc
+if [[ ${occ_ver_rc} -ne 0 ]]; then
+  log_json "WARN" "occ_cleanup_versions_failed" "Не удалось очистить версии файлов" "${occ_ver_err}" "${occ_ver_rc}"
 else
-  log_json "INFO" "occ_cleanup_versions_ok" "Версии файлов очищены" "$occ_ver_err" $occ_ver_rc
+  log_json "INFO" "occ_cleanup_versions_ok" "Версии файлов очищены" "${occ_ver_err}" "${occ_ver_rc}"
 fi
 
 ###############################################################################
 # DATABASE OPTIMIZATION (before services down)
 ###############################################################################
-if [ "$OPTIMIZE_MARIADB_BEFORE_BACKUP" -eq 1 ] && [ "$DB_OPTIMIZE_DUE" -eq 1 ]; then
+if [[ "${OPTIMIZE_MARIADB_BEFORE_BACKUP}" -eq 1 && "${DB_OPTIMIZE_DUE}" -eq 1 ]]; then
   log_json "INFO" "mariadb_optimize_start" "Оптимизация MariaDB перед архивированием"
   mariadb_opt_err=$(ssh_remote \
     "cd '${REMOTE_PATH}' && docker compose exec -T \
@@ -995,18 +1004,18 @@ if [ "$OPTIMIZE_MARIADB_BEFORE_BACKUP" -eq 1 ] && [ "$DB_OPTIMIZE_DUE" -eq 1 ]; 
           : > /var/lib/mysql/general.log || true; \
         fi'" 2>&1)
   mariadb_opt_rc=$?
-  if [ $mariadb_opt_rc -ne 0 ]; then
-    log_json "WARN" "mariadb_optimize_failed" "Оптимизация MariaDB завершилась с предупреждениями" "$mariadb_opt_err" $mariadb_opt_rc
+  if [[ ${mariadb_opt_rc} -ne 0 ]]; then
+    log_json "WARN" "mariadb_optimize_failed" "Оптимизация MariaDB завершилась с предупреждениями" "${mariadb_opt_err}" "${mariadb_opt_rc}"
   else
-    log_json "INFO" "mariadb_optimize_ok" "Оптимизация MariaDB завершена" "$mariadb_opt_err" $mariadb_opt_rc
+    log_json "INFO" "mariadb_optimize_ok" "Оптимизация MariaDB завершена" "${mariadb_opt_err}" "${mariadb_opt_rc}"
   fi
-elif [ "$OPTIMIZE_MARIADB_BEFORE_BACKUP" -eq 1 ]; then
+elif [[ "${OPTIMIZE_MARIADB_BEFORE_BACKUP}" -eq 1 ]]; then
   log_json "INFO" "mariadb_optimize_skip_not_due" "Оптимизация MariaDB пропущена — не настал плановый интервал (раз в ${DB_OPTIMIZE_INTERVAL_DAYS} дн.)"
 else
   log_json "INFO" "mariadb_optimize_skip" "Оптимизация MariaDB отключена (OPTIMIZE_MARIADB_BEFORE_BACKUP=0)"
 fi
 
-if [ "$OPTIMIZE_REDIS_BEFORE_BACKUP" -eq 1 ] && [ "$DB_OPTIMIZE_DUE" -eq 1 ]; then
+if [[ "${OPTIMIZE_REDIS_BEFORE_BACKUP}" -eq 1 && "${DB_OPTIMIZE_DUE}" -eq 1 ]]; then
   log_json "INFO" "redis_optimize_start" "Оптимизация Redis AOF перед архивированием"
   redis_opt_err=$(ssh_remote \
     "cd '${REMOTE_PATH}' && docker compose exec -T \
@@ -1023,12 +1032,12 @@ if [ "$OPTIMIZE_REDIS_BEFORE_BACKUP" -eq 1 ] && [ "$DB_OPTIMIZE_DUE" -eq 1 ]; th
         echo \"AOF rewrite did not finish within \$REDIS_WAIT seconds\"; \
         exit 1'" 2>&1)
   redis_opt_rc=$?
-  if [ $redis_opt_rc -ne 0 ]; then
-    log_json "WARN" "redis_optimize_failed" "Оптимизация Redis завершилась с предупреждениями" "$redis_opt_err" $redis_opt_rc
+  if [[ ${redis_opt_rc} -ne 0 ]]; then
+    log_json "WARN" "redis_optimize_failed" "Оптимизация Redis завершилась с предупреждениями" "${redis_opt_err}" "${redis_opt_rc}"
   else
-    log_json "INFO" "redis_optimize_ok" "Оптимизация Redis завершена" "$redis_opt_err" $redis_opt_rc
+    log_json "INFO" "redis_optimize_ok" "Оптимизация Redis завершена" "${redis_opt_err}" "${redis_opt_rc}"
   fi
-elif [ "$OPTIMIZE_REDIS_BEFORE_BACKUP" -eq 1 ]; then
+elif [[ "${OPTIMIZE_REDIS_BEFORE_BACKUP}" -eq 1 ]]; then
   log_json "INFO" "redis_optimize_skip_not_due" "Оптимизация Redis пропущена — не настал плановый интервал (раз в ${DB_OPTIMIZE_INTERVAL_DAYS} дн.)"
 else
   log_json "INFO" "redis_optimize_skip" "Оптимизация Redis отключена (OPTIMIZE_REDIS_BEFORE_BACKUP=0)"
@@ -1038,12 +1047,12 @@ log_json "INFO" "services_stop" "Останавливаем сервисы на 
 stop_err=$(ssh_remote \
   "cd '${REMOTE_PATH}' && docker compose down" 2>&1)
 stop_rc=$?
-if [ $stop_rc -ne 0 ]; then
-  log_json "WARN" "services_stop_failed" "Не удалось остановить сервисы" "$stop_err" $stop_rc
-  echo "Предупреждение: не удалось остановить сервисы (код $stop_rc): $stop_err" >&2
+if [[ ${stop_rc} -ne 0 ]]; then
+  log_json "WARN" "services_stop_failed" "Не удалось остановить сервисы" "${stop_err}" "${stop_rc}"
+  echo "Предупреждение: не удалось остановить сервисы (код ${stop_rc}): ${stop_err}" >&2
 else
   SERVICES_STOPPED=1
-  log_json "INFO" "services_stop_ok" "Сервисы остановлены" "" $stop_rc
+  log_json "INFO" "services_stop_ok" "Сервисы остановлены" "" "${stop_rc}"
   # Пауза перед стартом передачи: массовая остановка ~15 контейнеров (docker
   # compose down) на слабом железе ещё несколько секунд донастраивает сеть/DNS
   # на удалённой стороне после того, как сама команда уже вернула управление
@@ -1056,7 +1065,7 @@ fi
 ###############################################################################
 # SQLITE OPTIMIZATION (optional)
 ###############################################################################
-if [ "$OPTIMIZE_SQLITE_BEFORE_BACKUP" -eq 1 ] && [ "$DB_OPTIMIZE_DUE" -eq 1 ]; then
+if [[ "${OPTIMIZE_SQLITE_BEFORE_BACKUP}" -eq 1 && "${DB_OPTIMIZE_DUE}" -eq 1 ]]; then
   if ! ssh_remote "command -v sqlite3 >/dev/null 2>&1"; then
     log_json "WARN" "sqlite_optimize_skip_no_binary" "sqlite3 не найден на удалённом сервере — оптимизация SQLite пропущена" \
       "Установите sqlite3 на ${REMOTE_HOST} (например: apt install sqlite3) или отключите OPTIMIZE_SQLITE_BEFORE_BACKUP"
@@ -1066,19 +1075,19 @@ if [ "$OPTIMIZE_SQLITE_BEFORE_BACKUP" -eq 1 ] && [ "$DB_OPTIMIZE_DUE" -eq 1 ]; t
       "set -o pipefail; find '${REMOTE_PATH}' -type f -name '*.db' -print0 \
         | xargs -0 -r -I{} timeout ${SQLITE_OPTIMIZE_TIMEOUT_SEC}s sqlite3 \"{}\" 'PRAGMA optimize; VACUUM;'" 2>&1)
     sqlite_opt_rc=$?
-    if [ $sqlite_opt_rc -ne 0 ]; then
-      log_json "WARN" "sqlite_optimize_failed" "Оптимизация SQLite завершилась с предупреждениями" "$sqlite_opt_err" $sqlite_opt_rc
+    if [[ ${sqlite_opt_rc} -ne 0 ]]; then
+      log_json "WARN" "sqlite_optimize_failed" "Оптимизация SQLite завершилась с предупреждениями" "${sqlite_opt_err}" "${sqlite_opt_rc}"
     else
-      log_json "INFO" "sqlite_optimize_ok" "Оптимизация SQLite завершена" "$sqlite_opt_err" $sqlite_opt_rc
+      log_json "INFO" "sqlite_optimize_ok" "Оптимизация SQLite завершена" "${sqlite_opt_err}" "${sqlite_opt_rc}"
     fi
   fi
-elif [ "$OPTIMIZE_SQLITE_BEFORE_BACKUP" -eq 1 ]; then
+elif [[ "${OPTIMIZE_SQLITE_BEFORE_BACKUP}" -eq 1 ]]; then
   log_json "INFO" "sqlite_optimize_skip_not_due" "Оптимизация SQLite пропущена — не настал плановый интервал (раз в ${DB_OPTIMIZE_INTERVAL_DAYS} дн.)"
 else
   log_json "INFO" "sqlite_optimize_skip" "Оптимизация SQLite отключена (OPTIMIZE_SQLITE_BEFORE_BACKUP=0)"
 fi
 
-if [ "$DB_OPTIMIZE_DUE" -eq 1 ]; then
+if [[ "${DB_OPTIMIZE_DUE}" -eq 1 ]]; then
   db_optimize_mark_done
   log_json "INFO" "db_optimize_mark_done" "Плановая оптимизация БД отмечена выполненной — следующая через ${DB_OPTIMIZE_INTERVAL_DAYS} дн."
 fi
@@ -1101,62 +1110,62 @@ _progress_monitor() {
   local tick=0 prev_epoch="" prev_bytes=""
   local io_prev_epoch="" io_prev_read="" io_prev_write="" io_prev_ms=""
   while sleep 60; do
-    [ -f "$BACKUP_PATH" ] || break
+    [[ -f "${BACKUP_PATH}" ]] || break
     tick=$((tick + 1))
     local sz size_bytes now_epoch dt inst_mib_s diag_extra
-    sz=$(du -sh "$BACKUP_PATH" 2>/dev/null | cut -f1)
-    size_bytes=$(stat -c%s "$BACKUP_PATH" 2>/dev/null || wc -c < "$BACKUP_PATH" 2>/dev/null || printf '0')
+    sz=$(du -sh "${BACKUP_PATH}" 2>/dev/null | cut -f1)
+    size_bytes=$(stat -c%s "${BACKUP_PATH}" 2>/dev/null || wc -c < "${BACKUP_PATH}" 2>/dev/null || printf '0')
     now_epoch=$(date +%s)
 
     inst_mib_s="n/a"
-    if [ -n "$prev_epoch" ]; then
+    if [[ -n "${prev_epoch}" ]]; then
       dt=$((now_epoch - prev_epoch))
-      [ "$dt" -gt 0 ] && inst_mib_s=$(awk -v b1="$prev_bytes" -v b2="$size_bytes" -v d="$dt" 'BEGIN { printf "%.2f", ((b2-b1)/1048576)/d }')
+      [[ "${dt}" -gt 0 ]] && inst_mib_s=$(awk -v b1="${prev_bytes}" -v b2="${size_bytes}" -v d="${dt}" 'BEGIN { printf "%.2f", ((b2-b1)/1048576)/d }')
     fi
-    prev_epoch="$now_epoch"
-    prev_bytes="$size_bytes"
+    prev_epoch="${now_epoch}"
+    prev_bytes="${size_bytes}"
 
     diag_extra=""
-    if [ $((tick % 5)) -eq 0 ]; then
+    if [[ $((tick % 5)) -eq 0 ]]; then
       local remote_diag remote_load1 remote_mem_avail_mb rtt_ms local_load1 io_util_pct_field=""
       remote_diag="$(get_remote_diag)"
-      remote_load1=$(printf '%s\n' "$remote_diag" | sed -n '1p')
-      remote_mem_avail_mb=$(printf '%s\n' "$remote_diag" | sed -n '2p')
+      remote_load1=$(printf '%s\n' "${remote_diag}" | sed -n '1p')
+      remote_mem_avail_mb=$(printf '%s\n' "${remote_diag}" | sed -n '2p')
       rtt_ms="$(get_rtt_ms)"
       local_load1="$(get_local_load1)"
       diag_extra=", remote_load1=${remote_load1:-n/a}, remote_mem_avail_mb=${remote_mem_avail_mb:-n/a}, rtt_ms=${rtt_ms:-n/a}"
 
-      if [ $((tick % 10)) -eq 0 ]; then
+      if [[ $((tick % 10)) -eq 0 ]]; then
         local local_mem_avail_mb io_read_kib_s="n/a" io_write_kib_s="n/a" io_util_pct="n/a"
         local_mem_avail_mb="$(get_local_mem_avail_mb)"
 
-        if [ -n "$IO_DEVICE" ]; then
+        if [[ -n "${IO_DEVICE}" ]]; then
           local io_raw io_read io_write io_ms io_dt
-          io_raw="$(get_local_io_raw "$IO_DEVICE")"
-          io_read=$(printf '%s' "$io_raw" | awk '{print $1}')
-          io_write=$(printf '%s' "$io_raw" | awk '{print $2}')
-          io_ms=$(printf '%s' "$io_raw" | awk '{print $3}')
-          if [ -n "$io_prev_epoch" ] && [ -n "$io_read" ]; then
+          io_raw="$(get_local_io_raw "${IO_DEVICE}")"
+          io_read=$(printf '%s' "${io_raw}" | awk '{print $1}')
+          io_write=$(printf '%s' "${io_raw}" | awk '{print $2}')
+          io_ms=$(printf '%s' "${io_raw}" | awk '{print $3}')
+          if [[ -n "${io_prev_epoch}" && -n "${io_read}" ]]; then
             io_dt=$((now_epoch - io_prev_epoch))
-            if [ "$io_dt" -gt 0 ]; then
-              io_read_kib_s=$(awk -v a="$io_prev_read" -v b="$io_read" -v d="$io_dt" 'BEGIN { printf "%.1f", ((b-a)*512/1024)/d }')
-              io_write_kib_s=$(awk -v a="$io_prev_write" -v b="$io_write" -v d="$io_dt" 'BEGIN { printf "%.1f", ((b-a)*512/1024)/d }')
-              io_util_pct=$(awk -v a="$io_prev_ms" -v b="$io_ms" -v d="$io_dt" 'BEGIN { printf "%.1f", ((b-a)/(d*1000))*100 }')
-              io_util_pct_field="$io_util_pct"
+            if [[ "${io_dt}" -gt 0 ]]; then
+              io_read_kib_s=$(awk -v a="${io_prev_read}" -v b="${io_read}" -v d="${io_dt}" 'BEGIN { printf "%.1f", ((b-a)*512/1024)/d }')
+              io_write_kib_s=$(awk -v a="${io_prev_write}" -v b="${io_write}" -v d="${io_dt}" 'BEGIN { printf "%.1f", ((b-a)*512/1024)/d }')
+              io_util_pct=$(awk -v a="${io_prev_ms}" -v b="${io_ms}" -v d="${io_dt}" 'BEGIN { printf "%.1f", ((b-a)/(d*1000))*100 }')
+              io_util_pct_field="${io_util_pct}"
             fi
           fi
-          io_prev_epoch="$now_epoch"; io_prev_read="$io_read"; io_prev_write="$io_write"; io_prev_ms="$io_ms"
+          io_prev_epoch="${now_epoch}"; io_prev_read="${io_read}"; io_prev_write="${io_write}"; io_prev_ms="${io_ms}"
         fi
 
         log_json "INFO" "backup_resource_diag" "Совместный замер CPU/RAM/IO на QNAP" \
           "local_load1=${local_load1:-n/a}, local_mem_avail_mb=${local_mem_avail_mb:-n/a}, io_device=${IO_DEVICE:-n/a}, io_read_kib_s=${io_read_kib_s}, io_write_kib_s=${io_write_kib_s}, io_util_pct=${io_util_pct}"
       fi
 
-      printf '%s\t%s\t%s\t%s\t%s\n' "$now_epoch" "${remote_load1:-}" "${local_load1:-}" "${rtt_ms:-}" "$io_util_pct_field" >> "$DIAG_METRICS_FILE"
+      printf '%s\t%s\t%s\t%s\t%s\n' "${now_epoch}" "${remote_load1:-}" "${local_load1:-}" "${rtt_ms:-}" "${io_util_pct_field}" >> "${DIAG_METRICS_FILE}"
     fi
 
-    printf '%s\t%s\n' "$now_epoch" "$size_bytes" >> "$PROGRESS_METRICS_FILE"
-    [ -n "$sz" ] && log_json "INFO" "backup_progress" "Прогресс архивирования" \
+    printf '%s\t%s\n' "${now_epoch}" "${size_bytes}" >> "${PROGRESS_METRICS_FILE}"
+    [[ -n "${sz}" ]] && log_json "INFO" "backup_progress" "Прогресс архивирования" \
       "size=${sz}, bytes=${size_bytes}, inst_mib_s=${inst_mib_s}${diag_extra}"
   done
 }
@@ -1170,15 +1179,15 @@ REMOTE_TAR_CMD="set -o pipefail; tar --create --file=- --sparse${REMOTE_TAR_EXCL
 # Решаем, доступна ли передача в обход SSH-шифрования (см. RAW_TRANSFER_ENABLED
 # выше) — только если включена в conf И на удалённой стороне есть nc.
 USE_RAW_TRANSFER=0
-if [ "$RAW_TRANSFER_ENABLED" -eq 1 ]; then
-  if [ "$(ssh_remote "command -v nc >/dev/null 2>&1 && echo yes" 2>/dev/null)" = "yes" ]; then
+if [[ "${RAW_TRANSFER_ENABLED}" -eq 1 ]]; then
+  if [[ "$(ssh_remote "command -v nc >/dev/null 2>&1 && echo yes" 2>/dev/null)" = "yes" ]]; then
     USE_RAW_TRANSFER=1
   else
     log_json "WARN" "raw_transfer_nc_missing" "На удалённом сервере не найден nc — используется передача через SSH" ""
   fi
 fi
 
-if [ "$USE_RAW_TRANSFER" -eq 1 ]; then
+if [[ "${USE_RAW_TRANSFER}" -eq 1 ]]; then
   # Раздельные каналы: SSH запускает и останавливает удалённый листенер
   # (служебная команда), а сами байты бэкапа идут напрямую по TCP поверх
   # WireGuard, без дополнительного слоя SSH-шифрования поверх него.
@@ -1194,15 +1203,15 @@ nohup bash -c 'set -o pipefail; tar --create --file=- --sparse${REMOTE_TAR_EXCLU
   timeout ${RAW_TRANSFER_REMOTE_TIMEOUT_SEC} nc -N -l ${REMOTE_HOST} ${RAW_TRANSFER_PORT}; \
   echo \$? > \"${REMOTE_STATUS_FILE}\"' </dev/null >/dev/null 2>\"${REMOTE_ERR_FILE}\" &"
   RAW_LAUNCH_EPOCH=$(date +%s)
-  ssh_remote "$RAW_LAUNCH_CMD" >/dev/null 2>&1
+  ssh_remote "${RAW_LAUNCH_CMD}" >/dev/null 2>&1
   log_json "INFO" "raw_transfer_listener_launch" "Запущен приём бэкапа через raw TCP (порт ${RAW_TRANSFER_PORT}) в обход SSH-шифрования" ""
 
   raw_prev_size=0
-  [ "$BACKUP_APPEND" -eq 1 ] && raw_prev_size=$(stat -c%s "$BACKUP_PATH" 2>/dev/null || printf '0')
+  [[ "${BACKUP_APPEND}" -eq 1 ]] && raw_prev_size=$(stat -c%s "${BACKUP_PATH}" 2>/dev/null || printf '0')
 
   RAW_CONNECT_OK=0
   RAW_MID_STREAM_FAILURE=0
-  for _raw_attempt in $(seq 1 "$RAW_TRANSFER_CONNECT_RETRIES"); do
+  for _raw_attempt in $(seq 1 "${RAW_TRANSFER_CONNECT_RETRIES}"); do
     # --recv-only обязателен: без него ncat ведёт себя как двунаправленный
     # прокси и, увидев мгновенный EOF на СВОЁМ stdin (из /dev/null), рвёт
     # приём почти сразу (воспроизведено вживую — обрыв на 16-48 КБ вместо
@@ -1216,19 +1225,19 @@ nohup bash -c 'set -o pipefail; tar --create --file=- --sparse${REMOTE_TAR_EXCLU
     # --recv-only проверена вживую на 50 и 100 МБ по несколько раз подряд —
     # каждый раз точный побайтовый результат и мгновенное завершение обеих
     # сторон.
-    if [ "$BACKUP_APPEND" -eq 1 ]; then
-      ncat --recv-only "$REMOTE_HOST" "$RAW_TRANSFER_PORT" >> "$BACKUP_PATH" 2>"$err_tmp" < /dev/null
+    if [[ "${BACKUP_APPEND}" -eq 1 ]]; then
+      ncat --recv-only "${REMOTE_HOST}" "${RAW_TRANSFER_PORT}" >> "${BACKUP_PATH}" 2>"${err_tmp}" < /dev/null
     else
-      ncat --recv-only "$REMOTE_HOST" "$RAW_TRANSFER_PORT" > "$BACKUP_PATH" 2>"$err_tmp" < /dev/null
+      ncat --recv-only "${REMOTE_HOST}" "${RAW_TRANSFER_PORT}" > "${BACKUP_PATH}" 2>"${err_tmp}" < /dev/null
     fi
     _raw_rc=$?
-    _raw_cur_size=$(stat -c%s "$BACKUP_PATH" 2>/dev/null || printf '0')
+    _raw_cur_size=$(stat -c%s "${BACKUP_PATH}" 2>/dev/null || printf '0')
 
-    if [ "$_raw_rc" -eq 0 ]; then
+    if [[ "${_raw_rc}" -eq 0 ]]; then
       RAW_CONNECT_OK=1
       break
     fi
-    if [ "$_raw_cur_size" -gt "$raw_prev_size" ]; then
+    if [[ "${_raw_cur_size}" -gt "${raw_prev_size}" ]]; then
       # Байты уже пошли — листенер (он одноразовый, без -k) больше не
       # существует, повторное подключение невозможно в принципе. Это не
       # повод падать обратно на SSH-передачу (файл уже частично перезаписан
@@ -1236,27 +1245,27 @@ nohup bash -c 'set -o pipefail; tar --create --file=- --sparse${REMOTE_TAR_EXCLU
       RAW_MID_STREAM_FAILURE=1
       RAW_CONNECT_ELAPSED_S=$(( $(date +%s) - RAW_LAUNCH_EPOCH ))
       log_json "WARN" "raw_transfer_mid_stream_failure" "Соединение разорвано в середине передачи — повтор невозможен" \
-        "attempt=${_raw_attempt}, bytes=${_raw_cur_size}, elapsed_since_launch_s=${RAW_CONNECT_ELAPSED_S}, ncat_rc=${_raw_rc}, stderr=$(cat "$err_tmp"), remote_diag=[$(get_remote_failure_diag)]" $_raw_rc
+        "attempt=${_raw_attempt}, bytes=${_raw_cur_size}, elapsed_since_launch_s=${RAW_CONNECT_ELAPSED_S}, ncat_rc=${_raw_rc}, stderr=$(cat "${err_tmp}"), remote_diag=[$(get_remote_failure_diag)]" "${_raw_rc}"
       break
     fi
     log_json "WARN" "raw_transfer_connect_retry" "Повтор подключения к порту передачи" \
-      "attempt=${_raw_attempt}/${RAW_TRANSFER_CONNECT_RETRIES}, ncat_rc=${_raw_rc}" $_raw_rc
+      "attempt=${_raw_attempt}/${RAW_TRANSFER_CONNECT_RETRIES}, ncat_rc=${_raw_rc}" "${_raw_rc}"
     sleep 2
   done
 
-  if [ "$RAW_CONNECT_OK" -eq 1 ]; then
+  if [[ "${RAW_CONNECT_OK}" -eq 1 ]]; then
     # Чистый локальный EOF не доказывает, что tar|${COMP_CMD} на удалённой
     # стороне отработали успешно — nc просто ретранслирует байты до EOF,
     # ему неизвестен exit-код вышестоящих команд пайпа. Забираем реальный
     # статус из файла, который фоновый процесс пишет по завершении пайпа.
     RAW_CONNECT_ELAPSED_S=$(( $(date +%s) - RAW_LAUNCH_EPOCH ))
     raw_status=""
-    for _raw_poll in $(seq 1 "$RAW_TRANSFER_STATUS_POLL_RETRIES"); do
+    for _raw_poll in $(seq 1 "${RAW_TRANSFER_STATUS_POLL_RETRIES}"); do
       raw_status=$(ssh_remote "cat '${REMOTE_STATUS_FILE}' 2>/dev/null")
-      [ -n "$raw_status" ] && break
+      [[ -n "${raw_status}" ]] && break
       sleep 2
     done
-    case "$raw_status" in
+    case "${raw_status}" in
       ''|*[!0-9]*)
         backup_rc=1
         err_out="raw transfer: remote status file missing/unreadable"
@@ -1270,21 +1279,21 @@ nohup bash -c 'set -o pipefail; tar --create --file=- --sparse${REMOTE_TAR_EXCLU
           "bytes=${_raw_cur_size}, elapsed_since_launch_s=${RAW_CONNECT_ELAPSED_S}" 0
         ;;
       *)
-        backup_rc="$raw_status"
+        backup_rc="${raw_status}"
         err_out="remote pipeline failed rc=${raw_status}: $(ssh_remote "cat '${REMOTE_ERR_FILE}' 2>/dev/null")"
         log_json "WARN" "raw_transfer_status_fetch" "Удалённый пайплайн завершился с ошибкой" \
-          "${err_out}, bytes=${_raw_cur_size}, elapsed_since_launch_s=${RAW_CONNECT_ELAPSED_S}, remote_diag=[$(get_remote_failure_diag)]" "$backup_rc"
+          "${err_out}, bytes=${_raw_cur_size}, elapsed_since_launch_s=${RAW_CONNECT_ELAPSED_S}, remote_diag=[$(get_remote_failure_diag)]" "${backup_rc}"
         ;;
     esac
     ssh_remote "rm -f '${REMOTE_STATUS_FILE}' '${REMOTE_ERR_FILE}'" >/dev/null 2>&1
-  elif [ "$RAW_MID_STREAM_FAILURE" -eq 1 ]; then
+  elif [ "${RAW_MID_STREAM_FAILURE}" -eq 1 ]; then
     backup_rc=1
     err_out="raw transfer: connection dropped mid-stream after ${_raw_cur_size} bytes"
     ssh_remote "rm -f '${REMOTE_STATUS_FILE}' '${REMOTE_ERR_FILE}'" >/dev/null 2>&1
   else
     # Листенер так и не стал доступен ни разу за все попытки — в BACKUP_PATH
     # ничего нового не записано, безопасно вернуться к SSH-передаче.
-    err_out=$(cat "$err_tmp")
+    err_out=$(cat "${err_tmp}")
     log_json "WARN" "raw_transfer_connect_exhausted" "Не удалось подключиться к листенеру после ${RAW_TRANSFER_CONNECT_RETRIES} попыток — переход на передачу через SSH" \
       "${err_out}, remote_diag=[$(get_remote_failure_diag)]"
     ssh_remote "rm -f '${REMOTE_STATUS_FILE}' '${REMOTE_ERR_FILE}'" >/dev/null 2>&1
@@ -1292,44 +1301,44 @@ nohup bash -c 'set -o pipefail; tar --create --file=- --sparse${REMOTE_TAR_EXCLU
   fi
 fi
 
-if [ "$USE_RAW_TRANSFER" -eq 0 ]; then
-  [ "$RAW_TRANSFER_ENABLED" -eq 1 ] && log_json "INFO" "raw_transfer_fallback_ssh" "Передача выполняется через SSH-туннель" ""
-  if [ "$BACKUP_APPEND" -eq 1 ]; then
-    ssh_remote "$REMOTE_TAR_CMD" \
-      >> "$BACKUP_PATH" 2>"$err_tmp"
+if [[ "${USE_RAW_TRANSFER}" -eq 0 ]]; then
+  [[ "${RAW_TRANSFER_ENABLED}" -eq 1 ]] && log_json "INFO" "raw_transfer_fallback_ssh" "Передача выполняется через SSH-туннель" ""
+  if [[ "${BACKUP_APPEND}" -eq 1 ]]; then
+    ssh_remote "${REMOTE_TAR_CMD}" \
+      >> "${BACKUP_PATH}" 2>"${err_tmp}"
   else
-    ssh_remote "$REMOTE_TAR_CMD" \
-      > "$BACKUP_PATH" 2>"$err_tmp"
+    ssh_remote "${REMOTE_TAR_CMD}" \
+      > "${BACKUP_PATH}" 2>"${err_tmp}"
   fi
   backup_rc=$?
-  err_out=$(cat "$err_tmp")
+  err_out=$(cat "${err_tmp}")
 fi
-rm -f "$err_tmp"
+rm -f "${err_tmp}"
 ARCHIVE_END_EPOCH=$(date +%s)
 
-kill "$_PROGRESS_PID" 2>/dev/null
-wait "$_PROGRESS_PID" 2>/dev/null
+kill "${_PROGRESS_PID}" 2>/dev/null
+wait "${_PROGRESS_PID}" 2>/dev/null
 
-if [ "$backup_rc" -eq 0 ]; then
+if [[ "${backup_rc}" -eq 0 ]]; then
   archive_duration=$((ARCHIVE_END_EPOCH - ARCHIVE_START_EPOCH))
-  [ "$archive_duration" -lt 1 ] && archive_duration=1
+  [[ "${archive_duration}" -lt 1 ]] && archive_duration=1
 
-  backup_bytes=$(stat -c%s "$BACKUP_PATH" 2>/dev/null || wc -c < "$BACKUP_PATH" 2>/dev/null || printf '0')
-  backup_size=$(du -sh "$BACKUP_PATH" 2>/dev/null | cut -f1)
-  avg_mib_s=$(awk -v b="$backup_bytes" -v d="$archive_duration" 'BEGIN { printf "%.2f", (b/1048576)/d }')
+  backup_bytes=$(stat -c%s "${BACKUP_PATH}" 2>/dev/null || wc -c < "${BACKUP_PATH}" 2>/dev/null || printf '0')
+  backup_size=$(du -sh "${BACKUP_PATH}" 2>/dev/null | cut -f1)
+  avg_mib_s=$(awk -v b="${backup_bytes}" -v d="${archive_duration}" 'BEGIN { printf "%.2f", (b/1048576)/d }')
 
-  progress_samples=$(wc -l < "$PROGRESS_METRICS_FILE" 2>/dev/null || printf '0')
+  progress_samples=$(wc -l < "${PROGRESS_METRICS_FILE}" 2>/dev/null || printf '0')
   window_mib_s="n/a"
-  if [ "$progress_samples" -ge 2 ]; then
-    first_sample=$(head -n1 "$PROGRESS_METRICS_FILE")
-    last_sample=$(tail -n1 "$PROGRESS_METRICS_FILE")
-    first_ts=$(printf '%s' "$first_sample" | awk -F '\t' '{print $1}')
-    first_bytes=$(printf '%s' "$first_sample" | awk -F '\t' '{print $2}')
-    last_ts=$(printf '%s' "$last_sample" | awk -F '\t' '{print $1}')
-    last_bytes=$(printf '%s' "$last_sample" | awk -F '\t' '{print $2}')
+  if [[ "${progress_samples}" -ge 2 ]]; then
+    first_sample=$(head -n1 "${PROGRESS_METRICS_FILE}")
+    last_sample=$(tail -n1 "${PROGRESS_METRICS_FILE}")
+    first_ts=$(printf '%s' "${first_sample}" | awk -F '\t' '{print $1}')
+    first_bytes=$(printf '%s' "${first_sample}" | awk -F '\t' '{print $2}')
+    last_ts=$(printf '%s' "${last_sample}" | awk -F '\t' '{print $1}')
+    last_bytes=$(printf '%s' "${last_sample}" | awk -F '\t' '{print $2}')
     window_dt=$((last_ts - first_ts))
-    if [ "$window_dt" -gt 0 ]; then
-      window_mib_s=$(awk -v b1="$first_bytes" -v b2="$last_bytes" -v d="$window_dt" 'BEGIN { printf "%.2f", ((b2-b1)/1048576)/d }')
+    if [[ "${window_dt}" -gt 0 ]]; then
+      window_mib_s=$(awk -v b1="${first_bytes}" -v b2="${last_bytes}" -v d="${window_dt}" 'BEGIN { printf "%.2f", ((b2-b1)/1048576)/d }')
     fi
   fi
 
@@ -1337,29 +1346,29 @@ if [ "$backup_rc" -eq 0 ]; then
   # который заполняется в _progress_monitor раз в ~5 минут) — фактические
   # данные для probable_cause ниже, вместо угадывания по одной лишь
   # средней скорости.
-  diag_samples=$(wc -l < "$DIAG_METRICS_FILE" 2>/dev/null || printf '0')
+  diag_samples=$(wc -l < "${DIAG_METRICS_FILE}" 2>/dev/null || printf '0')
   avg_remote_load1="n/a"; avg_local_load1="n/a"; avg_rtt_ms="n/a"; avg_io_util_pct="n/a"
-  if [ "$diag_samples" -ge 1 ]; then
-    avg_remote_load1=$(awk -F'\t' '$2!=""{s+=$2; c++} END{if (c>0) printf "%.2f", s/c; else print "n/a"}' "$DIAG_METRICS_FILE")
-    avg_local_load1=$(awk -F'\t' '$3!=""{s+=$3; c++} END{if (c>0) printf "%.2f", s/c; else print "n/a"}' "$DIAG_METRICS_FILE")
-    avg_rtt_ms=$(awk -F'\t' '$4!=""{s+=$4; c++} END{if (c>0) printf "%.2f", s/c; else print "n/a"}' "$DIAG_METRICS_FILE")
-    avg_io_util_pct=$(awk -F'\t' '$5!=""{s+=$5; c++} END{if (c>0) printf "%.1f", s/c; else print "n/a"}' "$DIAG_METRICS_FILE")
+  if [[ "${diag_samples}" -ge 1 ]]; then
+    avg_remote_load1=$(awk -F'\t' '$2!=""{s+=$2; c++} END{if (c>0) printf "%.2f", s/c; else print "n/a"}' "${DIAG_METRICS_FILE}")
+    avg_local_load1=$(awk -F'\t' '$3!=""{s+=$3; c++} END{if (c>0) printf "%.2f", s/c; else print "n/a"}' "${DIAG_METRICS_FILE}")
+    avg_rtt_ms=$(awk -F'\t' '$4!=""{s+=$4; c++} END{if (c>0) printf "%.2f", s/c; else print "n/a"}' "${DIAG_METRICS_FILE}")
+    avg_io_util_pct=$(awk -F'\t' '$5!=""{s+=$5; c++} END{if (c>0) printf "%.1f", s/c; else print "n/a"}' "${DIAG_METRICS_FILE}")
   fi
 
   metrics_detail="file=${BACKUP_PATH}, size=${backup_size}, bytes=${backup_bytes}, duration_s=${archive_duration}, avg_mib_s=${avg_mib_s}, window_mib_s=${window_mib_s}, progress_samples=${progress_samples}, comp=${REMOTE_COMP:-gzip}, append=${BACKUP_APPEND}, local_nproc=${LOCAL_NPROC}, remote_nproc=${REMOTE_NPROC}, avg_local_load1=${avg_local_load1}, avg_remote_load1=${avg_remote_load1}, avg_rtt_ms=${avg_rtt_ms}, rtt_baseline_ms=${RTT_BASELINE_MS}, io_device=${IO_DEVICE:-n/a}, avg_io_util_pct=${avg_io_util_pct}"
-  log_json "INFO" "backup_metrics" "Метрики этапа архивирования" "$metrics_detail" 0
+  log_json "INFO" "backup_metrics" "Метрики этапа архивирования" "${metrics_detail}" 0
 
-  if awk -v s="$avg_mib_s" -v t="$BACKUP_DEGRADATION_MIBS_THRESHOLD" 'BEGIN { exit !(s < t) }'; then
+  if awk -v s="${avg_mib_s}" -v t="${BACKUP_DEGRADATION_MIBS_THRESHOLD}" 'BEGIN { exit !(s < t) }'; then
     probable_cause="unknown"
-    if [ "$progress_samples" -lt 2 ]; then
+    if [[ "${progress_samples}" -lt 2 ]]; then
       probable_cause="insufficient_progress_samples"
-    elif [ "$avg_remote_load1" != "n/a" ] && awk -v l="$avg_remote_load1" -v n="$REMOTE_NPROC" 'BEGIN { exit !(l >= n) }'; then
+    elif [[ "${avg_remote_load1}" != "n/a" ]] && awk -v l="${avg_remote_load1}" -v n="${REMOTE_NPROC}" 'BEGIN { exit !(l >= n) }'; then
       probable_cause="remote_cpu_contention"
-    elif [ "$avg_local_load1" != "n/a" ] && awk -v l="$avg_local_load1" -v n="$LOCAL_NPROC" 'BEGIN { exit !(l >= n) }'; then
+    elif [[ "${avg_local_load1}" != "n/a" ]] && awk -v l="${avg_local_load1}" -v n="${LOCAL_NPROC}" 'BEGIN { exit !(l >= n) }'; then
       probable_cause="local_cpu_or_io_contention"
-    elif [ "$avg_rtt_ms" != "n/a" ] && [ "$RTT_BASELINE_MS" != "n/a" ] && awk -v r="$avg_rtt_ms" -v b="$RTT_BASELINE_MS" 'BEGIN { exit !(r > b * 1.5) }'; then
+    elif [[ "${avg_rtt_ms}" != "n/a" && "${RTT_BASELINE_MS}" != "n/a" ]] && awk -v r="${avg_rtt_ms}" -v b="${RTT_BASELINE_MS}" 'BEGIN { exit !(r > b * 1.5) }'; then
       probable_cause="network_latency_increase"
-    elif [ "${REMOTE_COMP:-gzip}" = "zstd" ]; then
+    elif [[ "${REMOTE_COMP:-gzip}" = "zstd" ]]; then
       probable_cause="network_or_remote_io_or_zstd_cpu"
     else
       probable_cause="network_or_remote_io"
@@ -1368,25 +1377,25 @@ if [ "$backup_rc" -eq 0 ]; then
       "threshold_mib_s=${BACKUP_DEGRADATION_MIBS_THRESHOLD}, probable_cause=${probable_cause}, ${metrics_detail}" 0
   fi
 
-  backup_size=$(du -sh "$BACKUP_PATH" 2>/dev/null | cut -f1)
+  backup_size=$(du -sh "${BACKUP_PATH}" 2>/dev/null | cut -f1)
   log_json "INFO" "backup_done" "Резервная копия создана успешно" \
-    "file=${BACKUP_PATH}, size=${backup_size}" "$backup_rc"
+    "file=${BACKUP_PATH}, size=${backup_size}" "${backup_rc}"
   echo "Готово: ${BACKUP_PATH} (${backup_size})"
 
   # Очистка старых бэкапов, оставляем только 5 последних
   # shellcheck disable=SC2012
   old_backups=$(ls -1t "${BACKUP_DIR}/${SCRIPT_BASE}-"*.tar.* 2>/dev/null | tail -n +6)
-  if [ -n "$old_backups" ]; then
+  if [[ -n "${old_backups}" ]]; then
     log_json "INFO" "backup_cleanup" "Удаление старых резервных копий (оставляем 5)"
-    echo "$old_backups" | tr '\n' '\0' | xargs -0 -r rm -f
+    echo "${old_backups}" | tr '\n' '\0' | xargs -0 -r rm -f
   fi
 else
-  log_json "ERROR" "backup_failed" "Ошибка при создании резервной копии" "$err_out" "$backup_rc"
-  echo "Ошибка резервного копирования (код $backup_rc): $err_out" >&2
-  rm -f "$BACKUP_PATH" 2>/dev/null
-  exit "$backup_rc"
+  log_json "ERROR" "backup_failed" "Ошибка при создании резервной копии" "${err_out}" "${backup_rc}"
+  echo "Ошибка резервного копирования (код ${backup_rc}): ${err_out}" >&2
+  rm -f "${BACKUP_PATH}" 2>/dev/null
+  exit "${backup_rc}"
 fi
 
-rm -f "$PROGRESS_METRICS_FILE" "$DIAG_METRICS_FILE" 2>/dev/null
+rm -f "${PROGRESS_METRICS_FILE}" "${DIAG_METRICS_FILE}" 2>/dev/null
 
 exit 0

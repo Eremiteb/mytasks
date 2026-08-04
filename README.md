@@ -744,10 +744,18 @@ git clone --depth 1 https://github.com/bats-core/bats-core.git /tmp/bats-core
 - Workflow: `.github/workflows/bats-tests.yml`
 - Запускается автоматически на `push` и `pull_request`
 
-## Статический анализ (ShellCheck)
+## Статический анализ и проверки стиля
 
-Для всех shell-скриптов, описанных в данном README, настроен статический анализ кода (линтер) с помощью `ShellCheck`.
+Все shell- и Python-скрипты в корне репозитория проходят автоматическую проверку при каждом `push` и `pull_request`.
 
-**GitHub CI:**
-- Workflow: `.github/workflows/shellcheck.yml`
-- Запускается автоматически на `push` и `pull_request` при изменении файлов `*.sh`
+**GitHub CI:** `.github/workflows/shellcheck.yml`
+
+| Шаг | Что проверяется |
+|---|---|
+| ShellCheck error | Ошибки и предупреждения уровня `error` (блокируют merge) |
+| ShellCheck style | Предупреждения уровня `style` (предпочтительный `[[ ]]`, braces, `case *)`…) |
+| bash/sh syntax | `bash -n` или `sh -n` по shebang для каждого `.sh` |
+| Unbraced variable scan | grep-сканнер небракетированных `$VAR` в локальном bash-коде (не в remote-shell строках) |
+| Python syntax | `python3 -m py_compile` для каждого `.py` в корне |
+
+Workflow запускается при изменении `*.sh` или `*.py`.

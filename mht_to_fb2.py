@@ -92,6 +92,7 @@ class TitleParser(HTMLParser):
         self.data = []
 
     def handle_starttag(self, tag, attrs):
+        _ = attrs
         if tag.lower() == "title":
             self.in_title = True
 
@@ -99,9 +100,9 @@ class TitleParser(HTMLParser):
         if tag.lower() == "title":
             self.in_title = False
 
-    def handle_data(self, d):
+    def handle_data(self, data):
         if self.in_title:
-            self.data.append(d)
+            self.data.append(data)
 
     def get(self):
         t = " ".join("".join(self.data).split())

@@ -1,22 +1,67 @@
-name: ShellCheck
+name: Shell & Python checks
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: ["main", "master"]
     paths:
-      - '**.sh'
+      - "**.sh"
+      - "**.py"
   pull_request:
-    branches: [ "main", "master" ]
+    branches: ["main", "master"]
     paths:
-      - '**.sh'
+      - "**.sh"
+      - "**.py"
 
 jobs:
   shellcheck:
-    name: Shellcheck
+    name: ShellCheck (error + style)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Install ShellCheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
-      - name: Run ShellCheck
+
+      - name: ShellCheck error level
         run: shellcheck -S error ./*.sh
+
+      - name: ShellCheck style level
+        run: shellcheck -S style ./*.sh
+
+      - name: Bash/sh syntax
+        run: |
+          for f in ./*.sh; do
+            if head -1 "$f" | grep -qi bash; then
+              bash -n "$f" || { echo "SYNTAX FAIL: $f"; exit 1; }
+            else
+              sh -n "$f"   || { echo "SYNTAX FAIL: $f"; exit 1; }
+            fi
+          done
+
+      - name: Unbraced variable scan
+        run: |
+          fail=0
+          for f in ./*.sh; do
+            out=$(grep -nP '(?<!")\$(?!\{)[A-Za-z_][A-Za-z0-9_]*' "$f" \
+              | grep -v '^\s*#' \
+              | grep -v "\\\\'" \
+              | grep -v 'sh -lc\|bash -c\|MARIADB_ROOT\|REDIS_WAIT\|PURGE_BINLOGS\|TRUNCATE\|in_progress' \
+              || true)
+            if [ -n "$out" ]; then
+              echo "=== $f ===" && echo "$out"
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] || exit 1
+
+  python-check:
+    name: Python syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python syntax check
+        run: |
+          for f in ./*.py; do
+            python3 -m py_compile "$f" || { echo "SYNTAX FAIL: $f"; exit 1; }
+          done

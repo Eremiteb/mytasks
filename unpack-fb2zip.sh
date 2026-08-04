@@ -13,11 +13,11 @@ SCRIPT_BASE="${SCRIPT_NAME%.*}"
 SCRIPT_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${SCRIPT_DIR}/logs"
 LOG_TEMPLATE_FILE="${SCRIPT_DIR}/conf/log_template.conf"
-mkdir -p "$LOG_DIR"
+mkdir -p "${LOG_DIR}"
 
-if [[ -r "$LOG_TEMPLATE_FILE" ]]; then
+if [[ -r "${LOG_TEMPLATE_FILE}" ]]; then
   # shellcheck source=/dev/null
-  source "$LOG_TEMPLATE_FILE"
+  source "${LOG_TEMPLATE_FILE}"
 fi
 LOG_SCHEMA_VERSION="${LOG_SCHEMA_VERSION:-1.0}"
 LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
@@ -36,23 +36,24 @@ json_escape() {
   s=${s//$'\n'/\\n}
   s=${s//$'\r'/\\r}
   s=${s//$'\t'/\\t}
-  printf '%s' "$s"
+  printf '%s' "${s}"
 }
 
 log_json() {
   # level event msg src dst rc extra_json
   local level="${1-}" event="${2-}" msg="${3-}" src="${4-}" dst="${5-}" rc="${6-}" extra="${7-}"
   local t; t="$(ts_now)"
-  local level_norm; level_norm="$(printf '%s' "$level" | tr '[:upper:]' '[:lower:]')"
-  local j="{\"@timestamp\":\"$(json_escape "$t")\",\"schema.version\":\"$(json_escape "$LOG_SCHEMA_VERSION")\",\"compat.targets\":\"$(json_escape "$LOG_COMPAT_TARGETS")\",\"log.level\":\"$(json_escape "$level_norm")\",\"event.action\":\"$(json_escape "$event")\",\"service.name\":\"$(json_escape "$SCRIPT_BASE")\",\"script\":\"$(json_escape "$SCRIPT_NAME")\",\"event\":\"$(json_escape "$event")\",\"level\":\"$(json_escape "$level_norm")\""
-  [ -n "$msg" ] && j+=",\"msg\":\"$(json_escape "$msg")\""
-  [ -n "$msg" ] && j+=",\"message\":\"$(json_escape "$msg")\""
-  [ -n "$src" ] && j+=",\"src\":\"$(json_escape "$src")\""
-  [ -n "$dst" ] && j+=",\"dst\":\"$(json_escape "$dst")\""
-  j+=",\"rc\":$rc"
-  [ -n "$extra" ] && j+=",$extra"
+  local level_norm; level_norm="$(printf '%s' "${level}" | tr '[:upper:]' '[:lower:]')"
+  local j
+  j="{\"@timestamp\":\"$(json_escape "${t}")\",\"schema.version\":\"$(json_escape "${LOG_SCHEMA_VERSION}")\",\"compat.targets\":\"$(json_escape "${LOG_COMPAT_TARGETS}")\",\"log.level\":\"$(json_escape "${level_norm}")\",\"event.action\":\"$(json_escape "${event}")\",\"service.name\":\"$(json_escape "${SCRIPT_BASE}")\",\"script\":\"$(json_escape "${SCRIPT_NAME}")\",\"event\":\"$(json_escape "${event}")\",\"level\":\"$(json_escape "${level_norm}")\""
+  [ -n "${msg}" ] && j+=",\"msg\":\"$(json_escape "${msg}")\""
+  [ -n "${msg}" ] && j+=",\"message\":\"$(json_escape "${msg}")\""
+  [ -n "${src}" ] && j+=",\"src\":\"$(json_escape "${src}")\""
+  [ -n "${dst}" ] && j+=",\"dst\":\"$(json_escape "${dst}")\""
+  j+=",\"rc\":${rc}"
+  [ -n "${extra}" ] && j+=",${extra}"
   j+="}"
-  printf '%s\n' "$j" >>"$LOG_FILE"
+  printf '%s\n' "${j}" >>"${LOG_FILE}"
 }
 
 usage() {
@@ -78,9 +79,13 @@ EOF
 
 cleanup_logs() {
   local old_logs
-  old_logs=$(ls -1t "${LOG_DIR}/${SCRIPT_BASE}_"*.jsonl 2>/dev/null | tail -n +11 || true)
-  if [[ -n "${old_logs:-}" ]]; then
-    rm -f $old_logs
+  mapfile -t old_logs < <(
+    find "${LOG_DIR}" -maxdepth 1 -type f -name "${SCRIPT_BASE}_*.jsonl" -printf '%T@|%p\n' 2>/dev/null \
+      | sort -nr \
+      | awk -F'|' 'NR > 10 { print $2 }'
+  )
+  if ((${#old_logs[@]} > 0)); then
+    rm -f -- "${old_logs[@]}"
   fi
 }
 
@@ -95,19 +100,19 @@ unique_path() {
   # $1 = dir, $2 = filename
   local dir="$1" name="$2"
   local base ext cand n
-  base="$name"
+  base="${name}"
   ext=""
-  if [[ "$name" == *.* ]]; then
+  if [[ "${name}" == *.* ]]; then
     ext=".${name##*.}"
     base="${name%.*}"
   fi
-  cand="$dir/$name"
+  cand="${dir}/${name}"
   n=1
-  while [ -e "$cand" ]; do
-    cand="$dir/${base}_$n$ext"
+  while [ -e "${cand}" ]; do
+    cand="${dir}/${base}_${n}${ext}"
     n=$((n+1))
   done
-  printf '%s' "$cand"
+  printf '%s' "${cand}"
 }
 
 # --- args ---
@@ -122,7 +127,7 @@ while [ $# -gt 0 ]; do
 done
 
 [ -z "${ROOT_DIR}" ] && { echo "Ошибка: укажите -p DIR" >&2; usage; exit 2; }
-[ -d "$ROOT_DIR" ] || { echo "Ошибка: нет такой папки: $ROOT_DIR" >&2; exit 2; }
+[ -d "${ROOT_DIR}" ] || { echo "Ошибка: нет такой папки: ${ROOT_DIR}" >&2; exit 2; }
 
 if [ -z "${LOG_FILE}" ]; then
   LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}_$(date '+%Y-%m-%d').jsonl"
@@ -131,51 +136,51 @@ fi
 need_cmd find
 need_cmd unzip
 
-log_json "info" "start" "Начало обработки" "$ROOT_DIR" "" 0 "\"dry_run\":$DRY_RUN"
+log_json "info" "start" "Начало обработки" "${ROOT_DIR}" "" 0 "\"dry_run\":${DRY_RUN}"
 
 # --- main ---
 # Ищем именно *.fb2.zip
-find "$ROOT_DIR" -type f -name '*.fb2.zip' -print0 2>/dev/null | \
+find "${ROOT_DIR}" -type f -name '*.fb2.zip' -print0 2>/dev/null | \
 while IFS= read -r -d '' zipfile; do
-  dir="$(dirname -- "$zipfile")"
+  dir="$(dirname -- "${zipfile}")"
 
   # Список .fb2 внутри архива
-  if ! entries="$(unzip -Z1 -- "$zipfile" 2>/dev/null | awk 'tolower($0) ~ /\.fb2$/ {print}')" ; then
-    log_json "error" "zip_list_failed" "Не удалось прочитать список файлов в архиве" "$zipfile" "" 1 ""
+  if ! entries="$(unzip -Z1 -- "${zipfile}" 2>/dev/null | awk 'tolower($0) ~ /\.fb2$/ {print}')" ; then
+    log_json "error" "zip_list_failed" "Не удалось прочитать список файлов в архиве" "${zipfile}" "" 1 ""
     continue
   fi
 
-  if [ -z "$entries" ]; then
-    log_json "info" "no_fb2_inside" "В архиве нет .fb2" "$zipfile" "" 0 ""
+  if [ -z "${entries}" ]; then
+    log_json "info" "no_fb2_inside" "В архиве нет .fb2" "${zipfile}" "" 0 ""
     continue
   fi
 
   # Извлекаем каждую .fb2 “рядом” (basename), избегая конфликтов имён
   while IFS= read -r entry; do
-    [ -z "$entry" ] && continue
-    out_name="$(basename -- "$entry")"
-    out_path="$(unique_path "$dir" "$out_name")"
+    [ -z "${entry}" ] && continue
+    out_name="$(basename -- "${entry}")"
+    out_path="$(unique_path "${dir}" "${out_name}")"
 
-    if [ "$DRY_RUN" -eq 1 ]; then
-      log_json "info" "would_extract" "DRY-RUN: извлёк бы файл" "$zipfile" "$out_path" 0 "\"entry\":\"$(json_escape "$entry")\""
+    if [ "${DRY_RUN}" -eq 1 ]; then
+      log_json "info" "would_extract" "DRY-RUN: извлёк бы файл" "${zipfile}" "${out_path}" 0 "\"entry\":\"$(json_escape "${entry}")\""
       continue
     fi
 
     # unzip -p: печатает файл на stdout; пишем в итоговый файл
-    if unzip -p -- "$zipfile" "$entry" >"$out_path" 2>/dev/null; then
-      log_json "info" "extracted" "Файл извлечён" "$zipfile" "$out_path" 0 "\"entry\":\"$(json_escape "$entry")\""
+    if unzip -p -- "${zipfile}" "${entry}" >"${out_path}" 2>/dev/null; then
+      log_json "info" "extracted" "Файл извлечён" "${zipfile}" "${out_path}" 0 "\"entry\":\"$(json_escape "${entry}")\""
     else
       rc=$?
       # на случай частично созданного файла
-      [ -f "$out_path" ] && rm -f -- "$out_path"
-      log_json "error" "extract_failed" "Ошибка извлечения" "$zipfile" "$out_path" "$rc" "\"entry\":\"$(json_escape "$entry")\""
+      [ -f "${out_path}" ] && rm -f -- "${out_path}"
+      log_json "error" "extract_failed" "Ошибка извлечения" "${zipfile}" "${out_path}" "${rc}" "\"entry\":\"$(json_escape "${entry}")\""
     fi
-  done <<<"$entries"
+  done <<<"${entries}"
 
 done
 
-log_json "info" "finish" "Готово" "$ROOT_DIR" "" 0 "\"log\":\"$(json_escape "$LOG_FILE")\""
+log_json "info" "finish" "Готово" "${ROOT_DIR}" "" 0 "\"log\":\"$(json_escape "${LOG_FILE}")\""
 
-echo "OK. Лог: $LOG_FILE"
+echo "OK. Лог: ${LOG_FILE}"
 cleanup_logs
 exit 0

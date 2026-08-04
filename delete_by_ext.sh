@@ -7,17 +7,17 @@ set -eu
 ###############################################################################
 SCRIPT_NAME=$(basename -- "$0")
 SCRIPT_BASE=${SCRIPT_NAME%.*}
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P)
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P)
 
 LOG_DIR="${SCRIPT_DIR}/logs"
 TIMESTAMP="$(date '+%Y-%m-%d-%H-%M-%S')"
 LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}-${TIMESTAMP}.jsonl"
 LOG_TEMPLATE_FILE="${SCRIPT_DIR}/conf/log_template.conf"
-mkdir -p "$LOG_DIR"
+mkdir -p "${LOG_DIR}"
 
-if [ -r "$LOG_TEMPLATE_FILE" ]; then
+if [ -r "${LOG_TEMPLATE_FILE}" ]; then
   # shellcheck source=/dev/null
-  . "$LOG_TEMPLATE_FILE"
+  . "${LOG_TEMPLATE_FILE}"
 fi
 LOG_SCHEMA_VERSION="${LOG_SCHEMA_VERSION:-1.0}"
 LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
@@ -32,10 +32,12 @@ json_escape() {
 }
 
 cleanup_logs() {
-  old_logs=$(ls -1t "${LOG_DIR}/${SCRIPT_BASE}-"*.jsonl 2>/dev/null | tail -n +11 || true)
-  if [ -n "${old_logs:-}" ]; then
-    rm -f $old_logs
-  fi
+  find "${LOG_DIR}" -maxdepth 1 -type f -name "${SCRIPT_BASE}-*.jsonl" -printf '%T@|%p\n' 2>/dev/null \
+    | sort -nr \
+    | awk -F'|' 'NR > 10 { print $2 }' \
+    | while IFS= read -r old_log; do
+        [ -n "${old_log}" ] && rm -f -- "${old_log}"
+      done
 }
 
 log_json() {
@@ -44,20 +46,20 @@ log_json() {
   msg="$3"
   detail="${4:-}"
   rc="${5:-null}"
-  dry_run_json="$( [ "$DRY_RUN" -eq 1 ] && echo true || echo false )"
-  level_norm="$(printf '%s' "$level" | tr '[:upper:]' '[:lower:]')"
+  dry_run_json="$( [ "${DRY_RUN}" -eq 1 ] && echo true || echo false )"
+  level_norm="$(printf '%s' "${level}" | tr '[:upper:]' '[:lower:]')"
 
-  msg_esc="$(json_escape "$msg")"
-  detail_esc="$(json_escape "$detail")"
+  msg_esc="$(json_escape "${msg}")"
+  detail_esc="$(json_escape "${detail}")"
 
   printf '{"@timestamp":"%s","schema.version":"%s","compat.targets":"%s","log.level":"%s","message":"%s","event.action":"%s","service.name":"%s","script":"%s","event":"%s","level":"%s","dry_run":%s,"msg":"%s","detail":"%s","rc":%s}\n' \
-    "$(ts)" "$LOG_SCHEMA_VERSION" "$LOG_COMPAT_TARGETS" "$level_norm" "$msg_esc" "$event" "$SCRIPT_BASE" "$SCRIPT_NAME" "$event" "$level_norm" "$dry_run_json" "$msg_esc" "$detail_esc" "$rc" >> "$LOG_FILE"
+    "$(ts)" "${LOG_SCHEMA_VERSION}" "${LOG_COMPAT_TARGETS}" "${level_norm}" "${msg_esc}" "${event}" "${SCRIPT_BASE}" "${SCRIPT_NAME}" "${event}" "${level_norm}" "${dry_run_json}" "${msg_esc}" "${detail_esc}" "${rc}" >> "${LOG_FILE}"
 }
 
 usage() {
   cat <<EOF
 Использование:
-  $SCRIPT_NAME -d DIR -e EXT [--dry-run]
+  ${SCRIPT_NAME} -d DIR -e EXT [--dry-run]
 
 Опции:
   -d DIR       каталог для обработки
@@ -66,8 +68,8 @@ usage() {
   -h, --help   справка
 
 Примеры:
-  $SCRIPT_NAME -d /tmp -e log --dry-run
-  $SCRIPT_NAME -d ./downloads -e tmp
+  ${SCRIPT_NAME} -d /tmp -e log --dry-run
+  ${SCRIPT_NAME} -d ./downloads -e tmp
 EOF
 }
 
@@ -106,18 +108,18 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-if [ -z "$TARGET_DIR" ] || [ -z "$EXTENSION" ]; then
+if [ -z "${TARGET_DIR}" ] || [ -z "${EXTENSION}" ]; then
   usage >&2
   exit 1
 fi
 
-if [ ! -d "$TARGET_DIR" ]; then
-  echo "Каталог не найден: $TARGET_DIR" >&2
+if [ ! -d "${TARGET_DIR}" ]; then
+  echo "Каталог не найден: ${TARGET_DIR}" >&2
   exit 2
 fi
 
 EXTENSION=${EXTENSION#.}
-if [ -z "$EXTENSION" ]; then
+if [ -z "${EXTENSION}" ]; then
   echo "Ошибка: расширение не может быть пустым" >&2
   exit 2
 fi
@@ -132,32 +134,32 @@ ERROR_COUNT=0
 MATCHED_COUNT=0
 
 LIST_FILE=$(mktemp)
-trap 'rm -f -- "$LIST_FILE"' EXIT INT TERM
+trap 'rm -f -- "${LIST_FILE}"' EXIT INT TERM
 
-find "$TARGET_DIR" -type f -name "*.${EXTENSION}" -print > "$LIST_FILE"
+find "${TARGET_DIR}" -type f -name "*.${EXTENSION}" -print > "${LIST_FILE}"
 
 while IFS= read -r file; do
-  [ -z "$file" ] && continue
+  [ -z "${file}" ] && continue
   MATCHED_COUNT=$((MATCHED_COUNT + 1))
 
-  if [ "$DRY_RUN" -eq 1 ]; then
-    echo "[DRY-RUN] $file"
-    log_json "INFO" "would_delete" "Найден файл для удаления" "$file" 0
+  if [ "${DRY_RUN}" -eq 1 ]; then
+    echo "[DRY-RUN] ${file}"
+    log_json "INFO" "would_delete" "Найден файл для удаления" "${file}" 0
     continue
   fi
 
-  if rm -f -- "$file"; then
+  if rm -f -- "${file}"; then
     DELETED_COUNT=$((DELETED_COUNT + 1))
-    echo "[DELETED] $file"
-    log_json "INFO" "deleted" "Файл удален" "$file" 0
+    echo "[DELETED] ${file}"
+    log_json "INFO" "deleted" "Файл удален" "${file}" 0
   else
     ERROR_COUNT=$((ERROR_COUNT + 1))
-    echo "[ERROR]   $file"
-    log_json "ERROR" "delete_failed" "Не удалось удалить файл" "$file" 1
+    echo "[ERROR]   ${file}"
+    log_json "ERROR" "delete_failed" "Не удалось удалить файл" "${file}" 1
   fi
-done < "$LIST_FILE"
+done < "${LIST_FILE}"
 
-if [ "$ERROR_COUNT" -gt 0 ]; then
+if [ "${ERROR_COUNT}" -gt 0 ]; then
   log_json "ERROR" "done" "Завершено с ошибками" "matched=${MATCHED_COUNT}; deleted=${DELETED_COUNT}; errors=${ERROR_COUNT}" 1
   cleanup_logs
   exit 1

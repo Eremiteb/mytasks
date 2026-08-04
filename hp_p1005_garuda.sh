@@ -20,14 +20,14 @@ set -euo pipefail
 ###############################################################################
 # SCRIPT ID / PATHS
 ###############################################################################
-SCRIPT_NAME="$(basename -- "$0")"
+SCRIPT_NAME="$(basename -- "${0}")"
 SCRIPT_BASE="${SCRIPT_NAME%.*}"
 SCRIPT_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 LOG_TEMPLATE_FILE="${SCRIPT_DIR}/conf/log_template.conf"
 
-if [[ -r "$LOG_TEMPLATE_FILE" ]]; then
+if [[ -r "${LOG_TEMPLATE_FILE}" ]]; then
   # shellcheck source=/dev/null
-  source "$LOG_TEMPLATE_FILE"
+  source "${LOG_TEMPLATE_FILE}"
 fi
 LOG_SCHEMA_VERSION="${LOG_SCHEMA_VERSION:-1.0}"
 LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
@@ -42,18 +42,18 @@ LOG_FD=3
 # -------------------------
 
 json_escape() {
-  local s="$1"
-  s=${s//\\/\\\\}
-  s=${s//\"/\\\"}
-  s=${s//$'\n'/\\n}
-  s=${s//$'\r'/\\r}
-  s=${s//$'\t'/\\t}
-  printf '%s' "$s"
+  local s="${1}"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "${s}"
 }
 
 log_open() {
-  exec {LOG_FD}>>"$LOG_FILE"
-  log_write info log_open "logging started" "path==$LOG_FILE"
+  exec {LOG_FD}>>"${LOG_FILE}"
+  log_write info log_open "logging started" "path==${LOG_FILE}"
 }
 
 log_close() {
@@ -62,59 +62,87 @@ log_close() {
 }
 
 log_write() {
-  local level="$1"
-  local event="$2"
-  local msg="$3"
+  local level="${1}"
+  local event="${2}"
+  local msg="${3}"
   shift 3 || true
 
   local extras=""
   while (($#)); do
-    case "$1" in
+    case "${1}" in
       *=*)
-        local k="${1%%=*}"
-        local v="${1#*=}"
-        extras+=",\"$(json_escape "$k")\":\"$(json_escape "$v")\""
+        local k
+        local v
+        local k_esc
+        local v_esc
+        k="${1%%=*}"
+        v="${1#*=}"
+        k_esc="$(json_escape "${k}")"
+        v_esc="$(json_escape "${v}")"
+        extras+=",\"${k_esc}\":\"${v_esc}\""
+        ;;
+      *)
         ;;
     esac
     shift
   done
 
   local level_norm
-  level_norm="$(printf '%s' "$level" | tr '[:upper:]' '[:lower:]')"
+  local ts_iso
+  local schema_esc
+  local compat_esc
+  local level_norm_esc
+  local msg_esc
+  local event_esc
+  local script_base_esc
+  local hostname_esc
+  local script_name_esc
+
+  level_norm="$(printf '%s' "${level}" | tr '[:upper:]' '[:lower:]')"
+  ts_iso="$(date -Iseconds)"
+  schema_esc="$(json_escape "${LOG_SCHEMA_VERSION}")"
+  compat_esc="$(json_escape "${LOG_COMPAT_TARGETS}")"
+  level_norm_esc="$(json_escape "${level_norm}")"
+  msg_esc="$(json_escape "${msg}")"
+  event_esc="$(json_escape "${event}")"
+  script_base_esc="$(json_escape "${SCRIPT_BASE}")"
+  hostname_esc="$(json_escape "${HOSTNAME_SHORT}")"
+  script_name_esc="$(json_escape "${SCRIPT_NAME}")"
+
   printf '{"@timestamp":"%s","schema.version":"%s","compat.targets":"%s","log.level":"%s","message":"%s","event.action":"%s","service.name":"%s","host.name":"%s","script":"%s","event":"%s","level":"%s","msg":"%s"%s}\n' \
-    "$(date -Iseconds)" \
-    "$(json_escape "$LOG_SCHEMA_VERSION")" \
-    "$(json_escape "$LOG_COMPAT_TARGETS")" \
-    "$(json_escape "$level_norm")" \
-    "$(json_escape "$msg")" \
-    "$(json_escape "$event")" \
-    "$(json_escape "$SCRIPT_BASE")" \
-    "$(json_escape "$HOSTNAME_SHORT")" \
-    "$(json_escape "$SCRIPT_NAME")" \
-    "$(json_escape "$event")" \
-    "$(json_escape "$level_norm")" \
-    "$(json_escape "$msg")" \
-    "$extras" >&$LOG_FD
+    "${ts_iso}" \
+    "${schema_esc}" \
+    "${compat_esc}" \
+    "${level_norm_esc}" \
+    "${msg_esc}" \
+    "${event_esc}" \
+    "${script_base_esc}" \
+    "${hostname_esc}" \
+    "${script_name_esc}" \
+    "${event_esc}" \
+    "${level_norm_esc}" \
+    "${msg_esc}" \
+    "${extras}" >&"${LOG_FD}"
 }
 
 die() {
   echo "ERROR: $*" >&2
-  log_write error fatal "$*"
+  log_write error fatal "${*}"
   exit 1
 }
 
 info() {
-  echo "==> $*"
-  log_write info info "$*"
+  echo "==> ${*}"
+  log_write info info "${*}"
 }
 
 warn() {
-  echo "WARN: $*" >&2
-  log_write warn warn "$*"
+  echo "WARN: ${*}" >&2
+  log_write warn warn "${*}"
 }
 
 need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || die "Command not found: $1"
+  command -v "${1}" >/dev/null 2>&1 || die "Command not found: ${1}"
 }
 
 # -------------------------
@@ -125,11 +153,11 @@ check_pkgs() {
   info "Checking required packages"
   local missing=()
   for p in cups hplip hplip-plugin system-config-printer; do
-    if pacman -Q "$p" >/dev/null 2>&1; then
-      log_write info pkg_ok "$p" pkg="$p"
+    if pacman -Q "${p}" >/dev/null 2>&1; then
+      log_write info pkg_ok "${p}" pkg="${p}"
     else
-      log_write warn pkg_missing "$p" pkg="$p"
-      missing+=("$p")
+      log_write warn pkg_missing "${p}" pkg="${p}"
+      missing+=("${p}")
     fi
   done
   if ((${#missing[@]})); then
@@ -141,8 +169,8 @@ check_usb() {
   info "Checking USB device"
   local line
   line="$(lsusb | grep -iE '03f0:3d17|LaserJet P1005' || true)"
-  if [[ -n "$line" ]]; then
-    log_write info usb_detected "printer detected" line="$line"
+  if [[ -n "${line}" ]]; then
+    log_write info usb_detected "printer detected" line="${line}"
   else
     warn "Printer not detected via USB"
     log_write warn usb_missing "printer not detected"
@@ -221,8 +249,8 @@ main() {
   if (($# == 0)); then
     do_all=1
   else
-    for arg in "$@"; do
-      [[ "$arg" == "--all" ]] && do_all=1
+    for arg in "${@}"; do
+      [[ "${arg}" == "--all" ]] && do_all=1
     done
   fi
 
@@ -242,7 +270,7 @@ main() {
   fi
 
   log_close
-  info "Done. Log: $LOG_FILE"
+  info "Done. Log: ${LOG_FILE}"
 }
 
-main "$@"
+main "${@}"
