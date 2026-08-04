@@ -699,15 +699,28 @@ get_local_nproc() { nproc 2>/dev/null || echo 1; }
 # /proc/diskstats). На Entware этой сборки нет iostat/vmstat (минимальный
 # набор пакетов aarch64-k3.10 — только ash/bash/ncat/ssh/wg/zstd и т.п.),
 # поэтому IO читаем напрямую из ядра тем же способом, что loadavg/meminfo
-# выше — без установки дополнительных opkg-пакетов. Пусто, если df не смог
-# определить устройство или в diskstats нет строки с таким именем (например,
-# необычное имя mapper-устройства на некоторых прошивках QTS) — тогда IO
-# просто не измеряется (n/a в логах), а не гадаем по несвязанному диску.
+# выше — без установки дополнительных opkg-пакетов.
+#
+# Сопоставляем по major:minor, а не по имени: на QNAP BACKUP_DIR лежит на
+# /dev/mapper/cachedevN, который сам по себе настоящий device-mapper узел
+# (не symlink на dm-N — readlink -f возвращает его же самого), а в
+# /proc/diskstats он зарегистрирован под другим именем (dm-N) с теми же
+# major:minor (проверено вживую: cachedev1 → major:minor fb:9 hex → dm-9,
+# 251:9 в diskstats). "-P" у df обязателен — без него BusyBox df переносит
+# длинное имя устройства на отдельную строку, ломая разбор по NR==2.
+#
+# Пусто, если df/stat не смогли определить устройство или пары major:minor
+# нет в diskstats — тогда IO просто не измеряется (n/a в логах), а не гадаем
+# по несвязанному диску.
 get_local_io_device() {
-  local dev
-  dev=$(df "$BACKUP_DIR" 2>/dev/null | awk 'NR==2{print $1}' | sed 's#^/dev/##')
-  [ -n "$dev" ] || return
-  awk -v d="$dev" '$3==d{f=1} END{exit !f}' /proc/diskstats 2>/dev/null && printf '%s' "$dev"
+  local dev_path mm major minor
+  dev_path=$(df -P "$BACKUP_DIR" 2>/dev/null | awk 'NR==2{print $1}')
+  [ -n "$dev_path" ] || return
+  mm=$(stat -c '%t %T' "$dev_path" 2>/dev/null)
+  [ -n "$mm" ] || return
+  major=$((16#$(printf '%s' "$mm" | awk '{print $1}')))
+  minor=$((16#$(printf '%s' "$mm" | awk '{print $2}')))
+  awk -v maj="$major" -v min="$minor" '$1==maj && $2==min{print $3; f=1} END{exit !f}' /proc/diskstats 2>/dev/null
 }
 
 # Печатает "sectors_read sectors_written io_ms" для устройства $1 из
@@ -817,7 +830,14 @@ IO_DEVICE="$(get_local_io_device)"
 log_json "INFO" "backup_env_diag" "Снимок нагрузки перед архивированием" \
   "local_nproc=${LOCAL_NPROC}, local_load1=${_local_load1_baseline:-n/a}, local_mem_avail_mb=${_local_mem_avail_mb_baseline:-n/a}, remote_nproc=${REMOTE_NPROC}, remote_load1=${_remote_load1_baseline:-n/a}, remote_mem_avail_mb=${_remote_mem_avail_mb_baseline:-n/a}, rtt_baseline_ms=${RTT_BASELINE_MS}, io_device=${IO_DEVICE:-n/a}"
 if [ -z "$IO_DEVICE" ]; then
-  log_json "WARN" "io_diag_unavailable" "Не удалось определить блочное устройство под BACKUP_DIR — замер IO (backup_io_diag) пропущен" "backup_dir=${BACKUP_DIR}"
+  # На проде (2026-08-04) io_device вышел n/a — причина неизвестна (нет
+  # прямого SSH-доступа к QNAP для живой проверки). Пишем сырой вывод df,
+  # чтобы по следующему логу понять: df вообще не нашёл BACKUP_DIR, вернул
+  # пустую строку, или вернул имя устройства, которого нет в /proc/diskstats
+  # (например, длинное имя mapper-устройства на некоторых прошивках QTS).
+  _io_debug_df="$(df "$BACKUP_DIR" 2>&1 | tr '\n' ';')"
+  log_json "WARN" "io_diag_unavailable" "Не удалось определить блочное устройство под BACKUP_DIR — замер IO (backup_resource_diag) пропущен" \
+    "backup_dir=${BACKUP_DIR}, df_output=[${_io_debug_df:-empty}]"
 fi
 
 measure_network_speed
