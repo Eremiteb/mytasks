@@ -247,8 +247,8 @@ QNAP-версия `cloud_backup.sh` — то же резервное копир�
 **Планирование запуска на QNAP** — Планировщик задач QTS (если доступен) либо персистентный `crontab` (в отличие от обычного Linux, `/etc/config/crontab` переживает перезагрузку NAS, т.к. хранится в конфигурации прошивки):
 ```sh
 vi /etc/config/crontab
-# добавить строку (например, каждый день в 01:00):
-0 1 * * * /share/Public/tasks/cloud_backup_qnap.sh >/dev/null 2>&1
+# добавить строку (например, каждый день в 04:00):
+0 4 * * * /share/Public/tasks/cloud_backup_qnap.sh >/dev/null 2>&1
 crontab /etc/config/crontab
 /etc/init.d/crond.sh restart
 ```
