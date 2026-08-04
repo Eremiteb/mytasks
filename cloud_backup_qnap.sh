@@ -248,45 +248,49 @@ log_json() {
     "$ts_val" "$ts_val" "$LOG_SCHEMA_VERSION" "$LOG_COMPAT_TARGETS" "$level_norm" "$msg_esc" "$event" "$SCRIPT_BASE" "$SCRIPT_NAME" "$event" "$level_norm" "$msg_esc" "$detail_esc" "$rc" >> "$LOG_FILE"
 }
 
+# shellcheck disable=SC2329
 cleanup_logs() {
   local old_logs
+  # shellcheck disable=SC2012
   old_logs=$(ls -1t "${LOG_DIR}/${SCRIPT_BASE}-"*.jsonl 2>/dev/null | tail -n +6)
-  [ -n "$old_logs" ] && rm -f $old_logs
+  if [[ -n "${old_logs}" ]]; then
+    printf '%s\n' "${old_logs}" | xargs -r rm -f --
+  fi
 }
 
 VALIDATE_BACKUP_DETAIL=""
 
 validate_backup_file() {
-  local backup_path="$1"
+  local backup_path="${1}"
   local validate_out rc
 
   VALIDATE_BACKUP_DETAIL=""
 
-  if [ ! -s "$backup_path" ]; then
+  if [[ ! -s "${backup_path}" ]]; then
     VALIDATE_BACKUP_DETAIL="file is empty"
     return 1
   fi
 
-  case "$backup_path" in
+  case "${backup_path}" in
     *.tar.gz)
       if ! command -v gzip >/dev/null 2>&1; then
         VALIDATE_BACKUP_DETAIL="gzip not found"
         return 2
       fi
-      validate_out=$(gzip -t "$backup_path" 2>&1)
+      validate_out=$(gzip -t "${backup_path}" 2>&1)
       rc=$?
-      VALIDATE_BACKUP_DETAIL="$validate_out"
-      return $rc
+      VALIDATE_BACKUP_DETAIL="${validate_out}"
+      return ${rc}
       ;;
     *.tar.zst)
       if ! command -v zstd >/dev/null 2>&1; then
         VALIDATE_BACKUP_DETAIL="zstd not found (opkg install zstd)"
         return 2
       fi
-      validate_out=$(zstd -t "$backup_path" 2>&1)
+      validate_out=$(zstd -t "${backup_path}" 2>&1)
       rc=$?
-      VALIDATE_BACKUP_DETAIL="$validate_out"
-      return $rc
+      VALIDATE_BACKUP_DETAIL="${validate_out}"
+      return ${rc}
       ;;
     *)
       VALIDATE_BACKUP_DETAIL="unsupported backup extension"
@@ -305,6 +309,14 @@ fi
 
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
+
+# Значения приходят из source "$CONFIG_FILE", но часть IDE-анализаторов не
+# умеет отслеживать такие присваивания и помечает переменные как "не заданы".
+# Явно инициализируем пустыми значениями, затем ниже всё равно проверяем
+# обязательность через цикл for var in ...
+REMOTE_HOST="${REMOTE_HOST:-}"
+REMOTE_USER="${REMOTE_USER:-}"
+BACKUP_DIR="${BACKUP_DIR:-}"
 
 for var in WG_INTERFACE REMOTE_HOST REMOTE_USER BACKUP_DIR; do
   if [ -z "${!var:-}" ]; then
@@ -456,7 +468,7 @@ wg_is_up() {
 # Поднимает WireGuard в обход wg/wg-quick: запускает wireguard-go, настраивает
 # пира через сырой UAPI поверх ncat -U и назначает адрес/маршрут штатной ip(8).
 wg_up_userspace() {
-  local priv_b64 addr peer_pub_b64 psk_b64 endpoint keepalive
+  local priv_b64 addr peer_pub_b64 psk_b64 endpoint keepalive psk_hex
   local priv_hex peer_pub_hex uapi_tmp set_out i
 
   [ -r "$WG_CONF_FILE" ] || {
@@ -484,15 +496,19 @@ wg_up_userspace() {
   rm -f "$WG_SOCK" 2>/dev/null
   ip link delete "$WG_INTERFACE" 2>/dev/null
 
-  WG_I_PREFER_BUGGY_USERSPACE_TO_POLISHED_KMOD=1 wireguard-go "$WG_INTERFACE" >/dev/null 2>&1
+  WG_I_PREFER_BUGGY_USERSPACE_TO_POLISHED_KMOD=1 wireguard-go "${WG_INTERFACE}" >/dev/null 2>&1
+  psk_hex=""
+  if [[ -n "${psk_b64}" ]]; then
+    psk_hex=$(wg_b64_to_hex "${psk_b64}")
+  fi
 
   i=0
-  while [ ! -S "$WG_SOCK" ] && [ "$i" -lt 25 ]; do
+  while [[ ! -S "${WG_SOCK}" && "${i}" -lt 25 ]]; do
     sleep 0.2
     i=$((i + 1))
   done
-  if [ ! -S "$WG_SOCK" ]; then
-    log_json "ERROR" "wireguard_go_no_socket" "wireguard-go не создал UAPI-сокет" "$WG_SOCK"
+  if [[ ! -S "${WG_SOCK}" ]]; then
+    log_json "ERROR" "wireguard_go_no_socket" "wireguard-go не создал UAPI-сокет" "${WG_SOCK}"
     return 1
   fi
 
@@ -503,47 +519,53 @@ wg_up_userspace() {
     echo "listen_port=0"
     echo "replace_peers=true"
     echo "public_key=${peer_pub_hex}"
-    [ -n "$psk_b64" ] && echo "preshared_key=$(wg_b64_to_hex "$psk_b64")"
+    [[ -n "${psk_hex}" ]] && echo "preshared_key=${psk_hex}"
     echo "endpoint=${endpoint}"
     echo "persistent_keepalive_interval=${keepalive}"
     echo "replace_allowed_ips=true"
     echo "allowed_ip=${REMOTE_HOST}/32"
     echo ""
-  } > "$uapi_tmp"
-  set_out=$(ncat -U "$WG_SOCK" < "$uapi_tmp" 2>&1)
-  rm -f "$uapi_tmp"
+  } > "${uapi_tmp}"
+  set_out=$(ncat -U "${WG_SOCK}" < "${uapi_tmp}" 2>&1)
+  rm -f "${uapi_tmp}"
 
-  if ! printf '%s' "$set_out" | grep -q '^errno=0'; then
-    log_json "ERROR" "wg_uapi_set_failed" "UAPI 'set' вернул ошибку" "$set_out"
+  if ! printf '%s' "${set_out}" | grep -q '^errno=0'; then
+    log_json "ERROR" "wg_uapi_set_failed" "UAPI 'set' вернул ошибку" "${set_out}"
     return 1
   fi
 
-  ip address add "$addr" dev "$WG_INTERFACE" 2>/dev/null
-  ip link set mtu 1420 up dev "$WG_INTERFACE" 2>&1
-  ip route replace "${REMOTE_HOST}/32" dev "$WG_INTERFACE" 2>&1
+  ip address add "${addr}" dev "${WG_INTERFACE}" 2>/dev/null
+  ip link set mtu 1420 up dev "${WG_INTERFACE}" 2>&1
+  ip route replace "${REMOTE_HOST}/32" dev "${WG_INTERFACE}" 2>&1
 
   return 0
 }
 
 # Останавливает туннель: завершает wireguard-go (интерфейс и сокет исчезают
 # вместе с процессом), подчищает сокет-файл, если он вдруг остался.
+# shellcheck disable=SC2329
 wg_down_userspace() {
   local pid
+  # shellcheck disable=SC2009
   pid=$(ps w 2>/dev/null | grep "[w]ireguard-go ${WG_INTERFACE}" | awk '{print $1}')
   [ -n "$pid" ] && kill "$pid" 2>/dev/null
   rm -f "$WG_SOCK" 2>/dev/null
   return 0
 }
 
+# shellcheck disable=SC2329
 wg_down_if_needed() {
   if [ "$WG_BROUGHT_UP" -eq 1 ] && [ "${WG_KEEP_UP:-0}" -ne 1 ]; then
     log_json "INFO" "wg_down" "Останавливаем WireGuard ${WG_INTERFACE}..."
-    wg_down_userspace && \
-      log_json "INFO" "wg_down_ok" "WireGuard ${WG_INTERFACE} остановлен" || \
+    if wg_down_userspace; then
+      log_json "INFO" "wg_down_ok" "WireGuard ${WG_INTERFACE} остановлен"
+    else
       log_json "WARN" "wg_down_fail" "Не удалось остановить WireGuard ${WG_INTERFACE}"
+    fi
   fi
 }
 
+# shellcheck disable=SC2329
 services_start_if_needed() {
   if [ "$SERVICES_STOPPED" -eq 1 ]; then
     SERVICES_STOPPED=0
@@ -551,14 +573,15 @@ services_start_if_needed() {
     start_err=$(ssh_remote \
       "cd '${REMOTE_PATH}' && docker compose up -d" 2>&1)
     start_rc=$?
-    if [ $start_rc -ne 0 ]; then
-      log_json "WARN" "services_start_failed" "Не удалось запустить сервисы" "$start_err" $start_rc
+    if [ "$start_rc" -ne 0 ]; then
+      log_json "WARN" "services_start_failed" "Не удалось запустить сервисы" "$start_err" "$start_rc"
     else
-      log_json "INFO" "services_start_ok" "Сервисы запущены" "" $start_rc
+      log_json "INFO" "services_start_ok" "Сервисы запущены" "" "$start_rc"
     fi
   fi
 }
 
+# shellcheck disable=SC2329
 cleanup() {
   services_start_if_needed
   wg_down_if_needed
@@ -673,8 +696,10 @@ SSH_OPTS="-p ${REMOTE_SSH_PORT} -o StrictHostKeyChecking=accept-new -o ConnectTi
 # этой архитектуры нет пакета sshpass.
 ssh_remote() {
   if [ -n "$REMOTE_PASSWORD" ] && command -v sshpass >/dev/null 2>&1; then
+    # shellcheck disable=SC2086
     SSHPASS="$REMOTE_PASSWORD" sshpass -e ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" "$1"
   else
+    # shellcheck disable=SC2029,SC2086
     ssh $SSH_OPTS "${REMOTE_USER}@${REMOTE_HOST}" "$1"
   fi
 }
@@ -1285,7 +1310,7 @@ ARCHIVE_END_EPOCH=$(date +%s)
 kill "$_PROGRESS_PID" 2>/dev/null
 wait "$_PROGRESS_PID" 2>/dev/null
 
-if [ $backup_rc -eq 0 ]; then
+if [ "$backup_rc" -eq 0 ]; then
   archive_duration=$((ARCHIVE_END_EPOCH - ARCHIVE_START_EPOCH))
   [ "$archive_duration" -lt 1 ] && archive_duration=1
 
@@ -1345,20 +1370,21 @@ if [ $backup_rc -eq 0 ]; then
 
   backup_size=$(du -sh "$BACKUP_PATH" 2>/dev/null | cut -f1)
   log_json "INFO" "backup_done" "Резервная копия создана успешно" \
-    "file=${BACKUP_PATH}, size=${backup_size}" $backup_rc
+    "file=${BACKUP_PATH}, size=${backup_size}" "$backup_rc"
   echo "Готово: ${BACKUP_PATH} (${backup_size})"
 
   # Очистка старых бэкапов, оставляем только 5 последних
+  # shellcheck disable=SC2012
   old_backups=$(ls -1t "${BACKUP_DIR}/${SCRIPT_BASE}-"*.tar.* 2>/dev/null | tail -n +6)
   if [ -n "$old_backups" ]; then
     log_json "INFO" "backup_cleanup" "Удаление старых резервных копий (оставляем 5)"
     echo "$old_backups" | tr '\n' '\0' | xargs -0 -r rm -f
   fi
 else
-  log_json "ERROR" "backup_failed" "Ошибка при создании резервной копии" "$err_out" $backup_rc
+  log_json "ERROR" "backup_failed" "Ошибка при создании резервной копии" "$err_out" "$backup_rc"
   echo "Ошибка резервного копирования (код $backup_rc): $err_out" >&2
   rm -f "$BACKUP_PATH" 2>/dev/null
-  exit $backup_rc
+  exit "$backup_rc"
 fi
 
 rm -f "$PROGRESS_METRICS_FILE" "$DIAG_METRICS_FILE" 2>/dev/null
