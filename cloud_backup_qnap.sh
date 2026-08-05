@@ -817,8 +817,15 @@ nohup bash -c 'dd if=/dev/zero bs=1M count=${NETWORK_SPEED_TEST_MB} 2>/dev/null 
   ssh_remote "${test_launch}" >/dev/null 2>&1
   sleep 1
 
+  # На этом QNAP нет отдельного бинаря "timeout" (не входит ни в минимальный
+  # набор Entware, ни в applet'ы системного busybox — проверено вживую,
+  # "type timeout" не находит ничего). Раньше локальный ncat оборачивался в
+  # "timeout 60 ncat ...", что всегда падало с rc=127 ("timeout: command not
+  # found"), а не из-за самого ncat. Используем встроенный idle-таймаут ncat
+  # вместо внешней обёртки — той же цели (не зависнуть навсегда), без
+  # зависимости от отсутствующего бинаря.
   test_start=$(date +%s)
-  timeout 60 ncat --recv-only "${REMOTE_HOST}" "${RAW_TRANSFER_PORT}" > "${test_out}" 2>/dev/null < /dev/null
+  ncat --recv-only --idle-timeout 60s "${REMOTE_HOST}" "${RAW_TRANSFER_PORT}" > "${test_out}" 2>/dev/null < /dev/null
   test_rc=$?
   test_end=$(date +%s)
 
