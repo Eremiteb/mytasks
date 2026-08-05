@@ -108,7 +108,7 @@ unique_path() {
   fi
   cand="${dir}/${name}"
   n=1
-  while [ -e "${cand}" ]; do
+  while [[ -e "${cand}" ]]; do
     cand="${dir}/${base}_${n}${ext}"
     n=$((n+1))
   done
@@ -116,7 +116,7 @@ unique_path() {
 }
 
 # --- args ---
-while [ $# -gt 0 ]; do
+while [[ $# -gt 0 ]]; do
   case "$1" in
     -p|--path) ROOT_DIR="${2-}"; shift 2;;
     --dry-run) DRY_RUN=1; shift;;
@@ -129,7 +129,7 @@ done
 [ -z "${ROOT_DIR}" ] && { echo "Ошибка: укажите -p DIR" >&2; usage; exit 2; }
 [ -d "${ROOT_DIR}" ] || { echo "Ошибка: нет такой папки: ${ROOT_DIR}" >&2; exit 2; }
 
-if [ -z "${LOG_FILE}" ]; then
+if [[ -z "${LOG_FILE}" ]]; then
   LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}_$(date '+%Y-%m-%d').jsonl"
 fi
 
@@ -150,7 +150,7 @@ while IFS= read -r -d '' zipfile; do
     continue
   fi
 
-  if [ -z "${entries}" ]; then
+  if [[ -z "${entries}" ]]; then
     log_json "info" "no_fb2_inside" "В архиве нет .fb2" "${zipfile}" "" 0 ""
     continue
   fi
@@ -161,7 +161,7 @@ while IFS= read -r -d '' zipfile; do
     out_name="$(basename -- "${entry}")"
     out_path="$(unique_path "${dir}" "${out_name}")"
 
-    if [ "${DRY_RUN}" -eq 1 ]; then
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
       log_json "info" "would_extract" "DRY-RUN: извлёк бы файл" "${zipfile}" "${out_path}" 0 "\"entry\":\"$(json_escape "${entry}")\""
       continue
     fi

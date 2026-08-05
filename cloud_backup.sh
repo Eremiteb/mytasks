@@ -58,12 +58,16 @@ log_json() {
 
 # shellcheck disable=SC2329
 cleanup_logs() {
-  local old_logs=()
-  mapfile -t old_logs < <(
-    find "${LOG_DIR}" -maxdepth 1 -type f -name "${SCRIPT_BASE}-*.jsonl" -printf '%T@|%p\n' 2>/dev/null \
+  local old_logs=() old_log old_logs_file
+  old_logs_file="$(mktemp)"
+  if find "${LOG_DIR}" -maxdepth 1 -type f -name "${SCRIPT_BASE}-*.jsonl" -printf '%T@|%p\n' 2>/dev/null \
       | sort -nr \
-      | awk -F'|' 'NR > 5 { print $2 }'
-  )
+      | awk -F'|' 'NR > 5 { print $2 }' > "${old_logs_file}"; then
+    while IFS= read -r old_log; do
+      [[ -n "${old_log}" ]] && old_logs+=("${old_log}")
+    done < "${old_logs_file}"
+  fi
+  rm -f -- "${old_logs_file}"
   if ((${#old_logs[@]} > 0)); then
     rm -f -- "${old_logs[@]}"
   fi
@@ -91,7 +95,7 @@ validate_backup_file() {
       validate_out=$(gzip -t "${backup_path}" 2>&1)
       rc=$?
       VALIDATE_BACKUP_DETAIL="${validate_out}"
-      return ${rc}
+      return "${rc}"
       ;;
     *.tar.zst)
       if ! command -v zstd >/dev/null 2>&1; then
@@ -101,7 +105,7 @@ validate_backup_file() {
       validate_out=$(zstd -t "${backup_path}" 2>&1)
       rc=$?
       VALIDATE_BACKUP_DETAIL="${validate_out}"
-      return ${rc}
+      return "${rc}"
       ;;
     *)
       VALIDATE_BACKUP_DETAIL="unsupported backup extension"
@@ -325,11 +329,11 @@ if [[ -f "${BACKUP_PATH}" ]]; then
     fi
     if [[ "${validate_rc}" -eq 1 ]]; then
       log_json "WARN" "backup_existing_invalid" "Существующий файл бэкапа повреждён — удаляем и создаём заново" \
-        "${validate_detail}" ${validate_rc}
+        "${validate_detail}" "${validate_rc}"
       rm -f "${BACKUP_PATH}"
     else
       log_json "WARN" "backup_existing_unchecked" "Не удалось проверить существующий файл бэкапа — создаём заново без дозаписи" \
-        "${validate_detail}" ${validate_rc}
+        "${validate_detail}" "${validate_rc}"
     fi
   fi
 else
@@ -591,16 +595,20 @@ if [[ "${backup_rc}" -eq 0 ]]; then
 
   backup_size=$(du -sh "${BACKUP_PATH}" 2>/dev/null | cut -f1)
   log_json "INFO" "backup_done" "Резервная копия создана успешно" \
-    "file=${BACKUP_PATH}, size=${backup_size}" ${backup_rc}
+    "file=${BACKUP_PATH}, size=${backup_size}" "${backup_rc}"
   echo "Готово: ${BACKUP_PATH} (${backup_size})"
 
   # Очистка старых бэкапов, оставляем только 5 последних
   old_backups=()
-  mapfile -t old_backups < <(
-    find "${BACKUP_DIR}" -maxdepth 1 -type f -name "${SCRIPT_BASE}-*.tar.*" -printf '%T@|%p\n' 2>/dev/null \
+  _old_bak_file="$(mktemp)"
+  if find "${BACKUP_DIR}" -maxdepth 1 -type f -name "${SCRIPT_BASE}-*.tar.*" -printf '%T@|%p\n' 2>/dev/null \
       | sort -nr \
-      | awk -F'|' 'NR > 5 { print $2 }'
-  )
+      | awk -F'|' 'NR > 5 { print $2 }' > "${_old_bak_file}"; then
+    while IFS= read -r _old_bak; do
+      [[ -n "${_old_bak}" ]] && old_backups+=("${_old_bak}")
+    done < "${_old_bak_file}"
+  fi
+  rm -f -- "${_old_bak_file}"
   if ((${#old_backups[@]} > 0)); then
     log_json "INFO" "backup_cleanup" "Удаление старых резервных копий (оставляем 5)"
     rm -f -- "${old_backups[@]}"
@@ -609,7 +617,7 @@ else
   log_json "ERROR" "backup_failed" "Ошибка при создании резервной копии" "${err_out}" "${backup_rc}"
   echo "Ошибка резервного копирования (код ${backup_rc}): ${err_out}" >&2
   rm -f "${BACKUP_PATH}" 2>/dev/null
-  exit ${backup_rc}
+  exit "${backup_rc}"
 fi
 
 rm -f "${PROGRESS_METRICS_FILE}" 2>/dev/null

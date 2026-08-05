@@ -52,8 +52,9 @@ fi
 ###############################################################################
 mkdir -p "${OUTPUT_DIR}"
 
-echo "===== Ошибки | $(date) =====" >> "${OUTPUT_DIR}/${ERROR_LOG}"
-echo "===== Отчёт конвертации | $(date) =====" >> "${OUTPUT_DIR}/${REPORT_FILE}"
+current_date=$(date)
+echo "===== Ошибки | ${current_date} =====" >> "${OUTPUT_DIR}/${ERROR_LOG}"
+echo "===== Отчёт конвертации | ${current_date} =====" >> "${OUTPUT_DIR}/${REPORT_FILE}"
 
 # shellcheck disable=SC2016
 process_file='

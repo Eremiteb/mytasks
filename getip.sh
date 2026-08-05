@@ -44,9 +44,10 @@ log_json() {
 
     msg_esc="$(json_escape "$msg")"
     detail_esc="$(json_escape "$detail")"
+    _ts="$(ts)"
 
     printf '{"@timestamp":"%s","schema.version":"%s","compat.targets":"%s","log.level":"%s","message":"%s","event.action":"%s","service.name":"%s","script":"%s","event":"%s","level":"%s","msg":"%s","detail":"%s","rc":%s}\n' \
-        "$(ts)" "$LOG_SCHEMA_VERSION" "$LOG_COMPAT_TARGETS" "$level_norm" "$msg_esc" "$event" "$SCRIPT_BASE" "$SCRIPT_NAME" "$event" "$level_norm" "$msg_esc" "$detail_esc" "$rc" >> "$LOG_FILE"
+        "${_ts}" "$LOG_SCHEMA_VERSION" "$LOG_COMPAT_TARGETS" "$level_norm" "$msg_esc" "$event" "$SCRIPT_BASE" "$SCRIPT_NAME" "$event" "$level_norm" "$msg_esc" "$detail_esc" "$rc" >> "$LOG_FILE"
 }
 
 cleanup_logs() {

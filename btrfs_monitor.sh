@@ -50,22 +50,30 @@ log_json() {
     local event="$2"
     local msg="$3"
     local detail="${4:-}"
-    local msg_esc detail_esc level_norm
+    local msg_esc detail_esc level_norm timestamp
     msg_esc="$(json_escape "${msg}")"
     detail_esc="$(json_escape "${detail}")"
     level_norm="$(printf '%s' "${level}" | tr '[:upper:]' '[:lower:]')"
+    timestamp="$(ts)"
 
     printf '{"@timestamp":"%s","schema.version":"%s","compat.targets":"%s","log.level":"%s","message":"%s","event.action":"%s","service.name":"%s","script":"%s","event":"%s","level":"%s","msg":"%s","detail":"%s"}\n' \
-        "$(ts)" "${LOG_SCHEMA_VERSION}" "${LOG_COMPAT_TARGETS}" "${level_norm}" "${msg_esc}" "${event}" "${SCRIPT_BASE}" "${SCRIPT_NAME}" "${event}" "${level_norm}" "${msg_esc}" "${detail_esc}" >> "${LOG_FILE}"
+        "${timestamp}" "${LOG_SCHEMA_VERSION}" "${LOG_COMPAT_TARGETS}" "${level_norm}" "${msg_esc}" "${event}" "${SCRIPT_BASE}" "${SCRIPT_NAME}" "${event}" "${level_norm}" "${msg_esc}" "${detail_esc}" >> "${LOG_FILE}"
 }
 
 cleanup_logs() {
     local old_logs=()
-    mapfile -t old_logs < <(
-        find "${LOG_DIR}" -maxdepth 1 -type f -name "${SCRIPT_BASE}-*.jsonl" -printf '%T@|%p\n' 2>/dev/null \
-            | sort -nr \
-            | awk -F'|' -v keep="${KEEP_LOGS}" 'NR > keep { print $2 }'
-    )
+    local old_log old_logs_file
+
+    old_logs_file="$(mktemp)"
+    if find "${LOG_DIR}" -maxdepth 1 -type f -name "${SCRIPT_BASE}-*.jsonl" -printf '%T@|%p\n' 2>/dev/null \
+        | sort -nr \
+        | awk -F'|' -v keep="${KEEP_LOGS}" 'NR > keep { print $2 }' > "${old_logs_file}"; then
+        while IFS= read -r old_log; do
+            [[ -n "${old_log}" ]] && old_logs+=("${old_log}")
+        done < "${old_logs_file}"
+    fi
+    rm -f -- "${old_logs_file}"
+
     if ((${#old_logs[@]} > 0)); then
         rm -f -- "${old_logs[@]}"
     fi

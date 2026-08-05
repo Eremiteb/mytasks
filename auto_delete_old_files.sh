@@ -45,9 +45,10 @@ log_json() {
   _level_norm="$(printf '%s' "${_level}" | tr '[:upper:]' '[:lower:]')"
   _msg_esc="$(json_escape "${_msg}")"
   _detail_esc="$(json_escape "${_detail}")"
+  _ts="$(ts)"
 
   printf '{"@timestamp":"%s","schema.version":"%s","compat.targets":"%s","log.level":"%s","message":"%s","event.action":"%s","service.name":"%s","script":"%s","event":"%s","level":"%s","msg":"%s","detail":"%s","rc":%s}\n' \
-    "$(ts)" "${LOG_SCHEMA_VERSION}" "${LOG_COMPAT_TARGETS}" "${_level_norm}" "${_msg_esc}" "${_event}" "${SCRIPT_BASE}" "${SCRIPT_NAME}" "${_event}" "${_level_norm}" "${_msg_esc}" "${_detail_esc}" "${_rc}" >> "${LOG_FILE}"
+    "${_ts}" "${LOG_SCHEMA_VERSION}" "${LOG_COMPAT_TARGETS}" "${_level_norm}" "${_msg_esc}" "${_event}" "${SCRIPT_BASE}" "${SCRIPT_NAME}" "${_event}" "${_level_norm}" "${_msg_esc}" "${_detail_esc}" "${_rc}" >> "${LOG_FILE}"
 }
 
 cleanup_logs() {
@@ -96,6 +97,9 @@ case "${KEEP_DAYS}" in
     log_json "ERROR" "config_invalid" "KEEP_DAYS должен быть целым числом" "${KEEP_DAYS}" 2
     echo "Ошибка: KEEP_DAYS должен быть целым неотрицательным числом" >&2
     exit 2
+    ;;
+  *)
+    :
     ;;
 esac
 

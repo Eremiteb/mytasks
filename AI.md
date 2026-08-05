@@ -67,6 +67,8 @@ This repo is **not a single application** — it's a flat collection of independ
 
 **Shell style conventions.** All variables in root `.sh` scripts must use brace syntax (`${VAR}`, not `$VAR`), double-bracket tests (`[[ ]]` instead of `[ ]` in bash scripts), and quoted `return`/`exit` with numeric variables (`return "${rc}"`). `case` blocks must include an explicit `*)` branch. These are enforced by CI (`shellcheck -S style` + the unbraced variable scan).
 
+**Missed-error analysis is mandatory.** If a user points out a missed warning, bug, or regression, every assistant must first explain why the issue was missed, identify the controlling code path and the specific warning class, and state one falsifiable local hypothesis plus one cheap check before changing code. Do not skip this analysis or narrow the scope to only the first visible symptom.
+
 **Log cleanup pattern.** All `cleanup_logs()` functions use `find … -printf '%T@|%p\n' | sort -nr | awk 'NR > N { print $2 }'` with `mapfile -t` (bash) or a `while read` pipeline (POSIX sh) — never `ls | tail`. The `-name` argument to `find` is always fully quoted: `"${SCRIPT_BASE}-*.jsonl"`.
 
 **SSH option arrays.** Scripts that call `ssh`/`sshpass` define options as a bash array (`SSH_OPTS=(...)`) and expand them as `"${SSH_OPTS[@]}"` — never as a plain string with word splitting.

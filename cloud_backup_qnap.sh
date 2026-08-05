@@ -800,7 +800,9 @@ echo oom_recent=\"\${oom:-none}\"" 2>/dev/null | tr '\n' ', '
 # просто логируется предупреждением и не прерывает бэкап — сеть уже проверена
 # раньше через wg_check, это только диагностика скорости, а не связности.
 measure_network_speed() {
-  if [[ "$(ssh_remote "command -v nc >/dev/null 2>&1 && echo yes" 2>/dev/null)" != "yes" ]]; then
+  local _nc_check
+  _nc_check="$(ssh_remote "command -v nc >/dev/null 2>&1 && echo yes" 2>/dev/null)"
+  if [[ "${_nc_check}" != "yes" ]]; then
     log_json "WARN" "network_speed_test_skip_no_nc" "На удалённой стороне нет nc — замер скорости сети пропущен" ""
     return
   fi
@@ -946,6 +948,7 @@ else
   # списка пользователей, из-за чего while read получает EOF и обрабатывает
   # только первого пользователя — остальные (например, clouduser) молча
   # пропускаются без пересоздания files_trashbin и без записи в лог.
+  _uid_list="$(printf '%s\n' "${remote_users}" | sed -nE 's/^[[:space:]]*-[[:space:]]*([^:]+):.*/\1/p')"
   while IFS= read -r _uid <&3; do
     [[ -z "${_uid}" ]] && continue
     _repair_err=$(ssh_remote \
@@ -968,7 +971,7 @@ else
       occ_trash_repair_detail="${occ_trash_repair_detail}${_uid}: папка не найдена после mkdir -p; "
       log_json "ERROR" "occ_trashbin_verify_failed" "Папка files_trashbin отсутствует после попытки пересоздания" "user=${_uid}, path=${remote_datadir}/${_uid}/files_trashbin" "${_verify_rc}"
     fi
-  done 3<<< "$(printf '%s\n' "${remote_users}" | sed -nE 's/^[[:space:]]*-[[:space:]]*([^:]+):.*/\1/p')"
+  done 3<<< "${_uid_list}"
 fi
 if [[ ${occ_trash_repair_rc} -ne 0 ]]; then
   log_json "WARN" "occ_trashbin_repair_failed" "Не удалось пересоздать/подтвердить папки files_trashbin" "${occ_trash_repair_detail}" "${occ_trash_repair_rc}"
@@ -1180,7 +1183,8 @@ REMOTE_TAR_CMD="set -o pipefail; tar --create --file=- --sparse${REMOTE_TAR_EXCL
 # выше) — только если включена в conf И на удалённой стороне есть nc.
 USE_RAW_TRANSFER=0
 if [[ "${RAW_TRANSFER_ENABLED}" -eq 1 ]]; then
-  if [[ "$(ssh_remote "command -v nc >/dev/null 2>&1 && echo yes" 2>/dev/null)" = "yes" ]]; then
+  _nc_check_raw="$(ssh_remote "command -v nc >/dev/null 2>&1 && echo yes" 2>/dev/null)"
+  if [[ "${_nc_check_raw}" = "yes" ]]; then
     USE_RAW_TRANSFER=1
   else
     log_json "WARN" "raw_transfer_nc_missing" "На удалённом сервере не найден nc — используется передача через SSH" ""
@@ -1244,8 +1248,10 @@ nohup bash -c 'set -o pipefail; tar --create --file=- --sparse${REMOTE_TAR_EXCLU
       # новыми данными) — это прямая ошибка бэкапа.
       RAW_MID_STREAM_FAILURE=1
       RAW_CONNECT_ELAPSED_S=$(( $(date +%s) - RAW_LAUNCH_EPOCH ))
+      _mid_stderr=$(cat "${err_tmp}")
+      _mid_diag=$(get_remote_failure_diag)
       log_json "WARN" "raw_transfer_mid_stream_failure" "Соединение разорвано в середине передачи — повтор невозможен" \
-        "attempt=${_raw_attempt}, bytes=${_raw_cur_size}, elapsed_since_launch_s=${RAW_CONNECT_ELAPSED_S}, ncat_rc=${_raw_rc}, stderr=$(cat "${err_tmp}"), remote_diag=[$(get_remote_failure_diag)]" "${_raw_rc}"
+        "attempt=${_raw_attempt}, bytes=${_raw_cur_size}, elapsed_since_launch_s=${RAW_CONNECT_ELAPSED_S}, ncat_rc=${_raw_rc}, stderr=${_mid_stderr}, remote_diag=[${_mid_diag}]" "${_raw_rc}"
       break
     fi
     log_json "WARN" "raw_transfer_connect_retry" "Повтор подключения к порту передачи" \
@@ -1269,8 +1275,9 @@ nohup bash -c 'set -o pipefail; tar --create --file=- --sparse${REMOTE_TAR_EXCLU
       ''|*[!0-9]*)
         backup_rc=1
         err_out="raw transfer: remote status file missing/unreadable"
+        _fail_diag=$(get_remote_failure_diag)
         log_json "WARN" "raw_transfer_status_missing" "Не удалось получить статус удалённого пайплайна" \
-          "${err_out}, bytes=${_raw_cur_size}, elapsed_since_launch_s=${RAW_CONNECT_ELAPSED_S}, remote_diag=[$(get_remote_failure_diag)]"
+          "${err_out}, bytes=${_raw_cur_size}, elapsed_since_launch_s=${RAW_CONNECT_ELAPSED_S}, remote_diag=[${_fail_diag}]"
         ;;
       0)
         backup_rc=0
@@ -1280,13 +1287,15 @@ nohup bash -c 'set -o pipefail; tar --create --file=- --sparse${REMOTE_TAR_EXCLU
         ;;
       *)
         backup_rc="${raw_status}"
-        err_out="remote pipeline failed rc=${raw_status}: $(ssh_remote "cat '${REMOTE_ERR_FILE}' 2>/dev/null")"
+        _remote_err=$(ssh_remote "cat '${REMOTE_ERR_FILE}' 2>/dev/null")
+        err_out="remote pipeline failed rc=${raw_status}: ${_remote_err}"
+        _fail_diag=$(get_remote_failure_diag)
         log_json "WARN" "raw_transfer_status_fetch" "Удалённый пайплайн завершился с ошибкой" \
-          "${err_out}, bytes=${_raw_cur_size}, elapsed_since_launch_s=${RAW_CONNECT_ELAPSED_S}, remote_diag=[$(get_remote_failure_diag)]" "${backup_rc}"
+          "${err_out}, bytes=${_raw_cur_size}, elapsed_since_launch_s=${RAW_CONNECT_ELAPSED_S}, remote_diag=[${_fail_diag}]" "${backup_rc}"
         ;;
     esac
     ssh_remote "rm -f '${REMOTE_STATUS_FILE}' '${REMOTE_ERR_FILE}'" >/dev/null 2>&1
-  elif [ "${RAW_MID_STREAM_FAILURE}" -eq 1 ]; then
+  elif [[ "${RAW_MID_STREAM_FAILURE}" -eq 1 ]]; then
     backup_rc=1
     err_out="raw transfer: connection dropped mid-stream after ${_raw_cur_size} bytes"
     ssh_remote "rm -f '${REMOTE_STATUS_FILE}' '${REMOTE_ERR_FILE}'" >/dev/null 2>&1
@@ -1294,8 +1303,9 @@ nohup bash -c 'set -o pipefail; tar --create --file=- --sparse${REMOTE_TAR_EXCLU
     # Листенер так и не стал доступен ни разу за все попытки — в BACKUP_PATH
     # ничего нового не записано, безопасно вернуться к SSH-передаче.
     err_out=$(cat "${err_tmp}")
+    _fail_diag=$(get_remote_failure_diag)
     log_json "WARN" "raw_transfer_connect_exhausted" "Не удалось подключиться к листенеру после ${RAW_TRANSFER_CONNECT_RETRIES} попыток — переход на передачу через SSH" \
-      "${err_out}, remote_diag=[$(get_remote_failure_diag)]"
+      "${err_out}, remote_diag=[${_fail_diag}]"
     ssh_remote "rm -f '${REMOTE_STATUS_FILE}' '${REMOTE_ERR_FILE}'" >/dev/null 2>&1
     USE_RAW_TRANSFER=0
   fi
