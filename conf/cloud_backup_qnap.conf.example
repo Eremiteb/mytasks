@@ -65,6 +65,10 @@ REDIS_SERVICE_NAME="redis"
 # Максимальное ожидание завершения BGREWRITEAOF (сек)
 REDIS_REWRITE_WAIT_SEC="180"
 
+# Сколько последних строк docker compose logs снимать с Redis перед
+# services_stop (docker compose down) — после down логи контейнера теряются
+REDIS_LOG_TAIL_LINES="300"
+
 # Раз в сколько дней реально выполнять включённые выше оптимизации БД
 # (MariaDB/Redis/SQLite), даже если сам бэкап запускается ежедневно.
 # Между запусками, где интервал ещё не истёк, оптимизация пропускается —

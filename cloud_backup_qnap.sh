@@ -344,6 +344,7 @@ MARIADB_TRUNCATE_GENERAL_LOG="${MARIADB_TRUNCATE_GENERAL_LOG:-1}"
 OPTIMIZE_REDIS_BEFORE_BACKUP="${OPTIMIZE_REDIS_BEFORE_BACKUP:-0}"
 REDIS_SERVICE_NAME="${REDIS_SERVICE_NAME:-redis}"
 REDIS_REWRITE_WAIT_SEC="${REDIS_REWRITE_WAIT_SEC:-180}"
+REDIS_LOG_TAIL_LINES="${REDIS_LOG_TAIL_LINES:-300}"
 
 # Передача потока бэкапа через сырой TCP-сокет (nc/ncat) внутри уже
 # зашифрованного WireGuard-туннеля, минуя дополнительный слой SSH-шифрования —
@@ -1052,6 +1053,11 @@ elif [[ "${OPTIMIZE_REDIS_BEFORE_BACKUP}" -eq 1 ]]; then
 else
   log_json "INFO" "redis_optimize_skip" "Оптимизация Redis отключена (OPTIMIZE_REDIS_BEFORE_BACKUP=0)"
 fi
+
+redis_logs_out=$(ssh_remote \
+  "cd '${REMOTE_PATH}' && docker compose logs --no-color --tail=${REDIS_LOG_TAIL_LINES} '${REDIS_SERVICE_NAME}'" 2>&1)
+redis_logs_rc=$?
+log_json "INFO" "redis_logs_capture" "Логи Redis перед остановкой сервисов (docker compose down удалит контейнер вместе с ними)" "${redis_logs_out}" "${redis_logs_rc}"
 
 log_json "INFO" "services_stop" "Останавливаем сервисы на ${REMOTE_HOST}..."
 stop_err=$(ssh_remote \
