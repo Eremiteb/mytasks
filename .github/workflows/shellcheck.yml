@@ -50,7 +50,7 @@ jobs:
           fail=0
           for f in ./*.sh; do
             out=$(grep -nP '(?<!")\$(?!\{)[A-Za-z_][A-Za-z0-9_]*' "$f" \
-              | grep -v '^\s*#' \
+              | grep -vP '^\d+:\s*#' \
               | grep -v "\\\\'" \
               | grep -v 'sh -lc\|bash -c\|MARIADB_ROOT\|REDIS_WAIT\|PURGE_BINLOGS\|TRUNCATE\|in_progress' \
               || true)
