@@ -34,6 +34,28 @@
   То же самое для `conf/cloud_backup_qnap.conf.example` при изменении конфига
   (реальный `conf/cloud_backup_qnap.conf` на `/mnt/store/tasks/` не трогать
   без явной просьбы — он гитигнорится и содержит боевые значения).
+- **`shellcheck -S style` даёт разные результаты в зависимости от версии.**
+  CI (`.github/workflows/shellcheck.yml`) ставил shellcheck через
+  `apt-get install shellcheck` — на `ubuntu-latest` (24.04) это версия 0.9.0,
+  у которой есть настоящие баги: ложный `SC2317` на каждой строке внутри
+  функций, вызываемых только через `trap` (сработало бы и на
+  `cleanup()`/`cleanup_logs()`/`wg_down_if_needed()` этого скрипта, все они
+  вызываются только из `trap ... EXIT INT TERM`), и ложный `SC2015` на
+  `A && B || true`. Оба фикса — уже в shellcheck 0.11.0 (стабильный релиз на
+  2026-08-07). 2026-08-07 workflow переделан: качает бинарник напрямую с
+  `github.com/koalaman/shellcheck/releases/download/stable/...` вместо apt.
+  Локально при отладке — сверяться с `shellcheck --version`, если `-S style`
+  выдаёт что-то похожее на массовый `SC2317` в функциях, вызываемых из
+  `trap`, — это, скорее всего, версия тулза, а не баг в скрипте.
+  При сопутствующей чистке проекта под `--enable=check-extra-masked-returns`
+  (`SC2312`), `--enable=add-default-case` (`SC2249`),
+  `--enable=require-variable-braces` (`SC2250`) и `--enable=require-double-brackets`
+  (`SC2292`) — все это опциональные проверки shellcheck, не входящие даже в
+  `-S style` по умолчанию — `cloud_backup_qnap.sh` оказался единственным из
+  проверенных скриптов, где не понадобилось ни одной правки: код уже был в
+  стиле, который эти проверки не флагуют (в отличие от соседнего
+  `cloud_backup.sh`, где пришлось обернуть один конвейер `printf | sed` в
+  `{ ...; } || true`).
 - Логи прода: `/mnt/store/tasks/logs/cloud_backup_qnap-YYYY-MM-DD-HH-MM-SS.jsonl`
   (одна строка = один JSON-объект, поля `ts/level/event/msg/detail/rc`,
   разобрать через `jq -r '[.ts,.level,.event,.msg,.detail,.rc] | @tsv' <file>`).
