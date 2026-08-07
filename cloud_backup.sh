@@ -406,7 +406,7 @@ else
       occ_trash_repair_detail="${occ_trash_repair_detail}${_uid}: папка не найдена после mkdir -p; "
       log_json "ERROR" "occ_trashbin_verify_failed" "Папка files_trashbin отсутствует после попытки пересоздания" "user=${_uid}, path=${remote_datadir}/${_uid}/files_trashbin" "${_verify_rc}"
     fi
-  done < <(printf '%s\n' "${remote_users}" | sed -nE 's/^[[:space:]]*-[[:space:]]*([^:]+):.*/\1/p')
+  done < <({ printf '%s\n' "${remote_users}" | sed -nE 's/^[[:space:]]*-[[:space:]]*([^:]+):.*/\1/p'; } || true)
 fi
 if [[ "${occ_trash_repair_rc}" -ne 0 ]]; then
   log_json "WARN" "occ_trashbin_repair_failed" "Не удалось пересоздать/подтвердить папки files_trashbin" "${occ_trash_repair_detail}" "${occ_trash_repair_rc}"

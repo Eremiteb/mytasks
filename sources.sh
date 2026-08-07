@@ -115,6 +115,7 @@ FAIL_EXIT=0
 while IFS= read -r LINE || [ -n "${LINE}" ]; do
   case "${LINE}" in
     ""|\#*) continue ;;
+    *) ;;
   esac
 
   SRC=$(printf '%s' "${LINE}" | cut -d'|' -f1 | trim)
@@ -169,12 +170,13 @@ while IFS= read -r LINE || [ -n "${LINE}" ]; do
     case "${line}" in
       \*deleting\ *)
         name=${line#*deleting }
-        case "${name}" in */) continue ;; esac
+        case "${name}" in */) continue ;; *) ;; esac
         dstf="$(join_path "${DST}" "${name}")"
         ev="deleted"; [ "${DRY_RUN}" -eq 1 ] && ev="would_delete"
         log_json "info" "${ev}" "" "${dstf}" "file action: ${ev}" "" "${SRC}" "${DST}" null ""
         continue
         ;;
+      *) ;;
     esac
     item=$(printf '%s' "${line}" | cut -f1)
     name=$(printf '%s' "${line}" | cut -f2-)
@@ -185,6 +187,7 @@ while IFS= read -r LINE || [ -n "${LINE}" ]; do
         ev="written"; [ "${DRY_RUN}" -eq 1 ] && ev="would_write"
         log_json "info" "${ev}" "${srcf}" "${dstf}" "file action: ${ev}" "" "${SRC}" "${DST}" null "${item}"
         ;;
+      *) ;;
     esac
   done < "${OUT_TMP}"
 

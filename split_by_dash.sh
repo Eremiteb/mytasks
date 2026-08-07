@@ -149,9 +149,9 @@ if [ -n "${1:-}" ] && [ -d "$1" ]; then
 elif [ -r "${CONFIG_FILE}" ]; then
   log_json "INFO" "config_used" "Использование конфига" "${CONFIG_FILE}"
   while IFS= read -r line || [ -n "${line}" ]; do
-    case "${line}" in ""|\#*) continue ;; esac
-    case "${line}" in *DEST_DIR=*) continue ;; esac
-    target=$(trim "$(printf '%s' "${line}" | sed 's/#.*//')")
+    case "${line}" in ""|\#*) continue ;; *) ;; esac
+    case "${line}" in *DEST_DIR=*) continue ;; *) ;; esac
+    target=$(trim "$({ printf '%s' "${line}" | sed 's/#.*//'; } || true)")
     [ -n "${target}" ] && process_directory "${target}"
   done < "${CONFIG_FILE}"
 else

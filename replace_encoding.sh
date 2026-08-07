@@ -47,9 +47,9 @@ log_json() {
 cleanup_logs() {
     local old_logs
     mapfile -t old_logs < <(
-        find "${LOG_DIR}" -maxdepth 1 -type f -name "${SCRIPT_BASE}-*.jsonl" -printf '%T@|%p\n' 2>/dev/null \
+        { find "${LOG_DIR}" -maxdepth 1 -type f -name "${SCRIPT_BASE}-*.jsonl" -printf '%T@|%p\n' 2>/dev/null \
             | sort -nr \
-            | awk -F'|' 'NR > 10 { print $2 }'
+            | awk -F'|' 'NR > 10 { print $2 }'; } || true
     )
     if ((${#old_logs[@]} > 0)); then
         rm -f -- "${old_logs[@]}"
@@ -96,16 +96,17 @@ while getopts ":hdn-:" opt; do
                 *) echo "Ошибка: неизвестная опция --${OPTARG}" >&2; exit 1 ;;
             esac ;;
         \?) echo "Ошибка: неизвестная опция -${OPTARG}" >&2; exit 1 ;;
+        *) ;;
     esac
 done
 shift $((OPTIND - 1))
 
-[ -n "${1:-}" ] && [ -d "$1" ] && { TARGET_DIR="$1"; shift; }
-[ -n "${1:-}" ] && { FROM_STR="$1"; shift; }
-[ -n "${1:-}" ] && { TO_STR="$1"; shift; }
+[[ -n "${1:-}" ]] && [[ -d "$1" ]] && { TARGET_DIR="$1"; shift; }
+[[ -n "${1:-}" ]] && { FROM_STR="$1"; shift; }
+[[ -n "${1:-}" ]] && { TO_STR="$1"; shift; }
 
-[ ! -d "${TARGET_DIR}" ] && { echo "Ошибка: каталог '${TARGET_DIR}' не существует." >&2; exit 1; }
-[ -z "${FROM_STR}" ] && { echo "Ошибка: исходная строка пустая." >&2; exit 1; }
+[[ ! -d "${TARGET_DIR}" ]] && { echo "Ошибка: каталог '${TARGET_DIR}' не существует." >&2; exit 1; }
+[[ -z "${FROM_STR}" ]] && { echo "Ошибка: исходная строка пустая." >&2; exit 1; }
 
 log_json "INFO" "start" "Запуск замены строк" "dir=${TARGET_DIR}; from=${FROM_STR}; to=${TO_STR}; dry_run=${DRY_RUN}; recursive=${RECURSIVE}"
 
@@ -117,9 +118,9 @@ echo
 
 # Сначала собираем все файлы в массив и считаем общее количество
 if ${RECURSIVE}; then
-    mapfile -t files < <(grep -rlI -- "${FROM_STR}" "${TARGET_DIR}" 2>/dev/null)
+    mapfile -t files < <(grep -rlI -- "${FROM_STR}" "${TARGET_DIR}" 2>/dev/null || true)
 else
-    mapfile -t files < <(grep -lI -- "${FROM_STR}" "${TARGET_DIR}"/* 2>/dev/null)
+    mapfile -t files < <(grep -lI -- "${FROM_STR}" "${TARGET_DIR}"/* 2>/dev/null || true)
 fi
 total=${#files[@]}
 
@@ -158,7 +159,7 @@ for file in "${files[@]}"; do
     ((counter++))
     progress_bar "${counter}" "${total}"
 
-    [ -f "${file}" ] || continue
+    [[ -f "${file}" ]] || continue
 
     if ${DRY_RUN}; then
         echo -e "\nНайдено в: ${file}"

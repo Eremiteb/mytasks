@@ -284,7 +284,7 @@ extract_docx_meta() {
       gsub(/^[[ \t\r\n]+/, "", title); gsub(/[[ \t\r\n]+$/, "", title);
       gsub(/^[[ \t\r\n]+/, "", creator); gsub(/[[ \t\r\n]+$/, "", creator);
       printf "%s\t%s", title, creator;
-    }'
+    }' || true
 }
 
 make_out_path() {
@@ -332,7 +332,7 @@ run_pandoc_to_fb2() {
   local meta_title="" meta_creator="" ttitle="" tauthor=""
 
   if [[ "${in,,}" == *.docx ]]; then
-    IFS=$'\t' read -r meta_title meta_creator < <(extract_docx_meta "${in}")
+    IFS=$'\t' read -r meta_title meta_creator < <(extract_docx_meta "${in}" || true)
   fi
 
   case "${TITLE_MODE}" in
@@ -419,7 +419,7 @@ fallback_convert() {
     fi
 
     log_error "fallback_failed" "${src}" "${out}" "Fallback не помог для DOC" \
-      "mime=${mime:-unknown}; have_antiword=$(have_cmd antiword && echo 1 || echo 0); have_catdoc=$(have_cmd catdoc && echo 1 || echo 0); have_wvText=$(have_cmd wvText && echo 1 || echo 0); tail_err=$(tail -n 200 "${errfile}" 2>/dev/null || true)"
+      "mime=${mime:-unknown}; have_antiword=$(have_cmd antiword && echo 1 || echo 0 || true); have_catdoc=$(have_cmd catdoc && echo 1 || echo 0 || true); have_wvText=$(have_cmd wvText && echo 1 || echo 0 || true); tail_err=$(tail -n 200 "${errfile}" 2>/dev/null || true)"
     return 1
   fi
 
@@ -448,7 +448,7 @@ convert_one() {
 
   if matches_excludes "${base}"; then echo "SKIP|excluded|${src}|${out}"; return 0; fi
   if ! only_allows_ext "${ext}"; then echo "SKIP|filtered|${src}|${out}"; return 0; fi
-  case "${base}" in "~$"*) echo "SKIP|tempfile|${src}|${out}"; return 0 ;; esac
+  case "${base}" in "~$"*) echo "SKIP|tempfile|${src}|${out}"; return 0 ;; *) ;; esac
 
   if [[ -e "${out}" ]]; then
     if [[ "${OVERWRITE}" -eq 0 ]]; then echo "SKIP|exists|${src}|${out}"; return 0; fi
@@ -530,7 +530,7 @@ convert_one() {
     local lo_rc=$?
 
     produced="${workdir}/${base%.*}.odt"
-    [[ ! -f "${produced}" ]] && produced="$(find "${workdir}" -maxdepth 1 -type f -name '*.odt' -printf '%T@|%p\n' 2>/dev/null | sort -nr | awk -F'|' 'NR == 1 { print $2 }')"
+    [[ ! -f "${produced}" ]] && produced="$({ find "${workdir}" -maxdepth 1 -type f -name '*.odt' -printf '%T@|%p\n' 2>/dev/null | sort -nr | awk -F'|' 'NR == 1 { print $2 }'; } || true)"
 
     if [[ -z "${produced:-}" ]] || [[ ! -f "${produced}" ]] || lo_has_error "${errfile}"; then
       log_error "to_odt_failed" "${src}" "${out}" "Не удалось получить .odt" "rc=${lo_rc}; tail_err=$(tail -n 160 "${errfile}" 2>/dev/null || true)"
@@ -539,7 +539,7 @@ convert_one() {
       log_info "to_docx_alt_start" "${src}" "${out}" "LO -> docx (alt)" ""
       "${LO_CMD}" -env:UserInstallation="${lo_uri}" --headless --convert-to docx --outdir "${workdir}" "${src}" >>"${errfile}" 2>&1
       produced2="${workdir}/${base%.*}.docx"
-      [[ ! -f "${produced2}" ]] && produced2="$(find "${workdir}" -maxdepth 1 -type f -name '*.docx' -printf '%T@|%p\n' 2>/dev/null | sort -nr | awk -F'|' 'NR == 1 { print $2 }')"
+      [[ ! -f "${produced2}" ]] && produced2="$({ find "${workdir}" -maxdepth 1 -type f -name '*.docx' -printf '%T@|%p\n' 2>/dev/null | sort -nr | awk -F'|' 'NR == 1 { print $2 }'; } || true)"
 
       if [[ -n "${produced2:-}" ]] && [[ -f "${produced2}" ]] && ! lo_has_error "${errfile}"; then
         cp -f "${produced2}" "${staged_docx}" >>"${errfile}" 2>&1 || true
@@ -593,8 +593,8 @@ convert_one() {
 ###############################################################################
 log_info "scan_start" "${DIR}" "" "Старт" "log=${LOGFILE} dryrun=${DRYRUN} overwrite=${OVERWRITE} skip_newer=${SKIP_NEWER} only=${ONLY} excludes_count=${#EXCLUDES[@]} author_set=${AUTHOR_SET} author=${AUTHOR} title_mode=${TITLE_MODE} toc=${TOC} toc_depth=${TOC_DEPTH} log_level=${LOG_LEVEL}"
 
-TOTAL="$(find "${DIR}" -type f \( -iname '*.doc' -o -iname '*.docx' -o -iname '*.rtf' -o -iname '*.odt' \) -print | wc -l | awk '{print $1}')"
-case "${TOTAL}" in ''|*[!0-9]*) TOTAL=0 ;; esac
+TOTAL="$({ find "${DIR}" -type f \( -iname '*.doc' -o -iname '*.docx' -o -iname '*.rtf' -o -iname '*.odt' \) -print | wc -l | awk '{print $1}'; } || true)"
+case "${TOTAL}" in ''|*[!0-9]*) TOTAL=0 ;; *) ;; esac
 [[ "${TOTAL}" -gt 0 ]] || TOTAL=1
 
 i=0
@@ -614,6 +614,6 @@ while IFS= read -r -d '' f; do
   printf '[%6d/%-6d | %3d%%] %-4s %s -> %s' "${i}" "${TOTAL}" "${pct}" "${status}" "${src}" "${out}"
   [[ -n "${detail}" ]] && printf ' (%s)' "${detail}"
   printf '\n'
-done < <(find "${DIR}" -type f \( -iname '*.doc' -o -iname '*.docx' -o -iname '*.rtf' -o -iname '*.odt' \) -print0)
+done < <(find "${DIR}" -type f \( -iname '*.doc' -o -iname '*.docx' -o -iname '*.rtf' -o -iname '*.odt' \) -print0 || true)
 
 echo "Готово. Лог: ${LOGFILE}"
