@@ -1,0 +1,30 @@
+# Список дисков через запятую (имена или полные пути), например: sda,sdb
+# Пусто = автоопределение всех физических дисков через lsblk
+DISKS=""
+
+# Путь к базе SQLite с историей опросов
+DB_FILE="/home/esimych/esimych-docs/mytasks/state/disk_monitor.db"
+
+# Каталог для HTML-отчётов (по умолчанию disk_reports рядом со скриптом)
+REPORT_DIR="/home/esimych/esimych-docs/mytasks/disk_reports"
+
+# Сколько последних HTML-отчётов хранить
+REPORT_KEEP=5
+
+# Сколько последних JSONL-логов хранить
+KEEP_LOGS=10
+
+# Сколько последних опросов показывать на графике температуры
+HISTORY_POINTS=30
+
+# Путь к бинарю smartctl (если не в PATH)
+SMARTCTL_BIN="smartctl"
+
+# Пороги температуры (°C) для статусов "внимание" и "критично"
+TEMP_WARN_C=50
+TEMP_CRIT_C=60
+
+# Параметры desktop-уведомления при критическом состоянии (если есть notify-send)
+APP_NAME="DiskMonitor"
+ICON_NAME="drive-harddisk"
+URGENCY="critical"
