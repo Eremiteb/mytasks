@@ -44,9 +44,9 @@ logs/
 state/*
 !state/.gitkeep
 
-# HTML-отчёты disk_monitor.sh (генерируются скриптом, привязаны к машине)
-disk_reports/*
-!disk_reports/.gitkeep
+# HTML-отчёты system_monitor.sh (генерируются скриптом, привязаны к машине)
+system_reports/*
+!system_reports/.gitkeep
 
 # Configuration files (keep directory structure)
 conf/*

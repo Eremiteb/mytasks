@@ -1,10 +1,13 @@
 #!/usr/bin/env bats
 
-# Тесты для disk_monitor.sh
-# smartctl, lsblk и notify-send заменяются стабами; sqlite3 и jq — настоящие
-# (проверка реальной записи/чтения SQLite и разбора JSON важна сама по себе).
-# Скрипт копируется во временную папку, поэтому logs/, state/ и disk_reports/
-# создаются в TMP_DIR, а не в репозитории.
+# Тесты для system_monitor.sh
+# smartctl, lsblk, sensors, nvidia-smi и notify-send заменяются стабами;
+# sqlite3 и jq — настоящие (проверка реальной записи/чтения SQLite и
+# разбора JSON важна сама по себе). CPU опрашивается по-настоящему через
+# /proc/stat и /proc/loadavg (эти псевдофайлы есть на любом Linux, включая
+# CI-раннеры) — не стабится, т.к. это не внешняя команда, а чтение файла.
+# Скрипт копируется во временную папку, поэтому logs/, state/ и
+# system_reports/ создаются в TMP_DIR, а не в репозитории.
 
 setup() {
   REPO_ROOT="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
@@ -16,8 +19,8 @@ setup() {
 
   mkdir -p "$STUB_DIR" "$SMART_DIR" "$TMP_DIR/conf" "$TMP_DIR/logs" "$TMP_DIR/state"
 
-  cp "$REPO_ROOT/disk_monitor.sh" "$TMP_DIR/disk_monitor.sh"
-  chmod +x "$TMP_DIR/disk_monitor.sh"
+  cp "$REPO_ROOT/system_monitor.sh" "$TMP_DIR/system_monitor.sh"
+  chmod +x "$TMP_DIR/system_monitor.sh"
 
   # Здоровые диски по умолчанию: sda и sdb
   write_smart_json sda '{"smart_status":{"passed":true},"model_name":"TestDisk-A","serial_number":"SNAAA","temperature":{"current":35},"power_on_time":{"hours":1000},"ata_smart_attributes":{"table":[{"name":"Reallocated_Sector_Ct","raw":{"value":0}},{"name":"Current_Pending_Sector","raw":{"value":0}},{"name":"Offline_Uncorrectable","raw":{"value":0}}]}}'
@@ -68,6 +71,20 @@ exit 1
 EOF
   chmod +x "$STUB_DIR/smartctl"
 
+  # Стаб sensors: здоровая температура CPU по умолчанию (45°C)
+  cat > "$STUB_DIR/sensors" <<'EOF'
+#!/usr/bin/env bash
+printf '{"k10temp-pci-00c3":{"Adapter":"PCI adapter","Tctl":{"temp1_input": 45.0}}}\n'
+EOF
+  chmod +x "$STUB_DIR/sensors"
+
+  # Стаб nvidia-smi: одна здоровая видеокарта по умолчанию (40°C)
+  cat > "$STUB_DIR/nvidia-smi" <<'EOF'
+#!/usr/bin/env bash
+printf '0, Test GPU, 40, 20, 512, 4096, 25.50\n'
+EOF
+  chmod +x "$STUB_DIR/nvidia-smi"
+
   # Стаб notify-send: фиксирует факт вызова
   cat > "$STUB_DIR/notify-send" <<EOF
 #!/usr/bin/env bash
@@ -87,15 +104,15 @@ write_smart_json() {
 }
 
 run_monitor() {
-  run env PATH="$STUB_DIR:$PATH" bash "$TMP_DIR/disk_monitor.sh" "$@"
+  run env PATH="$STUB_DIR:$PATH" bash "$TMP_DIR/system_monitor.sh" "$@"
 }
 
 last_log() {
-  ls -1t "$TMP_DIR/logs"/disk_monitor-*.jsonl 2>/dev/null | head -1
+  ls -1t "$TMP_DIR/logs"/system_monitor-*.jsonl 2>/dev/null | head -1
 }
 
 db_query() {
-  sqlite3 -noheader -separator '|' "$TMP_DIR/state/disk_monitor.db" "$1"
+  sqlite3 -noheader -separator '|' "$TMP_DIR/state/system_monitor.db" "$1"
 }
 
 # ---------------------------------------------------------------------------
@@ -112,7 +129,7 @@ db_query() {
     [ -n "$_bin" ] && ln -sf "$_bin" "$iso/$_cmd" || true
   done
 
-  run env PATH="$iso" bash "$TMP_DIR/disk_monitor.sh"
+  run env PATH="$iso" bash "$TMP_DIR/system_monitor.sh"
 
   [ "$status" -eq 2 ]
   run grep -q '"event":"dependency_missing"' "$(last_log)"
@@ -134,14 +151,14 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# Опрос и запись в SQLite
+# Опрос и запись в SQLite — диски
 # ---------------------------------------------------------------------------
 
 @test "здоровые диски: опрос, запись в БД и отчёт, выход 0" {
   run_monitor
 
   [ "$status" -eq 0 ]
-  [ -f "$TMP_DIR/state/disk_monitor.db" ]
+  [ -f "$TMP_DIR/state/system_monitor.db" ]
   [[ "$output" == *"Отчёт:"* ]]
 
   run db_query "SELECT COUNT(*) FROM disk_stats;"
@@ -170,9 +187,9 @@ EOF
   run_monitor
   [ "$status" -eq 0 ]
 
-  run grep -q "Точка монтирования" "$TMP_DIR/disk_reports/latest.html"
+  run grep -q "Точка монтирования" "$TMP_DIR/system_reports/latest.html"
   [ "$status" -eq 0 ]
-  run grep -q "/home" "$TMP_DIR/disk_reports/latest.html"
+  run grep -q "/home" "$TMP_DIR/system_reports/latest.html"
   [ "$status" -eq 0 ]
 }
 
@@ -180,7 +197,7 @@ EOF
   run_monitor
   [ "$status" -eq 0 ]
 
-  run grep -q "Точки монтирования: sdb1: /home" "$TMP_DIR/disk_reports/latest.html"
+  run grep -q "Точки монтирования: sdb1: /home" "$TMP_DIR/system_reports/latest.html"
   [ "$status" -eq 0 ]
 }
 
@@ -201,25 +218,126 @@ EOF
   [ "$status" -eq 0 ]
   [ "$output" = "4000787030016" ]
 
-  run grep -q "Объём" "$TMP_DIR/disk_reports/latest.html"
+  run grep -q "Объём" "$TMP_DIR/system_reports/latest.html"
   [ "$status" -eq 0 ]
-  run grep -q "3.6 ТиБ" "$TMP_DIR/disk_reports/latest.html"
+  run grep -q "3.6 ТиБ" "$TMP_DIR/system_reports/latest.html"
   [ "$status" -eq 0 ]
 }
 
-@test "HTML-отчёт создаётся в disk_reports рядом со скриптом" {
+@test "HTML-отчёт создаётся в system_reports рядом со скриптом" {
   run_monitor
   [ "$status" -eq 0 ]
 
-  [ -f "$TMP_DIR/disk_reports/latest.html" ]
-  count=$(ls -1 "$TMP_DIR/disk_reports"/disk_monitor-*.html 2>/dev/null | wc -l)
+  [ -f "$TMP_DIR/system_reports/latest.html" ]
+  count=$(ls -1 "$TMP_DIR/system_reports"/system_monitor-*.html 2>/dev/null | wc -l)
   [ "$count" -ge 1 ]
-  run grep -q "Диагностика жёстких дисков" "$TMP_DIR/disk_reports/latest.html"
+  run grep -q "Диагностика системы" "$TMP_DIR/system_reports/latest.html"
   [ "$status" -eq 0 ]
 }
 
 # ---------------------------------------------------------------------------
-# Критическое состояние и уведомления
+# Опрос и запись в SQLite — CPU и GPU
+# ---------------------------------------------------------------------------
+
+@test "CPU: температура, загрузка и load average сохраняются в БД и в отчёте" {
+  run_monitor
+  [ "$status" -eq 0 ]
+
+  run db_query "SELECT temperature_c FROM cpu_stats ORDER BY id DESC LIMIT 1;"
+  [ "$status" -eq 0 ]
+  [ "$output" = "45" ]
+
+  run db_query "SELECT usage_percent IS NOT NULL, load1 IS NOT NULL FROM cpu_stats ORDER BY id DESC LIMIT 1;"
+  [ "$output" = "1|1" ]
+
+  run grep -q "Процессор (CPU)" "$TMP_DIR/system_reports/latest.html"
+  [ "$status" -eq 0 ]
+  run grep -qE '<td>45</td>' "$TMP_DIR/system_reports/latest.html"
+  [ "$status" -eq 0 ]
+}
+
+@test "GPU: данные сохраняются в БД и отображаются в отчёте" {
+  run_monitor
+  [ "$status" -eq 0 ]
+
+  run db_query "SELECT device, model, temperature_c, mem_total_mb FROM gpu_stats ORDER BY id DESC LIMIT 1;"
+  [ "$status" -eq 0 ]
+  [ "$output" = "0|Test GPU|40|4096" ]
+
+  run grep -q "Test GPU" "$TMP_DIR/system_reports/latest.html"
+  [ "$status" -eq 0 ]
+  run grep -q "Видеокарта (GPU)" "$TMP_DIR/system_reports/latest.html"
+  [ "$status" -eq 0 ]
+}
+
+# Для "недоступен" нужна ПОЛНОСТЬЮ изолированная PATH (замена, а не
+# "$STUB_DIR:$PATH" из run_monitor) — иначе реальные sensors/nvidia-smi,
+# если они есть на машине, где запускаются тесты, "просвечивают" через
+# оставшуюся часть реального PATH и тест ничего не проверяет.
+iso_path_without() {
+  local iso="$1"
+  mkdir -p "$iso"
+  cp "$STUB_DIR/lsblk" "$iso/lsblk"
+  cp "$STUB_DIR/smartctl" "$iso/smartctl"
+  cp "$STUB_DIR/notify-send" "$iso/notify-send"
+  for _cmd in bash env date mkdir ls rm mv chmod sed grep tr awk sleep mktemp basename dirname cat printf cp find sort sqlite3 jq; do
+    _bin="$(command -v "$_cmd" 2>/dev/null)"
+    [ -n "$_bin" ] && ln -sf "$_bin" "$iso/$_cmd" || true
+  done
+}
+
+@test "GPU: nvidia-smi недоступен → опрос GPU пропускается без ошибки" {
+  local iso="$TMP_DIR/iso_no_gpu"
+  iso_path_without "$iso"
+
+  run env PATH="$iso" bash "$TMP_DIR/system_monitor.sh"
+
+  [ "$status" -eq 0 ]
+  run grep -q '"event":"gpu_unavailable"' "$(last_log)"
+  [ "$status" -eq 0 ]
+  run db_query "SELECT COUNT(*) FROM gpu_stats;"
+  [ "$output" = "0" ]
+}
+
+@test "CPU: sensors недоступен → CPU опрашивается, но без температуры" {
+  local iso="$TMP_DIR/iso_no_sensors"
+  iso_path_without "$iso"
+
+  run env PATH="$iso" bash "$TMP_DIR/system_monitor.sh"
+
+  [ "$status" -eq 0 ]
+  run grep -q '"event":"sensors_unavailable"' "$(last_log)"
+  [ "$status" -eq 0 ]
+  run db_query "SELECT COUNT(*), temperature_c FROM cpu_stats;"
+  [ "$output" = "1|" ]
+}
+
+@test "высокая температура CPU выше критического порога → критично, выход 1" {
+  cat > "$TMP_DIR/conf/system_monitor.conf" <<'EOF'
+CPU_TEMP_CRIT_C=10
+EOF
+
+  run_monitor
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"КРИТИЧНО"* ]]
+  [[ "$output" == *"CPU"* ]]
+}
+
+@test "высокая температура GPU выше критического порога → критично, выход 1" {
+  cat > "$TMP_DIR/conf/system_monitor.conf" <<'EOF'
+GPU_TEMP_CRIT_C=10
+EOF
+
+  run_monitor
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"КРИТИЧНО"* ]]
+  [[ "$output" == *"GPU0"* ]]
+}
+
+# ---------------------------------------------------------------------------
+# Критическое состояние и уведомления — диски
 # ---------------------------------------------------------------------------
 
 @test "отказавший диск (FAILED) → критично, notify-send и выход 1" {
@@ -232,11 +350,11 @@ EOF
   [ -f "$NOTIFY_LOG" ]
   run grep -q "/dev/sdb" "$NOTIFY_LOG"
   [ "$status" -eq 0 ]
-  run grep -q '"event":"critical_disk_status"' "$(last_log)"
+  run grep -q '"event":"critical_status"' "$(last_log)"
   [ "$status" -eq 0 ]
 }
 
-@test "высокая температура выше критического порога → выход 1" {
+@test "высокая температура диска выше критического порога → выход 1" {
   write_smart_json sdb '{"smart_status":{"passed":true},"model_name":"TestDisk-B","serial_number":"SNBBB","temperature":{"current":70},"power_on_time":{"hours":2000},"ata_smart_attributes":{"table":[{"name":"Reallocated_Sector_Ct","raw":{"value":0}},{"name":"Current_Pending_Sector","raw":{"value":0}},{"name":"Offline_Uncorrectable","raw":{"value":0}}]}}'
 
   run_monitor
@@ -251,7 +369,7 @@ EOF
 
   [ "$status" -eq 0 ]
   [ ! -f "$NOTIFY_LOG" ]
-  run grep -q '"event":"disk_warning"' "$(last_log)"
+  run grep -q '"event":"system_warning"' "$(last_log)"
   [ "$status" -eq 0 ]
 }
 
@@ -279,13 +397,14 @@ EOF
   [ "$status" -eq 0 ]
 }
 
-@test "--report пересобирает отчёт из БД без повторного опроса дисков" {
+@test "--report пересобирает отчёт из БД без повторного опроса" {
   run_monitor
   [ "$status" -eq 0 ]
   before=$(db_query "SELECT COUNT(*) FROM disk_stats;")
+  before_cpu=$(db_query "SELECT COUNT(*) FROM cpu_stats;")
 
-  # Второй запуск изолирован от smartctl и lsblk — режим отчёта читает всё
-  # (включая точки монтирования) из уже сохранённых в БД данных
+  # Второй запуск изолирован от smartctl/lsblk/sensors/nvidia-smi — режим
+  # отчёта читает всё из уже сохранённых в БД данных
   local iso="$TMP_DIR/iso_report_only"
   mkdir -p "$iso"
   cp "$STUB_DIR/notify-send" "$iso/notify-send"
@@ -294,11 +413,13 @@ EOF
     [ -n "$_bin" ] && ln -sf "$_bin" "$iso/$_cmd" || true
   done
 
-  run env PATH="$iso" bash "$TMP_DIR/disk_monitor.sh" -r
+  run env PATH="$iso" bash "$TMP_DIR/system_monitor.sh" -r
 
   [ "$status" -eq 0 ]
   after=$(db_query "SELECT COUNT(*) FROM disk_stats;")
+  after_cpu=$(db_query "SELECT COUNT(*) FROM cpu_stats;")
   [ "$before" = "$after" ]
+  [ "$before_cpu" = "$after_cpu" ]
 }
 
 # ---------------------------------------------------------------------------
@@ -337,18 +458,18 @@ EOF
 }
 
 @test "старые JSONL-логи удаляются согласно KEEP_LOGS" {
-  cat > "$TMP_DIR/conf/disk_monitor.conf" <<'EOF'
+  cat > "$TMP_DIR/conf/system_monitor.conf" <<'EOF'
 KEEP_LOGS=2
 EOF
 
   for i in 1 2 3 4 5; do
-    touch "$TMP_DIR/logs/disk_monitor-2020-01-0${i}-00-00-00.jsonl"
+    touch "$TMP_DIR/logs/system_monitor-2020-01-0${i}-00-00-00.jsonl"
   done
 
   run_monitor
   [ "$status" -eq 0 ]
 
-  count=$(ls -1 "$TMP_DIR/logs"/disk_monitor-*.jsonl 2>/dev/null | wc -l)
+  count=$(ls -1 "$TMP_DIR/logs"/system_monitor-*.jsonl 2>/dev/null | wc -l)
   [ "$count" -le 2 ]
 }
 
@@ -357,20 +478,20 @@ EOF
 # ---------------------------------------------------------------------------
 
 @test "старые HTML-отчёты удаляются согласно REPORT_KEEP" {
-  cat > "$TMP_DIR/conf/disk_monitor.conf" <<'EOF'
+  cat > "$TMP_DIR/conf/system_monitor.conf" <<'EOF'
 REPORT_KEEP=2
 EOF
 
-  mkdir -p "$TMP_DIR/disk_reports"
+  mkdir -p "$TMP_DIR/system_reports"
   for i in 1 2 3 4 5; do
-    touch "$TMP_DIR/disk_reports/disk_monitor-2020-01-0${i}-00-00-00.html"
+    touch "$TMP_DIR/system_reports/system_monitor-2020-01-0${i}-00-00-00.html"
   done
 
   run_monitor
   [ "$status" -eq 0 ]
 
-  count=$(ls -1 "$TMP_DIR/disk_reports"/disk_monitor-*.html 2>/dev/null | wc -l)
+  count=$(ls -1 "$TMP_DIR/system_reports"/system_monitor-*.html 2>/dev/null | wc -l)
   [ "$count" -le 2 ]
   # latest.html — фиксированное имя, ротацией не затрагивается
-  [ -f "$TMP_DIR/disk_reports/latest.html" ]
+  [ -f "$TMP_DIR/system_reports/latest.html" ]
 }

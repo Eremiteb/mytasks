@@ -3,10 +3,10 @@
 DISKS=""
 
 # Путь к базе SQLite с историей опросов
-DB_FILE="/home/esimych/esimych-docs/mytasks/state/disk_monitor.db"
+DB_FILE="/home/esimych/esimych-docs/mytasks/state/system_monitor.db"
 
-# Каталог для HTML-отчётов (по умолчанию disk_reports рядом со скриптом)
-REPORT_DIR="/home/esimych/esimych-docs/mytasks/disk_reports"
+# Каталог для HTML-отчётов (по умолчанию system_reports рядом со скриптом)
+REPORT_DIR="/home/esimych/esimych-docs/mytasks/system_reports"
 
 # Сколько последних HTML-отчётов хранить
 REPORT_KEEP=5
@@ -14,17 +14,33 @@ REPORT_KEEP=5
 # Сколько последних JSONL-логов хранить
 KEEP_LOGS=10
 
-# Сколько последних опросов показывать на графике температуры
+# Сколько последних опросов показывать на графиках истории
 HISTORY_POINTS=30
 
 # Путь к бинарю smartctl (если не в PATH)
 SMARTCTL_BIN="smartctl"
 
-# Пороги температуры (°C) для статусов "внимание" и "критично"
+# Путь к бинарю sensors из lm_sensors (если не в PATH); опционально —
+# при отсутствии CPU опрашивается без температуры
+SENSORS_BIN="sensors"
+
+# Путь к бинарю nvidia-smi (если не в PATH); опционально — при отсутствии
+# (нет NVIDIA GPU/драйвера) опрос GPU просто пропускается
+NVIDIA_SMI_BIN="nvidia-smi"
+
+# Пороги температуры дисков (°C) для статусов "внимание" и "критично"
 TEMP_WARN_C=50
 TEMP_CRIT_C=60
 
+# Пороги температуры CPU (°C)
+CPU_TEMP_WARN_C=80
+CPU_TEMP_CRIT_C=90
+
+# Пороги температуры GPU (°C)
+GPU_TEMP_WARN_C=75
+GPU_TEMP_CRIT_C=85
+
 # Параметры desktop-уведомления при критическом состоянии (если есть notify-send)
-APP_NAME="DiskMonitor"
-ICON_NAME="drive-harddisk"
+APP_NAME="SystemMonitor"
+ICON_NAME="utilities-system-monitor"
 URGENCY="critical"

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Диагностика жёстких дисков (SMART): опрос, запись состояния в SQLite,
-# HTML-отчёт (таблица + диаграммы + аналитическая справка по каждому диску).
+# Диагностика системы: жёсткие диски (SMART), CPU и GPU. Опрос, запись
+# состояния в SQLite, HTML-отчёт (таблицы + диаграммы + аналитическая
+# справка по каждому диску).
 set -uo pipefail
 
 ###############################################################################
@@ -30,17 +31,23 @@ if [[ -r "${CONF_FILE}" ]]; then
     source "${CONF_FILE}"
 fi
 
-DB_FILE="${DB_FILE:-${STATE_DIR}/disk_monitor.db}"
-REPORT_DIR="${REPORT_DIR:-${SCRIPT_DIR}/disk_reports}"
+DB_FILE="${DB_FILE:-${STATE_DIR}/${SCRIPT_BASE}.db}"
+REPORT_DIR="${REPORT_DIR:-${SCRIPT_DIR}/system_reports}"
 REPORT_KEEP="${REPORT_KEEP:-5}"
 KEEP_LOGS="${KEEP_LOGS:-10}"
 HISTORY_POINTS="${HISTORY_POINTS:-30}"
 SMARTCTL_BIN="${SMARTCTL_BIN:-smartctl}"
+SENSORS_BIN="${SENSORS_BIN:-sensors}"
+NVIDIA_SMI_BIN="${NVIDIA_SMI_BIN:-nvidia-smi}"
 DISKS="${DISKS:-}"
 TEMP_WARN_C="${TEMP_WARN_C:-50}"
 TEMP_CRIT_C="${TEMP_CRIT_C:-60}"
-APP_NAME="${APP_NAME:-DiskMonitor}"
-ICON_NAME="${ICON_NAME:-drive-harddisk}"
+CPU_TEMP_WARN_C="${CPU_TEMP_WARN_C:-80}"
+CPU_TEMP_CRIT_C="${CPU_TEMP_CRIT_C:-90}"
+GPU_TEMP_WARN_C="${GPU_TEMP_WARN_C:-75}"
+GPU_TEMP_CRIT_C="${GPU_TEMP_CRIT_C:-85}"
+APP_NAME="${APP_NAME:-SystemMonitor}"
+ICON_NAME="${ICON_NAME:-utilities-system-monitor}"
 URGENCY="${URGENCY:-critical}"
 
 ###############################################################################
@@ -151,13 +158,14 @@ usage() {
   ${SCRIPT_NAME} [-r|--report] [-h|--help]
 
 Без аргументов:
-  Опрашивает диски (smartctl), сохраняет состояние в SQLite (${DB_FILE})
-  и формирует HTML-отчёт в ${REPORT_DIR}. Предназначен для запуска при
-  загрузке системы (cron @reboot / systemd) и по расписанию.
+  Опрашивает диски (smartctl), CPU (lm_sensors, /proc) и GPU (nvidia-smi,
+  если есть), сохраняет состояние в SQLite (${DB_FILE}) и формирует
+  HTML-отчёт в ${REPORT_DIR}. Предназначен для запуска по расписанию
+  (cron) и/или при загрузке системы.
 
 Опции:
   -r, --report   Только пересобрать HTML-отчёт из уже накопленных в
-                 SQLite данных, без повторного опроса дисков.
+                 SQLite данных, без повторного опроса.
   -h, --help     Показать эту справку и выйти.
 EOF
 }
@@ -206,6 +214,31 @@ CREATE TABLE IF NOT EXISTS disk_stats (
     uncorrectable_errors  INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_disk_stats_device_ts ON disk_stats(device, ts);
+
+CREATE TABLE IF NOT EXISTS cpu_stats (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts             TEXT NOT NULL,
+    model          TEXT,
+    temperature_c  INTEGER,
+    usage_percent  REAL,
+    load1          REAL,
+    load5          REAL,
+    load15         REAL
+);
+CREATE INDEX IF NOT EXISTS idx_cpu_stats_ts ON cpu_stats(ts);
+
+CREATE TABLE IF NOT EXISTS gpu_stats (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts             TEXT NOT NULL,
+    device         TEXT NOT NULL,
+    model          TEXT,
+    temperature_c  INTEGER,
+    usage_percent  REAL,
+    mem_used_mb    INTEGER,
+    mem_total_mb   INTEGER,
+    power_draw_w   REAL
+);
+CREATE INDEX IF NOT EXISTS idx_gpu_stats_device_ts ON gpu_stats(device, ts);
 SQL
     # Миграции для баз, созданных до появления этих колонок (ошибку "duplicate column" игнорируем)
     sqlite3 "${DB_FILE}" "ALTER TABLE disk_stats ADD COLUMN device_alias TEXT;" 2>/dev/null || true
@@ -218,8 +251,18 @@ insert_row() {
     sqlite3 "${DB_FILE}" "INSERT INTO disk_stats (ts, device, device_alias, mountpoints, model, serial, size_bytes, health, temperature_c, power_on_hours, reallocated_sectors, pending_sectors, uncorrectable_errors) VALUES ('$(sql_escape "${row_ts}")', '$(sql_escape "${device}")', '$(sql_escape "${alias}")', '$(sql_escape "${mountpoints}")', '$(sql_escape "${model}")', '$(sql_escape "${serial}")', $(sql_num "${size}"), '$(sql_escape "${health}")', $(sql_num "${temp}"), $(sql_num "${poh}"), $(sql_num "${realloc}"), $(sql_num "${pending}"), $(sql_num "${uncorrect}"));"
 }
 
+insert_cpu_row() {
+    local model="$1" temp="$2" usage="$3" load1="$4" load5="$5" load15="$6" row_ts="$7"
+    sqlite3 "${DB_FILE}" "INSERT INTO cpu_stats (ts, model, temperature_c, usage_percent, load1, load5, load15) VALUES ('$(sql_escape "${row_ts}")', '$(sql_escape "${model}")', $(sql_num "${temp}"), $(sql_num "${usage}"), $(sql_num "${load1}"), $(sql_num "${load5}"), $(sql_num "${load15}"));"
+}
+
+insert_gpu_row() {
+    local device="$1" model="$2" temp="$3" usage="$4" mem_used="$5" mem_total="$6" power="$7" row_ts="$8"
+    sqlite3 "${DB_FILE}" "INSERT INTO gpu_stats (ts, device, model, temperature_c, usage_percent, mem_used_mb, mem_total_mb, power_draw_w) VALUES ('$(sql_escape "${row_ts}")', '$(sql_escape "${device}")', '$(sql_escape "${model}")', $(sql_num "${temp}"), $(sql_num "${usage}"), $(sql_num "${mem_used}"), $(sql_num "${mem_total}"), $(sql_num "${power}"));"
+}
+
 ###############################################################################
-# DISCOVERY & POLLING
+# DISCOVERY & POLLING — ДИСКИ
 ###############################################################################
 discover_disks() {
     DEVICES=()
@@ -269,8 +312,6 @@ disk_mountpoints() {
     ' 2>/dev/null <<< "${json}"
 }
 
-# Устойчивое системное имя диска (udev, /dev/disk/by-id) — в отличие от
-# /dev/sdX, не меняется при перестановке дисков/перезагрузке.
 # Объём диска в байтах. Через lsblk (а не только smartctl), т.к. lsblk
 # уже обязательная зависимость режима опроса и доступен даже когда smartctl
 # не может прочитать диск (см. правило "все поля отчёта — из БД" в памяти).
@@ -281,6 +322,8 @@ disk_size_bytes() {
     return 0
 }
 
+# Устойчивое системное имя диска (udev, /dev/disk/by-id) — в отличие от
+# /dev/sdX, не меняется при перестановке дисков/перезагрузке.
 device_alias() {
     local dev="$1" real link resolved name fallback=""
     real="$(readlink -f -- "${dev}" 2>/dev/null || printf '%s' "${dev}")"
@@ -345,6 +388,91 @@ poll_disk() {
 }
 
 ###############################################################################
+# ОПРОС — CPU
+###############################################################################
+cpu_model() {
+    awk -F': ' '/^model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null
+}
+
+# Температура CPU через lm_sensors (JSON, -j). Опционально: если sensors
+# не установлен/не настроен (sensors-detect), CPU всё равно опрашивается —
+# просто без температуры. Ищем главный тепловой датчик пакета: Tctl/Tdie
+# (AMD, k10temp) или "Package id 0" (Intel, coretemp).
+cpu_temperature() {
+    command -v "${SENSORS_BIN}" >/dev/null 2>&1 || return 0
+    "${SENSORS_BIN}" -j 2>/dev/null | jq -r '
+        [.. | objects | to_entries[]? |
+         select(.key | test("^(Tctl|Tdie|Package id 0)$")) |
+         (.value | to_entries[]? | select(.key | test("_input$")) | .value)
+        ][0] // empty
+    ' 2>/dev/null | awk '{ if ($1 != "") printf "%.0f", $1 }'
+}
+
+# Загрузка CPU (%) — две выборки /proc/stat с интервалом 1с (тот же
+# принцип, что использует top/mpstat), без дополнительных зависимостей.
+cpu_usage_percent() {
+    local read1 read2 total1 idle1 total2 idle2 dtotal didle
+    read1="$(awk '/^cpu /{idle=$5; total=0; for(i=2;i<=NF;i++) total+=$i; print total, idle}' /proc/stat 2>/dev/null)"
+    [[ -z "${read1}" ]] && return 0
+    sleep 1
+    read2="$(awk '/^cpu /{idle=$5; total=0; for(i=2;i<=NF;i++) total+=$i; print total, idle}' /proc/stat 2>/dev/null)"
+    [[ -z "${read2}" ]] && return 0
+    read -r total1 idle1 <<< "${read1}"
+    read -r total2 idle2 <<< "${read2}"
+    dtotal=$((total2 - total1))
+    didle=$((idle2 - idle1))
+    ((dtotal <= 0)) && return 0
+    awk -v dt="${dtotal}" -v di="${didle}" 'BEGIN{printf "%.1f", (dt-di)/dt*100}'
+}
+
+poll_cpu() {
+    local row_ts="$1" model temp usage load1 load5 load15
+
+    model="$(cpu_model)"
+    temp="$(cpu_temperature)"
+    if [[ -z "${temp}" ]] && ! command -v "${SENSORS_BIN}" >/dev/null 2>&1; then
+        log_json "INFO" "sensors_unavailable" "lm_sensors не найден — температура CPU не будет записана" ""
+    fi
+    usage="$(cpu_usage_percent)"
+    read -r load1 load5 load15 _ < /proc/loadavg
+
+    insert_cpu_row "${model}" "${temp}" "${usage}" "${load1}" "${load5}" "${load15}" "${row_ts}"
+    log_json "INFO" "cpu_polled" "Опрошен процессор" "temp=${temp}; usage=${usage}%"
+}
+
+###############################################################################
+# ОПРОС — GPU
+###############################################################################
+gpu_available() {
+    command -v "${NVIDIA_SMI_BIN}" >/dev/null 2>&1
+}
+
+# Опционально: если nvidia-smi не найден (нет NVIDIA GPU или драйвера),
+# просто пропускаем опрос GPU — это нормальная ситуация, не ошибка.
+poll_gpu() {
+    local row_ts="$1" index model temp usage mem_used mem_total power
+
+    if ! gpu_available; then
+        log_json "INFO" "gpu_unavailable" "nvidia-smi не найден — опрос GPU пропущен" ""
+        return 0
+    fi
+
+    while IFS=',' read -r index model temp usage mem_used mem_total power; do
+        [[ -z "${index// /}" ]] && continue
+        index="$(printf '%s' "${index}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        model="$(printf '%s' "${model}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        temp="$(printf '%s' "${temp}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        usage="$(printf '%s' "${usage}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        mem_used="$(printf '%s' "${mem_used}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        mem_total="$(printf '%s' "${mem_total}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        power="$(printf '%s' "${power}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+
+        insert_gpu_row "${index}" "${model}" "${temp}" "${usage}" "${mem_used}" "${mem_total}" "${power}" "${row_ts}"
+        log_json "INFO" "gpu_polled" "Опрошена видеокарта" "GPU${index}: temp=${temp}; usage=${usage}%"
+    done < <("${NVIDIA_SMI_BIN}" --query-gpu=index,name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw --format=csv,noheader,nounits 2>/dev/null)
+}
+
+###############################################################################
 # REPORT ANALYSIS
 ###############################################################################
 classify_status() {
@@ -380,6 +508,22 @@ classify_status() {
         return
     fi
     echo "ok"
+}
+
+# Классификация по одному порогу температуры (CPU/GPU) -> ok|warn|crit|unknown
+classify_temp_status() {
+    local temp="$1" warn_c="$2" crit_c="$3"
+    if [[ ! "${temp}" =~ ^-?[0-9]+$ ]]; then
+        echo "unknown"
+        return
+    fi
+    if ((temp >= crit_c)); then
+        echo "crit"
+    elif ((temp >= warn_c)); then
+        echo "warn"
+    else
+        echo "ok"
+    fi
 }
 
 # Формирует текст аналитической справки по одному диску (на русском).
@@ -540,6 +684,8 @@ END {
             seg = seg sprintf("%.1f,%.1f ", px, py)
             pts_n++
             printf "<circle cx=\"%.1f\" cy=\"%.1f\" r=\"3\" fill=\"%s\"><title>%s: %s°C</title></circle>\n", px, py, color, dev, val[key]
+            if (d % 2 == 0) labely = py + 13; else labely = py - 7
+            printf "<text x=\"%.1f\" y=\"%.1f\" font-size=\"9\" fill=\"#52514e\" text-anchor=\"middle\">%s°</text>\n", px, labely, val[key]
         }
         if (pts_n >= 2) printf "<polyline points=\"%s\" fill=\"none\" stroke=\"%s\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>\n", seg, color
     }
@@ -616,6 +762,101 @@ END {
 EOF
 )
     awk "${awk_prog}" "${latest_file}"
+}
+
+# Общий многосерийный график для CPU/GPU: все метрики нормированы в шкалу
+# 0-100 (температура, °C, и проценты естественно укладываются в одну шкалу),
+# поэтому одна общая ось не нарушает правило "не смешивать разные шкалы" —
+# это не dual-axis, а честно общий диапазон. У каждой точки — свой суффикс
+# единицы измерения (° или %), проставленный в исходных данных.
+# Формат строк hist_file: "серия|ts|значение|суффикс"
+build_metric_chart() {
+    local ts_axis_file="$1" hist_file="$2" aria_label="$3"
+    local awk_prog
+
+    awk_prog=$(cat <<'EOF'
+BEGIN {
+    split("#2a78d6 #eb6834 #1baf7a #eda100 #e87ba4 #008300 #4a3aa7 #e34948", colors, " ")
+    W=760; H=260; PADL=34; PADR=16; PADT=16; PADB=34
+    YMIN=0; YMAX=100
+    n_ts=0; n_series=0
+}
+FNR==NR {
+    n_ts++
+    ts_order[n_ts]=$0
+    ts_index[$0]=n_ts
+    next
+}
+{
+    n=split($0, a, "|")
+    if (n<4) next
+    series=a[1]; t=a[2]; v=a[3]; unit=a[4]
+    if (!(series in seen)) { seen[series]=1; n_series++; series_order[n_series]=series }
+    xi = ts_index[t]
+    if (xi=="") next
+    key = series SUBSEP xi
+    if (v != "") { val[key]=v+0; hasval[key]=1; unitof[series]=unit }
+}
+END {
+    if (n_ts < 1 || n_series < 1) { print "<p class=\"empty\">Недостаточно данных для графика.</p>"; exit }
+    plot_w = W - PADL - PADR
+    plot_h = H - PADT - PADB
+
+    print "<div class=\"chart-wrap\">"
+    printf "<svg viewBox=\"0 0 %d %d\" preserveAspectRatio=\"xMidYMid meet\" class=\"chart-svg\" role=\"img\" aria-label=\"%s\">\n", W, H, ARIA
+
+    split("0 50 100", yticks, " ")
+    for (i=1;i<=3;i++) {
+        yv=yticks[i]+0
+        gy = PADT + (YMAX-yv)/(YMAX-YMIN)*plot_h
+        printf "<line x1=\"%d\" y1=\"%.1f\" x2=\"%d\" y2=\"%.1f\" stroke=\"#e1e0d9\" stroke-width=\"1\"/>\n", PADL, gy, W-PADR, gy
+        printf "<text x=\"%d\" y=\"%.1f\" font-size=\"11\" fill=\"#898781\" text-anchor=\"end\">%s</text>\n", PADL-6, gy+4, yv
+    }
+    printf "<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\" stroke=\"#c3c2b7\" stroke-width=\"1\"/>\n", PADL, PADT+plot_h, W-PADR, PADT+plot_h
+
+    if (n_series > 8) n_draw = 8; else n_draw = n_series
+
+    for (d=1; d<=n_draw; d++) {
+        series = series_order[d]
+        color = colors[((d-1)%8)+1]
+        seg = ""
+        pts_n = 0
+        for (xi=1; xi<=n_ts; xi++) {
+            key = series SUBSEP xi
+            if (!(key in hasval)) {
+                if (pts_n >= 2) printf "<polyline points=\"%s\" fill=\"none\" stroke=\"%s\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>\n", seg, color
+                seg=""; pts_n=0
+                continue
+            }
+            v = val[key]
+            if (v > YMAX) v = YMAX
+            if (v < YMIN) v = YMIN
+            if (n_ts>1) px = PADL + (xi-1)*(plot_w/(n_ts-1)); else px = PADL + plot_w/2
+            py = PADT + (YMAX-v)/(YMAX-YMIN)*plot_h
+            seg = seg sprintf("%.1f,%.1f ", px, py)
+            pts_n++
+            printf "<circle cx=\"%.1f\" cy=\"%.1f\" r=\"3\" fill=\"%s\"><title>%s: %s%s</title></circle>\n", px, py, color, series, val[key], unitof[series]
+            if (d % 2 == 0) labely = py + 13; else labely = py - 7
+            printf "<text x=\"%.1f\" y=\"%.1f\" font-size=\"9\" fill=\"#52514e\" text-anchor=\"middle\">%s%s</text>\n", px, labely, val[key], unitof[series]
+        }
+        if (pts_n >= 2) printf "<polyline points=\"%s\" fill=\"none\" stroke=\"%s\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>\n", seg, color
+    }
+
+    printf "<text x=\"%d\" y=\"%d\" font-size=\"11\" fill=\"#898781\" text-anchor=\"start\">%s</text>\n", PADL, H-8, ts_order[1]
+    if (n_ts > 1) printf "<text x=\"%d\" y=\"%d\" font-size=\"11\" fill=\"#898781\" text-anchor=\"end\">%s</text>\n", W-PADR, H-8, ts_order[n_ts]
+    print "</svg>"
+
+    print "<div class=\"legend\">"
+    for (d=1; d<=n_draw; d++) {
+        color = colors[((d-1)%8)+1]
+        printf "<span class=\"legend-item\"><i style=\"background:%s\"></i>%s</span>\n", color, series_order[d]
+    }
+    if (n_series > n_draw) printf "<span class=\"legend-item legend-more\">и ещё %d</span>\n", n_series-n_draw
+    print "</div></div>"
+}
+EOF
+)
+    awk -v ARIA="${aria_label}" "${awk_prog}" "${ts_axis_file}" "${hist_file}"
 }
 
 ###############################################################################
@@ -696,7 +937,94 @@ generate_report() {
     local temp_chart sector_chart
     temp_chart="$(build_temp_chart "${ts_axis_file}" "${hist_file}")"
     sector_chart="$(build_sector_chart "${latest_file}")"
-    rm -f -- "${ts_axis_file}" "${hist_file}" "${latest_file}"
+    rm -f -- "${hist_file}" "${latest_file}"
+
+    # --- CPU ---
+    local cpu_model_v cpu_temp cpu_usage cpu_load1 cpu_load5 cpu_load15 cpu_ts
+    local cpu_latest cpu_rows_html="" cpu_chart="<p class=\"empty\">Нет данных о CPU.</p>"
+    cpu_latest="$(sqlite3 -noheader -separator '|' "${DB_FILE}" \
+        "SELECT model, temperature_c, usage_percent, load1, load5, load15, ts FROM cpu_stats ORDER BY id DESC LIMIT 1;")"
+    if [[ -n "${cpu_latest}" ]]; then
+        IFS='|' read -r cpu_model_v cpu_temp cpu_usage cpu_load1 cpu_load5 cpu_load15 cpu_ts <<< "${cpu_latest}"
+        local cstatus ccolor clabel
+        cstatus="$(classify_temp_status "${cpu_temp}" "${CPU_TEMP_WARN_C}" "${CPU_TEMP_CRIT_C}")"
+        ccolor="$(status_color "${cstatus}")"
+        clabel="$(status_label "${cstatus}")"
+        case "${cstatus}" in
+            ok) ((n_ok++)) ;;
+            warn) ((n_warn++)); WARNING_LINES+=("CPU: ${clabel}") ;;
+            crit) ((n_crit++)); CRITICAL_LINES+=("CPU: ${clabel}") ;;
+            *) ((n_unknown++)) ;;
+        esac
+
+        cpu_rows_html="<tr>
+<td>$(html_escape "${cpu_model_v}")</td>
+<td><span class=\"badge\" style=\"--c:${ccolor}\"><i></i>$(html_escape "${clabel}")</span></td>
+<td>${cpu_temp:-—}</td>
+<td>${cpu_usage:-—}</td>
+<td>${cpu_load1:-—} / ${cpu_load5:-—} / ${cpu_load15:-—}</td>
+<td>$(html_escape "${cpu_ts}")</td>
+</tr>
+"
+        if [[ -n "${cutoff_ts}" ]]; then
+            local cpu_hist_file
+            cpu_hist_file="$(mktemp)"
+            sqlite3 -noheader -separator '|' "${DB_FILE}" \
+                "SELECT 'CPU температура', ts, COALESCE(temperature_c,''), '°' FROM cpu_stats WHERE ts >= '$(sql_escape "${cutoff_ts}")'
+                 UNION ALL
+                 SELECT 'CPU загрузка, %', ts, COALESCE(usage_percent,''), '%' FROM cpu_stats WHERE ts >= '$(sql_escape "${cutoff_ts}")';" > "${cpu_hist_file}"
+            cpu_chart="$(build_metric_chart "${ts_axis_file}" "${cpu_hist_file}" "История CPU: температура и загрузка")"
+            rm -f -- "${cpu_hist_file}"
+        fi
+    fi
+
+    # --- GPU ---
+    local gpu_latest gpu_device gpu_model_v gpu_temp gpu_usage gpu_mem_used gpu_mem_total gpu_power gpu_ts
+    local gpu_rows_html="" gpu_chart="<p class=\"empty\">Видеокарта NVIDIA не обнаружена (nvidia-smi недоступен) либо данных ещё нет.</p>"
+    gpu_latest="$(sqlite3 -noheader -separator '|' "${DB_FILE}" \
+        "SELECT device, model, temperature_c, usage_percent, mem_used_mb, mem_total_mb, power_draw_w, ts FROM gpu_stats WHERE id IN (SELECT MAX(id) FROM gpu_stats GROUP BY device) ORDER BY device;")"
+    if [[ -n "${gpu_latest}" ]]; then
+        while IFS='|' read -r gpu_device gpu_model_v gpu_temp gpu_usage gpu_mem_used gpu_mem_total gpu_power gpu_ts; do
+            [[ -z "${gpu_device}" ]] && continue
+            local gstatus gcolor glabel
+            gstatus="$(classify_temp_status "${gpu_temp}" "${GPU_TEMP_WARN_C}" "${GPU_TEMP_CRIT_C}")"
+            gcolor="$(status_color "${gstatus}")"
+            glabel="$(status_label "${gstatus}")"
+            case "${gstatus}" in
+                ok) ((n_ok++)) ;;
+                warn) ((n_warn++)); WARNING_LINES+=("GPU${gpu_device}: ${glabel}") ;;
+                crit) ((n_crit++)); CRITICAL_LINES+=("GPU${gpu_device}: ${glabel}") ;;
+                *) ((n_unknown++)) ;;
+            esac
+
+            gpu_rows_html+="<tr>
+<td>GPU${gpu_device}</td>
+<td>$(html_escape "${gpu_model_v}")</td>
+<td><span class=\"badge\" style=\"--c:${gcolor}\"><i></i>$(html_escape "${glabel}")</span></td>
+<td>${gpu_temp:-—}</td>
+<td>${gpu_usage:-—}</td>
+<td>${gpu_mem_used:-—} / ${gpu_mem_total:-—} МиБ</td>
+<td>${gpu_power:-—}</td>
+<td>$(html_escape "${gpu_ts}")</td>
+</tr>
+"
+        done <<< "${gpu_latest}"
+
+        if [[ -n "${cutoff_ts}" ]]; then
+            local gpu_hist_file
+            gpu_hist_file="$(mktemp)"
+            sqlite3 -noheader -separator '|' "${DB_FILE}" \
+                "SELECT 'GPU'||device||' температура', ts, COALESCE(temperature_c,''), '°' FROM gpu_stats WHERE ts >= '$(sql_escape "${cutoff_ts}")'
+                 UNION ALL
+                 SELECT 'GPU'||device||' загрузка, %', ts, COALESCE(usage_percent,''), '%' FROM gpu_stats WHERE ts >= '$(sql_escape "${cutoff_ts}")'
+                 UNION ALL
+                 SELECT 'GPU'||device||' VRAM, %', ts, CASE WHEN mem_total_mb>0 THEN ROUND(100.0*mem_used_mb/mem_total_mb,1) ELSE '' END, '%' FROM gpu_stats WHERE ts >= '$(sql_escape "${cutoff_ts}")';" > "${gpu_hist_file}"
+            gpu_chart="$(build_metric_chart "${ts_axis_file}" "${gpu_hist_file}" "История GPU: температура, загрузка, VRAM")"
+            rm -f -- "${gpu_hist_file}"
+        fi
+    fi
+
+    rm -f -- "${ts_axis_file}"
 
     tmp_report="$(mktemp)"
     cat > "${tmp_report}" <<HTML
@@ -704,7 +1032,7 @@ generate_report() {
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<title>Диагностика дисков — ${TIMESTAMP}</title>
+<title>Диагностика системы — ${TIMESTAMP}</title>
 <style>
 :root{
   --surface-1:#fcfcfb; --page:#f9f9f7; --text-primary:#0b0b0b; --text-secondary:#52514e;
@@ -743,11 +1071,11 @@ footer{color:var(--muted);font-size:12px;margin-top:12px}
 </style>
 </head>
 <body>
-<h1>Диагностика жёстких дисков</h1>
+<h1>Диагностика системы</h1>
 <div class="sub">Отчёт сформирован: ${TIMESTAMP} · база: $(html_escape "${DB_FILE}")</div>
 
 <div class="tiles">
-<div class="tile"><div class="n">$((n_ok + n_warn + n_crit + n_unknown))</div><div class="l">Всего дисков</div></div>
+<div class="tile"><div class="n">$((n_ok + n_warn + n_crit + n_unknown))</div><div class="l">Всего объектов</div></div>
 <div class="tile"><div class="n" style="color:#0ca30c">${n_ok}</div><div class="l">В норме</div></div>
 <div class="tile"><div class="n" style="color:#fab219">${n_warn}</div><div class="l">Внимание</div></div>
 <div class="tile"><div class="n" style="color:#d03b3b">${n_crit}</div><div class="l">Критично</div></div>
@@ -764,12 +1092,34 @@ ${rows_html}
 </section>
 
 <section>
-<h2>Аналитическая справка</h2>
+<h2>Аналитическая справка по дискам</h2>
 ${cards_html}
 </section>
 
 <section>
-<h2>История температуры (последние ${HISTORY_POINTS} опросов)</h2>
+<h2>Процессор (CPU)</h2>
+<table>
+<thead><tr><th>Модель</th><th>Статус</th><th>Темп., °C</th><th>Загрузка, %</th><th>Load avg (1/5/15)</th><th>Обновлено</th></tr></thead>
+<tbody>
+${cpu_rows_html:-<tr><td colspan="6" class="empty">Нет данных</td></tr>}
+</tbody>
+</table>
+${cpu_chart}
+</section>
+
+<section>
+<h2>Видеокарта (GPU)</h2>
+<table>
+<thead><tr><th>GPU</th><th>Модель</th><th>Статус</th><th>Темп., °C</th><th>Загрузка, %</th><th>VRAM</th><th>Мощность, Вт</th><th>Обновлено</th></tr></thead>
+<tbody>
+${gpu_rows_html:-<tr><td colspan="8" class="empty">Нет данных</td></tr>}
+</tbody>
+</table>
+${gpu_chart}
+</section>
+
+<section>
+<h2>История температуры дисков (последние ${HISTORY_POINTS} опросов)</h2>
 ${temp_chart}
 </section>
 
@@ -778,7 +1128,7 @@ ${temp_chart}
 ${sector_chart}
 </section>
 
-<footer>${SCRIPT_NAME} · пороги: warn=${TEMP_WARN_C}°C, crit=${TEMP_CRIT_C}°C · отчёт хранится ${REPORT_KEEP} последних версий в $(html_escape "${REPORT_DIR}")</footer>
+<footer>${SCRIPT_NAME} · пороги дисков: warn=${TEMP_WARN_C}°C, crit=${TEMP_CRIT_C}°C · CPU: warn=${CPU_TEMP_WARN_C}°C, crit=${CPU_TEMP_CRIT_C}°C · GPU: warn=${GPU_TEMP_WARN_C}°C, crit=${GPU_TEMP_CRIT_C}°C · отчёт хранится ${REPORT_KEEP} последних версий в $(html_escape "${REPORT_DIR}")</footer>
 </body>
 </html>
 HTML
@@ -809,11 +1159,13 @@ if ((REPORT_ONLY == 0)); then
         exit 2
     fi
 
-    log_json "INFO" "start" "Опрос дисков" "${#DEVICES[@]} устройств"
+    log_json "INFO" "start" "Опрос системы" "${#DEVICES[@]} дисков"
     RUN_TS="$(ts)"
     for dev in "${DEVICES[@]}"; do
         poll_disk "${dev}" "${RUN_TS}"
     done
+    poll_cpu "${RUN_TS}"
+    poll_gpu "${RUN_TS}"
 else
     ROW_COUNT="$(sqlite3 -noheader "${DB_FILE}" "SELECT COUNT(*) FROM disk_stats;" 2>/dev/null || echo 0)"
     if [[ "${ROW_COUNT}" -eq 0 ]]; then
@@ -838,14 +1190,14 @@ if [[ ${#CRITICAL_LINES[@]} -gt 0 ]]; then
     DETAIL="$(printf '%s; ' "${CRITICAL_LINES[@]}")"
     DETAIL="${DETAIL%; }"
     echo "КРИТИЧНО: ${DETAIL}"
-    notify_alert "Диски: критическое состояние" "${DETAIL}"
-    log_json "ERROR" "critical_disk_status" "Обнаружены диски в критическом состоянии" "${DETAIL}"
+    notify_alert "Система: критическое состояние" "${DETAIL}"
+    log_json "ERROR" "critical_status" "Обнаружены объекты в критическом состоянии" "${DETAIL}"
     FINAL_EXIT=1
 fi
 if [[ ${#WARNING_LINES[@]} -gt 0 ]]; then
     WDETAIL="$(printf '%s; ' "${WARNING_LINES[@]}")"
     WDETAIL="${WDETAIL%; }"
-    log_json "WARN" "disk_warning" "Диски, требующие внимания" "${WDETAIL}"
+    log_json "WARN" "system_warning" "Объекты, требующие внимания" "${WDETAIL}"
 fi
 
 echo "Отчёт: ${REPORT_FILE}"
