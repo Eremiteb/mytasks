@@ -23,6 +23,15 @@
   эту грабли 2026-08-07, диагностируя `redis_optimize_failed` (см. ниже).
   Формулируя живые команды для пользователя — всегда сверяться со `SERVICE`
   из `docker compose ps -a`, а не с именем контейнера.
+- **В стеке на 10.66.66.1 сервис `redis` (ключ в docker-compose.yml не
+  менялся) теперь на образе Valkey, а не Redis.** Проверено 2026-08-08:
+  `cd /opt/esimych-cloud && docker compose exec redis sh -lc 'command -v
+  redis-cli; command -v valkey-cli'` → оба бинаря есть
+  (`/usr/local/bin/redis-cli`, `/usr/local/bin/valkey-cli`) — `redis-cli`,
+  судя по всему, симлинк на `valkey-cli` для обратной совместимости.
+  Протокол командно совместим (`BGREWRITEAOF`, `INFO persistence` и т.д.).
+  Скрипт правок не потребовал — вызовы `redis-cli` в блоке оптимизации AOF
+  (~строки 1035, 1038) продолжают работать как есть.
 - Деплой-процедура после каждой правки:
   ```sh
   bash -n cloud_backup_qnap.sh && shellcheck -S error cloud_backup_qnap.sh \

@@ -248,17 +248,55 @@ SQL
 
 insert_row() {
     local device="$1" alias="$2" mountpoints="$3" model="$4" serial="$5" size="$6" health="$7" temp="$8" poh="$9" realloc="${10}" pending="${11}" uncorrect="${12}" row_ts="${13}"
-    sqlite3 "${DB_FILE}" "INSERT INTO disk_stats (ts, device, device_alias, mountpoints, model, serial, size_bytes, health, temperature_c, power_on_hours, reallocated_sectors, pending_sectors, uncorrectable_errors) VALUES ('$(sql_escape "${row_ts}")', '$(sql_escape "${device}")', '$(sql_escape "${alias}")', '$(sql_escape "${mountpoints}")', '$(sql_escape "${model}")', '$(sql_escape "${serial}")', $(sql_num "${size}"), '$(sql_escape "${health}")', $(sql_num "${temp}"), $(sql_num "${poh}"), $(sql_num "${realloc}"), $(sql_num "${pending}"), $(sql_num "${uncorrect}"));"
+    local q_ts q_device q_alias q_mountpoints q_model q_serial q_health
+    local n_size n_temp n_poh n_realloc n_pending n_uncorrect
+
+    q_ts="$(sql_escape "${row_ts}")"
+    q_device="$(sql_escape "${device}")"
+    q_alias="$(sql_escape "${alias}")"
+    q_mountpoints="$(sql_escape "${mountpoints}")"
+    q_model="$(sql_escape "${model}")"
+    q_serial="$(sql_escape "${serial}")"
+    q_health="$(sql_escape "${health}")"
+    n_size="$(sql_num "${size}")"
+    n_temp="$(sql_num "${temp}")"
+    n_poh="$(sql_num "${poh}")"
+    n_realloc="$(sql_num "${realloc}")"
+    n_pending="$(sql_num "${pending}")"
+    n_uncorrect="$(sql_num "${uncorrect}")"
+
+    sqlite3 "${DB_FILE}" "INSERT INTO disk_stats (ts, device, device_alias, mountpoints, model, serial, size_bytes, health, temperature_c, power_on_hours, reallocated_sectors, pending_sectors, uncorrectable_errors) VALUES ('${q_ts}', '${q_device}', '${q_alias}', '${q_mountpoints}', '${q_model}', '${q_serial}', ${n_size}, '${q_health}', ${n_temp}, ${n_poh}, ${n_realloc}, ${n_pending}, ${n_uncorrect});"
 }
 
 insert_cpu_row() {
     local model="$1" temp="$2" usage="$3" load1="$4" load5="$5" load15="$6" row_ts="$7"
-    sqlite3 "${DB_FILE}" "INSERT INTO cpu_stats (ts, model, temperature_c, usage_percent, load1, load5, load15) VALUES ('$(sql_escape "${row_ts}")', '$(sql_escape "${model}")', $(sql_num "${temp}"), $(sql_num "${usage}"), $(sql_num "${load1}"), $(sql_num "${load5}"), $(sql_num "${load15}"));"
+    local q_ts q_model n_temp n_usage n_load1 n_load5 n_load15
+
+    q_ts="$(sql_escape "${row_ts}")"
+    q_model="$(sql_escape "${model}")"
+    n_temp="$(sql_num "${temp}")"
+    n_usage="$(sql_num "${usage}")"
+    n_load1="$(sql_num "${load1}")"
+    n_load5="$(sql_num "${load5}")"
+    n_load15="$(sql_num "${load15}")"
+
+    sqlite3 "${DB_FILE}" "INSERT INTO cpu_stats (ts, model, temperature_c, usage_percent, load1, load5, load15) VALUES ('${q_ts}', '${q_model}', ${n_temp}, ${n_usage}, ${n_load1}, ${n_load5}, ${n_load15});"
 }
 
 insert_gpu_row() {
     local device="$1" model="$2" temp="$3" usage="$4" mem_used="$5" mem_total="$6" power="$7" row_ts="$8"
-    sqlite3 "${DB_FILE}" "INSERT INTO gpu_stats (ts, device, model, temperature_c, usage_percent, mem_used_mb, mem_total_mb, power_draw_w) VALUES ('$(sql_escape "${row_ts}")', '$(sql_escape "${device}")', '$(sql_escape "${model}")', $(sql_num "${temp}"), $(sql_num "${usage}"), $(sql_num "${mem_used}"), $(sql_num "${mem_total}"), $(sql_num "${power}"));"
+    local q_ts q_device q_model n_temp n_usage n_mem_used n_mem_total n_power
+
+    q_ts="$(sql_escape "${row_ts}")"
+    q_device="$(sql_escape "${device}")"
+    q_model="$(sql_escape "${model}")"
+    n_temp="$(sql_num "${temp}")"
+    n_usage="$(sql_num "${usage}")"
+    n_mem_used="$(sql_num "${mem_used}")"
+    n_mem_total="$(sql_num "${mem_total}")"
+    n_power="$(sql_num "${power}")"
+
+    sqlite3 "${DB_FILE}" "INSERT INTO gpu_stats (ts, device, model, temperature_c, usage_percent, mem_used_mb, mem_total_mb, power_draw_w) VALUES ('${q_ts}', '${q_device}', '${q_model}', ${n_temp}, ${n_usage}, ${n_mem_used}, ${n_mem_total}, ${n_power});"
 }
 
 ###############################################################################
@@ -278,7 +316,8 @@ discover_disks() {
         return 0
     fi
 
-    local name type
+    local name type lsblk_out
+    lsblk_out="$(lsblk -dn -o NAME,TYPE 2>/dev/null)"
     while read -r name type; do
         [[ "${type}" != "disk" ]] && continue
         case "${name}" in
@@ -286,7 +325,7 @@ discover_disks() {
             *) ;;
         esac
         DEVICES+=("/dev/${name}")
-    done < <(lsblk -dn -o NAME,TYPE 2>/dev/null)
+    done <<< "${lsblk_out}"
 }
 
 # Точки монтирования диска (по всем его разделам/дочерним устройствам).
@@ -457,6 +496,9 @@ poll_gpu() {
         return 0
     fi
 
+    local nvidia_out
+    nvidia_out="$("${NVIDIA_SMI_BIN}" --query-gpu=index,name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw --format=csv,noheader,nounits 2>/dev/null)"
+
     while IFS=',' read -r index model temp usage mem_used mem_total power; do
         [[ -z "${index// /}" ]] && continue
         index="$(printf '%s' "${index}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
@@ -469,7 +511,7 @@ poll_gpu() {
 
         insert_gpu_row "${index}" "${model}" "${temp}" "${usage}" "${mem_used}" "${mem_total}" "${power}" "${row_ts}"
         log_json "INFO" "gpu_polled" "Опрошена видеокарта" "GPU${index}: temp=${temp}; usage=${usage}%"
-    done < <("${NVIDIA_SMI_BIN}" --query-gpu=index,name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw --format=csv,noheader,nounits 2>/dev/null)
+    done <<< "${nvidia_out}"
 }
 
 ###############################################################################
@@ -884,6 +926,7 @@ generate_report() {
     while IFS='|' read -r device alias mountpoints model serial size health temp poh realloc pending uncorrect row_ts; do
         [[ -z "${device}" ]] && continue
         local status color label analysis
+        local e_device e_mountpoints e_model e_serial e_size e_label e_row_ts e_alias e_analysis
         status="$(classify_status "${health}" "${temp}" "${realloc}" "${pending}" "${uncorrect}")"
         color="$(status_color "${status}")"
         label="$(status_label "${status}")"
@@ -896,25 +939,35 @@ generate_report() {
             *) ((n_unknown++)) ;;
         esac
 
+        e_device="$(html_escape "${device}")"
+        e_mountpoints="$(html_escape "${mountpoints}")"
+        e_model="$(html_escape "${model}")"
+        e_serial="$(html_escape "${serial}")"
+        e_size="$(format_size "${size}")"
+        e_label="$(html_escape "${label}")"
+        e_row_ts="$(html_escape "${row_ts}")"
+        e_alias="$(html_escape "${alias}")"
+        e_analysis="$(html_escape "${analysis}")"
+
         rows_html+="<tr>
-<td>$(html_escape "${device}")</td>
-<td>${mountpoints:+$(html_escape "${mountpoints}")}</td>
-<td>$(html_escape "${model}")</td>
-<td>$(html_escape "${serial}")</td>
-<td>$(format_size "${size}")</td>
-<td><span class=\"badge\" style=\"--c:${color}\"><i></i>$(html_escape "${label}")</span></td>
+<td>${e_device}</td>
+<td>${mountpoints:+${e_mountpoints}}</td>
+<td>${e_model}</td>
+<td>${e_serial}</td>
+<td>${e_size}</td>
+<td><span class=\"badge\" style=\"--c:${color}\"><i></i>${e_label}</span></td>
 <td>${temp:-—}</td>
 <td>${poh:-—}</td>
 <td>${realloc:-0}</td>
 <td>${pending:-0}</td>
 <td>${uncorrect:-0}</td>
-<td>$(html_escape "${row_ts}")</td>
+<td>${e_row_ts}</td>
 </tr>
 "
 
         cards_html+="<div class=\"disk-card\" style=\"--c:${color}\">
-<h3><span class=\"badge\" style=\"--c:${color}\"><i></i>$(html_escape "${label}")</span> $(html_escape "${device}") <span class=\"muted\">$(html_escape "${model}")${alias:+ · ${alias}}</span></h3>
-<p>$(html_escape "${analysis}")</p>
+<h3><span class=\"badge\" style=\"--c:${color}\"><i></i>${e_label}</span> ${e_device} <span class=\"muted\">${e_model}${alias:+ · ${e_alias}}</span></h3>
+<p>${e_analysis}</p>
 </div>
 "
     done <<< "${latest_tsv}"
@@ -925,9 +978,11 @@ generate_report() {
         "SELECT ts FROM (SELECT DISTINCT ts FROM disk_stats ORDER BY ts DESC LIMIT ${HISTORY_POINTS}) ORDER BY ts ASC;" > "${ts_axis_file}"
     first_ts="$(head -n1 "${ts_axis_file}" 2>/dev/null || true)"
     if [[ -n "${first_ts}" ]]; then
+        local q_cutoff_ts
         cutoff_ts="${first_ts}"
+        q_cutoff_ts="$(sql_escape "${cutoff_ts}")"
         sqlite3 -noheader -separator '|' "${DB_FILE}" \
-            "SELECT device, ts, COALESCE(temperature_c,'') FROM disk_stats WHERE ts >= '$(sql_escape "${cutoff_ts}")' ORDER BY device, ts;" > "${hist_file}"
+            "SELECT device, ts, COALESCE(temperature_c,'') FROM disk_stats WHERE ts >= '${q_cutoff_ts}' ORDER BY device, ts;" > "${hist_file}"
     fi
 
     local latest_file
@@ -957,22 +1012,28 @@ generate_report() {
             *) ((n_unknown++)) ;;
         esac
 
+        local e_cpu_model e_clabel e_cpu_ts
+        e_cpu_model="$(html_escape "${cpu_model_v}")"
+        e_clabel="$(html_escape "${clabel}")"
+        e_cpu_ts="$(html_escape "${cpu_ts}")"
+
         cpu_rows_html="<tr>
-<td>$(html_escape "${cpu_model_v}")</td>
-<td><span class=\"badge\" style=\"--c:${ccolor}\"><i></i>$(html_escape "${clabel}")</span></td>
+<td>${e_cpu_model}</td>
+<td><span class=\"badge\" style=\"--c:${ccolor}\"><i></i>${e_clabel}</span></td>
 <td>${cpu_temp:-—}</td>
 <td>${cpu_usage:-—}</td>
 <td>${cpu_load1:-—} / ${cpu_load5:-—} / ${cpu_load15:-—}</td>
-<td>$(html_escape "${cpu_ts}")</td>
+<td>${e_cpu_ts}</td>
 </tr>
 "
         if [[ -n "${cutoff_ts}" ]]; then
-            local cpu_hist_file
+            local cpu_hist_file q_cutoff_ts_cpu
             cpu_hist_file="$(mktemp)"
+            q_cutoff_ts_cpu="$(sql_escape "${cutoff_ts}")"
             sqlite3 -noheader -separator '|' "${DB_FILE}" \
-                "SELECT 'CPU температура', ts, COALESCE(temperature_c,''), '°' FROM cpu_stats WHERE ts >= '$(sql_escape "${cutoff_ts}")'
+                "SELECT 'CPU температура', ts, COALESCE(temperature_c,''), '°' FROM cpu_stats WHERE ts >= '${q_cutoff_ts_cpu}'
                  UNION ALL
-                 SELECT 'CPU загрузка, %', ts, COALESCE(usage_percent,''), '%' FROM cpu_stats WHERE ts >= '$(sql_escape "${cutoff_ts}")';" > "${cpu_hist_file}"
+                 SELECT 'CPU загрузка, %', ts, COALESCE(usage_percent,''), '%' FROM cpu_stats WHERE ts >= '${q_cutoff_ts_cpu}';" > "${cpu_hist_file}"
             cpu_chart="$(build_metric_chart "${ts_axis_file}" "${cpu_hist_file}" "История CPU: температура и загрузка")"
             rm -f -- "${cpu_hist_file}"
         fi
@@ -997,34 +1058,44 @@ generate_report() {
                 *) ((n_unknown++)) ;;
             esac
 
+            local e_gpu_model e_glabel e_gpu_ts
+            e_gpu_model="$(html_escape "${gpu_model_v}")"
+            e_glabel="$(html_escape "${glabel}")"
+            e_gpu_ts="$(html_escape "${gpu_ts}")"
+
             gpu_rows_html+="<tr>
 <td>GPU${gpu_device}</td>
-<td>$(html_escape "${gpu_model_v}")</td>
-<td><span class=\"badge\" style=\"--c:${gcolor}\"><i></i>$(html_escape "${glabel}")</span></td>
+<td>${e_gpu_model}</td>
+<td><span class=\"badge\" style=\"--c:${gcolor}\"><i></i>${e_glabel}</span></td>
 <td>${gpu_temp:-—}</td>
 <td>${gpu_usage:-—}</td>
 <td>${gpu_mem_used:-—} / ${gpu_mem_total:-—} МиБ</td>
 <td>${gpu_power:-—}</td>
-<td>$(html_escape "${gpu_ts}")</td>
+<td>${e_gpu_ts}</td>
 </tr>
 "
         done <<< "${gpu_latest}"
 
         if [[ -n "${cutoff_ts}" ]]; then
-            local gpu_hist_file
+            local gpu_hist_file q_cutoff_ts_gpu
             gpu_hist_file="$(mktemp)"
+            q_cutoff_ts_gpu="$(sql_escape "${cutoff_ts}")"
             sqlite3 -noheader -separator '|' "${DB_FILE}" \
-                "SELECT 'GPU'||device||' температура', ts, COALESCE(temperature_c,''), '°' FROM gpu_stats WHERE ts >= '$(sql_escape "${cutoff_ts}")'
+                "SELECT 'GPU'||device||' температура', ts, COALESCE(temperature_c,''), '°' FROM gpu_stats WHERE ts >= '${q_cutoff_ts_gpu}'
                  UNION ALL
-                 SELECT 'GPU'||device||' загрузка, %', ts, COALESCE(usage_percent,''), '%' FROM gpu_stats WHERE ts >= '$(sql_escape "${cutoff_ts}")'
+                 SELECT 'GPU'||device||' загрузка, %', ts, COALESCE(usage_percent,''), '%' FROM gpu_stats WHERE ts >= '${q_cutoff_ts_gpu}'
                  UNION ALL
-                 SELECT 'GPU'||device||' VRAM, %', ts, CASE WHEN mem_total_mb>0 THEN ROUND(100.0*mem_used_mb/mem_total_mb,1) ELSE '' END, '%' FROM gpu_stats WHERE ts >= '$(sql_escape "${cutoff_ts}")';" > "${gpu_hist_file}"
+                 SELECT 'GPU'||device||' VRAM, %', ts, CASE WHEN mem_total_mb>0 THEN ROUND(100.0*mem_used_mb/mem_total_mb,1) ELSE '' END, '%' FROM gpu_stats WHERE ts >= '${q_cutoff_ts_gpu}';" > "${gpu_hist_file}"
             gpu_chart="$(build_metric_chart "${ts_axis_file}" "${gpu_hist_file}" "История GPU: температура, загрузка, VRAM")"
             rm -f -- "${gpu_hist_file}"
         fi
     fi
 
     rm -f -- "${ts_axis_file}"
+
+    local e_db_file e_report_dir
+    e_db_file="$(html_escape "${DB_FILE}")"
+    e_report_dir="$(html_escape "${REPORT_DIR}")"
 
     tmp_report="$(mktemp)"
     cat > "${tmp_report}" <<HTML
@@ -1072,7 +1143,7 @@ footer{color:var(--muted);font-size:12px;margin-top:12px}
 </head>
 <body>
 <h1>Диагностика системы</h1>
-<div class="sub">Отчёт сформирован: ${TIMESTAMP} · база: $(html_escape "${DB_FILE}")</div>
+<div class="sub">Отчёт сформирован: ${TIMESTAMP} · база: ${e_db_file}</div>
 
 <div class="tiles">
 <div class="tile"><div class="n">$((n_ok + n_warn + n_crit + n_unknown))</div><div class="l">Всего объектов</div></div>
@@ -1128,7 +1199,7 @@ ${temp_chart}
 ${sector_chart}
 </section>
 
-<footer>${SCRIPT_NAME} · пороги дисков: warn=${TEMP_WARN_C}°C, crit=${TEMP_CRIT_C}°C · CPU: warn=${CPU_TEMP_WARN_C}°C, crit=${CPU_TEMP_CRIT_C}°C · GPU: warn=${GPU_TEMP_WARN_C}°C, crit=${GPU_TEMP_CRIT_C}°C · отчёт хранится ${REPORT_KEEP} последних версий в $(html_escape "${REPORT_DIR}")</footer>
+<footer>${SCRIPT_NAME} · пороги дисков: warn=${TEMP_WARN_C}°C, crit=${TEMP_CRIT_C}°C · CPU: warn=${CPU_TEMP_WARN_C}°C, crit=${CPU_TEMP_CRIT_C}°C · GPU: warn=${GPU_TEMP_WARN_C}°C, crit=${GPU_TEMP_CRIT_C}°C · отчёт хранится ${REPORT_KEEP} последних версий в ${e_report_dir}</footer>
 </body>
 </html>
 HTML
