@@ -17,7 +17,7 @@ jobs:
     name: ShellCheck (error + style)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
       - name: Install ShellCheck
         # Ubuntu's apt package (0.9.0 on noble) has known false positives for
@@ -65,7 +65,7 @@ jobs:
     name: Python syntax
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
       - name: Python syntax check
         run: |

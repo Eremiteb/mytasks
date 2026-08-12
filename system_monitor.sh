@@ -451,10 +451,10 @@ cpu_temperature() {
 # принцип, что использует top/mpstat), без дополнительных зависимостей.
 cpu_usage_percent() {
     local read1 read2 total1 idle1 total2 idle2 dtotal didle
-    read1="$(awk '/^cpu /{idle=$5; total=0; for(i=2;i<=NF;i++) total+=$i; print total, idle}' /proc/stat 2>/dev/null)"
+    read1="$(awk '/^cpu /{total=$2+$3+$4+$5+$6+$7+$8+$9+$10+$11; print total, $5}' /proc/stat 2>/dev/null)"
     [[ -z "${read1}" ]] && return 0
     sleep 1
-    read2="$(awk '/^cpu /{idle=$5; total=0; for(i=2;i<=NF;i++) total+=$i; print total, idle}' /proc/stat 2>/dev/null)"
+    read2="$(awk '/^cpu /{total=$2+$3+$4+$5+$6+$7+$8+$9+$10+$11; print total, $5}' /proc/stat 2>/dev/null)"
     [[ -z "${read2}" ]] && return 0
     read -r total1 idle1 <<< "${read1}"
     read -r total2 idle2 <<< "${read2}"
