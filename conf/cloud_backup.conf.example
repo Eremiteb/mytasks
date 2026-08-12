@@ -28,12 +28,6 @@ SUDO_PASSWORD="your_sudo_password"
 # Оставить WireGuard активным после завершения скрипта: 1 — да, 0 — нет (по умолчанию)
 WG_KEEP_UP="0"
 
-# Оптимизировать SQLite-базы перед архивированием: 1 — да, 0 — нет (по умолчанию)
-OPTIMIZE_SQLITE_BEFORE_BACKUP="0"
-
-# Таймаут на обработку одной SQLite-базы (сек)
-SQLITE_OPTIMIZE_TIMEOUT_SEC="1800"
-
 # Оптимизировать MariaDB перед архивированием: 1 — да, 0 — нет (по умолчанию)
 OPTIMIZE_MARIADB_BEFORE_BACKUP="0"
 

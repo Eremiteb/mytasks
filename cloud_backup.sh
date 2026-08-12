@@ -146,8 +146,6 @@ REMOTE_PATH="${REMOTE_PATH:-/opt/esimych-cloud}"
 REMOTE_SSH_PORT="${REMOTE_SSH_PORT:-22}"
 WG_KEEP_UP="${WG_KEEP_UP:-0}"
 BACKUP_DEGRADATION_MIBS_THRESHOLD="${BACKUP_DEGRADATION_MIBS_THRESHOLD:-6}"
-OPTIMIZE_SQLITE_BEFORE_BACKUP="${OPTIMIZE_SQLITE_BEFORE_BACKUP:-0}"
-SQLITE_OPTIMIZE_TIMEOUT_SEC="${SQLITE_OPTIMIZE_TIMEOUT_SEC:-1800}"
 OPTIMIZE_MARIADB_BEFORE_BACKUP="${OPTIMIZE_MARIADB_BEFORE_BACKUP:-0}"
 MARIADB_SERVICE_NAME="${MARIADB_SERVICE_NAME:-mariadb}"
 MARIADB_PURGE_BINLOGS="${MARIADB_PURGE_BINLOGS:-0}"
@@ -495,26 +493,6 @@ if [[ "${stop_rc}" -ne 0 ]]; then
 else
   SERVICES_STOPPED=1
   log_json "INFO" "services_stop_ok" "Сервисы остановлены" "" "${stop_rc}"
-fi
-
-###############################################################################
-# SQLITE OPTIMIZATION (optional)
-###############################################################################
-if [[ "${OPTIMIZE_SQLITE_BEFORE_BACKUP}" -eq 1 ]]; then
-  log_json "INFO" "sqlite_optimize_start" "Оптимизация SQLite-баз перед архивированием"
-  export SSHPASS="${REMOTE_PASSWORD}"
-  sqlite_opt_err=$(sshpass -e ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" \
-    "set -o pipefail; find '${REMOTE_PATH}' -type f -name '*.db' -print0 \
-      | xargs -0 -r -I{} timeout ${SQLITE_OPTIMIZE_TIMEOUT_SEC}s sqlite3 \"{}\" 'PRAGMA optimize; VACUUM;'" 2>&1)
-  sqlite_opt_rc=$?
-  unset SSHPASS
-  if [[ "${sqlite_opt_rc}" -ne 0 ]]; then
-    log_json "WARN" "sqlite_optimize_failed" "Оптимизация SQLite завершилась с предупреждениями" "${sqlite_opt_err}" "${sqlite_opt_rc}"
-  else
-    log_json "INFO" "sqlite_optimize_ok" "Оптимизация SQLite завершена" "${sqlite_opt_err}" "${sqlite_opt_rc}"
-  fi
-else
-  log_json "INFO" "sqlite_optimize_skip" "Оптимизация SQLite отключена (OPTIMIZE_SQLITE_BEFORE_BACKUP=0)"
 fi
 
 export SSHPASS="${REMOTE_PASSWORD}"

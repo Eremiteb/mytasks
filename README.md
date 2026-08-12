@@ -99,13 +99,12 @@
 4. Чистит корзины всех пользователей и версии файлов Nextcloud (`occ trashbin:cleanup --all-users`, `occ versions:cleanup`)
 5. (Опционально) оптимизирует MariaDB (`mariadb-check --optimize`, очистка `general.log`, опционально purge binlogs)
 6. (Опционально) оптимизирует Redis AOF (`BGREWRITEAOF`)
-7. (Опционально) оптимизирует SQLite-базы (`PRAGMA optimize; VACUUM;`) перед архивированием
-8. Создаёт архив удалённой папки и сохраняет его в `BACKUP_DIR`
-9. Если архив за текущую дату уже существует и проходит проверку целостности, дозаписывает новый поток в тот же файл
-10. Если существующий архив пустой или повреждённый, удаляет его и создаёт заново
-11. Опускает WireGuard (если был поднят скриптом) — управляется параметром `WG_KEEP_UP`
+7. Создаёт архив удалённой папки и сохраняет его в `BACKUP_DIR`
+8. Если архив за текущую дату уже существует и проходит проверку целостности, дозаписывает новый поток в тот же файл
+9. Если существующий архив пустой или повреждённый, удаляет его и создаёт заново
+10. Опускает WireGuard (если был поднят скриптом) — управляется параметром `WG_KEEP_UP`
 
-**Зависимости:** `wg-quick`, `sshpass` (для опциональной оптимизации: `sqlite3` и `redis-cli` в соответствующих контейнерах)
+**Зависимости:** `wg-quick`, `sshpass` (для опциональной оптимизации: `redis-cli` в соответствующем контейнере)
 
 **Конфигурация** (`conf/cloud_backup.conf`):
 
@@ -126,8 +125,6 @@
 | `OPTIMIZE_REDIS_BEFORE_BACKUP`   | `0`       | Выполнить `BGREWRITEAOF` для Redis             |
 | `REDIS_SERVICE_NAME`             | `redis`   | Имя Redis-сервиса в `docker compose`           |
 | `REDIS_REWRITE_WAIT_SEC`         | `180`     | Верхний предел ожидания `BGREWRITEAOF` (сек) — не типичная длительность: определение завершения устойчиво к CRLF в выводе `redis-cli INFO`, поэтому при штатной работе rewrite завершается за секунды, значение — лишь потолок на случай реальной проблемы |
-| `OPTIMIZE_SQLITE_BEFORE_BACKUP` | `0`        | Перед архивированием выполнить `VACUUM` для `*.db` |
-| `SQLITE_OPTIMIZE_TIMEOUT_SEC`   | `1800`     | Таймаут на одну SQLite-базу в секундах         |
 
 **Логи:** JSONL-файл `logs/cloud_backup-YYYY-MM-DD-HH-MM-SS.jsonl`. Хранится 5 последних файлов.
 
@@ -193,14 +190,14 @@ QNAP-версия `cloud_backup.sh` — то же резервное копир�
 
 **Отличия от `cloud_backup.sh`:**
 - Shebang `#!/opt/bin/bash` — Entware bash напрямую (штатный `/bin/sh` на QTS не поддерживает массивы/`local`/`${!var}`)
-- `PATH` дополняется `/opt/sbin:/opt/bin` (Entware), т.к. QTS не содержит `wg-quick`, `wg`, `zstd`, `sqlite3`
+- `PATH` дополняется `/opt/sbin:/opt/bin` (Entware), т.к. QTS не содержит `wg-quick`, `wg`, `zstd`
 - Нет sudo-кода — Task Scheduler/cron на QNAP и так выполняют скрипт от root
 - **WireGuard поднимается в обход `wg`/`wg-quick`** — на части моделей QTS (проверено на ядре 4.2.8 aarch64) консольная утилита `wg(8)` не работает в принципе (`Protocol not supported`), поэтому туннель поднимается напрямую через userspace UAPI-сокет `wireguard-go` (см. `wg_up_userspace`/`wg_conf_get` в коде)
 - Аутентификация на удалённом сервере только по SSH-ключу (`REMOTE_SSH_KEY`) — пакета `sshpass` для архитектуры `aarch64-k3.10` в Entware нет
 - Автоматически переподключает bind-mount `/opt` → `ENTWARE_DATA_DIR`, если он слетел после перезагрузки NAS (`ensure_entware_mount`)
 - Как и десктопная версия, чистит корзину и версии файлов Nextcloud (`occ trashbin:cleanup --all-users`, `occ versions:cleanup`) и пересоздаёт папку `files_trashbin` для каждого пользователя после очистки (см. подробности в разделе `cloud_backup.sh` выше — код идентичен)
 
-**Предварительная настройка на QNAP** (разово, вручную) подробно описана в шапке самого скрипта: установка Entware, пакетов (`opkg install bash wireguard-tools wireguard-go ncat xxd zstd sqlite3-cli coreutils-stat`), создание конфига WireGuard-клиента с отдельным peer/IP, проверка userspace UAPI-сокета, копирование SSH-ключа на сервер, заполнение `conf/cloud_backup_qnap.conf` и (опционально, только для `RAW_TRANSFER_ENABLED="1"`) открытие порта передачи в фаерволе удалённого сервера — см. шаг 8 в шапке скрипта.
+**Предварительная настройка на QNAP** (разово, вручную) подробно описана в шапке самого скрипта: установка Entware, пакетов (`opkg install bash wireguard-tools wireguard-go ncat xxd zstd coreutils-stat`), создание конфига WireGuard-клиента с отдельным peer/IP, проверка userspace UAPI-сокета, копирование SSH-ключа на сервер, заполнение `conf/cloud_backup_qnap.conf` и (опционально, только для `RAW_TRANSFER_ENABLED="1"`) открытие порта передачи в фаерволе удалённого сервера — см. шаг 8 в шапке скрипта.
 
 **Конфигурация** (`conf/cloud_backup_qnap.conf`, см. `.example`):
 
@@ -215,8 +212,6 @@ QNAP-версия `cloud_backup.sh` — то же резервное копир�
 | `REMOTE_PATH`     | `/opt/esimych-cloud`        | Путь к папке на удалённой системе              |
 | `BACKUP_DIR`      | *(обязательно)*             | Папка на QNAP для резервных копий (напр. `/share/Public/backups`) |
 | `WG_KEEP_UP`      | `0`                         | Оставить WireGuard активным после завершения   |
-| `OPTIMIZE_SQLITE_BEFORE_BACKUP`  | `0`       | Перед архивированием выполнить `VACUUM` для `*.db` |
-| `SQLITE_OPTIMIZE_TIMEOUT_SEC`    | `1800`    | Таймаут на одну SQLite-базу в секундах         |
 | `OPTIMIZE_MARIADB_BEFORE_BACKUP` | `0`       | Выполнить оптимизацию MariaDB перед архивом    |
 | `MARIADB_SERVICE_NAME`           | `mariadb` | Имя MariaDB-сервиса в `docker compose`         |
 | `MARIADB_PURGE_BINLOGS`          | `0`       | Очистить старые binary logs                    |
@@ -224,7 +219,7 @@ QNAP-версия `cloud_backup.sh` — то же резервное копир�
 | `OPTIMIZE_REDIS_BEFORE_BACKUP`   | `0`       | Выполнить `BGREWRITEAOF` для Redis             |
 | `REDIS_SERVICE_NAME`             | `redis`   | Имя Redis-сервиса в `docker compose`           |
 | `REDIS_REWRITE_WAIT_SEC`         | `180`     | Верхний предел ожидания `BGREWRITEAOF` (сек), не типичная длительность (см. пояснение в разделе `cloud_backup.sh` выше) |
-| `DB_OPTIMIZE_INTERVAL_DAYS`      | `7`       | Раз в сколько дней реально выполнять включённые выше оптимизации БД (MariaDB/Redis/SQLite), даже если сам бэкап запускается ежедневно — между запусками, где интервал ещё не истёк, оптимизация пропускается (отметка хранится в `state/cloud_backup_qnap-db-optimize.state`); узкое место скорости архивирования — локальный CPU QNAP, а не состояние удалённых БД, поэтому ежедневная оптимизация не нужна |
+| `DB_OPTIMIZE_INTERVAL_DAYS`      | `7`       | Раз в сколько дней реально выполнять включённые выше оптимизации БД (MariaDB/Redis), даже если сам бэкап запускается ежедневно — между запусками, где интервал ещё не истёк, оптимизация пропускается (отметка хранится в `state/cloud_backup_qnap-db-optimize.state`); узкое место скорости архивирования — локальный CPU QNAP, а не состояние удалённых БД, поэтому ежедневная оптимизация не нужна |
 | `SSH_CIPHERS`                    | `chacha20-poly1305@openssh.com,aes128-gcm@openssh.com,aes256-gcm@openssh.com,aes128-ctr` | Приоритет SSH-шифров; `chacha20-poly1305` первым, т.к. на слабых ARM-чипах без аппаратного AES он обычно быстрее программного AES-GCM/CTR, а расшифровку входящего потока бэкапа выполняет именно QNAP |
 | `RAW_TRANSFER_ENABLED`           | `0`       | Передавать поток бэкапа через сырой TCP (`nc`/`ncat`) внутри WireGuard-туннеля в обход дополнительного слоя SSH-шифрования — см. раздел «Передача в обход SSH-шифрования» ниже. `0` — обычная передача через SSH (без изменений) |
 | `RAW_TRANSFER_PORT`              | `8873`    | TCP-порт для приёма потока на удалённом сервере (нужно один раз открыть в фаерволе, см. шаг 8 в шапке скрипта) |

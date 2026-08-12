@@ -11,7 +11,7 @@
 #     которые использует скрипт. Если Entware ставит bash по другому пути,
 #     поправьте shebang или создайте симлинк: ln -s <путь> /opt/bin/bash;
 #   - PATH дополнен /opt/sbin:/opt/bin (Entware), т.к. QTS сам по себе не
-#     содержит wg-quick, wg, zstd, sqlite3 и т.п.;
+#     содержит wg-quick, wg, zstd и т.п.;
 #   - убран весь sudo-код: Task Scheduler и Entware cron на QNAP и так
 #     выполняют скрипт от root, sudo не требуется и обычно не установлен;
 #   - подсказки по установке недостающих утилит даются через opkg, а не pacman.
@@ -45,7 +45,7 @@
 #        export PATH="/opt/sbin:/opt/bin:$PATH"
 #      и только потом:
 #        opkg update
-#        opkg install bash wireguard-tools wireguard-go ncat xxd zstd sqlite3-cli coreutils-stat
+#        opkg install bash wireguard-tools wireguard-go ncat xxd zstd coreutils-stat
 #      Если после export PATH команда "opkg" всё ещё не находится — значит
 #      шаг 1 (generic.sh) не завершился успешно, проверьте наличие файла
 #      /opt/bin/opkg.
@@ -176,7 +176,7 @@
 
 set -uo pipefail
 
-# Entware-утилиты (wg-quick, wg, zstd, sqlite3 и т.д.) лежат в /opt/*bin,
+# Entware-утилиты (wg-quick, wg, zstd и т.д.) лежат в /opt/*bin,
 # которых обычно нет в PATH при запуске из Task Scheduler/cron.
 export PATH="/opt/sbin:/opt/bin:${PATH}"
 
@@ -335,8 +335,6 @@ REMOTE_PATH="${REMOTE_PATH:-/opt/esimych-cloud}"
 REMOTE_SSH_PORT="${REMOTE_SSH_PORT:-22}"
 WG_KEEP_UP="${WG_KEEP_UP:-0}"
 BACKUP_DEGRADATION_MIBS_THRESHOLD="${BACKUP_DEGRADATION_MIBS_THRESHOLD:-6}"
-OPTIMIZE_SQLITE_BEFORE_BACKUP="${OPTIMIZE_SQLITE_BEFORE_BACKUP:-0}"
-SQLITE_OPTIMIZE_TIMEOUT_SEC="${SQLITE_OPTIMIZE_TIMEOUT_SEC:-1800}"
 OPTIMIZE_MARIADB_BEFORE_BACKUP="${OPTIMIZE_MARIADB_BEFORE_BACKUP:-0}"
 MARIADB_SERVICE_NAME="${MARIADB_SERVICE_NAME:-mariadb}"
 MARIADB_PURGE_BINLOGS="${MARIADB_PURGE_BINLOGS:-0}"
@@ -373,7 +371,7 @@ RAW_TRANSFER_STATUS_POLL_RETRIES="${RAW_TRANSFER_STATUS_POLL_RETRIES:-5}"
 # local_load1 — этот замер даёт третью точку данных для разбора таких случаев.
 NETWORK_SPEED_TEST_MB="${NETWORK_SPEED_TEST_MB:-50}"
 
-# Раз в сколько дней реально выполнять оптимизацию БД (MariaDB/Redis/SQLite),
+# Раз в сколько дней реально выполнять оптимизацию БД (MariaDB/Redis),
 # даже если сам бэкап запускается ежедневно. Обоснование по логам за
 # 2026-07-24..29: узкое место скорости архивирования — локальный CPU QNAP
 # (nproc=1, avg_load1 во время передачи ~1.5-1.8, см. probable_cause в
@@ -1076,31 +1074,6 @@ else
   # листенера сразу после docker compose down). Даём хосту стабилизироваться.
   sleep 5
   log_json "INFO" "post_services_stop_settle" "Пауза после остановки сервисов для стабилизации сети хоста" "sleep_sec=5"
-fi
-
-###############################################################################
-# SQLITE OPTIMIZATION (optional)
-###############################################################################
-if [[ "${OPTIMIZE_SQLITE_BEFORE_BACKUP}" -eq 1 && "${DB_OPTIMIZE_DUE}" -eq 1 ]]; then
-  if ! ssh_remote "command -v sqlite3 >/dev/null 2>&1"; then
-    log_json "WARN" "sqlite_optimize_skip_no_binary" "sqlite3 не найден на удалённом сервере — оптимизация SQLite пропущена" \
-      "Установите sqlite3 на ${REMOTE_HOST} (например: apt install sqlite3) или отключите OPTIMIZE_SQLITE_BEFORE_BACKUP"
-  else
-    log_json "INFO" "sqlite_optimize_start" "Оптимизация SQLite-баз перед архивированием"
-    sqlite_opt_err=$(ssh_remote \
-      "set -o pipefail; find '${REMOTE_PATH}' -type f -name '*.db' -print0 \
-        | xargs -0 -r -I{} timeout ${SQLITE_OPTIMIZE_TIMEOUT_SEC}s sqlite3 \"{}\" 'PRAGMA optimize; VACUUM;'" 2>&1)
-    sqlite_opt_rc=$?
-    if [[ ${sqlite_opt_rc} -ne 0 ]]; then
-      log_json "WARN" "sqlite_optimize_failed" "Оптимизация SQLite завершилась с предупреждениями" "${sqlite_opt_err}" "${sqlite_opt_rc}"
-    else
-      log_json "INFO" "sqlite_optimize_ok" "Оптимизация SQLite завершена" "${sqlite_opt_err}" "${sqlite_opt_rc}"
-    fi
-  fi
-elif [[ "${OPTIMIZE_SQLITE_BEFORE_BACKUP}" -eq 1 ]]; then
-  log_json "INFO" "sqlite_optimize_skip_not_due" "Оптимизация SQLite пропущена — не настал плановый интервал (раз в ${DB_OPTIMIZE_INTERVAL_DAYS} дн.)"
-else
-  log_json "INFO" "sqlite_optimize_skip" "Оптимизация SQLite отключена (OPTIMIZE_SQLITE_BEFORE_BACKUP=0)"
 fi
 
 if [[ "${DB_OPTIMIZE_DUE}" -eq 1 ]]; then
