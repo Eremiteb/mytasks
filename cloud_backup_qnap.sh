@@ -334,6 +334,7 @@ REMOTE_SSH_KEY="${REMOTE_SSH_KEY:-}"
 REMOTE_PATH="${REMOTE_PATH:-/opt/esimych-cloud}"
 REMOTE_SSH_PORT="${REMOTE_SSH_PORT:-22}"
 WG_KEEP_UP="${WG_KEEP_UP:-0}"
+BACKUP_KEEP_COUNT="${BACKUP_KEEP_COUNT:-5}"
 BACKUP_DEGRADATION_MIBS_THRESHOLD="${BACKUP_DEGRADATION_MIBS_THRESHOLD:-6}"
 OPTIMIZE_MARIADB_BEFORE_BACKUP="${OPTIMIZE_MARIADB_BEFORE_BACKUP:-0}"
 MARIADB_SERVICE_NAME="${MARIADB_SERVICE_NAME:-mariadb}"
@@ -1378,11 +1379,11 @@ if [[ "${backup_rc}" -eq 0 ]]; then
     "file=${BACKUP_PATH}, size=${backup_size}" "${backup_rc}"
   echo "Готово: ${BACKUP_PATH} (${backup_size})"
 
-  # Очистка старых бэкапов, оставляем только 5 последних
+  # Очистка старых бэкапов, оставляем только BACKUP_KEEP_COUNT последних
   # shellcheck disable=SC2012
-  old_backups=$(ls -1t "${BACKUP_DIR}/${SCRIPT_BASE}-"*.tar.* 2>/dev/null | tail -n +6)
+  old_backups=$(ls -1t "${BACKUP_DIR}/${SCRIPT_BASE}-"*.tar.* 2>/dev/null | tail -n "+$((BACKUP_KEEP_COUNT + 1))")
   if [[ -n "${old_backups}" ]]; then
-    log_json "INFO" "backup_cleanup" "Удаление старых резервных копий (оставляем 5)"
+    log_json "INFO" "backup_cleanup" "Удаление старых резервных копий (оставляем ${BACKUP_KEEP_COUNT})"
     echo "${old_backups}" | tr '\n' '\0' | xargs -0 -r rm -f
   fi
 else

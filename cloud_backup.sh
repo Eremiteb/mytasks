@@ -145,6 +145,7 @@ SUDO_PASSWORD="${SUDO_PASSWORD:-}"
 REMOTE_PATH="${REMOTE_PATH:-/opt/esimych-cloud}"
 REMOTE_SSH_PORT="${REMOTE_SSH_PORT:-22}"
 WG_KEEP_UP="${WG_KEEP_UP:-0}"
+BACKUP_KEEP_COUNT="${BACKUP_KEEP_COUNT:-5}"
 BACKUP_DEGRADATION_MIBS_THRESHOLD="${BACKUP_DEGRADATION_MIBS_THRESHOLD:-6}"
 OPTIMIZE_MARIADB_BEFORE_BACKUP="${OPTIMIZE_MARIADB_BEFORE_BACKUP:-0}"
 MARIADB_SERVICE_NAME="${MARIADB_SERVICE_NAME:-mariadb}"
@@ -576,19 +577,19 @@ if [[ "${backup_rc}" -eq 0 ]]; then
     "file=${BACKUP_PATH}, size=${backup_size}" "${backup_rc}"
   echo "Готово: ${BACKUP_PATH} (${backup_size})"
 
-  # Очистка старых бэкапов, оставляем только 5 последних
+  # Очистка старых бэкапов, оставляем только BACKUP_KEEP_COUNT последних
   old_backups=()
   _old_bak_file="$(mktemp)"
   if find "${BACKUP_DIR}" -maxdepth 1 -type f -name "${SCRIPT_BASE}-*.tar.*" -printf '%T@|%p\n' 2>/dev/null \
       | sort -nr \
-      | awk -F'|' 'NR > 5 { print $2 }' > "${_old_bak_file}"; then
+      | awk -F'|' -v keep="${BACKUP_KEEP_COUNT}" 'NR > keep { print $2 }' > "${_old_bak_file}"; then
     while IFS= read -r _old_bak; do
       [[ -n "${_old_bak}" ]] && old_backups+=("${_old_bak}")
     done < "${_old_bak_file}"
   fi
   rm -f -- "${_old_bak_file}"
   if ((${#old_backups[@]} > 0)); then
-    log_json "INFO" "backup_cleanup" "Удаление старых резервных копий (оставляем 5)"
+    log_json "INFO" "backup_cleanup" "Удаление старых резервных копий (оставляем ${BACKUP_KEEP_COUNT})"
     rm -f -- "${old_backups[@]}"
   fi
 else

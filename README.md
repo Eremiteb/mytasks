@@ -118,6 +118,7 @@
 | `REMOTE_PATH`     | `/opt/esimych-cloud`    | Путь к папке на удалённой системе              |
 | `BACKUP_DIR`      | *(обязательно)*         | Локальная папка для резервных копий            |
 | `WG_KEEP_UP`      | `0`                     | Оставить WireGuard активным после завершения   |
+| `BACKUP_KEEP_COUNT` | `5`                   | Сколько последних резервных копий хранить      |
 | `OPTIMIZE_MARIADB_BEFORE_BACKUP` | `0`       | Выполнить оптимизацию MariaDB перед архивом    |
 | `MARIADB_SERVICE_NAME`           | `mariadb` | Имя MariaDB-сервиса в `docker compose`         |
 | `MARIADB_PURGE_BINLOGS`          | `0`       | Очистить старые binary logs (`PURGE BINARY LOGS`) |
@@ -212,6 +213,7 @@ QNAP-версия `cloud_backup.sh` — то же резервное копир�
 | `REMOTE_PATH`     | `/opt/esimych-cloud`        | Путь к папке на удалённой системе              |
 | `BACKUP_DIR`      | *(обязательно)*             | Папка на QNAP для резервных копий (напр. `/share/Public/backups`) |
 | `WG_KEEP_UP`      | `0`                         | Оставить WireGuard активным после завершения   |
+| `BACKUP_KEEP_COUNT` | `5`                       | Сколько последних резервных копий хранить      |
 | `OPTIMIZE_MARIADB_BEFORE_BACKUP` | `0`       | Выполнить оптимизацию MariaDB перед архивом    |
 | `MARIADB_SERVICE_NAME`           | `mariadb` | Имя MariaDB-сервиса в `docker compose`         |
 | `MARIADB_PURGE_BINLOGS`          | `0`       | Очистить старые binary logs                    |
