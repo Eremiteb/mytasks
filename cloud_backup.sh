@@ -62,7 +62,7 @@ cleanup_logs() {
   old_logs_file="$(mktemp)"
   if find "${LOG_DIR}" -maxdepth 1 -type f -name "${SCRIPT_BASE}-*.jsonl" -printf '%T@|%p\n' 2>/dev/null \
       | sort -nr \
-      | awk -F'|' 'NR > 5 { print $2 }' > "${old_logs_file}"; then
+      | awk -F'|' -v keep="${BACKUP_KEEP_COUNT}" 'NR > keep { print $2 }' > "${old_logs_file}"; then
     while IFS= read -r old_log; do
       [[ -n "${old_log}" ]] && old_logs+=("${old_log}")
     done < "${old_logs_file}"

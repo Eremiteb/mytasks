@@ -252,7 +252,7 @@ log_json() {
 cleanup_logs() {
   local old_logs
   # shellcheck disable=SC2012
-  old_logs=$(ls -1t "${LOG_DIR}/${SCRIPT_BASE}-"*.jsonl 2>/dev/null | tail -n +6)
+  old_logs=$(ls -1t "${LOG_DIR}/${SCRIPT_BASE}-"*.jsonl 2>/dev/null | tail -n "+$((BACKUP_KEEP_COUNT + 1))")
   if [[ -n "${old_logs}" ]]; then
     printf '%s\n' "${old_logs}" | xargs -r rm -f --
   fi

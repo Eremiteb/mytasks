@@ -118,7 +118,7 @@
 | `REMOTE_PATH`     | `/opt/esimych-cloud`    | Путь к папке на удалённой системе              |
 | `BACKUP_DIR`      | *(обязательно)*         | Локальная папка для резервных копий            |
 | `WG_KEEP_UP`      | `0`                     | Оставить WireGuard активным после завершения   |
-| `BACKUP_KEEP_COUNT` | `5`                   | Сколько последних резервных копий хранить      |
+| `BACKUP_KEEP_COUNT` | `5`                   | Сколько последних резервных копий и логов хранить |
 | `OPTIMIZE_MARIADB_BEFORE_BACKUP` | `0`       | Выполнить оптимизацию MariaDB перед архивом    |
 | `MARIADB_SERVICE_NAME`           | `mariadb` | Имя MariaDB-сервиса в `docker compose`         |
 | `MARIADB_PURGE_BINLOGS`          | `0`       | Очистить старые binary logs (`PURGE BINARY LOGS`) |
@@ -127,7 +127,7 @@
 | `REDIS_SERVICE_NAME`             | `redis`   | Имя Redis-сервиса в `docker compose`           |
 | `REDIS_REWRITE_WAIT_SEC`         | `180`     | Верхний предел ожидания `BGREWRITEAOF` (сек) — не типичная длительность: определение завершения устойчиво к CRLF в выводе `redis-cli INFO`, поэтому при штатной работе rewrite завершается за секунды, значение — лишь потолок на случай реальной проблемы |
 
-**Логи:** JSONL-файл `logs/cloud_backup-YYYY-MM-DD-HH-MM-SS.jsonl`. Хранится 5 последних файлов.
+**Логи:** JSONL-файл `logs/cloud_backup-YYYY-MM-DD-HH-MM-SS.jsonl`. Хранится `BACKUP_KEEP_COUNT` последних файлов (тот же параметр, что и для архивов).
 
 **Имя архива:** `cloud_backup-YYYY-MM-DD.tar.gz` или `cloud_backup-YYYY-MM-DD.tar.zst`
 
@@ -213,7 +213,7 @@ QNAP-версия `cloud_backup.sh` — то же резервное копир�
 | `REMOTE_PATH`     | `/opt/esimych-cloud`        | Путь к папке на удалённой системе              |
 | `BACKUP_DIR`      | *(обязательно)*             | Папка на QNAP для резервных копий (напр. `/share/Public/backups`) |
 | `WG_KEEP_UP`      | `0`                         | Оставить WireGuard активным после завершения   |
-| `BACKUP_KEEP_COUNT` | `5`                       | Сколько последних резервных копий хранить      |
+| `BACKUP_KEEP_COUNT` | `5`                       | Сколько последних резервных копий и логов хранить |
 | `OPTIMIZE_MARIADB_BEFORE_BACKUP` | `0`       | Выполнить оптимизацию MariaDB перед архивом    |
 | `MARIADB_SERVICE_NAME`           | `mariadb` | Имя MariaDB-сервиса в `docker compose`         |
 | `MARIADB_PURGE_BINLOGS`          | `0`       | Очистить старые binary logs                    |
@@ -230,7 +230,7 @@ QNAP-версия `cloud_backup.sh` — то же резервное копир�
 | `RAW_TRANSFER_STATUS_POLL_RETRIES` | `5`     | Число попыток получить статус завершения удалённого пайплайна после приёма данных |
 | `NETWORK_SPEED_TEST_MB`          | `50`      | Размер тестовой передачи (МБ) для замера реальной скорости сети QNAP↔REMOTE_HOST перед началом бэкапа (событие `network_speed_test`) |
 
-**Логи:** JSONL-файл `logs/cloud_backup_qnap-YYYY-MM-DD-HH-MM-SS.jsonl` на QNAP. Хранится 5 последних файлов (см. `cleanup_logs`).
+**Логи:** JSONL-файл `logs/cloud_backup_qnap-YYYY-MM-DD-HH-MM-SS.jsonl` на QNAP. Хранится `BACKUP_KEEP_COUNT` последних файлов (см. `cleanup_logs`, тот же параметр, что и для архивов).
 
 **Диагностика деградации скорости:** перед началом и каждые ~5 минут во время передачи скрипт снимает `loadavg`/свободную память на QNAP и на удалённом сервере, а также RTT между ними (события `backup_env_diag`, `backup_progress`). Раз в ~10 минут (подмножество тех же тиков) отдельно и совместно (одним замером, чтобы значения относились к одному моменту) снимаются CPU (`loadavg`), RAM (`MemAvailable`) и IO самого QNAP — событие `backup_resource_diag`. IO читается напрямую из `/proc/diskstats` для блочного устройства под `BACKUP_DIR` (определяется при старте через `df -P` + сопоставление по major:minor, см. `io_device` в `backup_env_diag`, — не по имени: на QNAP `BACKUP_DIR` обычно лежит на `/dev/mapper/cachedevN`, который сам является настоящим device-mapper узлом с тем же major:minor, что и его запись в `diskstats`, но под другим именем, `dm-N`; `df -P` обязателен — без `-P` BusyBox `df` переносит длинное имя устройства на отдельную строку) — `io_read_kib_s`/`io_write_kib_s`/`io_util_pct` (доля времени, когда на устройстве была хотя бы одна незавершённая операция, как в `iostat`); работает без установки `iostat`/`vmstat` — в минимальной Entware-сборке этого QNAP таких пакетов нет. Если устройство определить не удалось, замер IO пропускается (`io_diag_unavailable`, WARN). Перед началом также запускается лёгкий замер реальной пропускной способности сети QNAP↔REMOTE_HOST тем же способом, что и сама передача (`network_speed_test`, best-effort — ошибка не прерывает бэкап, см. `NETWORK_SPEED_TEST_MB` выше) — результат (`mib_s`) напрямую сравним с `avg_mib_s` в `backup_metrics` и помогает отличить «узкое место в сети» от «узкое место в CPU/диске QNAP». После завершения в `backup_metrics` пишутся средние значения (`avg_local_load1`, `avg_remote_load1`, `avg_rtt_ms`, `avg_io_util_pct`), а при скорости ниже `BACKUP_DEGRADATION_MIBS_THRESHOLD` — `backup_degradation` с вероятной причиной (`probable_cause`: `local_cpu_or_io_contention`, `remote_cpu_contention`, `network_latency_increase` и т.д.), определённой по фактическим метрикам, а не по одной лишь средней скорости. Между остановкой сервисов (`docker compose down`) и стартом передачи скрипт выдерживает паузу `sleep 5` (событие `post_services_stop_settle`) — массовая остановка ~15 контейнеров ещё несколько секунд донастраивает сеть на удалённой стороне. При любой ошибке raw-transfer в лог дополнительно попадает снимок удалённой стороны на момент сбоя — `loadavg`, свободная память, место на диске и свежие OOM-килы из `dmesg` (см. `get_remote_failure_diag` в коде) — не нужно вручную SSH'иться для разбора инцидента.
 
