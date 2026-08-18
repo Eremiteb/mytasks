@@ -63,6 +63,16 @@ exit 0
 EOF
   chmod +x "$STUB_DIR/xxd"
 
+  # ncat проверяется как обязательная зависимость даже при выключенном
+  # RAW_TRANSFER_ENABLED. По умолчанию имитируем недоступный сетевой замер:
+  # это best-effort путь и он не должен зависеть от установленного в CI ncat.
+  # Тесты raw-transfer ниже заменяют этот стаб своей реализацией.
+  cat > "$STUB_DIR/ncat" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+  chmod +x "$STUB_DIR/ncat"
+
   export TMP_DIR STUB_DIR BACKUP_DIR WG_SOCK_PATH
 }
 
