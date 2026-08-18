@@ -41,6 +41,9 @@ WG_KEEP_UP="0"
 # Сколько последних резервных копий и файлов логов хранить (старше — удаляются)
 BACKUP_KEEP_COUNT="5"
 
+# Имя сервиса Nextcloud в docker compose (не container_name)
+NEXTCLOUD_SERVICE_NAME="nextcloud"
+
 # Оптимизировать MariaDB перед архивированием: 1 — да, 0 — нет (по умолчанию)
 OPTIMIZE_MARIADB_BEFORE_BACKUP="0"
 
@@ -65,6 +68,11 @@ REDIS_REWRITE_WAIT_SEC="180"
 # Сколько последних строк docker compose logs снимать с Redis перед
 # services_stop (docker compose down) — после down логи контейнера теряются
 REDIS_LOG_TAIL_LINES="300"
+
+# Сколько раз повторять docker compose up -d после бэкапа и сколько секунд
+# ждать между попытками. После каждой попытки проверяется docker compose ps -a.
+SERVICES_START_RETRIES="3"
+SERVICES_START_RETRY_DELAY_SEC="15"
 
 # Раз в сколько дней реально выполнять включённые выше оптимизации БД
 # (MariaDB/Redis), даже если сам бэкап запускается ежедневно.
@@ -95,6 +103,11 @@ RAW_TRANSFER_PORT="8873"
 # Использует тот же nc -N + ncat --recv-only, что и сама передача, поэтому
 # результат напрямую сравним с avg_mib_s в backup_metrics.
 #NETWORK_SPEED_TEST_MB="50"
+
+# Порог предупреждения о деградации средней скорости бэкапа (МиБ/с).
+# Значение 4 соответствует наблюдаемому диапазону этой QNAP: штатные прогоны
+# дают около 4.7-5.5 МиБ/с, а сетевые деградации — около 2-2.5 МиБ/с.
+BACKUP_DEGRADATION_MIBS_THRESHOLD="4"
 
 # Дополнительных переменных не требуется: во время передачи скрипт сам, раз в
 # ~10 минут, совместно снимает CPU (loadavg), RAM (MemAvailable) и IO

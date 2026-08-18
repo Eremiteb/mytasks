@@ -209,6 +209,7 @@ TIMESTAMP="$(date '+%Y-%m-%d-%H-%M-%S')"
 LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}-${TIMESTAMP}.jsonl"
 PROGRESS_METRICS_FILE=""
 DIAG_METRICS_FILE=""
+NETWORK_SPEED_TEST_MIB_S="n/a"
 
 mkdir -p "${LOG_DIR}"
 
@@ -229,7 +230,7 @@ json_escape() {
   # корректной одной строкой JSONL даже при шумном stderr внешних команд.
   printf '%s' "$1" \
     | tr '\n\t' '  ' \
-    | tr -d '\000-\010\013\014\016-\037' \
+    | tr -d '\001\002\003\004\005\006\007\010\013\014\016\017\020\021\022\023\024\025\026\027\030\031\032\033\034\035\036\037' \
     | sed 's/\\/\\\\/g; s/"/\\"/g; s/\r//g'
 }
 
@@ -335,7 +336,8 @@ REMOTE_PATH="${REMOTE_PATH:-/opt/esimych-cloud}"
 REMOTE_SSH_PORT="${REMOTE_SSH_PORT:-22}"
 WG_KEEP_UP="${WG_KEEP_UP:-0}"
 BACKUP_KEEP_COUNT="${BACKUP_KEEP_COUNT:-5}"
-BACKUP_DEGRADATION_MIBS_THRESHOLD="${BACKUP_DEGRADATION_MIBS_THRESHOLD:-6}"
+BACKUP_DEGRADATION_MIBS_THRESHOLD="${BACKUP_DEGRADATION_MIBS_THRESHOLD:-4}"
+NEXTCLOUD_SERVICE_NAME="${NEXTCLOUD_SERVICE_NAME:-nextcloud}"
 OPTIMIZE_MARIADB_BEFORE_BACKUP="${OPTIMIZE_MARIADB_BEFORE_BACKUP:-0}"
 MARIADB_SERVICE_NAME="${MARIADB_SERVICE_NAME:-mariadb}"
 MARIADB_PURGE_BINLOGS="${MARIADB_PURGE_BINLOGS:-0}"
@@ -344,6 +346,8 @@ OPTIMIZE_REDIS_BEFORE_BACKUP="${OPTIMIZE_REDIS_BEFORE_BACKUP:-0}"
 REDIS_SERVICE_NAME="${REDIS_SERVICE_NAME:-redis}"
 REDIS_REWRITE_WAIT_SEC="${REDIS_REWRITE_WAIT_SEC:-180}"
 REDIS_LOG_TAIL_LINES="${REDIS_LOG_TAIL_LINES:-300}"
+SERVICES_START_RETRIES="${SERVICES_START_RETRIES:-3}"
+SERVICES_START_RETRY_DELAY_SEC="${SERVICES_START_RETRY_DELAY_SEC:-15}"
 
 # Передача потока бэкапа через сырой TCP-сокет (nc/ncat) внутри уже
 # зашифрованного WireGuard-туннеля, минуя дополнительный слой SSH-шифрования —
@@ -571,28 +575,65 @@ wg_down_if_needed() {
 # shellcheck disable=SC2329
 services_start_if_needed() {
   if [[ "${SERVICES_STOPPED}" -eq 1 ]]; then
-    SERVICES_STOPPED=0
-    log_json "INFO" "services_start" "Запускаем сервисы на ${REMOTE_HOST}..."
-    start_err=$(ssh_remote \
-      "cd '${REMOTE_PATH}' && docker compose up -d" 2>&1)
-    start_rc=$?
-    if [[ "${start_rc}" -ne 0 ]]; then
-      log_json "WARN" "services_start_failed" "Не удалось запустить сервисы" "${start_err}" "${start_rc}"
-    else
-      log_json "INFO" "services_start_ok" "Сервисы запущены" "" "${start_rc}"
-    fi
+    local attempt start_out start_rc services_state services_state_rc recovery_diag
+    attempt=1
+    while [[ "${attempt}" -le "${SERVICES_START_RETRIES}" ]]; do
+      log_json "INFO" "services_start" "Запускаем сервисы на ${REMOTE_HOST}..." \
+        "attempt=${attempt}, max_attempts=${SERVICES_START_RETRIES}"
+      start_out=$(ssh_remote \
+        "cd '${REMOTE_PATH}' && docker compose up -d" 2>&1)
+      start_rc=$?
+      services_state=""
+      services_state_rc=1
+      if [[ "${start_rc}" -eq 0 ]]; then
+        services_state=$(ssh_remote \
+          "cd '${REMOTE_PATH}' && docker compose ps -a" 2>&1)
+        services_state_rc=$?
+        if [[ "${services_state_rc}" -eq 0 ]] \
+            && ! printf '%s\n' "${services_state}" | grep -Eiq 'unhealthy|exited|dead|restarting'; then
+          SERVICES_STOPPED=0
+          log_json "INFO" "services_start_ok" "Сервисы запущены" \
+            "attempt=${attempt}; compose_ps=${services_state:-<пусто>}" 0
+          return 0
+        fi
+        start_rc=1
+        start_out="${start_out}; docker compose ps -a: ${services_state:-<пусто>}"
+      fi
+
+      log_json "WARN" "services_start_retry" "Не удалось запустить все сервисы — повторяем попытку" \
+        "attempt=${attempt}, max_attempts=${SERVICES_START_RETRIES}; ${start_out}" "${start_rc}"
+      if [[ "${attempt}" -lt "${SERVICES_START_RETRIES}" ]]; then
+        sleep "${SERVICES_START_RETRY_DELAY_SEC}"
+      fi
+      attempt=$((attempt + 1))
+    done
+
+    recovery_diag=$(ssh_remote \
+      "cd '${REMOTE_PATH}' && { docker compose ps -a; docker compose logs --no-color --tail=${REDIS_LOG_TAIL_LINES} '${REDIS_SERVICE_NAME}'; }" 2>&1)
+    log_json "ERROR" "services_start_failed" "Не удалось запустить сервисы после повторных попыток" \
+      "attempts=${SERVICES_START_RETRIES}; last_error=${start_out}; diagnostics=${recovery_diag}" "${start_rc}"
+    return 1
   fi
+  return 0
 }
 
 # shellcheck disable=SC2329
 cleanup() {
-  services_start_if_needed
+  local original_rc="${1:-0}" final_rc
+  final_rc="${original_rc}"
+  if ! services_start_if_needed; then
+    final_rc=1
+  fi
   wg_down_if_needed
   [[ -n "${PROGRESS_METRICS_FILE}" ]] && rm -f "${PROGRESS_METRICS_FILE}" 2>/dev/null
   [[ -n "${DIAG_METRICS_FILE}" ]] && rm -f "${DIAG_METRICS_FILE}" 2>/dev/null
   cleanup_logs
+  trap - EXIT INT TERM
+  exit "${final_rc}"
 }
-trap cleanup EXIT INT TERM
+trap 'cleanup "$?"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 log_json "INFO" "start" "Запуск резервного копирования (QNAP)"
 
@@ -838,6 +879,7 @@ nohup bash -c 'dd if=/dev/zero bs=1M count=${NETWORK_SPEED_TEST_MB} 2>/dev/null 
 
   if [[ "${test_rc}" -eq 0 && "${test_bytes}" -gt 0 ]]; then
     test_mib_s=$(awk -v b="${test_bytes}" -v d="${test_dur}" 'BEGIN { printf "%.2f", (b/1048576)/d }')
+    NETWORK_SPEED_TEST_MIB_S="${test_mib_s}"
     log_json "INFO" "network_speed_test" "Замер скорости сети перед началом бэкапа" \
       "bytes=${test_bytes}, duration_s=${test_dur}, mib_s=${test_mib_s}"
   else
@@ -920,9 +962,20 @@ log_json "INFO" "backup_excludes" "Применены встроенные ис�
 ###############################################################################
 # NEXTCLOUD CLEANUP (occ)
 ###############################################################################
+nextcloud_stack_state=$(ssh_remote \
+  "cd '${REMOTE_PATH}' && docker compose ps -a '${NEXTCLOUD_SERVICE_NAME}'" 2>&1)
+nextcloud_stack_state_rc=$?
+if [[ "${nextcloud_stack_state_rc}" -eq 0 ]]; then
+  log_json "INFO" "nextcloud_preflight" "Состояние сервиса Nextcloud перед очисткой" \
+    "service=${NEXTCLOUD_SERVICE_NAME}; ${nextcloud_stack_state}" 0
+else
+  log_json "WARN" "nextcloud_preflight_failed" "Не удалось получить состояние сервиса Nextcloud" \
+    "service=${NEXTCLOUD_SERVICE_NAME}; ${nextcloud_stack_state}" "${nextcloud_stack_state_rc}"
+fi
+
 log_json "INFO" "occ_cleanup_start" "Очистка корзин пользователей (occ trashbin:cleanup)..."
 occ_trash_err=$(ssh_remote \
-  "docker exec -u www-data esimych-cloud-app php occ trashbin:cleanup --all-users" 2>&1)
+  "cd '${REMOTE_PATH}' && docker compose exec -T -u www-data '${NEXTCLOUD_SERVICE_NAME}' php occ trashbin:cleanup --all-users" 2>&1)
 occ_trash_rc=$?
 if [[ ${occ_trash_rc} -ne 0 ]]; then
   log_json "WARN" "occ_cleanup_trash_failed" "Не удалось очистить корзины" "${occ_trash_err}" "${occ_trash_rc}"
@@ -940,9 +993,9 @@ fi
 occ_trash_repair_detail=""
 occ_trash_repair_rc=0
 remote_datadir=$(ssh_remote \
-  "docker exec -u www-data esimych-cloud-app php occ config:system:get datadirectory" 2>/dev/null | tr -d '\r\n')
+  "cd '${REMOTE_PATH}' && docker compose exec -T -u www-data '${NEXTCLOUD_SERVICE_NAME}' php occ config:system:get datadirectory" 2>/dev/null | tr -d '\r\n')
 remote_users=$(ssh_remote \
-  "docker exec -u www-data esimych-cloud-app php occ user:list" 2>/dev/null)
+  "cd '${REMOTE_PATH}' && docker compose exec -T -u www-data '${NEXTCLOUD_SERVICE_NAME}' php occ user:list" 2>/dev/null)
 log_json "INFO" "occ_user_list" "Получен список пользователей Nextcloud (occ user:list)" "${remote_users:-<пусто>}"
 if [[ -z "${remote_datadir}" || -z "${remote_users}" ]]; then
   occ_trash_repair_rc=1
@@ -959,7 +1012,7 @@ else
   while IFS= read -r _uid <&3; do
     [[ -z "${_uid}" ]] && continue
     _repair_err=$(ssh_remote \
-      "docker exec -u www-data esimych-cloud-app mkdir -p '${remote_datadir}/${_uid}/files_trashbin'" 2>&1)
+      "cd '${REMOTE_PATH}' && docker compose exec -T -u www-data '${NEXTCLOUD_SERVICE_NAME}' mkdir -p '${remote_datadir}/${_uid}/files_trashbin'" 2>&1)
     _repair_rc=$?
     if [[ ${_repair_rc} -ne 0 ]]; then
       occ_trash_repair_rc=1
@@ -969,7 +1022,7 @@ else
     # Проверяем, что папка реально существует после mkdir -p (а не просто
     # команда молча ничего не сделала из-за проблем с docker exec/SSH) —
     # результат логируется отдельно для каждого пользователя.
-    ssh_remote "docker exec -u www-data esimych-cloud-app test -d '${remote_datadir}/${_uid}/files_trashbin'" >/dev/null 2>&1
+    ssh_remote "cd '${REMOTE_PATH}' && docker compose exec -T -u www-data '${NEXTCLOUD_SERVICE_NAME}' test -d '${remote_datadir}/${_uid}/files_trashbin'" >/dev/null 2>&1
     _verify_rc=$?
     if [[ ${_verify_rc} -eq 0 ]]; then
       log_json "INFO" "occ_trashbin_verify_ok" "Папка files_trashbin подтверждена после пересоздания" "user=${_uid}, path=${remote_datadir}/${_uid}/files_trashbin" 0
@@ -988,7 +1041,7 @@ fi
 
 log_json "INFO" "occ_versions_start" "Очистка версий файлов (occ versions:cleanup)..."
 occ_ver_err=$(ssh_remote \
-  "docker exec -u www-data esimych-cloud-app php occ versions:cleanup" 2>&1)
+  "cd '${REMOTE_PATH}' && docker compose exec -T -u www-data '${NEXTCLOUD_SERVICE_NAME}' php occ versions:cleanup" 2>&1)
 occ_ver_rc=$?
 if [[ ${occ_ver_rc} -ne 0 ]]; then
   log_json "WARN" "occ_cleanup_versions_failed" "Не удалось очистить версии файлов" "${occ_ver_err}" "${occ_ver_rc}"
@@ -1352,13 +1405,16 @@ if [[ "${backup_rc}" -eq 0 ]]; then
     avg_io_util_pct=$(awk -F'\t' '$5!=""{s+=$5; c++} END{if (c>0) printf "%.1f", s/c; else print "n/a"}' "${DIAG_METRICS_FILE}")
   fi
 
-  metrics_detail="file=${BACKUP_PATH}, size=${backup_size}, bytes=${backup_bytes}, duration_s=${archive_duration}, avg_mib_s=${avg_mib_s}, window_mib_s=${window_mib_s}, progress_samples=${progress_samples}, comp=${REMOTE_COMP:-gzip}, append=${BACKUP_APPEND}, local_nproc=${LOCAL_NPROC}, remote_nproc=${REMOTE_NPROC}, avg_local_load1=${avg_local_load1}, avg_remote_load1=${avg_remote_load1}, avg_rtt_ms=${avg_rtt_ms}, rtt_baseline_ms=${RTT_BASELINE_MS}, io_device=${IO_DEVICE:-n/a}, avg_io_util_pct=${avg_io_util_pct}"
+  metrics_detail="file=${BACKUP_PATH}, size=${backup_size}, bytes=${backup_bytes}, duration_s=${archive_duration}, avg_mib_s=${avg_mib_s}, window_mib_s=${window_mib_s}, network_test_mib_s=${NETWORK_SPEED_TEST_MIB_S}, progress_samples=${progress_samples}, comp=${REMOTE_COMP:-gzip}, append=${BACKUP_APPEND}, local_nproc=${LOCAL_NPROC}, remote_nproc=${REMOTE_NPROC}, avg_local_load1=${avg_local_load1}, avg_remote_load1=${avg_remote_load1}, avg_rtt_ms=${avg_rtt_ms}, rtt_baseline_ms=${RTT_BASELINE_MS}, io_device=${IO_DEVICE:-n/a}, avg_io_util_pct=${avg_io_util_pct}"
   log_json "INFO" "backup_metrics" "Метрики этапа архивирования" "${metrics_detail}" 0
 
   if awk -v s="${avg_mib_s}" -v t="${BACKUP_DEGRADATION_MIBS_THRESHOLD}" 'BEGIN { exit !(s < t) }'; then
     probable_cause="unknown"
     if [[ "${progress_samples}" -lt 2 ]]; then
       probable_cause="insufficient_progress_samples"
+    elif [[ "${NETWORK_SPEED_TEST_MIB_S}" != "n/a" ]] \
+        && awk -v s="${NETWORK_SPEED_TEST_MIB_S}" -v t="${BACKUP_DEGRADATION_MIBS_THRESHOLD}" 'BEGIN { exit !(s < t) }'; then
+      probable_cause="network_throughput_limit"
     elif [[ "${avg_remote_load1}" != "n/a" ]] && awk -v l="${avg_remote_load1}" -v n="${REMOTE_NPROC}" 'BEGIN { exit !(l >= n) }'; then
       probable_cause="remote_cpu_contention"
     elif [[ "${avg_local_load1}" != "n/a" ]] && awk -v l="${avg_local_load1}" -v n="${LOCAL_NPROC}" 'BEGIN { exit !(l >= n) }'; then

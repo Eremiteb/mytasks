@@ -229,3 +229,106 @@ EOF
   run gzip -t "$backup_file"
   [ "$status" -eq 0 ]
 }
+
+@test "JSONL сохраняет дефисы в путях и именах контейнеров" {
+  cat > "$STUB_DIR/ssh" <<EOF
+#!/usr/bin/env bash
+case "\$*" in
+  *"command -v zstd >/dev/null 2>&1"*) echo gzip; exit 0 ;;
+  *"tar --create"*) printf '$GZIP_FIXTURE'; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+  chmod +x "$STUB_DIR/ssh"
+
+  run_script
+
+  [ "$status" -eq 0 ]
+  log_file=$(ls "$TMP_DIR/logs"/cloud_backup_qnap-*.jsonl 2>/dev/null | head -1)
+  run grep -q '/opt/esimych-cloud' "$log_file"
+  [ "$status" -eq 0 ]
+}
+
+@test "OCC использует настраиваемое имя сервиса docker compose" {
+  cat >> "$TMP_DIR/conf/cloud_backup_qnap.conf" <<'EOF'
+NEXTCLOUD_SERVICE_NAME="cloud-app"
+EOF
+
+  cat > "$STUB_DIR/ssh" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$TMP_DIR/ssh_commands"
+case "\$*" in
+  *"command -v zstd >/dev/null 2>&1"*) echo gzip; exit 0 ;;
+  *"tar --create"*) printf '$GZIP_FIXTURE'; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+  chmod +x "$STUB_DIR/ssh"
+
+  run_script
+
+  [ "$status" -eq 0 ]
+  run grep -q "docker compose exec -T -u www-data 'cloud-app' php occ trashbin:cleanup" "$TMP_DIR/ssh_commands"
+  [ "$status" -eq 0 ]
+}
+
+@test "запуск сервисов повторяется и завершается успехом на третьей попытке" {
+  cat >> "$TMP_DIR/conf/cloud_backup_qnap.conf" <<'EOF'
+SERVICES_START_RETRIES="3"
+SERVICES_START_RETRY_DELAY_SEC="0"
+EOF
+
+  cat > "$STUB_DIR/ssh" <<EOF
+#!/usr/bin/env bash
+case "\$*" in
+  *"command -v zstd >/dev/null 2>&1"*) echo gzip; exit 0 ;;
+  *"tar --create"*) printf '$GZIP_FIXTURE'; exit 0 ;;
+  *"docker compose up -d"*)
+    count=0
+    [ -f "$TMP_DIR/start_attempts" ] && count=\$(cat "$TMP_DIR/start_attempts")
+    count=\$((count + 1))
+    printf '%s\n' "\$count" > "$TMP_DIR/start_attempts"
+    [ "\$count" -ge 3 ]
+    ;;
+  *"docker compose ps -a"*) echo 'nextcloud running healthy'; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+  chmod +x "$STUB_DIR/ssh"
+
+  run_script
+
+  [ "$status" -eq 0 ]
+  [ "$(cat "$TMP_DIR/start_attempts")" -eq 3 ]
+  log_file=$(ls "$TMP_DIR/logs"/cloud_backup_qnap-*.jsonl 2>/dev/null | head -1)
+  run grep -q '"event":"services_start_retry"' "$log_file"
+  [ "$status" -eq 0 ]
+  run grep -q '"event":"services_start_ok"' "$log_file"
+  [ "$status" -eq 0 ]
+}
+
+@test "окончательная ошибка запуска сервисов делает задание неуспешным" {
+  cat >> "$TMP_DIR/conf/cloud_backup_qnap.conf" <<'EOF'
+SERVICES_START_RETRIES="2"
+SERVICES_START_RETRY_DELAY_SEC="0"
+EOF
+
+  cat > "$STUB_DIR/ssh" <<EOF
+#!/usr/bin/env bash
+case "\$*" in
+  *"command -v zstd >/dev/null 2>&1"*) echo gzip; exit 0 ;;
+  *"tar --create"*) printf '$GZIP_FIXTURE'; exit 0 ;;
+  *"docker compose up -d"*) exit 1 ;;
+  *"docker compose ps -a"*) echo 'valkey exited unhealthy'; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+  chmod +x "$STUB_DIR/ssh"
+
+  run_script
+
+  [ "$status" -ne 0 ]
+  log_file=$(ls "$TMP_DIR/logs"/cloud_backup_qnap-*.jsonl 2>/dev/null | head -1)
+  run grep -q '"event":"services_start_failed".*"level":"error"' "$log_file"
+  [ "$status" -eq 0 ]
+}
