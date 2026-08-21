@@ -23,6 +23,11 @@ setup() {
   cp "$REPO_ROOT/cloud_backup_qnap.sh" "$TMP_DIR/cloud_backup_qnap.sh"
   chmod +x "$TMP_DIR/cloud_backup_qnap.sh"
 
+  if [[ "${BATS_TEST_NAME}" = "zstd использует уровень сжатия 3" ]]; then
+    export TMP_DIR
+    return
+  fi
+
   python3 -c "import socket; s=socket.socket(socket.AF_UNIX); s.bind('$WG_SOCK_PATH')"
 
   cat > "$TMP_DIR/conf/cloud_backup_qnap.conf" <<EOF
@@ -89,6 +94,12 @@ run_script() {
 }
 
 # ---------------------------------------------------------------------------
+
+@test "zstd использует уровень сжатия 3" {
+  run grep -F 'zstd) COMP_CMD="zstd -3 --threads=0 -c"' "$TMP_DIR/cloud_backup_qnap.sh"
+
+  [ "$status" -eq 0 ]
+}
 
 @test "RAW_TRANSFER_ENABLED=0 — поведение как раньше, ncat не вызывается" {
   cat > "$STUB_DIR/ssh" <<EOF
