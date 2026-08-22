@@ -60,3 +60,6 @@ conf/*
 .sources.err*
 .sources.out*
 *.sync-conflict
+
+# Graphify (generated code graph)
+graphify-out/
