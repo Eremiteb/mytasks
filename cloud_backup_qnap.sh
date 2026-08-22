@@ -343,7 +343,7 @@ MARIADB_SERVICE_NAME="${MARIADB_SERVICE_NAME:-mariadb}"
 MARIADB_PURGE_BINLOGS="${MARIADB_PURGE_BINLOGS:-0}"
 MARIADB_TRUNCATE_GENERAL_LOG="${MARIADB_TRUNCATE_GENERAL_LOG:-1}"
 OPTIMIZE_REDIS_BEFORE_BACKUP="${OPTIMIZE_REDIS_BEFORE_BACKUP:-0}"
-REDIS_SERVICE_NAME="${REDIS_SERVICE_NAME:-redis}"
+REDIS_SERVICE_NAME="${REDIS_SERVICE_NAME:-valkey}"
 REDIS_REWRITE_WAIT_SEC="${REDIS_REWRITE_WAIT_SEC:-180}"
 REDIS_LOG_TAIL_LINES="${REDIS_LOG_TAIL_LINES:-300}"
 SERVICES_START_RETRIES="${SERVICES_START_RETRIES:-3}"
@@ -1109,7 +1109,7 @@ fi
 redis_logs_out=$(ssh_remote \
   "cd '${REMOTE_PATH}' && docker compose logs --no-color --tail=${REDIS_LOG_TAIL_LINES} '${REDIS_SERVICE_NAME}'" 2>&1)
 redis_logs_rc=$?
-log_json "INFO" "redis_logs_capture" "Логи Redis перед остановкой сервисов (docker compose down удалит контейнер вместе с ними)" "${redis_logs_out}" "${redis_logs_rc}"
+log_json "INFO" "redis_logs_capture" "Логи Redis/Valkey перед остановкой сервисов (docker compose down удалит контейнер вместе с ними)" "${redis_logs_out}" "${redis_logs_rc}"
 
 log_json "INFO" "services_stop" "Останавливаем сервисы на ${REMOTE_HOST}..."
 stop_err=$(ssh_remote \

@@ -248,7 +248,7 @@ QNAP-версия `cloud_backup.sh` — то же резервное копир�
 | `MARIADB_PURGE_BINLOGS`          | `0`       | Очистить старые binary logs                    |
 | `MARIADB_TRUNCATE_GENERAL_LOG`   | `1`       | Очистить `general.log` перед архивом           |
 | `OPTIMIZE_REDIS_BEFORE_BACKUP`   | `0`       | Выполнить `BGREWRITEAOF` для Redis             |
-| `REDIS_SERVICE_NAME`             | `redis`   | Имя Redis-сервиса в `docker compose`           |
+| `REDIS_SERVICE_NAME`             | `valkey`  | Имя сервиса Redis/Valkey в `docker compose`    |
 | `REDIS_REWRITE_WAIT_SEC`         | `180`     | Верхний предел ожидания `BGREWRITEAOF` (сек), не типичная длительность (см. пояснение в разделе `cloud_backup.sh` выше) |
 | `DB_OPTIMIZE_INTERVAL_DAYS`      | `7`       | Раз в сколько дней реально выполнять включённые выше оптимизации БД (MariaDB/Redis), даже если сам бэкап запускается ежедневно — между запусками, где интервал ещё не истёк, оптимизация пропускается (отметка хранится в `state/cloud_backup_qnap-db-optimize.state`); узкое место скорости архивирования — локальный CPU QNAP, а не состояние удалённых БД, поэтому ежедневная оптимизация не нужна |
 | `SSH_CIPHERS`                    | `chacha20-poly1305@openssh.com,aes128-gcm@openssh.com,aes256-gcm@openssh.com,aes128-ctr` | Приоритет SSH-шифров; `chacha20-poly1305` первым, т.к. на слабых ARM-чипах без аппаратного AES он обычно быстрее программного AES-GCM/CTR, а расшифровку входящего потока бэкапа выполняет именно QNAP |

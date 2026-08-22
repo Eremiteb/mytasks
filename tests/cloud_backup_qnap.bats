@@ -23,7 +23,7 @@ setup() {
   cp "$REPO_ROOT/cloud_backup_qnap.sh" "$TMP_DIR/cloud_backup_qnap.sh"
   chmod +x "$TMP_DIR/cloud_backup_qnap.sh"
 
-  if [[ "${BATS_TEST_NAME}" = "zstd использует уровень сжатия 3" ]]; then
+  if [[ "${BATS_TEST_DESCRIPTION}" = "актуальные значения zstd и Valkey заданы по умолчанию" ]]; then
     export TMP_DIR
     return
   fi
@@ -95,9 +95,11 @@ run_script() {
 
 # ---------------------------------------------------------------------------
 
-@test "zstd использует уровень сжатия 3" {
+@test "актуальные значения zstd и Valkey заданы по умолчанию" {
   run grep -F 'zstd) COMP_CMD="zstd -3 --threads=0 -c"' "$TMP_DIR/cloud_backup_qnap.sh"
+  [ "$status" -eq 0 ]
 
+  run grep -F 'REDIS_SERVICE_NAME="${REDIS_SERVICE_NAME:-valkey}"' "$TMP_DIR/cloud_backup_qnap.sh"
   [ "$status" -eq 0 ]
 }
 

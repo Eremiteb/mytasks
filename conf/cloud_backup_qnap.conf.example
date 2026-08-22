@@ -59,8 +59,8 @@ MARIADB_TRUNCATE_GENERAL_LOG="1"
 # Оптимизировать Redis AOF перед архивированием: 1 — да, 0 — нет (по умолчанию)
 OPTIMIZE_REDIS_BEFORE_BACKUP="0"
 
-# Имя сервиса Redis в docker compose
-REDIS_SERVICE_NAME="redis"
+# Имя сервиса Redis/Valkey в docker compose
+REDIS_SERVICE_NAME="valkey"
 
 # Максимальное ожидание завершения BGREWRITEAOF (сек)
 REDIS_REWRITE_WAIT_SEC="180"
