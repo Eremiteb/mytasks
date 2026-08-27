@@ -59,6 +59,16 @@ Lint `music_downloader/` (ruff config lives at `music_downloader/.ruff.toml`, py
 ruff check music_downloader/
 ```
 
+## Graphify
+
+The generated project graph lives in `graphify-out/` and is excluded from Git.
+Use it for navigation and analysis before manually searching the source code.
+After changing code or configuration, refresh it from the repository root:
+
+```sh
+graphify update .
+```
+
 ## Architecture
 
 > When asked to work on "the project", always ask which script — there is no shared entry point.
