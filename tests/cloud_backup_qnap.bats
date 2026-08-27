@@ -101,6 +101,12 @@ run_script() {
 
   run grep -F 'REDIS_SERVICE_NAME="${REDIS_SERVICE_NAME:-valkey}"' "$TMP_DIR/cloud_backup_qnap.sh"
   [ "$status" -eq 0 ]
+
+  run grep -F 'WG_ENDPOINT="${WG_ENDPOINT:-}"' "$TMP_DIR/cloud_backup_qnap.sh"
+  [ "$status" -eq 0 ]
+
+  run grep -F 'endpoint="${WG_ENDPOINT}"' "$TMP_DIR/cloud_backup_qnap.sh"
+  [ "$status" -eq 0 ]
 }
 
 @test "RAW_TRANSFER_ENABLED=0 — поведение как раньше, ncat не вызывается" {

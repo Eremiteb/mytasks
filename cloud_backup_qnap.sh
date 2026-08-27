@@ -93,6 +93,8 @@
 #        PersistentKeepalive = 25
 #        EOF
 #        chmod 600 /opt/etc/wireguard/wg0-qnap.conf
+#      Внешний endpoint также можно переопределить через WG_ENDPOINT в
+#      conf/cloud_backup_qnap.conf — это удобнее при смене публичного IP.
 #      Если конфиг всё же правился в vi/скопирован откуда-то ещё и wg-quick
 #      падает с "Line unrecognized" — проверьте на BOM/CRLF и пересоздайте
 #      именно heredoc-способом выше:
@@ -335,6 +337,7 @@ REMOTE_SSH_KEY="${REMOTE_SSH_KEY:-}"
 REMOTE_PATH="${REMOTE_PATH:-/opt/esimych-cloud}"
 REMOTE_SSH_PORT="${REMOTE_SSH_PORT:-22}"
 WG_KEEP_UP="${WG_KEEP_UP:-0}"
+WG_ENDPOINT="${WG_ENDPOINT:-}"
 BACKUP_KEEP_COUNT="${BACKUP_KEEP_COUNT:-5}"
 BACKUP_DEGRADATION_MIBS_THRESHOLD="${BACKUP_DEGRADATION_MIBS_THRESHOLD:-4}"
 NEXTCLOUD_SERVICE_NAME="${NEXTCLOUD_SERVICE_NAME:-nextcloud}"
@@ -475,7 +478,7 @@ wg_is_up() {
 # Поднимает WireGuard в обход wg/wg-quick: запускает wireguard-go, настраивает
 # пира через сырой UAPI поверх ncat -U и назначает адрес/маршрут штатной ip(8).
 wg_up_userspace() {
-  local priv_b64 addr peer_pub_b64 psk_b64 endpoint keepalive psk_hex
+  local priv_b64 addr peer_pub_b64 psk_b64 endpoint endpoint_source keepalive psk_hex
   local priv_hex peer_pub_hex uapi_tmp set_out i
 
   [[ -r "${WG_CONF_FILE}" ]] || {
@@ -488,14 +491,22 @@ wg_up_userspace() {
   peer_pub_b64=$(wg_conf_get PublicKey)
   psk_b64=$(wg_conf_get PresharedKey)
   endpoint=$(wg_conf_get Endpoint)
+  endpoint_source="wireguard_config"
+  if [[ -n "${WG_ENDPOINT}" ]]; then
+    endpoint="${WG_ENDPOINT}"
+    endpoint_source="backup_config"
+  fi
   keepalive=$(wg_conf_get PersistentKeepalive)
   keepalive="${keepalive:-25}"
 
   if [[ -z "${priv_b64}" || -z "${addr}" || -z "${peer_pub_b64}" || -z "${endpoint}" ]]; then
     log_json "ERROR" "wg_conf_incomplete" "В конфиге отсутствуют обязательные поля" \
-      "нужны PrivateKey, Address, PublicKey и Endpoint в ${WG_CONF_FILE}"
+      "нужны PrivateKey, Address, PublicKey и Endpoint в ${WG_CONF_FILE} либо WG_ENDPOINT в ${CONFIG_FILE}"
     return 1
   fi
+
+  log_json "INFO" "wg_endpoint_selected" "Выбран endpoint WireGuard" \
+    "endpoint=${endpoint}, source=${endpoint_source}"
 
   priv_hex=$(wg_b64_to_hex "${priv_b64}")
   peer_pub_hex=$(wg_b64_to_hex "${peer_pub_b64}")

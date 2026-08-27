@@ -9,7 +9,14 @@
 # Имя WireGuard-интерфейса на QNAP (файл конфига: /opt/etc/wireguard/<имя>.conf)
 WG_INTERFACE="wg0-qnap"
 
+# Необязательное переопределение внешнего endpoint сервера WireGuard.
+# Если оставить пустым, Endpoint читается из /opt/etc/wireguard/<WG_INTERFACE>.conf.
+# Укажите актуальный публичный IPv4-адрес и порт, например:
+# WG_ENDPOINT="203.0.113.10:51820"
+WG_ENDPOINT=""
+
 # IP-адрес удалённого сервера (тот же сервер, что и в cloud_backup.conf)
+# Это внутренний адрес внутри WireGuard; при смене публичного IP не меняется.
 REMOTE_HOST="10.66.66.1"
 
 # Логин SSH
