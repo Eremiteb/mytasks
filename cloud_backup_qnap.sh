@@ -984,75 +984,13 @@ else
     "service=${NEXTCLOUD_SERVICE_NAME}; ${nextcloud_stack_state}" "${nextcloud_stack_state_rc}"
 fi
 
-log_json "INFO" "occ_cleanup_start" "Очистка корзин пользователей (occ trashbin:cleanup)..."
-occ_trash_err=$(ssh_remote \
-  "cd '${REMOTE_PATH}' && docker compose exec -T -u www-data '${NEXTCLOUD_SERVICE_NAME}' php occ trashbin:cleanup --all-users" 2>&1)
-occ_trash_rc=$?
-if [[ ${occ_trash_rc} -ne 0 ]]; then
-  log_json "WARN" "occ_cleanup_trash_failed" "Не удалось очистить корзины" "${occ_trash_err}" "${occ_trash_rc}"
-else
-  log_json "INFO" "occ_cleanup_trash_ok" "Корзины очищены" "${occ_trash_err}" "${occ_trash_rc}"
-fi
-
-# "occ trashbin:cleanup --all-users" при полной очистке физически удаляет
-# саму папку data/<user>/files_trashbin (не только её содержимое), если она
-# опустела. Из-за этого встроенный фоновый джоб Nextcloud ExpireTrash (он
-# запускается через cron.php независимо от расписания этого скрипта) затем
-# падает с "NotFoundException.../files_trashbin" при каждом своём запуске,
-# пока папка не появится снова. Пересоздаём её для каждого пользователя сразу
-# после очистки — mkdir -p идемпотентен и безопасен.
-occ_trash_repair_detail=""
-occ_trash_repair_rc=0
-remote_datadir=$(ssh_remote \
-  "cd '${REMOTE_PATH}' && docker compose exec -T -u www-data '${NEXTCLOUD_SERVICE_NAME}' php occ config:system:get datadirectory" 2>/dev/null | tr -d '\r\n')
-remote_users=$(ssh_remote \
-  "cd '${REMOTE_PATH}' && docker compose exec -T -u www-data '${NEXTCLOUD_SERVICE_NAME}' php occ user:list" 2>/dev/null)
-log_json "INFO" "occ_user_list" "Получен список пользователей Nextcloud (occ user:list)" "${remote_users:-<пусто>}"
-if [[ -z "${remote_datadir}" || -z "${remote_users}" ]]; then
-  occ_trash_repair_rc=1
-  occ_trash_repair_detail="не удалось получить datadirectory или список пользователей"
-else
-  # Читаем список пользователей из отдельного файлового дескриптора (3), а не
-  # из stdin (0): ssh_remote() внутри тела цикла вызывает ssh без "-n", и он
-  # по умолчанию читает stdin. Если список подавать через <<< на стандартный
-  # ввод цикла, первый же вызов ssh внутри тела "съедает" из stdin остаток
-  # списка пользователей, из-за чего while read получает EOF и обрабатывает
-  # только первого пользователя — остальные (например, clouduser) молча
-  # пропускаются без пересоздания files_trashbin и без записи в лог.
-  _uid_list="$(printf '%s\n' "${remote_users}" | sed -nE 's/^[[:space:]]*-[[:space:]]*([^:]+):.*/\1/p')"
-  while IFS= read -r _uid <&3; do
-    [[ -z "${_uid}" ]] && continue
-    _repair_err=$(ssh_remote \
-      "cd '${REMOTE_PATH}' && docker compose exec -T -u www-data '${NEXTCLOUD_SERVICE_NAME}' mkdir -p '${remote_datadir}/${_uid}/files_trashbin'" 2>&1)
-    _repair_rc=$?
-    if [[ ${_repair_rc} -ne 0 ]]; then
-      occ_trash_repair_rc=1
-      occ_trash_repair_detail="${occ_trash_repair_detail}${_uid}: ${_repair_err}; "
-      continue
-    fi
-    # Проверяем, что папка реально существует после mkdir -p (а не просто
-    # команда молча ничего не сделала из-за проблем с docker exec/SSH) —
-    # результат логируется отдельно для каждого пользователя.
-    ssh_remote "cd '${REMOTE_PATH}' && docker compose exec -T -u www-data '${NEXTCLOUD_SERVICE_NAME}' test -d '${remote_datadir}/${_uid}/files_trashbin'" >/dev/null 2>&1
-    _verify_rc=$?
-    if [[ ${_verify_rc} -eq 0 ]]; then
-      log_json "INFO" "occ_trashbin_verify_ok" "Папка files_trashbin подтверждена после пересоздания" "user=${_uid}, path=${remote_datadir}/${_uid}/files_trashbin" 0
-    else
-      occ_trash_repair_rc=1
-      occ_trash_repair_detail="${occ_trash_repair_detail}${_uid}: папка не найдена после mkdir -p; "
-      log_json "ERROR" "occ_trashbin_verify_failed" "Папка files_trashbin отсутствует после попытки пересоздания" "user=${_uid}, path=${remote_datadir}/${_uid}/files_trashbin" "${_verify_rc}"
-    fi
-  done 3<<< "${_uid_list}"
-fi
-if [[ ${occ_trash_repair_rc} -ne 0 ]]; then
-  log_json "WARN" "occ_trashbin_repair_failed" "Не удалось пересоздать/подтвердить папки files_trashbin" "${occ_trash_repair_detail}" "${occ_trash_repair_rc}"
-else
-  log_json "INFO" "occ_trashbin_repair_ok" "Папки files_trashbin пересозданы и проверены для всех пользователей" "" 0
-fi
-
-# Приложение files_versions в Nextcloud отключено (occ app:disable), поэтому
-# у occ нет команды versions:cleanup — шаг пропускается полностью, а не просто
-# игнорирует ошибку.
+# Приложения files_trashbin и files_versions в Nextcloud отключены
+# (occ app:disable), поэтому у occ нет команд trashbin:cleanup/
+# versions:cleanup (и нет самой папки data/<user>/files_trashbin, чинить
+# которую был нужен отдельный repair-блок ниже, пока trashbin:cleanup её
+# существования зависела) — оба шага пропускаются полностью, а не просто
+# игнорируют ошибку.
+log_json "INFO" "occ_trashbin_skipped" "Очистка корзин пропущена (files_trashbin отключено)" "" 0
 log_json "INFO" "occ_versions_skipped" "Очистка версий файлов пропущена (files_versions отключено)" "" 0
 
 ###############################################################################

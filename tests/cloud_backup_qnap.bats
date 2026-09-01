@@ -297,7 +297,10 @@ EOF
   run_script
 
   [ "$status" -eq 0 ]
-  run grep -q "docker compose exec -T -u www-data 'cloud-app' php occ trashbin:cleanup" "$TMP_DIR/ssh_commands"
+  # trashbin:cleanup/versions:cleanup убраны (files_trashbin/files_versions
+  # отключены в Nextcloud) — единственный оставшийся occ-связанный вызов с
+  # настраиваемым именем сервиса это "docker compose ps -a" в preflight-проверке.
+  run grep -q "docker compose ps -a 'cloud-app'" "$TMP_DIR/ssh_commands"
   [ "$status" -eq 0 ]
 }
 
