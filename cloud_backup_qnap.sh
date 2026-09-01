@@ -1050,15 +1050,10 @@ else
   log_json "INFO" "occ_trashbin_repair_ok" "Папки files_trashbin пересозданы и проверены для всех пользователей" "" 0
 fi
 
-log_json "INFO" "occ_versions_start" "Очистка версий файлов (occ versions:cleanup)..."
-occ_ver_err=$(ssh_remote \
-  "cd '${REMOTE_PATH}' && docker compose exec -T -u www-data '${NEXTCLOUD_SERVICE_NAME}' php occ versions:cleanup" 2>&1)
-occ_ver_rc=$?
-if [[ ${occ_ver_rc} -ne 0 ]]; then
-  log_json "WARN" "occ_cleanup_versions_failed" "Не удалось очистить версии файлов" "${occ_ver_err}" "${occ_ver_rc}"
-else
-  log_json "INFO" "occ_cleanup_versions_ok" "Версии файлов очищены" "${occ_ver_err}" "${occ_ver_rc}"
-fi
+# Приложение files_versions в Nextcloud отключено (occ app:disable), поэтому
+# у occ нет команды versions:cleanup — шаг пропускается полностью, а не просто
+# игнорирует ошибку.
+log_json "INFO" "occ_versions_skipped" "Очистка версий файлов пропущена (files_versions отключено)" "" 0
 
 ###############################################################################
 # DATABASE OPTIMIZATION (before services down)
