@@ -1,0 +1,14 @@
+[Unit]
+Description=Run system_monitor every 6h; catch up missed runs after boot
+
+[Timer]
+OnCalendar=*-*-* 00,06,12,18:00:00
+# Если слот пропущен (машина была выключена) — запустить при первой загрузке,
+# но не чаще одного раза за интервал (в отличие от cron @reboot)
+Persistent=true
+# Небольшая задержка, чтобы диски/датчики/nvidia успели подняться после старта
+RandomizedDelaySec=2min
+Unit=system-monitor.service
+
+[Install]
+WantedBy=timers.target

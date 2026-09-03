@@ -428,7 +428,29 @@ sudo ./system_monitor.sh -r
 Опрос CPU/GPU root не требует, но так как весь скрипт обычно запускается под
 root ради дисков, они опрашиваются в том же (привилегированном) запуске.
 
-**Cron (каждые 6 часов):**
+**Расписание — systemd timer (рекомендуется):**
+
+Юнит-файлы лежат в `systemd/system-monitor.service` и `systemd/system-monitor.timer`.
+Таймер срабатывает в 00/06/12/18 часов, а благодаря `Persistent=true` пропущенный
+слот (машина была выключена) выполняется при первой же загрузке — и не более одного
+раза за интервал. Обычный cron `0 */6` пропуски не догоняет: если компьютер
+включают, скажем, в 18:30 и выключают до полуночи, замеры не будут попадать в базу
+вообще.
+
+```sh
+sudo cp systemd/system-monitor.service systemd/system-monitor.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now system-monitor.timer
+
+# Проверка
+systemctl list-timers system-monitor.timer
+journalctl -u system-monitor.service -n 20
+```
+
+Если раньше скрипт стоял в root-crontab — строку `0 */6 * * * …system_monitor.sh`
+оттуда нужно убрать (`sudo crontab -e`), иначе опрос будет идти дважды.
+
+**Cron (альтернатива, без догоняния пропусков):**
 ```cron
 0 */6 * * * /home/esimych/esimych-docs/mytasks/system_monitor.sh >/dev/null 2>&1
 ```

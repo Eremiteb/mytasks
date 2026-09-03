@@ -1,0 +1,11 @@
+[Unit]
+Description=System monitor: SMART / CPU / GPU -> SQLite + HTML report
+Documentation=file:///home/esimych/esimych-docs/mytasks/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/esimych/esimych-docs/mytasks/system_monitor.sh
+# Скрипт возвращает 1 при критическом состоянии — это штатный результат, а не сбой юнита
+SuccessExitStatus=1
