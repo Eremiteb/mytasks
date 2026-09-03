@@ -223,6 +223,51 @@ EOF
   [ -z "$leftover" ]
 }
 
+@test "raw transfer: листенер недоступен все попытки — фолбэк на SSH, в лог попадает удалённый err-файл" {
+  cat >> "$TMP_DIR/conf/cloud_backup_qnap.conf" <<'EOF'
+RAW_TRANSFER_ENABLED="1"
+RAW_TRANSFER_CONNECT_RETRIES="2"
+EOF
+
+  cat > "$STUB_DIR/ssh" <<EOF
+#!/usr/bin/env bash
+case "\$*" in
+  *"command -v zstd >/dev/null 2>&1"*) echo gzip; exit 0 ;;
+  *"command -v nc >/dev/null 2>&1 && echo yes"*) echo yes; exit 0 ;;
+  *"nohup bash -c"*) exit 0 ;;
+  *"rm -f '"*) exit 0 ;;
+  *"cat '"*"raw-status-"*) echo 1; exit 0 ;;
+  *"cat '"*"raw-err-"*) echo "nc: invalid option -- 'N'"; exit 0 ;;
+  *"tar --create"*) printf '$GZIP_FIXTURE'; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+  chmod +x "$STUB_DIR/ssh"
+
+  cat > "$STUB_DIR/ncat" <<EOF
+#!/usr/bin/env bash
+echo "Ncat: Connection refused." >&2
+exit 1
+EOF
+  chmod +x "$STUB_DIR/ncat"
+
+  run_script
+
+  [ "$status" -eq 0 ]
+  log_file=$(ls "$TMP_DIR/logs"/cloud_backup_qnap-*.jsonl 2>/dev/null | head -1)
+  run grep '"event":"raw_transfer_connect_exhausted"' "$log_file"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Ncat: Connection refused."* ]]
+  [[ "$output" == *"remote_status=1"* ]]
+  [[ "$output" == *"remote_err=nc: invalid option -- 'N'"* ]]
+  run grep -q '"event":"raw_transfer_fallback_ssh"' "$log_file"
+  [ "$status" -eq 0 ]
+  backup_file=$(ls "$BACKUP_DIR"/cloud_backup_qnap-*.tar.gz 2>/dev/null | head -1)
+  [ -n "$backup_file" ]
+  run gzip -t "$backup_file"
+  [ "$status" -eq 0 ]
+}
+
 @test "raw transfer: nc отсутствует на удалённой стороне — фолбэк на SSH" {
   cat >> "$TMP_DIR/conf/cloud_backup_qnap.conf" <<'EOF'
 RAW_TRANSFER_ENABLED="1"

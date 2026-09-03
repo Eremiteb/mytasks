@@ -1286,10 +1286,18 @@ nohup bash -c 'set -o pipefail; tar --create --file=- --sparse${REMOTE_TAR_EXCLU
   else
     # Листенер так и не стал доступен ни разу за все попытки — в BACKUP_PATH
     # ничего нового не записано, безопасно вернуться к SSH-передаче.
+    # Локальный stderr ncat различает только «Ncat: TIMEOUT.» (пакеты
+    # дропает фаервол, листенер скорее всего жив и ждёт) и «Connection
+    # refused» (порт открыт, но никто не слушает — удалённый пайплайн упал
+    # на старте). Во втором случае причина лежит в REMOTE_ERR_FILE/
+    # REMOTE_STATUS_FILE, поэтому вычитываем их ДО удаления — иначе лог
+    # не позволяет отличить проблему с nc/tar на сервере от сетевой.
     err_out=$(cat "${err_tmp}")
+    _remote_status=$(ssh_remote "cat '${REMOTE_STATUS_FILE}' 2>/dev/null")
+    _remote_err=$(ssh_remote "cat '${REMOTE_ERR_FILE}' 2>/dev/null")
     _fail_diag=$(get_remote_failure_diag)
     log_json "WARN" "raw_transfer_connect_exhausted" "Не удалось подключиться к листенеру после ${RAW_TRANSFER_CONNECT_RETRIES} попыток — переход на передачу через SSH" \
-      "${err_out}, remote_diag=[${_fail_diag}]"
+      "${err_out}, remote_status=${_remote_status:-none}, remote_err=${_remote_err:-none}, remote_diag=[${_fail_diag}]"
     ssh_remote "rm -f '${REMOTE_STATUS_FILE}' '${REMOTE_ERR_FILE}'" >/dev/null 2>&1
     USE_RAW_TRANSFER=0
   fi
