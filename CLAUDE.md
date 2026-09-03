@@ -22,3 +22,17 @@ Production `state/system_monitor.db` is root-owned from before this
 change; `cpu_stats`/`gpu_stats` tables appear on the next `sudo
 ./system_monitor.sh` run (`CREATE TABLE IF NOT EXISTS`), not by editing
 the script.
+
+## `system_monitor.sh` scheduling (2026-09-03)
+
+Moved from root-crontab `0 */6 * * *` to a systemd timer
+(`systemd/system-monitor.{service,timer}`, installed to
+`/etc/systemd/system`, cron line removed). Root cause: this machine
+runs ~18:30-23:00 daily, so plain cron hit the 18:00 slot only when
+booted before 18:00 and the 00:00 slot only when shut down after
+midnight — `disk_stats` had gaps 30.08 18:00 -> 02.09 00:00 -> nothing.
+`Persistent=true` catches the missed slot at boot, once per interval
+(unlike `@reboot`, which would double-fire on a re-boot). Service uses
+`SuccessExitStatus=1` because exit 1 = "critical state found", not a
+unit failure. `systemctl` is unreachable from the agent sandbox (no
+system D-Bus) — use `pkexec`/unsandboxed for install and inspection.
