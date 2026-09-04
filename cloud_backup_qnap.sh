@@ -900,11 +900,11 @@ nohup bash -c 'dd if=/dev/zero bs=1M count=${NETWORK_SPEED_TEST_MB} 2>/dev/null 
 }
 
 # Выбираем быстрейший доступный компрессор на удалённом сервере:
-# zstd -3 --threads=0 > pigz -1 > gzip -1
+# zstd -5 --threads=0 > pigz -1 > gzip -1
 REMOTE_COMP=$(ssh_remote \
   "if command -v zstd >/dev/null 2>&1; then echo zstd; elif command -v pigz >/dev/null 2>&1; then echo pigz; else echo gzip; fi" 2>/dev/null)
 case "${REMOTE_COMP}" in
-  zstd) COMP_CMD="zstd -3 --threads=0 -c";         BACKUP_EXT="tar.zst" ;;
+  zstd) COMP_CMD="zstd -5 --threads=0 -c";         BACKUP_EXT="tar.zst" ;;
   pigz) COMP_CMD="pigz -1";                       BACKUP_EXT="tar.gz"  ;;
   *)    COMP_CMD="gzip -1";                        BACKUP_EXT="tar.gz"  ;;
 esac

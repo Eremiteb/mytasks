@@ -96,7 +96,7 @@ run_script() {
 # ---------------------------------------------------------------------------
 
 @test "актуальные значения zstd и Valkey заданы по умолчанию" {
-  run grep -F 'zstd) COMP_CMD="zstd -3 --threads=0 -c"' "$TMP_DIR/cloud_backup_qnap.sh"
+  run grep -F 'zstd) COMP_CMD="zstd -5 --threads=0 -c"' "$TMP_DIR/cloud_backup_qnap.sh"
   [ "$status" -eq 0 ]
 
   run grep -F 'REDIS_SERVICE_NAME="${REDIS_SERVICE_NAME:-valkey}"' "$TMP_DIR/cloud_backup_qnap.sh"
