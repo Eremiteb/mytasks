@@ -652,7 +652,7 @@ python3 mht_to_fb2.py /архивы --dry-run
 ./music_downloader.sh
 ```
 
-> Подробнее — в [README загрузчика](https://github.com/Eremiteb/music_downloader#readme) или локальном `music_downloader/README.md`. Каталог `music_downloader/` исключён из Git-репозитория `mytasks` и имеет собственный репозиторий: изменения загрузчика коммитятся и отправляются отдельно. Рабочая конфигурация, БД и логи в Git не включаются.
+> Подробнее — в [README загрузчика](music_downloader/README.md). Каталог `music_downloader/` входит в этот репозиторий как обычная папка, без вложенного `.git` и без submodule. Код, драйверы, тесты и шаблон конфигурации версионируются вместе с `mytasks`; рабочий JSON, БД, логи и `venv` исключены правилами `music_downloader/.gitignore`. CI загрузчика находится в `.github/workflows/music-downloader.yml`.
 
 ---
 

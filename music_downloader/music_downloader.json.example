@@ -1,0 +1,76 @@
+{
+    "log_cleanup_days": 10,
+    "log_max_files": 10,
+
+    "file_permissions": {
+        "enabled": true,
+        "mode": "0666"
+    },
+
+    "download_paths": [
+        {
+            "path": "/mnt/copy/Music/_cloud/",
+            "max_size_mb": 3072
+        },
+        {
+            "path": "/var/downloads/clouddata/syncthing/Music/_cloud/",
+            "max_size_mb": 3072
+        }
+    ],
+
+    "sites": [
+        {
+            "site_name": "sefon.pro",
+            "site_script": "drivers/music_downloader_sefon_pro.py",
+            "base_url": "https://sefon.pro",
+            "categories": [
+                "/news/",
+                "/news/2"
+            ]
+        },
+        {
+            "site_name": "lmusic_kz",
+            "site_script": "drivers/music_downloader_lmusic_kz.py",
+            "base_url": "https://lmusic.kz",
+            "categories": [
+                "/top_kz/monthly",
+                "/sections/kazakhstan",
+                "/sections/foreign-music",
+                "/sections/rusian"
+            ]
+        },
+        {
+            "site_name": "agugai_kz",
+            "site_script": "drivers/music_downloader_agugai_kz.py",
+            "base_url": "https://agugai.kz",
+            "categories": [
+                "/catalog/music"
+            ]
+        },
+        {
+            "site_name": "lmu_kz",
+            "site_script": "drivers/music_downloader_lmu_kz.py",
+            "base_url": "https://lmu.kz",
+            "categories": [
+                "/sections/kazakhstan"
+            ]
+        },
+        {
+            "site_name": "tunes_kz",
+            "site_script": "drivers/music_downloader_tunes_kz.py",
+            "base_url": "https://tunes.kz",
+            "categories": [
+                "/"
+            ]
+        },
+        {
+            "site_name": "jamendo_com",
+            "site_script": "drivers/music_downloader_jamendo_com.py",
+            "base_url": "https://jamendo.com",
+            "client_id": "60c4cb2b",
+            "categories": [
+                "/"
+            ]
+        }
+    ]
+}

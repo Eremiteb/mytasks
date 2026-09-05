@@ -54,7 +54,6 @@ conf/*
 !conf/*.conf.example
 
 # Local project directories (exclude from GitHub)
-/music_downloader/
 /music_downloader-dev/
 /newline_to_space/
 .sources.err*

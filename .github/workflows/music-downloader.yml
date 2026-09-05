@@ -1,0 +1,87 @@
+name: Music downloader
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "music_downloader/**"
+      - "tests/test_music_downloader.py"
+      - ".github/workflows/music-downloader.yml"
+  pull_request:
+    branches: ["**"]
+    paths:
+      - "music_downloader/**"
+      - "tests/test_music_downloader.py"
+      - ".github/workflows/music-downloader.yml"
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: music_downloader/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r music_downloader/requirements.txt
+
+      - name: Run static analysis (Ruff)
+        id: ruff
+        run: |
+          mkdir -p reports
+
+          set +e
+          ruff check music_downloader/ --output-format=github | tee reports/ruff-github.txt
+          RUFF_EXIT=${PIPESTATUS[0]}
+
+          ruff check music_downloader/ --output-format=full | tee reports/ruff.txt
+          ruff check music_downloader/ --output-format=json > reports/ruff.json
+          ruff check music_downloader/ --output-format=sarif > reports/ruff.sarif
+          set -e
+
+          echo "ruff_exit=$RUFF_EXIT" >> "$GITHUB_OUTPUT"
+
+      - name: Publish static analysis summary
+        if: always()
+        run: |
+          {
+            echo "## Static Analysis"
+            echo ""
+            echo "Ruff completed."
+            echo ""
+            echo "- PR annotations: enabled (GitHub format)."
+            echo "- Human-readable report: reports/ruff.txt (artifact)."
+            echo "- Machine-readable reports: reports/ruff.json, reports/ruff.sarif (artifact)."
+            echo "- SARIF is stored as artifact only (Code Scanning upload disabled for current plan)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload static analysis reports
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: static-analysis-reports
+          path: reports/
+
+      - name: Run tests
+        run: python -m pytest music_downloader/tests tests/test_music_downloader.py -q
+
+      - name: Fail build if Ruff found issues
+        if: steps.ruff.outputs.ruff_exit != '0'
+        run: |
+          echo "Ruff found issues. See annotations, summary, and artifact static-analysis-reports."
+          exit 1
