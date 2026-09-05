@@ -204,34 +204,37 @@ def apply_file_permissions(file_path, perm_cfg):
         logger.error(f"Ошибка chmod для {file_path}: {e}")
 
 
-def get_dir_size_mb(path):
+def get_dir_size_bytes(path):
+    def on_error(error):
+        raise error
+
+    if not os.path.isdir(path):
+        raise NotADirectoryError(f"Целевой каталог недоступен: {path}")
     total_size = 0
-    if not os.path.exists(path):
-        return 0
-    for dirpath, _, filenames in os.walk(path):
+    for dirpath, _, filenames in os.walk(path, onerror=on_error):
         for f in filenames:
             fp = os.path.join(dirpath, f)
             if not os.path.islink(fp):
                 total_size += os.path.getsize(fp)
-    return round(total_size / (1024 * 1024), 2)
+    return total_size
 
 
 def check_paths_and_limits(download_paths, s_name):
     """Проверка существования папок и лимитов."""
     for folder in download_paths:
         path = folder["path"]
-        if not os.path.exists(path):
+        if not os.path.isdir(path):
             logger.error(
-                f"КРИТИЧЕСКАЯ ОШИБКА: Целевой путь {path} не найден.",
+                f"КРИТИЧЕСКАЯ ОШИБКА: Целевой каталог {path} не найден.",
                 extra={"site": s_name},
             )
             return True
         limit_mb = folder.get("max_size_mb", 1024)
-        current_size = get_dir_size_mb(path)
+        current_size = get_dir_size_bytes(path)
         logger.info(
-            f"Статус {path}: {current_size}/{limit_mb} MB", extra={"site": s_name}
+            f"Статус {path}: {current_size / 1048576:.2f}/{limit_mb} МиБ", extra={"site": s_name}
         )
-        if current_size >= limit_mb:
+        if current_size >= limit_mb * 1048576:
             logger.error(
                 f"КРИТИЧЕСКАЯ ОШИБКА: Превышен лимит в {path}.", extra={"site": s_name}
             )
@@ -309,8 +312,29 @@ def track_identity(artist, title):
     return normalize_db_text(artist), normalize_db_text(title)
 
 
+class DownloadLimitExceeded(OSError):
+    """Трек не помещается хотя бы в одну из общих папок."""
+
+
 def save_response(response, download_paths, filename, expected_size=0):
-    """Атомарно сохраняет один поток во все каталоги и возвращает размер."""
+    """Сохраняет поток во все каталоги, не превышая доступный для трека объём."""
+    if not download_paths:
+        raise ValueError("Не заданы папки для сохранения")
+    # ponytail: бюджет рассчитан для одного писателя; для параллельных нужны квоты файловой системы.
+    paths = [os.path.realpath(folder["path"]) for folder in download_paths]
+    if len(set(paths)) != len(paths):
+        raise ValueError("Папки для сохранения не должны повторяться")
+    budgets = []
+    for folder, path in zip(download_paths, paths, strict=True):
+        # В лимит родительской папки входят также копии трека в дочерних папках.
+        copies = sum(os.path.commonpath([path, destination]) == path for destination in paths)
+        remaining = int(folder.get("max_size_mb", 1024) * 1048576) - get_dir_size_bytes(path)
+        budgets.append((remaining // copies, folder["path"]))
+    available, limiting_path = min(budgets)
+    if available <= 0 or expected_size > available:
+        raise DownloadLimitExceeded(
+            f"Лимит папки {limiting_path}: доступно {max(available, 0)} байт, размер трека {expected_size} байт"
+        )
     files = []
     temp_paths = []
     final_paths = []
@@ -327,6 +351,10 @@ def save_response(response, download_paths, filename, expected_size=0):
             for chunk in response.iter_content(chunk_size=131072):
                 if not chunk:
                     continue
+                if downloaded_bytes + len(chunk) > available:
+                    raise DownloadLimitExceeded(
+                        f"Лимит папки {limiting_path}: трек превышает доступные {available} байт"
+                    )
                 downloaded_bytes += len(chunk)
                 for file_obj in files:
                     file_obj.write(chunk)
@@ -376,7 +404,7 @@ def run():
     max_log_files = config.get("log_max_files", 10)
     cleanup_old_logs(cleanup_days=cleanup_days, max_files=max_log_files)
 
-    # Инициализация драйверов и структуры данных для Round-Robin обработки
+    # Инициализация драйверов и очередей для поочерёдной обработки
     sites_data = []
     queued_tracks = set()
     for site_cfg in config.get("sites", []):
@@ -406,7 +434,7 @@ def run():
             "processed_count": 0
         })
 
-    # Round-Robin обработка по разделам: сначала разделы 0 всех сайтов, потом разделы 1, и т.д.
+    # Обработка по кругу: сначала разделы 0 всех сайтов, потом разделы 1 и т. д.
     max_categories = max(len(s["categories"]) for s in sites_data) if sites_data else 0
     
     for category_level in range(max_categories):
@@ -448,7 +476,7 @@ def run():
                         new_tracks_count += 1
                 logger.info(f"В очередь добавлено {new_tracks_count} новых треков", extra={"site": s_name})
 
-        # Round-Robin скачивание песен: по одной песне от каждого сайта
+        # Скачивание по кругу: по одной песне от каждого сайта
         while any(site_data["current_queue"] for site_data in sites_data):
             for site_data in sites_data:
                 if not site_data["current_queue"]:
@@ -488,7 +516,7 @@ def run():
                                 r, download_paths, clean_fn, content_length
                             )
 
-                            # Применение прав доступа к файлу (USER-MODE, без chown)
+                            # Применение прав доступа к файлу без смены владельца
                             for saved_path in saved_paths:
                                 apply_file_permissions(saved_path, perm_cfg)
 
@@ -506,6 +534,9 @@ def run():
                             time.sleep(1.2)
                         else:
                             logger.error(f"Ошибка соединения (код: {r.status_code})", extra={"site": s_name})
+                except DownloadLimitExceeded as e:
+                    logger.error(f"Загрузка остановлена: {e}", extra={"site": s_name})
+                    raise SystemExit(2) from e
                 except Exception as e:
                     logger.error(
                         f"Ошибка скачивания {t.get('title')}: {e}", extra={"site": s_name}

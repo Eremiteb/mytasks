@@ -7,12 +7,13 @@ from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
-logger = logging.getLogger("Engine")
+logger = logging.LoggerAdapter(logging.getLogger("Engine"), {"site": "jamendo_com"})
 
 _TRACK_ID_RE = re.compile(r"\b(\d{6,})\b")
 _MP3_URL_TEMPLATE = "https://mp3d.jamendo.com/?trackid={track_id}&format=mp32"
 _API_FILE_TEMPLATE = "https://api.jamendo.com/v3.0/tracks/file?client_id={client_id}&id={track_id}"
 _API_PLAYLIST_TRACKS = "https://api.jamendo.com/v3.0/playlists/tracks/"
+_API_TRACKS = "https://api.jamendo.com/v3.0/tracks/"
 _CONFIG_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "music_downloader.json"
 )
@@ -201,6 +202,51 @@ def _extract_playlist_id(category_path):
     return m.group(1) if m else None
 
 
+def _fetch_tracks(session, client_id):
+    params = {
+        "client_id": client_id,
+        "format": "json",
+        "limit": 200,
+        "order": "releasedate_desc",
+    }
+    try:
+        resp = session.get(_API_TRACKS, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.error(f"JAMENDO: / — не удалось получить JSON из tracks API: {e}")
+        return []
+
+    headers = data.get("headers") if isinstance(data, dict) else None
+    if not isinstance(headers, dict):
+        logger.error("JAMENDO: / — некорректный ответ tracks API: отсутствует объект headers")
+        return []
+    if headers.get("status") != "success":
+        err = headers.get("error_message") or "неизвестная ошибка API"
+        logger.error(f"JAMENDO: / — ошибка tracks API: {err}")
+        return []
+    if headers.get("warnings"):
+        logger.warning(f"JAMENDO: / — предупреждение tracks API: {headers['warnings']}")
+
+    results = data.get("results")
+    if not isinstance(results, list):
+        logger.error("JAMENDO: / — некорректный ответ tracks API: results не является списком")
+        return []
+    tracks = []
+    for entry in results:
+        # audiodownload_allowed — поле ответа, а не параметр фильтрации API.
+        if not isinstance(entry, dict) or entry.get("audiodownload_allowed") is not True:
+            continue
+        download_url = entry.get("audiodownload")
+        if not isinstance(download_url, str) or not download_url.strip():
+            continue
+        track = _extract_track_from_entry(entry)
+        if track:
+            track["download_url"] = download_url
+            tracks.append(track)
+    return _dedupe_tracks(tracks)
+
+
 def _fetch_playlist_tracks(session, playlist_id, client_id):
     tracks = []
     offset = 0
@@ -217,20 +263,22 @@ def _fetch_playlist_tracks(session, playlist_id, client_id):
             resp = session.get(_API_PLAYLIST_TRACKS, params=params, timeout=30)
             resp.raise_for_status()
         except Exception as e:
-            logger.error(f"JAMENDO: API request failed: {e}")
+            logger.error(f"JAMENDO: плейлист {playlist_id} — ошибка запроса API: {e}")
             return []
 
         try:
             data = resp.json()
         except Exception as e:
-            logger.error(f"JAMENDO: API response is not JSON: {e}")
+            logger.error(f"JAMENDO: плейлист {playlist_id} — ответ API не является JSON: {e}")
             return []
 
         headers = data.get("headers", {}) if isinstance(data, dict) else {}
         if headers.get("status") != "success":
-            err = headers.get("error_message") or "unknown API error"
-            logger.error(f"JAMENDO: API error: {err}")
+            err = headers.get("error_message") or "неизвестная ошибка API"
+            logger.error(f"JAMENDO: плейлист {playlist_id} — ошибка API: {err}")
             return []
+        if headers.get("warnings"):
+            logger.warning(f"JAMENDO: плейлист {playlist_id} — предупреждение API: {headers['warnings']}")
 
         results = data.get("results", []) if isinstance(data, dict) else []
         if not results:
@@ -238,6 +286,11 @@ def _fetch_playlist_tracks(session, playlist_id, client_id):
 
         for item in results:
             for t in item.get("tracks", []) or []:
+                if t.get("audiodownload_allowed") is not True:
+                    continue
+                download_url = t.get("audiodownload")
+                if not isinstance(download_url, str) or not download_url.strip():
+                    continue
                 track_id = _coerce_track_id(t.get("id") or t.get("track_id"))
                 if not track_id:
                     continue
@@ -245,7 +298,7 @@ def _fetch_playlist_tracks(session, playlist_id, client_id):
                 if not artist and isinstance(t.get("artist"), dict):
                     artist = t.get("artist", {}).get("name")
                 title = t.get("name") or t.get("title")
-                download_url = t.get("audiodownload") or t.get("audio") or _build_download_url(track_id)
+
                 tracks.append({
                     "id": track_id,
                     "artist": artist,
@@ -274,13 +327,23 @@ def get_tracks(session, base_url, category_path):
     client_id = _get_client_id()
     if not client_id:
         logger.error(
-            "JAMENDO: missing JAMENDO_CLIENT_ID. Set env var JAMENDO_CLIENT_ID or add client_id for jamendo_com in music_downloader.json. Get a client id at https://developer.jamendo.com/"
+            "JAMENDO: отсутствует client_id. Задайте JAMENDO_CLIENT_ID или client_id для jamendo_com "
+            "в music_downloader.json. Получить идентификатор: https://developer.jamendo.com/"
         )
-    if client_id and playlist_id:
-        tracks = _fetch_playlist_tracks(session, playlist_id, client_id)
+        if category_path == "/":
+            return []
+    if client_id and (category_path == "/" or playlist_id):
+        tracks = (
+            _fetch_tracks(session, client_id)
+            if category_path == "/"
+            else _fetch_playlist_tracks(session, playlist_id, client_id)
+        )
         for t in tracks:
             t["referer"] = playlist_url
-        logger.info(f"JAMENDO: {category_path} -> {len(tracks)} tracks (api)")
+        if tracks:
+            logger.info(f"JAMENDO: {category_path} — получено треков через API: {len(tracks)}")
+        else:
+            logger.warning(f"JAMENDO: {category_path} — API не вернул доступных для скачивания треков")
         time.sleep(1.0)
         return tracks
 
@@ -288,7 +351,7 @@ def get_tracks(session, base_url, category_path):
         resp = session.get(playlist_url, timeout=30, headers=headers)
         resp.raise_for_status()
     except Exception as e:
-        logger.error(f"JAMENDO: failed to fetch playlist {category_path}: {e}")
+        logger.error(f"JAMENDO: не удалось получить страницу {category_path}: {e}")
         return []
 
     soup = BeautifulSoup(resp.text, "html.parser")
@@ -302,6 +365,9 @@ def get_tracks(session, base_url, category_path):
         t["download_url"] = _build_download_url(t["id"])
         t["referer"] = playlist_url
 
-    logger.info(f"JAMENDO: {category_path} -> {len(tracks)} tracks")
+    if tracks:
+        logger.info(f"JAMENDO: {category_path} — найдено треков в HTML: {len(tracks)}")
+    else:
+        logger.warning(f"JAMENDO: {category_path} — в HTML не найдено треков")
     time.sleep(1.0)
     return tracks
