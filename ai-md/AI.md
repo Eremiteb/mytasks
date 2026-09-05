@@ -3,6 +3,13 @@
 This file is the single source of project guidance for all AI coding assistants.
 Tool-specific entry points (CLAUDE.md, AGENTS.md, GEMINI.md, .github/copilot-instructions.md, .cursorrules) all redirect here.
 
+## Язык ответов и комментариев
+
+- Все ответы пользователю, промежуточные сообщения и пояснения писать на русском языке.
+- Все новые и изменяемые комментарии в коде, строки документации (docstring) и поясняющий текст в документации писать на русском языке.
+- При работе с файлами переводить встречающиеся иноязычные комментарии и пояснения на русский, сохраняя их смысл и техническую точность.
+- Не переводить идентификаторы кода, команды, пути, ключи конфигурации, имена API и служебные директивы инструментов. Оригинальные сообщения ошибок и цитаты при необходимости сохранять, сопровождая пояснением на русском.
+
 ## Validation commands
 
 Run before and after any edit to confirm nothing is broken.
