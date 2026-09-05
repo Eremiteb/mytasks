@@ -49,14 +49,16 @@ Python syntax check for root `.py` files (also enforced by CI):
 for f in ./*.py; do python3 -m py_compile "$f"; done
 ```
 
-Python unit tests (only relevant if the local, gitignored `music_downloader/` project is present):
+Python unit tests (run from the repository root; requires the separate, gitignored `music_downloader/` checkout and its installed dependencies):
 ```sh
-python3 -m pytest tests/test_music_downloader.py
+music_downloader/venv/bin/python -m pytest tests/test_music_downloader.py music_downloader/tests -q
 ```
+
+These tests use temporary destinations and mocked HTTP responses; they cover shared global download paths, rejection of invalid/missing/full destinations before scraper creation, atomic file writes, and database deduplication. Do not run a real download just to validate configuration changes.
 
 Lint `music_downloader/` (ruff config lives at `music_downloader/.ruff.toml`, py311, line-length 120):
 ```sh
-ruff check music_downloader/
+music_downloader/venv/bin/ruff check music_downloader/
 ```
 
 ## Graphify
@@ -97,4 +99,8 @@ This repo is **not a single application** — it's a flat collection of independ
 
 **Machine-specific disk observation (2026-08-22).** `/mnt/copy` is mounted from `/dev/sda1`; the physical disk is `/dev/sda`, Seagate `ST4000DM004-2U9104` (4 TB, serial `WW608PYW`). In `state/system_monitor.db`, the complete history available on 2026-08-22 contains 26 records from `2026-08-08T18:13:43+0500` through `2026-08-22T18:00:00+0500`. `Reallocated_Sector_Ct` was 7077 through 2026-08-14 18:00 and increased to 7085 at 2026-08-15 00:00, then remained at 7085 through the latest record; pending and uncorrectable sectors remained 0, SMART overall-health was `PASSED`, temperature was 36°C in the latest record. `system_monitor.sh` correctly classifies this as `warn` because any positive reallocated-sector count is degradation. Treat these numbers as a dated operational snapshot, not stable README documentation; verify SQLite again before answering later questions.
 
-**`music_downloader/` and `newline_to_space/` are separate, local-only Python subprojects**, entirely excluded from this git repo (gitignored as top-level dirs) — they have their own venvs, dependencies, and `music_downloader/` has its own `.ruff.toml` and README. `music_downloader.sh` in the repo root is only a thin wrapper: activate `music_downloader/venv`, run `music_downloader.py`, then chain into `split_by_dash.sh` on success. `tests/test_music_downloader.py` imports directly from the gitignored `music_downloader/` directory, so it only runs where that project exists locally.
+**`music_downloader/` and `newline_to_space/` are separate Python subprojects**, entirely excluded from this Git repo (gitignored as top-level dirs), with their own venvs and dependencies. `music_downloader/` is a separate Git checkout of `Eremiteb/music_downloader`, with its own `.ruff.toml` and README. Inspect status/remotes in both repositories when a task spans them; commit and push downloader changes separately from `mytasks` documentation and tests. Never force-add the nested checkout, its real `music_downloader.json`, SQLite database, logs, or `graphify-out/` to the parent repo.
+
+**Music downloader configuration.** The required nonempty `download_paths` list lives at the JSON root alongside `sites` and applies to every bridge/driver. Every track is saved to all listed destinations. Per-site `download_paths` is no longer used; migrate older configs by moving one shared list to the root and removing per-site copies. `max_size_mb` is a whole-directory limit (default 1024), checked once before any site access, not an enforced quota during the run. Missing/empty/wrong-type global lists, missing paths, and already-full destinations exit with code `2`. Keep the real local JSON, `.json.example`, and downloader README consistent in structure without replacing machine-specific paths/limits with example values.
+
+**Music downloader wrapper and tests.** `music_downloader.sh` activates `music_downloader/venv` if present, runs `music_downloader.py`, deactivates the venv, and invokes `split_by_dash.sh` only on downloader exit code `0`. The sorter has separate path configuration. Individual driver/track failures are logged and can still yield exit code `0`; a missing JSON file also currently returns `0` without downloading. Engine logs are `logs/music_downloader_engine-<timestamp>.jsonl`, separate from wrapper logs `logs/music_downloader-<timestamp>.jsonl`. `tests/test_music_downloader.py` imports the nested checkout directly and only runs where that project is present. Related current docs are the root README, this file, and `music_downloader/README.md`; historical QNAP notes are not a downloader changelog.

@@ -1,12 +1,16 @@
+import json
 import os
 import sqlite3
 import sys
 import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 # Добавляем путь к music_downloader в sys.path для импорта
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "music_downloader")))
 
+import music_downloader
 from music_downloader import DatabaseManager, capitalize_first, safe_filename, save_response, track_identity
 
 class TestMusicDownloader(unittest.TestCase):
@@ -58,6 +62,73 @@ class TestMusicDownloader(unittest.TestCase):
                 save_response(Response(), paths, "track.mp3", expected_size=100)
             self.assertFalse(os.path.exists(os.path.join(root, "track.mp3")))
             self.assertFalse(os.path.exists(os.path.join(root, "track.mp3.part")))
+
+    def test_run_uses_global_destinations_for_all_sites(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            paths = [{"path": str(root / name), "max_size_mb": 1024} for name in ("one", "two")]
+            for folder in paths:
+                Path(folder["path"]).mkdir()
+            driver = root / "driver.py"
+            driver.write_text(
+                "def get_tracks(scraper, base_url, category):\n"
+                "    return [{'id': '1', 'artist': 'Artist', 'title': base_url, "
+                "'download_url': 'https://example.com/track.mp3'}]\n",
+                encoding="utf-8",
+            )
+            config = {
+                "download_paths": paths,
+                "sites": [
+                    {"site_name": name, "site_script": str(driver), "base_url": name, "categories": ["/"]}
+                    for name in ("First", "Second")
+                ],
+            }
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            response = MagicMock(status_code=200, headers={"content-length": "3"})
+            response.iter_content.return_value = [b"abc"]
+            scraper = MagicMock()
+            scraper.get.return_value.__enter__.return_value = response
+            with (
+                patch.multiple(music_downloader, CONFIG_PATH=str(config_path), DB_PATH=str(root / "db.sqlite")),
+                patch.object(music_downloader, "setup_logging"),
+                patch.object(music_downloader, "cleanup_old_logs"),
+                patch.object(music_downloader.time, "sleep"),
+                patch.object(music_downloader.cloudscraper, "create_scraper", return_value=scraper),
+                patch.object(music_downloader, "check_paths_and_limits", wraps=music_downloader.check_paths_and_limits) as check,
+            ):
+                music_downloader.run()
+
+            check.assert_called_once_with(paths, "system")
+            self.assertEqual(scraper.get.call_count, 2)
+            for folder in paths:
+                for title in ("First", "Second"):
+                    self.assertEqual((Path(folder["path"]) / f"Artist - {title}.mp3").read_bytes(), b"abc")
+            with sqlite3.connect(root / "db.sqlite") as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM downloads").fetchone()[0], 2)
+
+    def test_run_rejects_invalid_global_destinations_before_scraper(self):
+        with tempfile.TemporaryDirectory() as root:
+            config_path = Path(root) / "config.json"
+            configs = [
+                {"sites": [{"download_paths": [{"path": root}]}]},
+                {"download_paths": []},
+                {"download_paths": "not a list"},
+                {"download_paths": [{"path": str(Path(root) / "missing")}]},
+                {"download_paths": [{"path": root, "max_size_mb": 0}]},
+            ]
+            for config in configs:
+                with self.subTest(config=config):
+                    config_path.write_text(json.dumps(config), encoding="utf-8")
+                    with (
+                        patch.object(music_downloader, "CONFIG_PATH", str(config_path)),
+                        patch.object(music_downloader, "setup_logging"),
+                        patch.object(music_downloader.cloudscraper, "create_scraper") as create_scraper,
+                        self.assertRaises(SystemExit) as error,
+                    ):
+                        music_downloader.run()
+                    self.assertEqual(error.exception.code, 2)
+                    create_scraper.assert_not_called()
 
     def test_database_removes_legacy_table_and_case_insensitive_duplicates(self):
         with tempfile.TemporaryDirectory() as root:
