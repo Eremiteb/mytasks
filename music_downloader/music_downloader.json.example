@@ -71,6 +71,22 @@
             "categories": [
                 "/"
             ]
+        },
+        {
+            "site_name": "shazam_com",
+            "site_script": "drivers/music_downloader_shazam.py",
+            "base_url": "https://www.shazam.com",
+            "categories": [
+                "/ru-ru/charts/top-200/world"
+            ]
+        },
+        {
+            "site_name": "mychords_net",
+            "site_script": "drivers/music_downloader_mychords_net.py",
+            "base_url": "https://music.mychords.net",
+            "categories": [
+                "/ru/novinki"
+            ]
         }
     ]
 }

@@ -155,6 +155,133 @@ class TestMusicDownloader(unittest.TestCase):
             with sqlite3.connect(root / "db.sqlite") as conn:
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM downloads").fetchone()[0], 2)
 
+    def test_run_resolves_only_new_chart_track_after_deduplication(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            destination = root / "music"
+            destination.mkdir()
+            (destination / "Artist - Old.mp3").write_bytes(b"keep")
+            db_path = root / "db.sqlite"
+            DatabaseManager(str(db_path)).add_record(
+                "shazam_old", "Artist", "Old", "shazam", filename="Artist - Old.mp3", filesize=4
+            )
+            driver = root / "driver.py"
+            driver.write_text(
+                "def get_tracks(scraper, base_url, category):\n"
+                "    return [{'id': key, 'artist': 'Artist', 'title': title} for key, title in\n"
+                "            [('old', 'Renamed'), ('alias', 'Old'), ('chart-new', 'New'), ('duplicate', 'New')]]\n"
+                "def resolve_track(session, track):\n"
+                "    return session.resolve_track(session, track.copy())\n",
+                encoding="utf-8",
+            )
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps({
+                "download_paths": [{"path": str(destination)}],
+                "sites": [{"site_name": "shazam", "site_script": str(driver),
+                           "base_url": "https://chart.example", "categories": ["/"]}],
+            }), encoding="utf-8")
+            resolved = {
+                "download_url": "https://audio.example/new.mp3",
+                "referer": "https://audio.example/new",
+                "src": "https://source.example/new",
+            }
+            response = MagicMock(status_code=200, headers={"content-length": "3"})
+            response.iter_content.return_value = [b"abc"]
+            scraper = MagicMock()
+            scraper.resolve_track.return_value = resolved
+            scraper.get.return_value.__enter__.return_value = response
+            with (
+                patch.multiple(music_downloader, CONFIG_PATH=str(config_path), DB_PATH=str(db_path)),
+                patch.object(music_downloader, "setup_logging"),
+                patch.object(music_downloader, "cleanup_old_logs"),
+                patch.object(music_downloader.time, "sleep"),
+                patch.object(music_downloader.cloudscraper, "create_scraper", return_value=scraper),
+            ):
+                music_downloader.run()
+
+            scraper.resolve_track.assert_called_once()
+            session, track = scraper.resolve_track.call_args.args
+            self.assertIs(session, scraper)
+            self.assertEqual(track["id"], "chart-new")
+            self.assertNotIn("download_url", track)
+            scraper.get.assert_called_once_with(
+                resolved["download_url"], timeout=60, headers={"Referer": resolved["referer"]}, stream=True
+            )
+            self.assertEqual(sorted(p.name for p in destination.iterdir()), ["Artist - New.mp3", "Artist - Old.mp3"])
+            self.assertEqual((destination / "Artist - New.mp3").read_bytes(), b"abc")
+            self.assertEqual((destination / "Artist - Old.mp3").read_bytes(), b"keep")
+            with sqlite3.connect(db_path) as conn:
+                self.assertEqual(conn.execute(
+                    "SELECT id, src, filename, filesize FROM downloads ORDER BY id"
+                ).fetchall(), [
+                    ("shazam_chart-new", resolved["src"], "Artist - New.mp3", 3),
+                    ("shazam_old", None, "Artist - Old.mp3", 4),
+                ])
+
+    def test_run_skips_unresolved_chart_track_and_continues(self):
+        for outcome in (None, RuntimeError("Сбой resolver")):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as root:
+                root = Path(root)
+                destination = root / "music"
+                destination.mkdir()
+                driver = root / "driver.py"
+                driver.write_text(
+                    "def get_tracks(scraper, base_url, category):\n"
+                    "    return [{'id': key, 'artist': 'Artist', 'title': title} for key, title in\n"
+                    "            [('chart-skip', 'Skip'), ('chart-next', 'Next')]]\n"
+                    "def resolve_track(session, track):\n"
+                    "    return session.resolve_track(session, track.copy())\n",
+                    encoding="utf-8",
+                )
+                config_path = root / "config.json"
+                config_path.write_text(json.dumps({
+                    "download_paths": [{"path": str(destination)}],
+                    "sites": [{"site_name": "shazam", "site_script": str(driver),
+                               "base_url": "https://chart.example", "categories": ["/"]}],
+                }), encoding="utf-8")
+                resolved = {
+                    "download_url": "https://audio.example/next.mp3",
+                    "referer": "https://audio.example/next",
+                    "src": "https://source.example/next",
+                }
+                response = MagicMock(status_code=200, headers={"content-length": "3"})
+                response.iter_content.return_value = [b"abc"]
+                scraper = MagicMock()
+                scraper.resolve_track.side_effect = [outcome, resolved]
+                scraper.get.return_value.__enter__.return_value = response
+                with (
+                    patch.multiple(music_downloader, CONFIG_PATH=str(config_path), DB_PATH=str(root / "db.sqlite")),
+                    patch.object(music_downloader, "setup_logging"),
+                    patch.object(music_downloader, "cleanup_old_logs"),
+                    patch.object(music_downloader.time, "sleep"),
+                    patch.object(music_downloader.cloudscraper, "create_scraper", return_value=scraper),
+                    patch.object(music_downloader.logger, "error") as log_error,
+                ):
+                    music_downloader.run()
+
+                self.assertEqual(
+                    [call.args[1]["id"] for call in scraper.resolve_track.call_args_list],
+                    ["chart-skip", "chart-next"],
+                )
+                for call in scraper.resolve_track.call_args_list:
+                    self.assertIs(call.args[0], scraper)
+                    self.assertNotIn("download_url", call.args[1])
+                if outcome is None:
+                    log_error.assert_not_called()
+                else:
+                    log_error.assert_called_once_with(
+                        "Ошибка скачивания Skip: Сбой resolver", extra={"site": "shazam"}
+                    )
+                scraper.get.assert_called_once_with(
+                    resolved["download_url"], timeout=60, headers={"Referer": resolved["referer"]}, stream=True
+                )
+                self.assertEqual(list(destination.iterdir()), [destination / "Artist - Next.mp3"])
+                self.assertEqual((destination / "Artist - Next.mp3").read_bytes(), b"abc")
+                with sqlite3.connect(root / "db.sqlite") as conn:
+                    self.assertEqual(conn.execute(
+                        "SELECT id, src, filename, filesize FROM downloads"
+                    ).fetchall(), [("shazam_chart-next", resolved["src"], "Artist - Next.mp3", 3)])
+
     def test_run_stops_on_limit_without_recording_partial_track(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)

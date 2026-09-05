@@ -493,6 +493,13 @@ def run():
                 try:
                     artist = capitalize_first(t.get("artist")) or "Unknown Artist"
                     title = capitalize_first(t.get("title")) or "Unknown Title"
+                    resolver = getattr(site_data["provider"], "resolve_track", None)
+                    if resolver is not None:
+                        resolved = resolver(scraper, t)
+                        if resolved is None:
+                            queued_tracks.discard(track_identity(artist, title))
+                            continue
+                        t.update(resolved)
                     logger.info(f"Загружаю: {artist} - {title}", extra={"site": s_name})
                     headers = {"Referer": t.get("referer", s_cfg["base_url"])}
                     with scraper.get(
@@ -538,6 +545,7 @@ def run():
                     logger.error(f"Загрузка остановлена: {e}", extra={"site": s_name})
                     raise SystemExit(2) from e
                 except Exception as e:
+                    queued_tracks.discard(track_identity(t["artist"], t["title"]))
                     logger.error(
                         f"Ошибка скачивания {t.get('title')}: {e}", extra={"site": s_name}
                     )
