@@ -1,1 +1,1 @@
-Project guidance is in [AI.md](../ai-md/AI.md). Read it before making any changes.
+Все актуальные требования проекта находятся в [`ai-md/AI.md`](../ai-md/AI.md). Перед любыми изменениями обязательно прочитать этот файл и следовать ему.

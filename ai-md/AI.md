@@ -1,117 +1,145 @@
 # AI.md
 
-This file is the single source of project guidance for all AI coding assistants.
-Tool-specific entry points (CLAUDE.md, AGENTS.md, GEMINI.md, .github/copilot-instructions.md, .cursorrules) all redirect here.
+Единый источник проектных требований для всех ИИ-ассистентов. Точки входа `.cursorrules`, `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` и `.github/copilot-instructions.md` должны ссылаться сюда.
 
-## Язык ответов и комментариев
+## Язык
 
-- Все ответы пользователю, промежуточные сообщения и пояснения писать на русском языке.
-- Все новые и изменяемые комментарии в коде, строки документации (docstring) и поясняющий текст в документации писать на русском языке.
-- При работе с файлами переводить встречающиеся иноязычные комментарии и пояснения на русский, сохраняя их смысл и техническую точность.
-- Не переводить идентификаторы кода, команды, пути, ключи конфигурации, имена API и служебные директивы инструментов. Оригинальные сообщения ошибок и цитаты при необходимости сохранять, сопровождая пояснением на русском.
+- Все ответы пользователю, промежуточные сообщения и пояснения писать по-русски.
+- Все новые и изменяемые комментарии, docstring и поясняющий текст документации писать по-русски; встречающиеся в редактируемых файлах иноязычные пояснения переводить без потери смысла и технической точности.
+- Не переводить идентификаторы, команды, пути, ключи конфигурации, имена API и служебные директивы. Оригинальные ошибки и цитаты при необходимости сохранять с русским пояснением.
 
-## Validation commands
+## Валидация
 
-Run before and after any edit to confirm nothing is broken.
+До и после любых изменений проверять, что ничего не сломано.
 
-Run the full bats test suite (requires bats-core; install once if missing):
+Полный набор Bats-тестов (нужен `bats-core`; при отсутствии установить один раз):
 ```sh
 git clone --depth 1 https://github.com/bats-core/bats-core.git /tmp/bats-core
 sudo /tmp/bats-core/install.sh /usr/local
 bats --print-output-on-failure tests
 ```
 
-Run a single script's test file:
+Один тестовый файл скрипта:
 ```sh
 bats --print-output-on-failure tests/getip.bats
 ```
 
-Syntax-check every root shell script at once (also enforced by `tests/all_scripts_syntax.bats`):
+Проверка синтаксиса отдельного корневого shell-скрипта (также контролируется `tests/all_scripts_syntax.bats`):
 ```sh
 bash -n ./some_script.sh
 ```
 
-Lint shell scripts — error level (blocks CI) and style level (brace style, `[[ ]]`, `case *)`…):
+ShellCheck: ошибки блокируют CI, уровень style проверяет фигурные скобки, `[[ ]]`, ветку `case *)` и другие соглашения:
 ```sh
 shellcheck -S error ./*.sh
 shellcheck -S style ./*.sh
 ```
 
-Syntax-check all root shell scripts by shebang (also enforced by CI):
+Проверка всех корневых shell-скриптов с учётом shebang (также выполняется CI):
 ```sh
 for f in ./*.sh; do
   if head -1 "$f" | grep -qi bash; then bash -n "$f"; else sh -n "$f"; fi
 done
 ```
 
-Scan for unbraced variable references in local shell code (CI-enforced, skips comments and remote-shell strings):
+Поиск ссылок на переменные без фигурных скобок в локальном shell-коде (контролируется CI; пропускает комментарии и строки удалённого shell):
 ```sh
 grep -nP '(?<!")\$(?!\{)[A-Za-z_][A-Za-z0-9_]*' ./*.sh \
   | grep -v '^\s*#' | grep -v "\\\\'" \
   | grep -v 'sh -lc\|bash -c\|MARIADB_ROOT\|REDIS_WAIT\|PURGE_BINLOGS\|TRUNCATE\|in_progress'
 ```
 
-Python syntax check for root `.py` files (also enforced by CI):
+Проверка синтаксиса корневых `.py` (также выполняется CI):
 ```sh
 for f in ./*.py; do python3 -m py_compile "$f"; done
 ```
 
-Python unit tests (run from the repository root after installing `music_downloader/requirements.txt` into its venv):
+Python-тесты из корня репозитория после установки `music_downloader/requirements.txt` в venv:
 ```sh
 music_downloader/venv/bin/python -m pytest tests/test_music_downloader.py music_downloader/tests -q
 ```
+Тесты используют временные каталоги и подменённые HTTP-ответы; покрывают общие глобальные пути загрузки, отклонение неверных, отсутствующих и заполненных каталогов до создания скрапера, атомарную запись и дедупликацию БД. Для проверки конфигурации не запускать реальное скачивание.
 
-These tests use temporary destinations and mocked HTTP responses; they cover shared global download paths, rejection of invalid/missing/full destinations before scraper creation, atomic file writes, and database deduplication. Do not run a real download just to validate configuration changes.
-
-Lint `music_downloader/` (ruff config lives at `music_downloader/.ruff.toml`, py311, line-length 120):
+Ruff для `music_downloader/` (`music_downloader/.ruff.toml`: Python 3.11, длина строки 120):
 ```sh
 music_downloader/venv/bin/ruff check music_downloader/
 ```
 
 ## Graphify
 
-The generated project graph lives in `graphify-out/` and is excluded from Git.
-Use it for navigation and analysis before manually searching the source code.
-After changing code or configuration, refresh it from the repository root:
+Правила обязательны для агентов, входящих через `.cursorrules`, `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` и `.github/copilot-instructions.md`.
 
-```sh
-graphify update .
-```
+- Граф проекта находится в исключённом из Git каталоге `graphify-out/`; не добавлять его принудительно.
+- Перед ручным поиском по исходникам проверять `graphify-out/graph.json` и использовать Graphify для навигации и анализа связей.
+- Если граф существует, на естественно-язычные вопросы о кодовой базе сначала отвечать через `graphify query "<вопрос>"`, не перестраивая граф без необходимости.
+- Если графа нет, а нужен анализ кодовой базы, выполнить из корня `graphify .`.
+- После изменения кода или конфигурации выполнить из корня `graphify update .`.
+- Graphify не требует паролей или API-ключей. Не запрашивать их и не останавливать работу из-за отсутствия `GEMINI_API_KEY`/`GOOGLE_API_KEY`; использовать доступное локальное или агентское извлечение.
 
-## Architecture
+## Устройство репозитория и общие соглашения
 
-> When asked to work on "the project", always ask which script — there is no shared entry point.
+- Это не единое приложение, а плоский набор независимых целевых Bash/Python-скриптов в корне. Они не импортируют и не вызывают друг друга, кроме запуска `split_by_dash.sh` из `music_downloader.sh` при успехе. Если просят работать «с проектом», уточнять конкретный скрипт: общей точки входа нет.
+- Корневые Bash-скрипты используют `${VAR}`, а не `$VAR`, `[[ ]]`, а не `[ ]`, и заключённые в кавычки числовые переменные в `return`/`exit` (`return "${rc}"`). Каждый `case` содержит явную ветку `*)`. Это контролируют `shellcheck -S style` и поиск переменных без скобок.
+- Если пользователь указывает на пропущенное предупреждение, ошибку или регрессию, до изменений обязательно объяснить причину пропуска, определить управляющий путь кода и класс предупреждения, сформулировать одну опровергаемую локальную гипотезу и одну дешёвую проверку. Не ограничиваться первым видимым симптомом.
+- Все `cleanup_logs()` используют `find … -printf '%T@|%p\n' | sort -nr | awk 'NR > N { print $2 }'` с `mapfile -t` в Bash либо конвейером `while read` в POSIX sh; не использовать `ls | tail`. Аргумент `-name` у `find` всегда полностью заключать в кавычки: `"${SCRIPT_BASE}-*.jsonl"`.
+- Скрипты с `ssh`/`sshpass` задают параметры Bash-массивом `SSH_OPTS=(...)` и раскрывают как `"${SSH_OPTS[@]}"`; не хранить их в строке с word splitting.
+- Стандартная структура корневого `.sh`: `SCRIPT ID / PATHS` → `HELPERS` → `ARGS` → `MAIN`; проверки зависимостей и параметров выполняются в начале, применяется `set -eu` либо `set -uo pipefail` по модели обработки ошибок конкретного скрипта. При изменении и добавлении скриптов сохранять эту структуру.
+- Конфигурация скрипта хранится в `conf/<script_name>.conf` и подключается как shell-файл во время выполнения. В Git находятся только `conf/*.conf.example`; реальные `conf/*.conf` игнорируются, создаются пользователем, а скрипты при первом запуске выполняют `mkdir -p conf`. Не коммитить реальные конфиги; для нового настраиваемого скрипта добавлять соответствующий `.example`.
+- Логи — по одному JSON-объекту на строку в `logs/<script>-<timestamp>.jsonl` либо в фиксированном суточном файле; ротация сохраняет последние 5 или 10 файлов скрипта. Общая схема берётся из `conf/log_template.conf`, если он есть, иначе используются встроенные значения. Записи содержат ECS-поля (`@timestamp`, `log.level`, `event.action`, `service.name`, `schema.version`) для ELK/OpenSearch/Loki/Graylog/Splunk и совместимые старые поля (`script`, `event`, `msg`, `detail`, `rc`). `logs/`, `state/` и реальные `conf/*.conf` игнорируются Git как машинно-зависимые runtime-артефакты.
 
-This repo is **not a single application** — it's a flat collection of independent, single-purpose bash/Python scripts living in the repo root. Scripts do not import or call each other's code (the one exception is `music_downloader.sh` invoking `split_by_dash.sh` on success). When asked to work on "the project", clarify which script — there is no shared entry point.
+## Тесты, CI и Git
 
-**Shell style conventions.** All variables in root `.sh` scripts must use brace syntax (`${VAR}`, not `$VAR`), double-bracket tests (`[[ ]]` instead of `[ ]` in bash scripts), and quoted `return`/`exit` with numeric variables (`return "${rc}"`). `case` blocks must include an explicit `*)` branch. These are enforced by CI (`shellcheck -S style` + the unbraced variable scan).
+- `tests/` примерно один к одному соответствует корневым скриптам (`<script>.bats`) и использует bats-core. Внешние программы (`curl`, `notify-send`, `docker`, `ssh` и другие) подменяются временными исполняемыми файлами, каталог которых добавляется в начало `PATH`; образец — `tests/getip.bats`: каталог заглушек и `env PATH="$STUB_DIR:$PATH" bash -c "..."`. `tests/all_scripts_syntax.bats` автоматически проверяет каждый корневой `*.sh` через `bash -n`/`sh -n` по shebang, поэтому новые скрипты получают проверку синтаксиса без отдельной записи.
+- CI состоит из независимых workflows. `.github/workflows/shellcheck.yml` запускает `shellcheck -S error`, `shellcheck -S style`, синтаксическую проверку `bash -n`/`sh -n`, поиск переменных без скобок и `python3 -m py_compile` для корневых `.py`; срабатывает только при изменениях `*.sh`/`*.py`. `.github/workflows/bats-tests.yml` запускает все Bats-тесты при каждом push/PR. `.github/workflows/music-downloader.yml` устанавливает зависимости загрузчика, проверяет `music_downloader/` Ruff, публикует отчёты Ruff и запускает `music_downloader/tests/` вместе с `tests/test_music_downloader.py` на Python 3.12; фильтры путей включают загрузчик, общие тесты и сам workflow.
+- `music_downloader/` — отслеживаемый Python-подпроект этого репозитория, не вложенный Git checkout и не submodule. Его исходники, драйверы, тесты, README, `.ruff.toml`, requirements и `.json.example` коммитятся вместе с `mytasks`. Реальные `music_downloader.json`, SQLite-БД и резервные копии, логи и venv остаются локальными по `.gitignore`; не добавлять их или `graphify-out/` принудительно. Резервная копия прежних вложенных Git-метаданных хранится в игнорируемом `state/music_downloader-git-backup-6394179/`, не активна и не должна попадать в Git. `newline_to_space/` остаётся отдельным локальным Python-подпроектом, исключённым из Git.
 
-**Missed-error analysis is mandatory.** If a user points out a missed warning, bug, or regression, every assistant must first explain why the issue was missed, identify the controlling code path and the specific warning class, and state one falsifiable local hypothesis plus one cheap check before changing code. Do not skip this analysis or narrow the scope to only the first visible symptom.
+## Резервное копирование QNAP
 
-**Log cleanup pattern.** All `cleanup_logs()` functions use `find … -printf '%T@|%p\n' | sort -nr | awk 'NR > N { print $2 }'` with `mapfile -t` (bash) or a `while read` pipeline (POSIX sh) — never `ls | tail`. The `-name` argument to `find` is always fully quoted: `"${SCRIPT_BASE}-*.jsonl"`.
+- `cloud_backup.sh` работает на настольной машине через `sudo`, `wg-quick` и `sshpass`; `cloud_backup_qnap.sh` запускается непосредственно на QNAP NAS через Entware cron/Task Scheduler без `sudo` и только с SSH-ключами. Оба используют один `REMOTE_HOST` и независимо выполняют на нём `docker compose down`/`up -d` вокруг копирования. Никогда не запускать их одновременно для одного `REMOTE_HOST`: сервисы могут перезапускаться или остаться выключенными.
+- На части ядер QTS вариант QNAP не может использовать `wg`/`wg-quick` (`Protocol not supported`) и поднимает туннель вручную через userspace UAPI-сокет `wireguard-go`; см. `wg_up_userspace` и `wg_conf_get`.
+- **Перед любой работой с `cloud_backup_qnap.sh` обязательно прочитать `ai-md/cloud_backup_qnap.NOTES.md`.**
 
-**SSH option arrays.** Scripts that call `ssh`/`sshpass` define options as a bash array (`SSH_OPTS=(...)`) and expand them as `"${SSH_OPTS[@]}"` — never as a plain string with word splitting.
+## `system_monitor.sh` и systemd
 
-**Standard script layout.** Every root `.sh` script follows the same internal structure: `SCRIPT ID / PATHS` → `HELPERS` → `ARGS` → `MAIN`, with explicit dependency/parameter checks up front and `set -eu` or `set -uo pipefail` (chosen per script's error-handling needs). Follow this shape when editing or adding scripts rather than introducing a different convention.
+- `system_monitor.sh` переименован из `disk_monitor.sh`; кроме дисков он опрашивает CPU (`sensors -j`, загрузка из `/proc/stat`, `/proc/loadavg`) и каждую GPU через `nvidia-smi`. `sensors` и `nvidia-smi` необязательны: при их отсутствии нет температуры CPU или раздела GPU, но запуск не завершается ошибкой. Работа проверена на Ryzen 7 5800X и RTX 3060 Ti.
+- `shellcheck -o all` должен оставаться без замечаний. Вложенные вызовы `$(sql_escape ...)`/`$(html_escape ...)` внутри больших строк сначала выносить в `local`-переменные. Сценарии отсутствующих зависимостей тестировать с полностью изолированным `PATH` через `iso_path_without()` в Bats, а не только `PATH="$STUB_DIR:$PATH"`, иначе доступны реальные `sensors`/`nvidia-smi` машины.
+- Рабочая `state/system_monitor.db` исторически принадлежит root. Таблицы `cpu_stats`/`gpu_stats` создаются через `CREATE TABLE IF NOT EXISTS` при следующем `sudo ./system_monitor.sh`, а не редактированием скрипта.
+- Расписание перенесено из root-crontab `0 */6 * * *` в `systemd/system-monitor.{service,timer}`, устанавливаемые в `/etc/systemd/system`; cron-запись удалена. `Persistent=true` выполняет один пропущенный интервал при загрузке без двойного запуска, возможного с `@reboot`. В service задано `SuccessExitStatus=1`, потому что код `1` означает найденное критическое состояние, а не сбой unit.
+- Из агентской песочницы `systemctl` не видит system D-Bus; для установки и проверки использовать `pkexec` либо запуск вне песочницы.
 
-**Config convention.** Each script that needs configuration reads `conf/<script_name>.conf`, sourced as a shell file at runtime. Only `conf/*.conf.example` templates are committed; real `conf/*.conf` files are gitignored and created by the user (scripts also `mkdir -p conf` on first run if it's missing). Never commit a real `conf/*.conf` file, and when adding a new configurable script, add a matching `.example` template.
+**Снимок состояния диска от 2026-08-22.** `/mnt/copy` смонтирован с `/dev/sda1`; физический диск `/dev/sda` — Seagate `ST4000DM004-2U9104`, 4 ТБ, серийный номер `WW608PYW`. На эту дату полная история `state/system_monitor.db` содержит 26 записей от `2026-08-08T18:13:43+0500` до `2026-08-22T18:00:00+0500`. `Reallocated_Sector_Ct` равнялся 7077 до 2026-08-14 18:00, вырос до 7085 в 2026-08-15 00:00 и оставался таким до последней записи; pending и uncorrectable — 0, SMART overall-health — `PASSED`, последняя температура — 36°C. `system_monitor.sh` верно классифицирует это как `warn`, поскольку любое положительное число перераспределённых секторов означает деградацию. Это датированный рабочий снимок, а не постоянная документация: перед ответами по текущему состоянию заново проверять SQLite.
 
-**Unified JSONL logging.** Scripts that log write one JSON object per line to `logs/<script>-<timestamp>.jsonl` (or a fixed daily filename, depending on the script), rotating to keep only the last 5 or 10 files per script. The field schema is unified across scripts via `conf/log_template.conf` (sourced if present, falls back to hardcoded defaults) so entries carry both ECS-style fields (`@timestamp`, `log.level`, `event.action`, `service.name`, `schema.version`) for ELK/OpenSearch/Loki/Graylog/Splunk, and legacy fields (`script`, `event`, `msg`, `detail`, `rc`) for backward compatibility. `logs/`, `state/`, and real `conf/*.conf` are all gitignored — they're runtime/machine-specific artifacts, not source.
+## `music_downloader`: конфигурация и поведение
 
-**Two independent backup scripts, same remote.** `cloud_backup.sh` (desktop, runs via `sudo`, uses `wg-quick` + `sshpass`) and `cloud_backup_qnap.sh` (runs directly on the QNAP NAS itself via Entware cron/Task Scheduler, no sudo, SSH-key auth only) both back up the same `REMOTE_HOST`. The QNAP variant cannot use `wg`/`wg-quick` at all on some QTS kernels (`Protocol not supported`), so it brings the tunnel up manually over the `wireguard-go` userspace UAPI socket (see `wg_up_userspace`/`wg_conf_get`). Both scripts independently run `docker compose down`/`up -d` on the remote host around the backup — **never run both against the same `REMOTE_HOST` concurrently**, or the remote services can flap or get stuck down.
+- Обязательный непустой `download_paths` находится в корне JSON рядом с `sites` и общий для всех мостов: каждый трек сохраняется во все перечисленные каталоги. Внутрисайтовые настройки каталогов больше не используются; при миграции перенести один общий список в корень и удалить копии из сайтов. Синхронно поддерживать структуру рабочего JSON, `.json.example` и README, не заменяя реальные пути и лимиты примерными.
+- `max_size_mb` ограничивает весь каталог с подкаталогами, по умолчанию 1024 МиБ; проверка в байтах выполняется при старте и перед каждым сохранением. `save_response` проверяет каждый блок потока, в том числе без `Content-Length`, и учитывает копии в дочерних целевых каталогах. При переполнении `DownloadLimitExceeded` удаляет `.part`, завершает процесс с кодом `2`, не записывает незавершённый трек в БД и не запускает сортировщик; уже скачанное не удаляется. Контроль рассчитан на один процесс, для сторонних параллельных записей нужны квоты файловой системы. Отсутствующий, пустой или неверного типа глобальный список, отсутствующие каталоги и уже заполненные каталоги также дают код `2`.
 
-**Testing architecture.** `tests/` mirrors the root scripts roughly 1:1 (`<script>.bats` per script), using bats-core. Tests stub external binaries (curl, notify-send, docker, ssh, etc.) by prepending a temp directory containing fake executables to `PATH` rather than mocking in-process — see `tests/getip.bats` for the pattern (stub dir + `env PATH="$STUB_DIR:$PATH" bash -c "..."`). `tests/all_scripts_syntax.bats` is a catch-all that runs `bash -n`/`sh -n` (based on the shebang) over every root `*.sh` automatically, so new scripts get syntax-checked for free without adding a test entry.
+### Jamendo
 
-**CI uses independent workflows**, not one pipeline: `.github/workflows/shellcheck.yml` runs `shellcheck -S error`, `shellcheck -S style`, `bash -n`/`sh -n` syntax check, unbraced-variable grep scan, and `python3 -m py_compile` for root `.py` files — triggered only when a push/PR touches `*.sh` or `*.py`; `.github/workflows/bats-tests.yml` runs the full bats suite on every push/PR regardless of what changed. `.github/workflows/music-downloader.yml` installs the downloader requirements, lints `music_downloader/`, publishes Ruff reports, and runs both `music_downloader/tests/` and `tests/test_music_downloader.py` on Python 3.12. Its path filters cover the downloader, its shared tests and the workflow itself.
+- Категория `/` получает из официального `tracks` API одну страницу до 200 последних треков (`releasedate_desc`), `/playlist/<ID>` использует API плейлистов.
+- Принимать только записи с `audiodownload_allowed: true` и непустым `audiodownload`; не подменять его потоковым `audio`. Нужен `client_id` сайта либо `JAMENDO_CLIENT_ID`.
+- Ошибки API и пустые результаты логировать по-русски с `site=jamendo_com`. Проверки метаданных не должны скачивать аудио.
 
-**Machine-specific disk observation (2026-08-22).** `/mnt/copy` is mounted from `/dev/sda1`; the physical disk is `/dev/sda`, Seagate `ST4000DM004-2U9104` (4 TB, serial `WW608PYW`). In `state/system_monitor.db`, the complete history available on 2026-08-22 contains 26 records from `2026-08-08T18:13:43+0500` through `2026-08-22T18:00:00+0500`. `Reallocated_Sector_Ct` was 7077 through 2026-08-14 18:00 and increased to 7085 at 2026-08-15 00:00, then remained at 7085 through the latest record; pending and uncorrectable sectors remained 0, SMART overall-health was `PASSED`, temperature was 36°C in the latest record. `system_monitor.sh` correctly classifies this as `warn` because any positive reallocated-sector count is degradation. Treat these numbers as a dated operational snapshot, not stable README documentation; verify SQLite again before answering later questions.
+### Контракт драйверов, Shazam и MyChords
 
-**`music_downloader/` is a tracked Python subproject in this repository**, not a nested Git checkout or submodule. Commit its source, drivers, tests, README, `.ruff.toml`, requirements and `.json.example` together with the rest of `mytasks`. Its `.gitignore` keeps the real `music_downloader.json`, SQLite database/backups, logs and venv local; never force-add these or `graphify-out/`. The former nested Git metadata is backed up locally under ignored `state/music_downloader-git-backup-6394179/`; it is not active and must not be added to Git. `newline_to_space/` remains a separate, gitignored local Python subproject.
+- Драйвер реализует `get_tracks(session, base_url, category)`. Необязательный `resolve_track(session, track)` движок вызывает только перед скачиванием нового трека, после проверки БД и общей очереди; результат — словарь `download_url/referer/src` либо `None`. При `None` или исключении трек пропускается без записи в БД, а пара «исполнитель—название» удаляется из `queued_tracks`.
+- Драйверы загружаются через `spec_from_file_location`; каталог загрузчика отсутствует в `sys.path`, поэтому соседние драйверы подключать по пути, как `_load_driver` в Shazam, а не через `from drivers import`.
+- `shazam_com`: чарт `/ru-ru/charts/top-200/world` запрашивать с проверенными Firefox-заголовками `CHART_HEADERS` — Chrome-профиль и `curl` без заголовков возвращали 405/204/чужую страницу. `parse_chart` восстанавливает SSR-вставки `$RS(...)` и требует canonical чарта, ровно 200 карточек `[data-test-id="songItem"]`, ранги 1…200 и 200 уникальных `adam_<id>` из `/song/<id>/`. Аудио искать в Sefon (`/search/?q=`) и LMusic (`/search?q=`, `lmusic.parse_tracks`) только при точном совпадении `_match_key` исполнителя и названия; превью Shazam/Apple не использовать.
+- `mychords_net`: `/ru/novinki` → `li.b-listing__full__item a.b-listing__full__item__name` («Исполнитель - Название», ID из `/<id>-slug.html`) → страница трека `div.b-words__player[data-src]` с iframe `audio.xpleer.com/embed/` → `#file[data-mp3]` на `storage.xpleer.com` (`audio/mpeg`). Образцы HTML находятся в игнорируемом `state/`: `shazam-chart.html`, `mychords-*.html`, `xpleer-embed.html`.
 
-**Конфигурация загрузчика музыки.** Обязательный непустой список `download_paths` находится в корне JSON рядом с `sites` и действует для всех мостов: каждый трек сохраняется во все указанные папки. Настройки папок внутри сайтов больше не используются; при миграции перенесите один общий список в корень и удалите копии из сайтов. `max_size_mb` — лимит всей папки с подкаталогами (по умолчанию 1024 МиБ), проверяемый в байтах при старте и перед каждым сохранением. `save_response` проверяет также каждый блок потока, включая ответы без `Content-Length`, и учитывает копии в дочерних целевых папках. При превышении доступного объёма `DownloadLimitExceeded` приводит к удалению `.part` и выходу `2`, без записи неготового трека в БД и запуска сортировщика. Уже скачанное не удаляется. Контроль рассчитан на один процесс: сторонние записи во время скачивания требуют квот файловой системы. Отсутствующий/пустой/неверного типа глобальный список, отсутствующие папки и уже заполненные каталоги также завершают запуск с кодом `2`. Поддерживайте одинаковую структуру рабочего JSON, `.json.example` и README, не заменяя реальные пути/лимиты значениями из примера.
+### Обёртка и тесты
 
-**Jamendo.** Категория `/` получает одну страницу до 200 последних треков из официального `tracks` API (`releasedate_desc`), а `/playlist/<ID>` использует API плейлистов. Принимаются только записи с `audiodownload_allowed: true` и непустым `audiodownload`, без подмены на потоковое `audio`. Нужен `client_id` сайта или `JAMENDO_CLIENT_ID`. Ошибки API и пустые результаты логируются по-русски с `site=jamendo_com`. Проверки метаданных не должны скачивать аудиофайлы.
+- `music_downloader.sh` активирует `music_downloader/venv`, если он есть, запускает `music_downloader.py`, деактивирует venv и вызывает `split_by_dash.sh` только при коде `0`; у сортировщика отдельная настройка пути.
+- Ошибки отдельных драйверов и треков логируются, но общий код может оставаться `0`; отсутствие JSON-файла сейчас также возвращает `0` без загрузки.
+- Логи движка — `logs/music_downloader_engine-<timestamp>.jsonl`, отдельно от логов обёртки `logs/music_downloader-<timestamp>.jsonl`.
+- `tests/test_music_downloader.py` импортирует отслеживаемые исходники `music_downloader/` напрямую; перед Python-тестами установить requirements. Актуальная связанная документация: корневой README, этот файл и `music_downloader/README.md`; старые заметки QNAP не являются changelog загрузчика.
 
-**Контракт драйверов и мосты Shazam/MyChords.** Драйвер реализует `get_tracks(session, base_url, category)`; необязательный `resolve_track(session, track)` вызывается движком только перед скачиванием нового трека (после БД и общей очереди) и возвращает словарь `download_url/referer/src` или `None`. `None`/исключение → трек пропускается без записи в БД, его пара «исполнитель—название» удаляется из `queued_tracks`. Драйверы загружаются через `spec_from_file_location`, каталог загрузчика не в `sys.path` — соседние драйверы подключать по пути (см. `_load_driver` в Shazam), не через `from drivers import`. `shazam_com`: чарт `/ru-ru/charts/top-200/world` запрашивается с проверенными Firefox-заголовками (`CHART_HEADERS`; Chrome-профиль и `curl` без заголовков получали 405/204/чужую страницу), `parse_chart` восстанавливает SSR-вставки `$RS(...)` и требует canonical чарта, ровно 200 карточек `[data-test-id="songItem"]`, ранги 1…200 и 200 уникальных `adam_<id>` из `/song/<id>/`. Аудио ищется в поиске Sefon (`/search/?q=`) и LMusic (`/search?q=`, `lmusic.parse_tracks`) только при точном совпадении `_match_key` исполнителя и названия; превью Shazam/Apple не используются. `mychords_net`: `/ru/novinki` → `li.b-listing__full__item a.b-listing__full__item__name` («Исполнитель - Название», ID из `/<id>-slug.html`) → страница трека `div.b-words__player[data-src]` с iframe `audio.xpleer.com/embed/` → `#file[data-mp3]` на `storage.xpleer.com` (`audio/mpeg`). Сохранённые образцы HTML лежат в игнорируемом `state/` (`shazam-chart.html`, `mychords-*.html`, `xpleer-embed.html`).
+## Библиотека `/mnt/copy/Books`
 
-**Music downloader wrapper and tests.** `music_downloader.sh` activates `music_downloader/venv` if present, runs `music_downloader.py`, deactivates the venv, and invokes `split_by_dash.sh` only on downloader exit code `0`. The sorter has separate path configuration. Individual driver/track failures are logged and can still yield exit code `0`; a missing JSON file also currently returns `0` without downloading. Engine logs are `logs/music_downloader_engine-<timestamp>.jsonl`, separate from wrapper logs `logs/music_downloader-<timestamp>.jsonl`. `tests/test_music_downloader.py` imports the tracked `music_downloader/` source directly; install its requirements before running the Python tests. Related current docs are the root README, this file, and `music_downloader/README.md`; historical QNAP notes are not a downloader changelog.
+- Библиотека находится вне Git. Не добавлять книги и сгенерированные отчёты из `state/` в репозиторий. Перед удалениями создавать локальный JSON-отчёт с путями, размерами и причинами.
+- При дедупликации удалять только подтверждённые копии. Если одна книга есть в нескольких форматах, удалять TXT только при наличии полноценного `fb2`, `epub`, `pdf` или аналогичного варианта. Не включать в дедупликацию и граф исходные `.html`/`.htm` и каталоги ресурсов `*_files`, `*.files`, `* files`.
+- RTF, DOC, DOCX и CHM преобразовывать в EPUB; исходник удалять только после проверки ZIP/CRC, `mimetype`, `META-INF/container.xml`, содержательных страниц и текста. Повреждённый CHM сначала проверять независимыми средствами (`ebook-convert`, chmlib, 7-Zip); физически неполный и невосстановимый файл удалять только с отчётом.
+- Если нужен `sudo`, использовать графический askpass через Zenity с явным пользователем `esimych`; не запрашивать пароль в чате и не сохранять его.
+- Отдельный граф библиотеки хранится в `state/books-graph/graphify-out/`. После изменения состава книг полностью пересобирать его через `state/build_books_graph.py`, проверяя итоговые счётчики, ошибки сканирования, оборванные связи и отсутствие временных `.part.epub`.
+
+**Состояние на 2026-09-06.** Удалены 1 113 подтверждённых межформатных TXT-дубликатов и 5 122 точных бинарных дубликата; 448 исходников RTF/DOC/CHM преобразованы в проверенные EPUB. `ЕСИС80.chm` восстановлен как текстовый `/mnt/copy/Books/_documentation/ЕСИС80.epub` (13 209 XHTML-страниц, около 18 млн текстовых символов), четыре физически обрезанных CHM удалены после неудачных проверок. RTF/DOC/DOCX/CHM в библиотеке не осталось. Последний граф с исключёнными HTML-ресурсами: 150 591 файл, 188 630 узлов, 348 796 связей, 38 сообществ, без ошибок сканирования и оборванных связей.
