@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import logging
 import os
 import re
@@ -33,6 +34,28 @@ CHART_HEADERS = {
     "Accept-Language": "en-US,en;q=0.5",
     "Accept-Encoding": "gzip, deflate",
 }
+
+# Shazam (Next.js App Router за Fastly) периодически отдаёт по адресу чарта
+# HTTP 200 со страницей чужой песни (иной canonical, ~1.8 МБ вместо ~3.7 МБ).
+# Дефект держится до истечения TTL узла и виден не со всех маршрутов, причём
+# полноценная HTML-страница и RSC-поток того же адреса «ломаются» независимо
+# друг от друга. Поэтому каждая попытка сначала читает HTML, а при неудаче —
+# RSC-поток (заголовок `RSC: 1`, ответ `text/x-component` с теми же данными в
+# полезной нагрузке `self.__next_f`); попытки распределены по минутам и идут с
+# новым соединением. Query-параметр-«антикэш» не добавлять: отдельный ключ
+# Fastly чаще указывает как раз на «отравленную» копию.
+CHART_RETRY_DELAYS = (15, 45, 90)
+
+# Куски RSC-потока Next.js: `self.__next_f.push([1, "<json-строка>"])`.
+_FLIGHT_PUSH_RE = re.compile(r'self\.__next_f\.push\(\[1,\s*("(?:[^"\\]|\\.)*")\]\)', re.S)
+# Блок карточки чарта в RSC: имя трека, имя исполнителя и ссылка на песню идут
+# подряд в пропсах плавающего меню SongItem.
+_FLIGHT_TRACK_RE = re.compile(
+    r'"trackName":"((?:[^"\\]|\\.)*)",'
+    r'"artistName":"((?:[^"\\]|\\.)*)"'
+    r'(?:,"aria-label":"(?:[^"\\]|\\.)*")?'
+    r',"url":"https://www\.shazam\.com/song/(\d+)/[^"]*"'
+)
 
 
 def parse_chart(html):
@@ -87,20 +110,82 @@ def parse_chart(html):
     return tracks
 
 
-def get_tracks(session, base_url, category_path):
-    """Возвращает метаданные чарта; поиск MP3 выполняется после дедупликации движком."""
-    target_url = urljoin(base_url, category_path)
-    try:
-        response = session.get(target_url, headers=CHART_HEADERS, timeout=(5, 20))
-        response.raise_for_status()
-        if response.status_code != 200 or not response.text.strip():
-            raise ValueError(f"Пустой или неожиданный ответ Shazam: HTTP {response.status_code}")
-        tracks = parse_chart(response.text)
-    except Exception as error:
-        logger.error(f"Shazam: не удалось прочитать мировой чарт: {error}")
-        return []
-    logger.info(f"Shazam: получено {len(tracks)} позиций; источники будут проверены перед скачиванием")
+def parse_flight_chart(body):
+    """Извлекает Top 200 из RSC-потока Next.js.
+
+    Принимает и «сырой» ответ `text/x-component`, и полную HTML-страницу — в
+    последней тот же поток лежит в тегах `self.__next_f.push`. JavaScript не
+    исполняется: порядок карточек в потоке совпадает с позициями чарта
+    (проверено против DOM-разбора), поэтому ранг берётся из порядка следования.
+    """
+    chunks = _FLIGHT_PUSH_RE.findall(body)
+    flight = "".join(json.loads(chunk) for chunk in chunks) if chunks else body
+
+    tracks = []
+    seen = set()
+    for title_raw, artist_raw, song_id in _FLIGHT_TRACK_RE.findall(flight):
+        if song_id in seen:
+            continue
+        seen.add(song_id)
+        tracks.append({
+            # Тот же song/ADAM ID, что и у DOM-разбора, — ключи БД совпадают.
+            "id": f"adam_{song_id}",
+            "rank": len(tracks) + 1,
+            "artist": unescape(json.loads(f'"{artist_raw}"')).strip(),
+            "title": unescape(json.loads(f'"{title_raw}"')).strip(),
+            "src": f"https://www.shazam.com/song/{song_id}/",
+        })
+    if len(tracks) != 200 or any(not track["artist"] or not track["title"] for track in tracks):
+        raise ValueError(f"RSC-поток Shazam: ожидался Top 200 с уникальными ID; получено {len(tracks)}")
     return tracks
+
+
+# Источники чарта в порядке предпочтения: обычная страница, затем RSC-поток
+# того же адреса (отдельный объект кэша, отравляется независимо).
+CHART_SOURCES = (
+    ("HTML", {}, parse_chart),
+    ("RSC", {"RSC": "1"}, parse_flight_chart),
+)
+
+
+def get_tracks(session, base_url, category_path):
+    """Возвращает метаданные чарта; поиск MP3 выполняется после дедупликации движком.
+
+    Каждая попытка читает HTML-страницу, а при неудаче — RSC-поток того же
+    адреса; попытки повторяются по расписанию ``CHART_RETRY_DELAYS`` с новым
+    соединением. ``ERROR`` пишется только после того, как оба источника не
+    ответили ни разу, — сама по себе такая запись означает временный сбой
+    Shazam/CDN. На поломку разбора указывают ``В карточке чарта...`` /
+    ``Ожидался полный Top 200...`` / ``RSC-поток Shazam...`` при живом чарте.
+    """
+    target_url = urljoin(base_url, category_path)
+    last_error = None
+    attempt = 0
+    for delay in (0, *CHART_RETRY_DELAYS):
+        if delay:
+            time.sleep(delay)
+        attempt += 1
+        for kind, extra_headers, parser in CHART_SOURCES:
+            headers = {**CHART_HEADERS, **extra_headers}
+            if attempt > 1:
+                # Новое соединение — шанс выйти на другой пограничный узел CDN.
+                headers["Connection"] = "close"
+            try:
+                response = session.get(target_url, headers=headers, timeout=(5, 20))
+                response.raise_for_status()
+                if response.status_code != 200 or not response.text.strip():
+                    raise ValueError(f"пустой ответ: HTTP {response.status_code}")
+                tracks = parser(response.text)
+            except Exception as error:
+                last_error = f"{kind}: {error}"
+                continue
+            if kind != "HTML":
+                logger.info("Shazam: HTML-страница недоступна, чарт получен из RSC-потока")
+            logger.info(f"Shazam: получено {len(tracks)} позиций; источники будут проверены перед скачиванием")
+            return tracks
+        logger.warning(f"Shazam: попытка {attempt} чтения мирового чарта не удалась ({last_error})")
+    logger.error(f"Shazam: не удалось прочитать мировой чарт за {attempt} попыток (вероятен временный сбой Shazam/CDN): {last_error}")
+    return []
 
 
 def _match_key(value):

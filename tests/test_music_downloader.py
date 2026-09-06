@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import sqlite3
@@ -34,6 +35,22 @@ class TestMusicDownloader(unittest.TestCase):
             track_identity("әсем", "менің әнім"),
         )
 
+    def test_track_identity_ignores_separators_and_punctuation(self):
+        # «&», «+», пробелы, скобки — всё это отбрасывается
+        self.assertEqual(
+            track_identity("Вася & Петя", "Song (Remix)"),
+            track_identity("Вася  +Петя", "song remix"),
+        )
+        self.assertEqual(
+            track_identity("AC/DC", "T.N.T."),
+            track_identity("ac dc", "tnt"),
+        )
+        # слова при этом не склеиваются в один ключ
+        self.assertNotEqual(
+            track_identity("Artist", "Song"),
+            track_identity("Artist", "Song Remix"),
+        )
+
     def test_save_response_writes_all_destinations_atomically(self):
         class Response:
             def iter_content(self, chunk_size):
@@ -45,9 +62,10 @@ class TestMusicDownloader(unittest.TestCase):
             for item in paths:
                 os.mkdir(item["path"])
 
-            size, saved = save_response(Response(), paths, "track.mp3", expected_size=6)
+            size, saved, filehash = save_response(Response(), paths, "track.mp3", expected_size=6)
 
             self.assertEqual(size, 6)
+            self.assertEqual(filehash, hashlib.sha256(b"abcdef").hexdigest())
             self.assertEqual([open(path, "rb").read() for path in saved], [b"abcdef", b"abcdef"])
             self.assertFalse(any(os.path.exists(f"{path}.part") for path in saved))
 
@@ -133,10 +151,15 @@ class TestMusicDownloader(unittest.TestCase):
             }
             config_path = root / "config.json"
             config_path.write_text(json.dumps(config), encoding="utf-8")
-            response = MagicMock(status_code=200, headers={"content-length": "3"})
-            response.iter_content.return_value = [b"abc"]
+            # У каждого сайта своё содержимое — иначе второй трек отсеется дедупом по хешу
+            bodies = {"First": b"abc", "Second": b"abcd"}
+            responses = []
+            for body in bodies.values():
+                item = MagicMock(status_code=200, headers={"content-length": str(len(body))})
+                item.iter_content.return_value = [body]
+                responses.append(item)
             scraper = MagicMock()
-            scraper.get.return_value.__enter__.return_value = response
+            scraper.get.return_value.__enter__.side_effect = responses
             with (
                 patch.multiple(music_downloader, CONFIG_PATH=str(config_path), DB_PATH=str(root / "db.sqlite")),
                 patch.object(music_downloader, "setup_logging"),
@@ -150,8 +173,8 @@ class TestMusicDownloader(unittest.TestCase):
             check.assert_called_once_with(paths, "system")
             self.assertEqual(scraper.get.call_count, 2)
             for folder in paths:
-                for title in ("First", "Second"):
-                    self.assertEqual((Path(folder["path"]) / f"Artist - {title}.mp3").read_bytes(), b"abc")
+                for title, body in bodies.items():
+                    self.assertEqual((Path(folder["path"]) / f"Artist - {title}.mp3").read_bytes(), body)
             with sqlite3.connect(root / "db.sqlite") as conn:
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM downloads").fetchone()[0], 2)
 
@@ -365,11 +388,119 @@ class TestMusicDownloader(unittest.TestCase):
                 self.assertIsNone(
                     conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='allsongs'").fetchone()
                 )
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(downloads)")}
+                self.assertIn("filehash", columns)
                 with self.assertRaises(sqlite3.IntegrityError):
                     conn.execute(
-                        "INSERT INTO downloads VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        "INSERT INTO downloads (id, artist, title, site, timestamp, src, filename, filesize) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                         ("again", "әсем", "ән", "three", "2026-01-03", None, "again.mp3", 3),
                     )
+
+    def test_database_collapses_rows_that_share_key_only_after_wider_normalization(self):
+        with tempfile.TemporaryDirectory() as root:
+            db_path = os.path.join(root, "music.db")
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    "CREATE TABLE downloads (id TEXT PRIMARY KEY, artist TEXT, title TEXT, site TEXT, "
+                    "timestamp DATETIME, src TEXT, filename TEXT, filesize INTEGER)"
+                )
+                conn.execute("CREATE UNIQUE INDEX idx_downloads_artist_title ON downloads(artist, title)")
+                conn.executemany(
+                    "INSERT INTO downloads (id, artist, title, site, timestamp, src, filename, filesize) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        # различались только по прежней нормализации (пробел vs без)
+                        ("a", "artist", "song remix", "s", "2026-01-01", None, "a.mp3", 1),
+                        ("b", "artist", "songremix", "s", "2026-01-02", None, "b.mp3", 2),
+                    ],
+                )
+
+            DatabaseManager(db_path)  # не должно падать на ещё живом UNIQUE-индексе
+
+            with sqlite3.connect(db_path) as conn:
+                self.assertEqual(conn.execute("SELECT id FROM downloads").fetchall(), [("b",)])
+
+    def test_database_collapses_filehash_duplicates_and_enforces_partial_unique(self):
+        with tempfile.TemporaryDirectory() as root:
+            db_path = os.path.join(root, "music.db")
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    "CREATE TABLE downloads (id TEXT PRIMARY KEY, artist TEXT, title TEXT, site TEXT, "
+                    "timestamp DATETIME, src TEXT, filename TEXT, filesize INTEGER, filehash TEXT)"
+                )
+                conn.executemany(
+                    "INSERT INTO downloads (id, artist, title, site, timestamp, filename, filehash) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        ("a", "x", "one", "s", "2026-01-01", "a.mp3", "HHH"),
+                        ("b", "y", "two", "s", "2026-01-02", "b.mp3", "HHH"),  # тот же контент
+                        ("c", "z", "three", "s", "2026-01-03", "c.mp3", None),
+                        ("d", "w", "four", "s", "2026-01-04", "d.mp3", None),  # NULL не ограничен
+                    ],
+                )
+
+            DatabaseManager(db_path)
+
+            with sqlite3.connect(db_path) as conn:
+                self.assertEqual(
+                    conn.execute("SELECT id FROM downloads ORDER BY id").fetchall(),
+                    [("b",), ("c",), ("d",)],  # из пары одинакового хеша осталась свежая
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    conn.execute(
+                        "INSERT INTO downloads (id, artist, title, site, timestamp, filehash) "
+                        "VALUES ('e', 'q', 'five', 's', '2026-01-05', 'HHH')"
+                    )
+                # несколько NULL-хешей разрешены
+                conn.execute(
+                    "INSERT INTO downloads (id, artist, title, site, timestamp, filehash) "
+                    "VALUES ('f', 'q', 'six', 's', '2026-01-06', NULL)"
+                )
+
+    def test_run_deduplicates_identical_audio_by_content_hash(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            destination = root / "music"
+            destination.mkdir()
+            driver = root / "driver.py"
+            driver.write_text(
+                "def get_tracks(scraper, base_url, category):\n"
+                "    return [\n"
+                "        {'id': 'a', 'artist': 'Alpha', 'title': 'Original', 'download_url': 'https://e/a.mp3'},\n"
+                "        {'id': 'b', 'artist': 'Beta', 'title': 'Reupload', 'download_url': 'https://e/b.mp3'},\n"
+                "    ]\n",
+                encoding="utf-8",
+            )
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps({
+                "download_paths": [{"path": str(destination)}],
+                "sites": [{"site_name": "s", "site_script": str(driver), "base_url": "b", "categories": ["/"]}],
+            }), encoding="utf-8")
+            response = MagicMock(status_code=200, headers={"content-length": "3"})
+            response.iter_content.return_value = [b"abc"]
+            scraper = MagicMock()
+            scraper.get.return_value.__enter__.return_value = response
+            with (
+                patch.multiple(music_downloader, CONFIG_PATH=str(config_path), DB_PATH=str(root / "db.sqlite")),
+                patch.object(music_downloader, "setup_logging"),
+                patch.object(music_downloader, "cleanup_old_logs"),
+                patch.object(music_downloader.time, "sleep"),
+                patch.object(music_downloader.cloudscraper, "create_scraper", return_value=scraper),
+            ):
+                music_downloader.run()
+
+            # оба ID зафиксированы (повторно не качаются), но на диске одна копия,
+            # и хеш хранит только оригинал — дубликат записан с filehash=NULL,
+            # чтобы не нарушать частичный UNIQUE-индекс.
+            self.assertEqual([p.name for p in destination.iterdir()], ["Alpha - Original.mp3"])
+            self.assertEqual((destination / "Alpha - Original.mp3").read_bytes(), b"abc")
+            with sqlite3.connect(root / "db.sqlite") as conn:
+                rows = conn.execute("SELECT id, filehash FROM downloads ORDER BY id").fetchall()
+            self.assertEqual(rows, [
+                ("s_a", hashlib.sha256(b"abc").hexdigest()),
+                ("s_b", None),
+            ])
 
 
 if __name__ == "__main__":

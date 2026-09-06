@@ -1,3 +1,4 @@
+import hashlib
 import importlib.util
 import json
 import logging
@@ -5,6 +6,7 @@ import os
 import re
 import sqlite3
 import time
+import unicodedata
 from contextlib import ExitStack, suppress
 from datetime import datetime
 
@@ -41,36 +43,17 @@ LOGS_DIR = get_log_dir()
 os.makedirs(LOGS_DIR, exist_ok=True)
 LOG_PATH = os.path.join(LOGS_DIR, f"{LOG_NAME}-{TIMESTAMP}.jsonl")
 
-DB_QUOTE_TRANSLATION = str.maketrans(
-    {
-        '"': "",
-        "`": "",
-        "'": "",
-        "‘": "",
-        "’": "",
-        "‚": "",
-        "‛": "",
-        "«": "",
-        "»": "",
-        "“": "",
-        "”": "",
-        "„": "",
-        "‟": "",
-        "‹": "",
-        "›": "",
-        "〝": "",
-        "〞": "",
-        "〟": "",
-        "＂": "",
-    }
-)
-
-
 def normalize_db_text(value):
+    """Ключ дедупликации: NFKC-нормализация, casefold и только буквы и цифры.
+
+    Любые разделители, пробелы и пунктуация отбрасываются, поэтому «Вася & Петя»,
+    «Вася +Петя» и «ВасяПетя» дают один ключ. Слова при этом не удаляются —
+    «Song (Remix)» и «Song» остаются разными.
+    """
     if not value:
         return ""
-    normalized = str(value).translate(DB_QUOTE_TRANSLATION)
-    return " ".join(normalized.split()).casefold()
+    text = unicodedata.normalize("NFKC", str(value)).casefold()
+    return "".join(char for char in text if char.isalnum())
 
 
 class DatabaseManager:
@@ -81,9 +64,19 @@ class DatabaseManager:
     def _create_table(self):
         with sqlite3.connect(self.path) as conn:
             conn.execute(
-                "CREATE TABLE IF NOT EXISTS downloads (id TEXT PRIMARY KEY, artist TEXT, title TEXT, site TEXT, timestamp DATETIME, src TEXT, filename TEXT, filesize INTEGER)"
+                "CREATE TABLE IF NOT EXISTS downloads (id TEXT PRIMARY KEY, artist TEXT, title TEXT, site TEXT, timestamp DATETIME, src TEXT, filename TEXT, filesize INTEGER, filehash TEXT)"
             )
             conn.execute("DROP TABLE IF EXISTS allsongs")
+
+            # Старые БД создавались без filehash: добавляем колонку на месте.
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(downloads)")}
+            if "filehash" not in columns:
+                conn.execute("ALTER TABLE downloads ADD COLUMN filehash TEXT")
+
+            # Индекс снимаем до перенормализации: при более широком ключе разные
+            # прежде строки могут схлопнуться в один `artist/title`, и UPDATE
+            # нарушил бы ещё живой UNIQUE до того, как отработает дедуп ниже.
+            conn.execute("DROP INDEX IF EXISTS idx_downloads_artist_title")
 
             rows = conn.execute("SELECT id, artist, title FROM downloads").fetchall()
             conn.executemany(
@@ -101,15 +94,41 @@ class DatabaseManager:
                 ") AS duplicate_number FROM downloads"
                 ") WHERE duplicate_number > 1)"
             )
-            conn.execute("DROP INDEX IF EXISTS idx_downloads_artist_title")
+            # Одинаковый filehash — тот же файл под другим именем: оставляем самую
+            # свежую строку, остальные с этим хешем удаляем (NULL не трогаем).
+            conn.execute("DROP INDEX IF EXISTS idx_downloads_filehash")
+            conn.execute(
+                "DELETE FROM downloads WHERE id IN ("
+                "SELECT id FROM ("
+                "SELECT id, ROW_NUMBER() OVER ("
+                "PARTITION BY filehash ORDER BY timestamp DESC, id DESC"
+                ") AS duplicate_number FROM downloads WHERE filehash IS NOT NULL"
+                ") WHERE duplicate_number > 1)"
+            )
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_downloads_artist_title "
                 "ON downloads(artist, title)"
+            )
+            # Частичный UNIQUE: одна строка на содержимое; строки без хеша (NULL) —
+            # в том числе намеренно записанные дубликаты — не ограничиваются.
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_downloads_filehash "
+                "ON downloads(filehash) WHERE filehash IS NOT NULL"
             )
 
     def is_downloaded(self, track_id):
         with sqlite3.connect(self.path) as conn:
             cur = conn.execute("SELECT 1 FROM downloads WHERE id = ?", (track_id,))
+            return cur.fetchone() is not None
+
+    def is_downloaded_by_hash(self, filehash):
+        """Проверка по SHA-256 содержимого: тот же файл мог прийти под другим именем."""
+        if not filehash:
+            return False
+        with sqlite3.connect(self.path) as conn:
+            cur = conn.execute(
+                "SELECT 1 FROM downloads WHERE filehash = ? LIMIT 1", (filehash,)
+            )
             return cur.fetchone() is not None
 
     def is_downloaded_by_artist_title(self, artist, title):
@@ -121,14 +140,16 @@ class DatabaseManager:
             )
             return cur.fetchone() is not None
 
-    def add_record(self, track_id, artist, title, site, src=None, filename=None, filesize=None):
+    def add_record(self, track_id, artist, title, site, src=None, filename=None, filesize=None, filehash=None):
         timestamp = datetime.now().isoformat()
         artist_normalized = normalize_db_text(artist)
         title_normalized = normalize_db_text(title)
         with sqlite3.connect(self.path) as conn:
             conn.execute(
-                "INSERT INTO downloads (id, artist, title, site, timestamp, src, filename, filesize) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (track_id, artist_normalized, title_normalized, site, timestamp, src, filename, filesize),
+                "INSERT OR IGNORE INTO downloads "
+                "(id, artist, title, site, timestamp, src, filename, filesize, filehash) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (track_id, artist_normalized, title_normalized, site, timestamp, src, filename, filesize, filehash),
             )
 
 
@@ -317,7 +338,11 @@ class DownloadLimitExceeded(OSError):
 
 
 def save_response(response, download_paths, filename, expected_size=0):
-    """Сохраняет поток во все каталоги, не превышая доступный для трека объём."""
+    """Сохраняет поток во все каталоги, не превышая доступный для трека объём.
+
+    Возвращает ``(число_байт, список_путей, sha256_hex)`` — хеш считается по
+    фактически записанному содержимому и используется для дедупликации.
+    """
     if not download_paths:
         raise ValueError("Не заданы папки для сохранения")
     # ponytail: бюджет рассчитан для одного писателя; для параллельных нужны квоты файловой системы.
@@ -339,6 +364,7 @@ def save_response(response, download_paths, filename, expected_size=0):
     temp_paths = []
     final_paths = []
     downloaded_bytes = 0
+    digest = hashlib.sha256()
     try:
         with ExitStack() as stack:
             for folder in download_paths:
@@ -356,6 +382,7 @@ def save_response(response, download_paths, filename, expected_size=0):
                         f"Лимит папки {limiting_path}: трек превышает доступные {available} байт"
                     )
                 downloaded_bytes += len(chunk)
+                digest.update(chunk)
                 for file_obj in files:
                     file_obj.write(chunk)
 
@@ -364,7 +391,7 @@ def save_response(response, download_paths, filename, expected_size=0):
 
         for temp_path, final_path in zip(temp_paths, final_paths, strict=True):
             os.replace(temp_path, final_path)
-        return downloaded_bytes, final_paths
+        return downloaded_bytes, final_paths, digest.hexdigest()
     except Exception:
         for temp_path in temp_paths:
             with suppress(OSError):
@@ -519,13 +546,26 @@ def run():
                             logger.info(f"Соединение установлено (код: {r.status_code})", extra={"site": s_name})
 
                             logger.info(f"Сохраняю файл: {clean_fn}", extra={"site": s_name})
-                            downloaded_bytes, saved_paths = save_response(
+                            downloaded_bytes, saved_paths, filehash = save_response(
                                 r, download_paths, clean_fn, content_length
                             )
 
-                            # Применение прав доступа к файлу без смены владельца
-                            for saved_path in saved_paths:
-                                apply_file_permissions(saved_path, perm_cfg)
+                            # Тот же файл уже скачан (другое имя/источник): физические
+                            # копии удаляем. ID фиксируем, чтобы не качать снова, но с
+                            # filehash=NULL — иначе нарушится частичный UNIQUE-индекс.
+                            duplicate = db.is_downloaded_by_hash(filehash)
+                            if duplicate:
+                                for saved_path in saved_paths:
+                                    with suppress(OSError):
+                                        os.remove(saved_path)
+                                logger.info(
+                                    f"Дубликат по содержимому, копии удалены: {clean_fn}",
+                                    extra={"site": s_name},
+                                )
+                            else:
+                                # Применение прав доступа к файлу без смены владельца
+                                for saved_path in saved_paths:
+                                    apply_file_permissions(saved_path, perm_cfg)
 
                             db.add_record(
                                 track_key,
@@ -535,10 +575,12 @@ def run():
                                 t.get("src") or t.get("referer") or t.get("download_url"),
                                 clean_fn,
                                 downloaded_bytes,
+                                None if duplicate else filehash,
                             )
-                            site_data["processed_count"] += 1
-                            logger.info(f"Успешно скачан: {clean_fn} ({downloaded_bytes} байт)", extra={"site": s_name})
-                            time.sleep(1.2)
+                            if not duplicate:
+                                site_data["processed_count"] += 1
+                                logger.info(f"Успешно скачан: {clean_fn} ({downloaded_bytes} байт)", extra={"site": s_name})
+                                time.sleep(1.2)
                         else:
                             logger.error(f"Ошибка соединения (код: {r.status_code})", extra={"site": s_name})
                 except DownloadLimitExceeded as e:
