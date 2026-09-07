@@ -106,7 +106,23 @@ def test_api_errors_and_empty_not_silent(session, caplog, category, failure):
     assert any(record.levelno == expected_level for record in caplog.records)
     assert all(record.site == "jamendo_com" for record in caplog.records)
     assert "JAMENDO:" in caplog.text
-    assert session.get.call_count == 1
+    if category == "/":
+        expected_calls = 1 + len(jamendo._API_RETRY_DELAYS)
+    else:
+        expected_calls = 1 if failure in ("empty", "disabled") else 1 + len(jamendo._API_RETRY_DELAYS)
+    assert session.get.call_count == expected_calls
+
+
+def test_api_tracks_recovers_after_transient_empty_response(session, caplog):
+    caplog.set_level(logging.INFO)
+    session.get.side_effect = [
+        Mock(status_code=200, json=lambda: {"headers": {"status": "success"}, "results": []}),
+        Mock(status_code=200, json=lambda: {"headers": {"status": "success"}, "results": [TRACK.copy()]}),
+    ]
+    tracks = jamendo.get_tracks(session, BASE_URL, "/")
+    assert len(tracks) == 1
+    assert tracks[0]["id"] == "123456"
+    assert session.get.call_count == 2
 
 
 @pytest.mark.parametrize("payload", [None, {}, {"headers": None}, {"headers": {"status": "success"}, "results": {}}])

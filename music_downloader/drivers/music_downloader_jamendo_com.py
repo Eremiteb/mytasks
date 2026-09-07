@@ -14,6 +14,7 @@ _MP3_URL_TEMPLATE = "https://mp3d.jamendo.com/?trackid={track_id}&format=mp32"
 _API_FILE_TEMPLATE = "https://api.jamendo.com/v3.0/tracks/file?client_id={client_id}&id={track_id}"
 _API_PLAYLIST_TRACKS = "https://api.jamendo.com/v3.0/playlists/tracks/"
 _API_TRACKS = "https://api.jamendo.com/v3.0/tracks/"
+_API_RETRY_DELAYS = (1, 3, 5)
 _CONFIG_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "music_downloader.json"
 )
@@ -209,42 +210,73 @@ def _fetch_tracks(session, client_id):
         "limit": 200,
         "order": "releasedate_desc",
     }
-    try:
-        resp = session.get(_API_TRACKS, params=params, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        logger.error(f"JAMENDO: / — не удалось получить JSON из tracks API: {e}")
-        return []
-
-    headers = data.get("headers") if isinstance(data, dict) else None
-    if not isinstance(headers, dict):
-        logger.error("JAMENDO: / — некорректный ответ tracks API: отсутствует объект headers")
-        return []
-    if headers.get("status") != "success":
-        err = headers.get("error_message") or "неизвестная ошибка API"
-        logger.error(f"JAMENDO: / — ошибка tracks API: {err}")
-        return []
-    if headers.get("warnings"):
-        logger.warning(f"JAMENDO: / — предупреждение tracks API: {headers['warnings']}")
-
-    results = data.get("results")
-    if not isinstance(results, list):
-        logger.error("JAMENDO: / — некорректный ответ tracks API: results не является списком")
-        return []
-    tracks = []
-    for entry in results:
-        # audiodownload_allowed — поле ответа, а не параметр фильтрации API.
-        if not isinstance(entry, dict) or entry.get("audiodownload_allowed") is not True:
+    last_error = None
+    last_error_level = logging.ERROR
+    attempt = 0
+    for delay in (0, *_API_RETRY_DELAYS):
+        if delay:
+            time.sleep(delay)
+        attempt += 1
+        try:
+            resp = session.get(_API_TRACKS, params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            last_error = f"не удалось получить JSON из tracks API: {e}"
+            last_error_level = logging.ERROR
             continue
-        download_url = entry.get("audiodownload")
-        if not isinstance(download_url, str) or not download_url.strip():
+
+        headers = data.get("headers") if isinstance(data, dict) else None
+        if not isinstance(headers, dict):
+            last_error = "некорректный ответ tracks API: отсутствует объект headers"
+            last_error_level = logging.ERROR
             continue
-        track = _extract_track_from_entry(entry)
-        if track:
-            track["download_url"] = download_url
-            tracks.append(track)
-    return _dedupe_tracks(tracks)
+        if headers.get("status") != "success":
+            err = headers.get("error_message") or "неизвестная ошибка API"
+            last_error = f"ошибка tracks API: {err}"
+            last_error_level = logging.ERROR
+            continue
+        if headers.get("warnings"):
+            logger.warning(f"JAMENDO: / — предупреждение tracks API: {headers['warnings']}")
+
+        results = data.get("results")
+        if not isinstance(results, list):
+            last_error = "некорректный ответ tracks API: results не является списком"
+            last_error_level = logging.ERROR
+            continue
+        if not results:
+            last_error = "API вернул пустой список results"
+            last_error_level = logging.WARNING
+            continue
+
+        tracks = []
+        for entry in results:
+            # audiodownload_allowed — поле ответа, а не параметр фильтрации API.
+            if not isinstance(entry, dict) or entry.get("audiodownload_allowed") is not True:
+                continue
+            download_url = entry.get("audiodownload")
+            if not isinstance(download_url, str) or not download_url.strip():
+                continue
+            track = _extract_track_from_entry(entry)
+            if track:
+                track["download_url"] = download_url
+                tracks.append(track)
+
+        deduped = _dedupe_tracks(tracks)
+        if not deduped:
+            last_error = "в ответе API нет треков с разрешённым audiodownload"
+            last_error_level = logging.WARNING
+            continue
+
+        if attempt > 1:
+            logger.info(f"JAMENDO: / — список получен после попытки {attempt}")
+        return deduped
+
+    if last_error_level == logging.ERROR:
+        logger.error(f"JAMENDO: / — не удалось получить треки за {attempt} попыток ({last_error})")
+    else:
+        logger.warning(f"JAMENDO: / — не удалось получить треки за {attempt} попыток ({last_error})")
+    return []
 
 
 def _fetch_playlist_tracks(session, playlist_id, client_id):
@@ -259,28 +291,43 @@ def _fetch_playlist_tracks(session, playlist_id, client_id):
             "limit": limit,
             "offset": offset,
         }
-        try:
-            resp = session.get(_API_PLAYLIST_TRACKS, params=params, timeout=30)
-            resp.raise_for_status()
-        except Exception as e:
-            logger.error(f"JAMENDO: плейлист {playlist_id} — ошибка запроса API: {e}")
+        results = None
+        headers = {}
+        last_error = None
+        attempt = 0
+        for delay in (0, *_API_RETRY_DELAYS):
+            if delay:
+                time.sleep(delay)
+            attempt += 1
+            try:
+                resp = session.get(_API_PLAYLIST_TRACKS, params=params, timeout=30)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as e:
+                last_error = f"ошибка запроса API: {e}"
+                continue
+
+            headers = data.get("headers", {}) if isinstance(data, dict) else {}
+            if headers.get("status") != "success":
+                err = headers.get("error_message") or "неизвестная ошибка API"
+                last_error = f"ошибка API: {err}"
+                continue
+            if headers.get("warnings"):
+                logger.warning(f"JAMENDO: плейлист {playlist_id} — предупреждение API: {headers['warnings']}")
+
+            raw_results = data.get("results")
+            if isinstance(raw_results, list):
+                results = raw_results
+                break
+            last_error = "results не является списком"
+
+        if results is None:
+            logger.error(
+                f"JAMENDO: плейлист {playlist_id} — не удалось получить страницу (offset {offset}) "
+                f"за {attempt} попыток: {last_error}"
+            )
             return []
 
-        try:
-            data = resp.json()
-        except Exception as e:
-            logger.error(f"JAMENDO: плейлист {playlist_id} — ответ API не является JSON: {e}")
-            return []
-
-        headers = data.get("headers", {}) if isinstance(data, dict) else {}
-        if headers.get("status") != "success":
-            err = headers.get("error_message") or "неизвестная ошибка API"
-            logger.error(f"JAMENDO: плейлист {playlist_id} — ошибка API: {err}")
-            return []
-        if headers.get("warnings"):
-            logger.warning(f"JAMENDO: плейлист {playlist_id} — предупреждение API: {headers['warnings']}")
-
-        results = data.get("results", []) if isinstance(data, dict) else []
         if not results:
             break
 

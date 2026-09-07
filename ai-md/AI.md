@@ -117,7 +117,7 @@ music_downloader/venv/bin/ruff check music_downloader/
 
 ### Jamendo
 
-- Категория `/` получает из официального `tracks` API одну страницу до 200 последних треков (`releasedate_desc`), `/playlist/<ID>` использует API плейлистов.
+- Категория `/` получает из официального `tracks` API одну страницу до 200 последних треков (`releasedate_desc`), `/playlist/<ID>` использует API плейлистов. Периодические пустые ответы CDN и сбои API повторяются по `_API_RETRY_DELAYS` (`1, 3, 5` с).
 - Принимать только записи с `audiodownload_allowed: true` и непустым `audiodownload`; не подменять его потоковым `audio`. Нужен `client_id` сайта либо `JAMENDO_CLIENT_ID`.
 - Ошибки API и пустые результаты логировать по-русски с `site=jamendo_com`. Проверки метаданных не должны скачивать аудио.
 
