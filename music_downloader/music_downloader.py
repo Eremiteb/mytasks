@@ -64,14 +64,25 @@ class DatabaseManager:
     def _create_table(self):
         with sqlite3.connect(self.path) as conn:
             conn.execute(
-                "CREATE TABLE IF NOT EXISTS downloads (id TEXT PRIMARY KEY, artist TEXT, title TEXT, site TEXT, timestamp DATETIME, src TEXT, filename TEXT, filesize INTEGER, filehash TEXT)"
+                "CREATE TABLE IF NOT EXISTS downloads ("
+                "id TEXT PRIMARY KEY, artist TEXT, title TEXT, "
+                "original_artist TEXT, original_title TEXT, site TEXT, "
+                "timestamp DATETIME, src TEXT, filename TEXT, filesize INTEGER, filehash TEXT)"
             )
             conn.execute("DROP TABLE IF EXISTS allsongs")
 
-            # Старые БД создавались без filehash: добавляем колонку на месте.
             columns = {row[1] for row in conn.execute("PRAGMA table_info(downloads)")}
-            if "filehash" not in columns:
-                conn.execute("ALTER TABLE downloads ADD COLUMN filehash TEXT")
+            for column in ("original_artist", "original_title", "filehash"):
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE downloads ADD COLUMN {column} TEXT")
+
+            # В старых строках точное исходное написание уже могло быть потеряно,
+            # поэтому сохраняем лучшее доступное значение до очередной нормализации.
+            conn.execute(
+                "UPDATE downloads SET "
+                "original_artist = COALESCE(original_artist, artist), "
+                "original_title = COALESCE(original_title, title)"
+            )
 
             # Индекс снимаем до перенормализации: при более широком ключе разные
             # прежде строки могут схлопнуться в один `artist/title`, и UPDATE
@@ -140,16 +151,41 @@ class DatabaseManager:
             )
             return cur.fetchone() is not None
 
-    def add_record(self, track_id, artist, title, site, src=None, filename=None, filesize=None, filehash=None):
+    def add_record(
+        self,
+        track_id,
+        artist,
+        title,
+        site,
+        src=None,
+        filename=None,
+        filesize=None,
+        filehash=None,
+        original_artist=None,
+        original_title=None,
+    ):
         timestamp = datetime.now().isoformat()
         artist_normalized = normalize_db_text(artist)
         title_normalized = normalize_db_text(title)
         with sqlite3.connect(self.path) as conn:
             conn.execute(
                 "INSERT OR IGNORE INTO downloads "
-                "(id, artist, title, site, timestamp, src, filename, filesize, filehash) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (track_id, artist_normalized, title_normalized, site, timestamp, src, filename, filesize, filehash),
+                "(id, artist, title, original_artist, original_title, site, "
+                "timestamp, src, filename, filesize, filehash) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    track_id,
+                    artist_normalized,
+                    title_normalized,
+                    artist if original_artist is None else original_artist,
+                    title if original_title is None else original_title,
+                    site,
+                    timestamp,
+                    src,
+                    filename,
+                    filesize,
+                    filehash,
+                ),
             )
 
 
@@ -491,10 +527,14 @@ def run():
                     if db.is_downloaded(track_key):
                         continue
                     # Проверка на существование только по artist/title (в нижнем регистре)
-                    artist = capitalize_first(t.get("artist")) or "Unknown Artist"
-                    title = capitalize_first(t.get("title")) or "Unknown Title"
+                    original_artist = (t.get("artist") or "").strip()
+                    original_title = (t.get("title") or "").strip()
+                    artist = capitalize_first(original_artist) or "Unknown Artist"
+                    title = capitalize_first(original_title) or "Unknown Title"
                     t["artist"] = artist
                     t["title"] = title
+                    t["_original_artist"] = original_artist or artist
+                    t["_original_title"] = original_title or title
                     identity = track_identity(artist, title)
                     if identity not in queued_tracks and not db.is_downloaded_by_artist_title(artist, title):
                         t["_site_cfg"] = s_cfg
@@ -576,6 +616,8 @@ def run():
                                 clean_fn,
                                 downloaded_bytes,
                                 None if duplicate else filehash,
+                                t["_original_artist"],
+                                t["_original_title"],
                             )
                             if not duplicate:
                                 site_data["processed_count"] += 1

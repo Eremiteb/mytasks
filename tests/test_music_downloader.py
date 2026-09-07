@@ -138,7 +138,7 @@ class TestMusicDownloader(unittest.TestCase):
             driver = root / "driver.py"
             driver.write_text(
                 "def get_tracks(scraper, base_url, category):\n"
-                "    return [{'id': '1', 'artist': 'Artist', 'title': base_url, "
+                "    return [{'id': '1', 'artist': 'artist', 'title': base_url, "
                 "'download_url': 'https://example.com/track.mp3'}]\n",
                 encoding="utf-8",
             )
@@ -177,6 +177,12 @@ class TestMusicDownloader(unittest.TestCase):
                     self.assertEqual((Path(folder["path"]) / f"Artist - {title}.mp3").read_bytes(), body)
             with sqlite3.connect(root / "db.sqlite") as conn:
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM downloads").fetchone()[0], 2)
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT original_artist, original_title FROM downloads ORDER BY id"
+                    ).fetchall(),
+                    [("artist", "First"), ("artist", "Second")],
+                )
 
     def test_run_resolves_only_new_chart_track_after_deduplication(self):
         with tempfile.TemporaryDirectory() as root:
@@ -377,7 +383,7 @@ class TestMusicDownloader(unittest.TestCase):
                     "INSERT INTO downloads VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     [
                         ("old", "ӘСЕМ", "  Ән  ", "one", "2026-01-01", None, "old.mp3", 1),
-                        ("new", "әсем", "ән", "two", "2026-01-02", None, "new.mp3", 2),
+                        ("new", "Әсем", "ӘН!", "two", "2026-01-02", None, "new.mp3", 2),
                     ],
                 )
 
@@ -389,7 +395,13 @@ class TestMusicDownloader(unittest.TestCase):
                     conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='allsongs'").fetchone()
                 )
                 columns = {row[1] for row in conn.execute("PRAGMA table_info(downloads)")}
-                self.assertIn("filehash", columns)
+                self.assertTrue({"original_artist", "original_title", "filehash"} <= columns)
+                self.assertEqual(
+                    conn.execute(
+                        "SELECT artist, title, original_artist, original_title FROM downloads"
+                    ).fetchone(),
+                    ("әсем", "ән", "Әсем", "ӘН!"),
+                )
                 with self.assertRaises(sqlite3.IntegrityError):
                     conn.execute(
                         "INSERT INTO downloads (id, artist, title, site, timestamp, src, filename, filesize) "
