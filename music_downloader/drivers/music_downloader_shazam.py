@@ -17,6 +17,8 @@ def _load_driver(name):
     """Загружает соседний драйвер по пути: движок не добавляет каталог загрузчика в sys.path."""
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"{name}.py")
     spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Не удалось загрузить драйвер {name} из {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -62,7 +64,8 @@ def parse_chart(html):
     """Извлекает полный мировой Top 200, не смешивая его с рекомендациями."""
     soup = BeautifulSoup(html, "html.parser")
     canonical = soup.select_one('link[rel="canonical"]')
-    canonical_url = urlsplit(canonical.get("href", "") if canonical else "")
+    canonical_href = canonical.get("href") if canonical else None
+    canonical_url = urlsplit(canonical_href if isinstance(canonical_href, str) else "")
     if (
         canonical_url.hostname not in ("shazam.com", "www.shazam.com")
         or not canonical_url.path.rstrip("/").endswith("/charts/top-200/world")
@@ -89,7 +92,10 @@ def parse_chart(html):
         rank = card.select_one('[class*="SongItem-module_rankingNumber"]')
         if title is None or artist is None or rank is None:
             raise ValueError("В карточке чарта нет названия, исполнителя или позиции")
-        song_id = re.search(r"/song/(\d+)(?:/|$)", title.get("href", ""))
+        title_href = title.get("href")
+        if not isinstance(title_href, str):
+            raise ValueError("В карточке чарта отсутствует ссылка на песню")
+        song_id = re.search(r"/song/(\d+)(?:/|$)", title_href)
         if song_id is None:
             raise ValueError("В карточке чарта отсутствует идентификатор песни")
         tracks.append({
@@ -98,7 +104,7 @@ def parse_chart(html):
             "rank": int(rank.get_text(strip=True)),
             "artist": unescape(artist.get_text(" ", strip=True)),
             "title": unescape(title.get_text(" ", strip=True)),
-            "src": urljoin("https://www.shazam.com", title["href"]),
+            "src": urljoin("https://www.shazam.com", title_href),
         })
     if (
         len(tracks) != 200

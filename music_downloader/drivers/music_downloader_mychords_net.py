@@ -15,7 +15,8 @@ def parse_listing(html, base_url):
     """Возвращает записи списка новинок: ID и адрес страницы трека, исполнитель и название."""
     tracks = []
     for link in BeautifulSoup(html, "html.parser").select("li.b-listing__full__item a.b-listing__full__item__name"):
-        href = link.get("href", "")
+        href_value = link.get("href")
+        href = href_value if isinstance(href_value, str) else ""
         track_id = _TRACK_ID_RE.search(href)
         if track_id is None:
             continue
@@ -35,8 +36,12 @@ def parse_player_url(html, base_url):
     player = BeautifulSoup(html, "html.parser").select_one("div.b-words__player[data-src]")
     if player is None:
         return None
-    iframe = BeautifulSoup(player["data-src"], "html.parser").find("iframe", src=True)
-    return urljoin(base_url, iframe["src"]) if iframe else None
+    player_html = player.get("data-src")
+    if not isinstance(player_html, str):
+        return None
+    iframe = BeautifulSoup(player_html, "html.parser").find("iframe", src=True)
+    iframe_src = iframe.get("src") if iframe else None
+    return urljoin(base_url, iframe_src) if isinstance(iframe_src, str) else None
 
 
 def parse_player_file(html):
@@ -44,7 +49,10 @@ def parse_player_file(html):
     file_tag = BeautifulSoup(html, "html.parser").select_one("#file[data-mp3]")
     if file_tag is None:
         return None
-    download_url = file_tag["data-mp3"].strip()
+    download_value = file_tag.get("data-mp3")
+    if not isinstance(download_value, str):
+        return None
+    download_url = download_value.strip()
     if urlsplit(download_url).scheme not in ("http", "https"):
         return None
     return download_url

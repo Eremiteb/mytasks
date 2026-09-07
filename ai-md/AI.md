@@ -133,7 +133,7 @@ music_downloader/venv/bin/ruff check music_downloader/
 - `music_downloader.sh` активирует `music_downloader/venv`, если он есть, запускает `music_downloader.py`, деактивирует venv и вызывает `split_by_dash.sh` только при коде `0`; у сортировщика отдельная настройка пути.
 - Ошибки отдельных драйверов и треков логируются, но общий код может оставаться `0`; отсутствие JSON-файла сейчас также возвращает `0` без загрузки.
 - Логи движка — `logs/music_downloader_engine-<timestamp>.jsonl`, отдельно от логов обёртки `logs/music_downloader-<timestamp>.jsonl`.
-- `tests/test_music_downloader.py` импортирует отслеживаемые исходники `music_downloader/` напрямую; перед Python-тестами установить requirements. Актуальная связанная документация: корневой README, этот файл и `music_downloader/README.md`; старые заметки QNAP не являются changelog загрузчика.
+- `tests/test_music_downloader.py` загружает `music_downloader/music_downloader.py` напрямую через `spec_from_file_location`, чтобы Zed не принимал одноимённый каталог за namespace-пакет; перед Python-тестами установить requirements. Актуальная связанная документация: корневой README, этот файл и `music_downloader/README.md`; старые заметки QNAP не являются changelog загрузчика.
 
 ## Библиотека `/mnt/copy/Books`
 

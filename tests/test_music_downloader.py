@@ -1,18 +1,24 @@
 import hashlib
+import importlib.util
 import json
 import os
 import sqlite3
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-# Добавляем путь к music_downloader в sys.path для импорта
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "music_downloader")))
+MODULE_PATH = Path(__file__).resolve().parents[1] / "music_downloader" / "music_downloader.py"
+SPEC = importlib.util.spec_from_file_location("music_downloader_engine", MODULE_PATH)
+assert SPEC is not None and SPEC.loader is not None
+music_downloader = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(music_downloader)
 
-import music_downloader
-from music_downloader import DatabaseManager, capitalize_first, safe_filename, save_response, track_identity
+DatabaseManager = music_downloader.DatabaseManager
+capitalize_first = music_downloader.capitalize_first
+safe_filename = music_downloader.safe_filename
+save_response = music_downloader.save_response
+track_identity = music_downloader.track_identity
 
 class TestMusicDownloader(unittest.TestCase):
     def test_safe_filename(self):
@@ -66,7 +72,7 @@ class TestMusicDownloader(unittest.TestCase):
 
             self.assertEqual(size, 6)
             self.assertEqual(filehash, hashlib.sha256(b"abcdef").hexdigest())
-            self.assertEqual([open(path, "rb").read() for path in saved], [b"abcdef", b"abcdef"])
+            self.assertEqual([Path(path).read_bytes() for path in saved], [b"abcdef", b"abcdef"])
             self.assertFalse(any(os.path.exists(f"{path}.part") for path in saved))
 
     def test_save_response_removes_partial_files_on_size_mismatch(self):
