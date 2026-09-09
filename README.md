@@ -47,25 +47,13 @@ Shell-скрипты в корне репозитория используют �
 
 ### Единый шаблон логов
 
-Единый шаблон хранится в `conf/log_template.conf`.
-
-Для коммита в репозиторий используйте пример `conf/log_template.conf.example`.
-
-Shell-скрипты с JSONL-логированием читают этот файл, если он доступен, и
-пишут унифицированные поля, подходящие для ELK/OpenSearch, Loki, Graylog и
-Splunk:
-
-- `@timestamp`
-- `schema.version`
-- `compat.targets`
-- `log.level`
-- `message`
-- `event.action`
-- `service.name`
-
-Также сохраняются служебные поля совместимости (`script`, `event`, `msg`, `detail`, `rc` и т.д.), чтобы не ломать существующие разборщики.
-
-Это упрощает сопровождение, делает поведение скриптов предсказуемым и улучшает диагностику ошибок.
+Шаблон — `conf/log_template.conf` (пример для коммита: `conf/log_template.conf.example`).
+Shell-скрипты с JSONL-логированием читают его, если он доступен, и пишут
+унифицированные поля, подходящие для ELK/OpenSearch, Loki, Graylog и Splunk
+(`@timestamp`, `schema.version`, `compat.targets`, `log.level`, `message`,
+`event.action`, `service.name`), плюс служебные поля совместимости
+(`script`, `event`, `msg`, `detail`, `rc` и т.д.), чтобы не ломать
+существующие разборщики.
 
 ---
 
@@ -796,53 +784,17 @@ Jamendo для категории `/` использует официальны�
 
 ---
 
-## Тесты (bats-core)
+## Тесты и статический анализ
 
-Каталог `tests/` содержит отдельные Bats-тесты для актуальных shell-скриптов
-и общий `all_scripts_syntax.bats`, который проверяет синтаксис каждого
-корневого `*.sh` по его шебангу. Внешние команды стабируются через временный
-`PATH`; для `system_monitor.sh` настоящими остаются `sqlite3` и `jq`.
+Полные команды (установка bats-core, запуск отдельного набора, ShellCheck,
+`python3 -m py_compile` и т.д.) и правила именования — в разделе
+«Валидация» [`ai-md/AI.md`](ai-md/AI.md), не дублируются здесь.
 
-Установка и полный запуск:
-
-```sh
-git clone --depth 1 https://github.com/bats-core/bats-core.git /tmp/bats-core
-sudo /tmp/bats-core/install.sh /usr/local
-bats --print-output-on-failure tests
-```
-
-Запуск одного набора:
-
-```sh
-bats --print-output-on-failure tests/cloud_backup_qnap.bats
-```
-
-**GitHub CI:**
-- Workflow: `.github/workflows/bats-tests.yml`
-- Запускается автоматически на `push` и `pull_request`
-
-## Статический анализ и проверки стиля
-
-При изменении корневых `*.sh` или `*.py` запускается workflow статического
-анализа.
-
-**GitHub CI:** `.github/workflows/shellcheck.yml`
-
-| Шаг | Что проверяется |
-|---|---|
-| ShellCheck error | Ошибки и предупреждения уровня `error` (блокируют merge) |
-| ShellCheck style | Предупреждения уровня `style` (предпочтительный `[[ ]]`, braces, `case *)`…) |
-| bash/sh syntax | `bash -n` или `sh -n` по shebang для каждого `.sh` |
-| Unbraced variable scan | grep-сканнер небракетированных `$VAR` в локальном bash-коде (не в remote-shell строках) |
-| Python syntax | `python3 -m py_compile` для каждого `.py` в корне |
-
-Workflow запускается при изменении `*.sh` или `*.py`.
-
-Перед локальной отправкой изменений shell-скрипта дополнительно выполняйте
-все опциональные проверки ShellCheck:
-
-```sh
-bash -n path/to/script.sh
-shellcheck -S style path/to/script.sh
-shellcheck -o all path/to/script.sh
-```
+Кратко: `tests/` — по Bats-файлу на актуальный корневой скрипт плюс общий
+`all_scripts_syntax.bats` (синтаксис каждого `*.sh` по шебангу); внешние
+команды стабируются через временный `PATH` (для `system_monitor.sh`
+настоящими остаются `sqlite3` и `jq`). CI — два независимых workflow:
+`.github/workflows/bats-tests.yml` (все Bats-тесты на каждый push/PR) и
+`.github/workflows/shellcheck.yml` (ShellCheck `error`+`style`, синтаксис
+`bash -n`/`sh -n`, сканер небракетированных `$VAR`, `py_compile` — только
+при изменении `*.sh`/`*.py`).
