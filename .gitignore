@@ -47,6 +47,7 @@ state/*
 # HTML-отчёты system_monitor.sh (генерируются скриптом, привязаны к машине)
 system_reports/*
 !system_reports/.gitkeep
+reports/
 
 # Configuration files (keep directory structure)
 conf/*
