@@ -1,0 +1,34 @@
+# Живые русские субтитры к казахской речи (live_subtitles). Шаблон: установщик подставляет @...@.
+# Привязан к llama.cpp: перевод идёт через llama-server, поэтому сервис стартует после него и
+# останавливается вместе с ним (Requires + After). Окно рисуется в Wayland-сессии пользователя.
+[Unit]
+Description=Живые русские субтитры к казахской речи (llama.cpp)
+Requires=llama-server.service
+After=llama-server.service user@@UID@.service
+
+[Service]
+Type=simple
+User=@USER@
+Group=@USER@
+WorkingDirectory=@PROJECT@
+Environment=XDG_RUNTIME_DIR=/run/user/@UID@
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@UID@/bus
+Environment=WAYLAND_DISPLAY=@WAYLAND_DISPLAY@
+Environment=XDG_SESSION_TYPE=wayland
+Environment=HF_HOME=/var/lib/llama.cpp/hf-cache
+# В работе ничего не скачиваем: обновления приносит только live-subtitles-update.service.
+Environment=HF_HUB_OFFLINE=1
+# При загрузке системы Wayland-сессии ещё нет: ждём её сокет (до 15 мин), иначе юнит считается упавшим и перезапускается.
+ExecStartPre=/bin/sh -c 'until [ -S /run/user/@UID@/@WAYLAND_DISPLAY@ ]; do sleep 2; done'
+TimeoutStartSec=15min
+ExecStart=@PROJECT@/venv/bin/python -u @PROJECT@/subtitles.py --service
+# Перезапуск только при сбое: если субтитры закрыли правой кнопкой (код 0), сервис не оживает сам.
+Restart=on-failure
+RestartSec=10
+# Сервис не должен мешать работе и кодовым сессиям llama-server.
+Nice=10
+OOMScoreAdjust=300
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

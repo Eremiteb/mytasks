@@ -1,0 +1,14 @@
+# torch ставится из индекса cu128 (см. run.fish / README): --index-url https://download.pytorch.org/whl/cu128
+faster-whisper>=1.1
+# transformers нужен только для translator = "nllb"
+transformers>=4.45
+sentencepiece
+numpy
+PyQt6
+silero-vad
+# для manage_models.py (замеры) и тестов
+pyarrow
+soundfile
+jiwer
+sacrebleu
+pytest

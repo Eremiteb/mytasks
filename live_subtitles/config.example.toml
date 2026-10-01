@@ -1,0 +1,52 @@
+# Пример настроек. Скопируйте в config.toml и оставьте только нужные ключи:
+# всё, чего нет в config.toml, берётся из DEFAULTS в начале subtitles.py.
+
+# --- Звук ---
+audio_source = ""            # "" = monitor устройства вывода по умолчанию; иначе имя из `pactl list short sources`
+
+# --- Нарезка на фразы (VAD) ---
+vad_threshold = 0.5          # 0..1: выше — строже к «речи» (меньше срабатываний на музыку)
+vad_neg_threshold = 0.35     # ниже этого значения кадр считается тишиной
+min_silence_ms = 450         # пауза, после которой фраза считается законченной
+soft_phrase_ms = 2500        # после этой длины фраза режется по короткой паузе
+soft_silence_ms = 200        # короткая пауза для «мягкого» разреза
+max_phrase_ms = 5500         # жёсткий предел длины фразы
+min_speech_ms = 300          # более короткие всплески отбрасываются
+preroll_ms = 300             # пре-ролл: сколько звука до начала речи добавлять
+min_phrase_rms = 0.004       # фразы тише считаются шумом и не распознаются
+max_chars_per_sec = 30       # больше символов в секунду — галлюцинация Whisper
+max_compression_ratio = 2.4  # zlib-сжатие текста выше — зацикливание Whisper
+
+# --- Модели ---
+# Дообученный на казахском turbo (WER на FLEURS 10,4% против 22,9% у базовой); готовится convert_whisper.py.
+# Если каталога нет — берётся "large-v3-turbo".
+whisper_model = "/var/lib/llama.cpp/whisper-ct2/whisper-turbo-ksc2"
+whisper_beam_size = 5              # 1 — быстрее, 5 — чуть точнее (время почти не меняется)
+whisper_compute_type = "int8_float16"   # экономит ~1 ГБ VRAM (перевод быстрее); "float16" — максимум точности
+translator = "llama"               # "llama" — через llama-server (не ест VRAM под NLLB), "nllb" — локально
+llama_url = "http://127.0.0.1:8080/v1"
+llama_model = "qwen3.5-9b"        # секция из /etc/llama.cpp/models.ini; точнее, но медленнее (4–8 с) — "qwen3.6-35b-a3b"
+llama_timeout_sec = 30
+llama_load_timeout_sec = 300       # первая загрузка модели роутером
+nllb_model = "facebook/nllb-200-distilled-1.3B"   # либо "facebook/nllb-200-distilled-600M"
+nllb_beams = 2
+
+# --- Задержка ---
+max_lag_sec = 6.0            # фразы старше этого возраста пропускаются, чтобы не отставать
+
+# --- Окно ---
+show_original = true         # мелкий серый оригинал над переводом
+font_size_ru = 30           # русский перевод (левая колонка таблицы)
+font_size_kk = 26           # казахский оригинал (правая колонка)
+window_width_frac = 0.8      # ширина окна — доля ширины экрана
+bottom_margin_px = 60        # отступ от нижнего края экрана
+background_alpha = 190       # 0..255, прозрачность подложки
+clear_after_sec = 8.0        # через сколько секунд после последней фразы скрывать субтитры
+qt_platform = "wayland"      # "wayland" (нативно, нужно правило KWin) или "xcb" (через XWayland)
+layer_shell = true          # Wayland: слой Overlay (layer-shell-qt) — окно остаётся над полноэкранным видео
+follow_window = true         # привязать субтитры к окну браузера (KWin-скрипт), иначе — низ экрана
+browser_classes = ["firefox", "chrom", "brave", "vivaldi", "opera", "zen", "librewolf", "floorp", "edge"]   # подстроки класса окна
+show_indicator = true        # постоянный значок состояния (слушаю / слышу речь / перевожу / ошибка)
+max_height_frac = 0.4        # высота окна субтитров — доля высоты окна браузера; шрифт подгоняется, чтобы текст влез
+min_font_scale = 0.45        # нижний предел автоуменьшения шрифта
+lid_skip_sec = 12             # язык не проверять повторно, если казахская фраза была не более стольких секунд назад

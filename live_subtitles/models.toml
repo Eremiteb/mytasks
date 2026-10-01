@@ -1,0 +1,52 @@
+# Кандидаты для менеджера моделей (manage_models.py). Только этот список: произвольные
+# репозитории из интернета автоматически не подбираются и не скачиваются.
+
+# Выбор: среди кандидатов, укладывающихся в лимиты, берётся лучший по качеству (WER / chrF).
+[selection]
+asr_max_rtf = 0.15          # распознавание не медленнее 0,15 от длительности речи
+mt_max_p90_sec = 2.0        # 90-й перцентиль времени перевода одной фразы (Whisper при этом загружен)
+mt_tie_chrf = 0.5           # разница chrF меньше этой считается ничьей — побеждает более быстрый
+update_every_days = 7       # как часто проверять обновления и пересчитывать выбор
+# После выбора удалять всё, что не нужно в работе: проигравших кандидатов, необработанные веса (остаётся готовая
+# CTranslate2-модель) и перечисленные ниже лишние репозитории. Экономит диск; при следующем пересчёте нужное
+# скачается и сконвертируется заново. false — оставлять всё.
+prune_unused = true
+purge_repos = ["abilmansplus/whisper-turbo-kaz-rus-v1", "deepvk/kazRush-kk-ru"]
+
+# --- распознавание (faster-whisper / CTranslate2) ---
+# kind = "ct2-convert": репозиторий Hugging Face со safetensors, конвертируется в CTranslate2;
+# kind = "faster-whisper": готовая модель, которую сам скачивает faster-whisper.
+[[asr]]
+name = "whisper-turbo-ksc2"
+repo = "abilmansplus/whisper-turbo-ksc2"
+kind = "ct2-convert"
+
+[[asr]]
+name = "kazakh-whisper-large-v3-turbo"
+repo = "shyngys879/kazakh-whisper-large-v3-turbo"
+kind = "ct2-convert"
+
+[[asr]]
+name = "large-v3-turbo"
+repo = "large-v3-turbo"
+kind = "faster-whisper"
+
+# --- перевод kk -> ru ---
+# kind = "llama": секция /etc/llama.cpp/models.ini (должна быть в llama-server);
+# kind = "nllb": локальная модель Hugging Face (запасной вариант без llama-server).
+[[mt]]
+name = "qwen3.5-9b-translate"
+kind = "llama"
+
+[[mt]]
+name = "qwen3.5-9b"
+kind = "llama"
+
+[[mt]]
+name = "qwen3.6-35b-a3b"
+kind = "llama"
+
+[[mt]]
+name = "nllb-200-distilled-1.3B"
+repo = "facebook/nllb-200-distilled-1.3B"
+kind = "nllb"

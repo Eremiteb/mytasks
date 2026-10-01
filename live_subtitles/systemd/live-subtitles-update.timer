@@ -1,0 +1,12 @@
+[Unit]
+Description=Ежедневная проверка: не пора ли обновить и пересчитать модели live_subtitles
+
+[Timer]
+# Срабатывает ночью и через 20 минут после загрузки; сама служба решает (due), пора ли работать.
+OnCalendar=*-*-* 04:00:00
+OnBootSec=20min
+Persistent=true
+RandomizedDelaySec=15min
+
+[Install]
+WantedBy=timers.target
