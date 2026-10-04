@@ -97,13 +97,12 @@ Shell-скрипты с JSONL-логированием читают его, ес
 3. Выбирает компрессор на удалённом сервере: `zstd`, `pigz` или `gzip`
 4. Чистит корзины всех пользователей и версии файлов Nextcloud (`occ trashbin:cleanup --all-users`, `occ versions:cleanup`)
 5. (Опционально) оптимизирует MariaDB (`mariadb-check --optimize`, очистка `general.log`, опционально purge binlogs)
-6. (Опционально) оптимизирует Redis AOF (`BGREWRITEAOF`)
-7. Создаёт архив удалённой папки и сохраняет его в `BACKUP_DIR`
-8. Если архив за текущую дату уже существует и проходит проверку целостности, дозаписывает новый поток в тот же файл
-9. Если существующий архив пустой или повреждённый, удаляет его и создаёт заново
-10. Опускает WireGuard (если был поднят скриптом) — управляется параметром `WG_KEEP_UP`
+6. Создаёт архив удалённой папки и сохраняет его в `BACKUP_DIR`
+7. Если архив за текущую дату уже существует и проходит проверку целостности, дозаписывает новый поток в тот же файл
+8. Если существующий архив пустой или повреждённый, удаляет его и создаёт заново
+9. Опускает WireGuard (если был поднят скриптом) — управляется параметром `WG_KEEP_UP`
 
-**Зависимости:** `wg-quick`, `sshpass` (для опциональной оптимизации: `redis-cli` в соответствующем контейнере)
+**Зависимости:** `wg-quick`, `sshpass`
 
 **Конфигурация** (`conf/cloud_backup.conf`):
 
@@ -124,9 +123,6 @@ Shell-скрипты с JSONL-логированием читают его, ес
 | `MARIADB_SERVICE_NAME`           | `mariadb` | Имя MariaDB-сервиса в `docker compose`         |
 | `MARIADB_PURGE_BINLOGS`          | `0`       | Очистить старые binary logs (`PURGE BINARY LOGS`) |
 | `MARIADB_TRUNCATE_GENERAL_LOG`   | `1`       | Очистить `general.log` перед архивом           |
-| `OPTIMIZE_REDIS_BEFORE_BACKUP`   | `0`       | Выполнить `BGREWRITEAOF` для Redis             |
-| `REDIS_SERVICE_NAME`             | `redis`   | Имя Redis-сервиса в `docker compose`           |
-| `REDIS_REWRITE_WAIT_SEC`         | `180`     | Верхний предел ожидания `BGREWRITEAOF` (сек) — не типичная длительность: определение завершения устойчиво к CRLF в выводе `redis-cli INFO`, поэтому при штатной работе rewrite завершается за секунды, значение — лишь потолок на случай реальной проблемы |
 
 **Логи:** JSONL-файл `logs/cloud_backup-YYYY-MM-DD-HH-MM-SS.jsonl`. Хранится `BACKUP_KEEP_COUNT` последних файлов (тот же параметр, что и для архивов).
 
@@ -221,11 +217,7 @@ QNAP-версия `cloud_backup.sh` — то же резервное копир�
 | `MARIADB_SERVICE_NAME`           | `mariadb` | Имя MariaDB-сервиса в `docker compose`         |
 | `MARIADB_PURGE_BINLOGS`          | `0`       | Очистить старые binary logs                    |
 | `MARIADB_TRUNCATE_GENERAL_LOG`   | `1`       | Очистить `general.log` перед архивом           |
-| `OPTIMIZE_REDIS_BEFORE_BACKUP`   | `0`       | Выполнить `BGREWRITEAOF` для Redis             |
-| `REDIS_SERVICE_NAME`             | `valkey`  | Имя сервиса Redis/Valkey в `docker compose`    |
-| `REDIS_REWRITE_WAIT_SEC`         | `180`     | Верхний предел ожидания `BGREWRITEAOF` (сек), не типичная длительность (см. пояснение в разделе `cloud_backup.sh` выше) |
-| `REDIS_LOG_TAIL_LINES`           | `300`     | Число последних строк Redis/Valkey, сохраняемых перед `docker compose down` |
-| `DB_OPTIMIZE_INTERVAL_DAYS`      | `7`       | Интервал выполнения включённых оптимизаций MariaDB/Redis; дата последнего запуска хранится в `state/cloud_backup_qnap-db-optimize.state` |
+| `DB_OPTIMIZE_INTERVAL_DAYS`      | `7`       | Интервал выполнения включённой оптимизации MariaDB; дата последнего запуска хранится в `state/cloud_backup_qnap-db-optimize.state` |
 | `SSH_CIPHERS`                    | `chacha20-poly1305@openssh.com,aes128-gcm@openssh.com,aes256-gcm@openssh.com,aes128-ctr` | Приоритет SSH-шифров; `chacha20-poly1305` первым, т.к. на слабых ARM-чипах без аппаратного AES он обычно быстрее программного AES-GCM/CTR, а расшифровку входящего потока бэкапа выполняет именно QNAP |
 | `RAW_TRANSFER_ENABLED`           | `0`       | Передавать поток бэкапа через сырой TCP (`nc`/`ncat`) внутри WireGuard-туннеля в обход дополнительного слоя SSH-шифрования — см. раздел «Передача в обход SSH-шифрования» ниже. `0` — обычная передача через SSH (без изменений) |
 | `RAW_TRANSFER_PORT`              | `8873`    | TCP-порт для приёма потока на удалённом сервере (нужно один раз открыть в фаерволе, см. шаг 8 в шапке скрипта) |
@@ -244,7 +236,7 @@ QNAP-версия `cloud_backup.sh` — то же резервное копир�
 `BACKUP_DEGRADATION_MIBS_THRESHOLD` создаётся `backup_degradation` с вероятной
 причиной. Ошибки raw-transfer дополняются снимком состояния удалённого сервера.
 
-После бэкапа `docker compose up -d` и состояние контейнеров проверяются до `SERVICES_START_RETRIES` раз. Если после всех попыток остаются `unhealthy`, `exited`, `dead` или `restarting` контейнеры, в лог записываются `docker compose ps -a` и логи Redis/Valkey, а сам скрипт завершается с ненулевым кодом.
+После бэкапа `docker compose up -d` и состояние контейнеров проверяются до `SERVICES_START_RETRIES` раз. Сбоем считаются контейнеры в состоянии `unhealthy`, `dead`, `restarting` или `Exited` с ненулевым кодом; `Exited (0)` (контейнеры-сироты удалённых из compose сервисов, одноразовые init-контейнеры) сбоем не считается. Если после всех попыток сбойные контейнеры остаются, в лог записывается `docker compose ps -a`, а сам скрипт завершается с ненулевым кодом. Оптимизация Redis и снятие его логов удалены вместе с сервисом `valkey` из стека (2026-10-01).
 
 **Передача в обход SSH-шифрования (`RAW_TRANSFER_ENABLED`):** при значении
 `1` сжатый поток передаётся через сырой TCP внутри WireGuard-туннеля, без

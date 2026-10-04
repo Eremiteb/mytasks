@@ -151,9 +151,6 @@ OPTIMIZE_MARIADB_BEFORE_BACKUP="${OPTIMIZE_MARIADB_BEFORE_BACKUP:-0}"
 MARIADB_SERVICE_NAME="${MARIADB_SERVICE_NAME:-mariadb}"
 MARIADB_PURGE_BINLOGS="${MARIADB_PURGE_BINLOGS:-0}"
 MARIADB_TRUNCATE_GENERAL_LOG="${MARIADB_TRUNCATE_GENERAL_LOG:-1}"
-OPTIMIZE_REDIS_BEFORE_BACKUP="${OPTIMIZE_REDIS_BEFORE_BACKUP:-0}"
-REDIS_SERVICE_NAME="${REDIS_SERVICE_NAME:-redis}"
-REDIS_REWRITE_WAIT_SEC="${REDIS_REWRITE_WAIT_SEC:-180}"
 
 ###############################################################################
 # WireGuard
@@ -452,34 +449,6 @@ if [[ "${OPTIMIZE_MARIADB_BEFORE_BACKUP}" -eq 1 ]]; then
   fi
 else
   log_json "INFO" "mariadb_optimize_skip" "Оптимизация MariaDB отключена (OPTIMIZE_MARIADB_BEFORE_BACKUP=0)"
-fi
-
-if [[ "${OPTIMIZE_REDIS_BEFORE_BACKUP}" -eq 1 ]]; then
-  log_json "INFO" "redis_optimize_start" "Оптимизация Redis AOF перед архивированием"
-  export SSHPASS="${REMOTE_PASSWORD}"
-  redis_opt_err=$(sshpass -e ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" \
-    "cd '${REMOTE_PATH}' && docker compose exec -T \
-      -e REDIS_WAIT='${REDIS_REWRITE_WAIT_SEC}' \
-      '${REDIS_SERVICE_NAME}' sh -lc 'set -e; \
-        redis-cli BGREWRITEAOF >/dev/null; \
-        i=0; \
-        while [ \${i} -lt \${REDIS_WAIT} ]; do \
-          in_progress=\$(redis-cli INFO persistence | tr -d '\\r' | sed -n \"s/^aof_rewrite_in_progress:\\([0-9]\\+\\)$/\\1/p\"); \
-          [ \"\${in_progress}\" = \"0\" ] && exit 0; \
-          i=\$((i + 1)); \
-          sleep 1; \
-        done; \
-        echo \"AOF rewrite did not finish within \${REDIS_WAIT} seconds\"; \
-        exit 1'" 2>&1)
-  redis_opt_rc=$?
-  unset SSHPASS
-  if [[ "${redis_opt_rc}" -ne 0 ]]; then
-    log_json "WARN" "redis_optimize_failed" "Оптимизация Redis завершилась с предупреждениями" "${redis_opt_err}" "${redis_opt_rc}"
-  else
-    log_json "INFO" "redis_optimize_ok" "Оптимизация Redis завершена" "${redis_opt_err}" "${redis_opt_rc}"
-  fi
-else
-  log_json "INFO" "redis_optimize_skip" "Оптимизация Redis отключена (OPTIMIZE_REDIS_BEFORE_BACKUP=0)"
 fi
 
 log_json "INFO" "services_stop" "Останавливаем сервисы на ${REMOTE_HOST}..."

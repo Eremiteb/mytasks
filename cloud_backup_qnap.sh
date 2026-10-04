@@ -345,10 +345,6 @@ OPTIMIZE_MARIADB_BEFORE_BACKUP="${OPTIMIZE_MARIADB_BEFORE_BACKUP:-0}"
 MARIADB_SERVICE_NAME="${MARIADB_SERVICE_NAME:-mariadb}"
 MARIADB_PURGE_BINLOGS="${MARIADB_PURGE_BINLOGS:-0}"
 MARIADB_TRUNCATE_GENERAL_LOG="${MARIADB_TRUNCATE_GENERAL_LOG:-1}"
-OPTIMIZE_REDIS_BEFORE_BACKUP="${OPTIMIZE_REDIS_BEFORE_BACKUP:-0}"
-REDIS_SERVICE_NAME="${REDIS_SERVICE_NAME:-valkey}"
-REDIS_REWRITE_WAIT_SEC="${REDIS_REWRITE_WAIT_SEC:-180}"
-REDIS_LOG_TAIL_LINES="${REDIS_LOG_TAIL_LINES:-300}"
 SERVICES_START_RETRIES="${SERVICES_START_RETRIES:-3}"
 SERVICES_START_RETRY_DELAY_SEC="${SERVICES_START_RETRY_DELAY_SEC:-15}"
 
@@ -379,16 +375,15 @@ RAW_TRANSFER_STATUS_POLL_RETRIES="${RAW_TRANSFER_STATUS_POLL_RETRIES:-5}"
 # local_load1 — этот замер даёт третью точку данных для разбора таких случаев.
 NETWORK_SPEED_TEST_MB="${NETWORK_SPEED_TEST_MB:-50}"
 
-# Раз в сколько дней реально выполнять оптимизацию БД (MariaDB/Redis),
+# Раз в сколько дней реально выполнять оптимизацию БД (MariaDB),
 # даже если сам бэкап запускается ежедневно. Обоснование по логам за
 # 2026-07-24..29: узкое место скорости архивирования — локальный CPU QNAP
 # (nproc=1, avg_load1 во время передачи ~1.5-1.8, см. probable_cause в
 # backup_degradation), а не состояние удалённых БД, т.е. ежедневная
 # оптимизация НЕ помогает со скоростью бэкапа. При этом сама оптимизация не
 # бесплатна: MariaDB для части таблиц вместо OPTIMIZE делает recreate+analyze
-# (полная перезапись таблицы), а Redis BGREWRITEAOF 2026-07-29 не уложился в
-# REDIS_REWRITE_WAIT_SEC=600 и провалился — т.е. ежедневно тратится время
-# впустую. Раз в неделю достаточно для типичной нагрузки Nextcloud.
+# (полная перезапись таблицы) — т.е. ежедневно тратится время впустую.
+# Раз в неделю достаточно для типичной нагрузки Nextcloud.
 DB_OPTIMIZE_INTERVAL_DAYS="${DB_OPTIMIZE_INTERVAL_DAYS:-7}"
 STATE_DIR="${SCRIPT_DIR}/state"
 DB_OPTIMIZE_STATE_FILE="${STATE_DIR}/${SCRIPT_BASE}-db-optimize.state"
@@ -600,8 +595,11 @@ services_start_if_needed() {
         services_state=$(ssh_remote \
           "cd '${REMOTE_PATH}' && docker compose ps -a" 2>&1)
         services_state_rc=$?
+        # «Exited (0)» не считаем сбоем: так выглядят контейнеры-сироты
+        # удалённых из compose сервисов и одноразовые init-контейнеры
+        # (2026-09-25 из-за orphan freshrss запуск ложно признавался неудачным).
         if [[ "${services_state_rc}" -eq 0 ]] \
-            && ! printf '%s\n' "${services_state}" | grep -Eiq 'unhealthy|exited|dead|restarting'; then
+            && ! printf '%s\n' "${services_state}" | grep -Eiq 'unhealthy|dead|restarting|exited \([1-9][0-9]*\)'; then
           SERVICES_STOPPED=0
           log_json "INFO" "services_start_ok" "Сервисы запущены" \
             "attempt=${attempt}; compose_ps=${services_state:-<пусто>}" 0
@@ -620,7 +618,7 @@ services_start_if_needed() {
     done
 
     recovery_diag=$(ssh_remote \
-      "cd '${REMOTE_PATH}' && { docker compose ps -a; docker compose logs --no-color --tail=${REDIS_LOG_TAIL_LINES} '${REDIS_SERVICE_NAME}'; }" 2>&1)
+      "cd '${REMOTE_PATH}' && docker compose ps -a" 2>&1)
     log_json "ERROR" "services_start_failed" "Не удалось запустить сервисы после повторных попыток" \
       "attempts=${SERVICES_START_RETRIES}; last_error=${start_out}; diagnostics=${recovery_diag}" "${start_rc}"
     return 1
@@ -1021,39 +1019,6 @@ elif [[ "${OPTIMIZE_MARIADB_BEFORE_BACKUP}" -eq 1 ]]; then
 else
   log_json "INFO" "mariadb_optimize_skip" "Оптимизация MariaDB отключена (OPTIMIZE_MARIADB_BEFORE_BACKUP=0)"
 fi
-
-if [[ "${OPTIMIZE_REDIS_BEFORE_BACKUP}" -eq 1 && "${DB_OPTIMIZE_DUE}" -eq 1 ]]; then
-  log_json "INFO" "redis_optimize_start" "Оптимизация Redis AOF перед архивированием"
-  redis_opt_err=$(ssh_remote \
-    "cd '${REMOTE_PATH}' && docker compose exec -T \
-      -e REDIS_WAIT='${REDIS_REWRITE_WAIT_SEC}' \
-      '${REDIS_SERVICE_NAME}' sh -lc 'set -e; \
-        redis-cli BGREWRITEAOF >/dev/null; \
-        i=0; \
-        while [ \$i -lt \$REDIS_WAIT ]; do \
-          in_progress=\$(redis-cli INFO persistence | tr -d '\\r' | sed -n \"s/^aof_rewrite_in_progress:\\([0-9]\\+\\)$/\\1/p\"); \
-          [ \"\$in_progress\" = \"0\" ] && exit 0; \
-          i=\$((i + 1)); \
-          sleep 1; \
-        done; \
-        echo \"AOF rewrite did not finish within \$REDIS_WAIT seconds\"; \
-        exit 1'" 2>&1)
-  redis_opt_rc=$?
-  if [[ ${redis_opt_rc} -ne 0 ]]; then
-    log_json "WARN" "redis_optimize_failed" "Оптимизация Redis завершилась с предупреждениями" "${redis_opt_err}" "${redis_opt_rc}"
-  else
-    log_json "INFO" "redis_optimize_ok" "Оптимизация Redis завершена" "${redis_opt_err}" "${redis_opt_rc}"
-  fi
-elif [[ "${OPTIMIZE_REDIS_BEFORE_BACKUP}" -eq 1 ]]; then
-  log_json "INFO" "redis_optimize_skip_not_due" "Оптимизация Redis пропущена — не настал плановый интервал (раз в ${DB_OPTIMIZE_INTERVAL_DAYS} дн.)"
-else
-  log_json "INFO" "redis_optimize_skip" "Оптимизация Redis отключена (OPTIMIZE_REDIS_BEFORE_BACKUP=0)"
-fi
-
-redis_logs_out=$(ssh_remote \
-  "cd '${REMOTE_PATH}' && docker compose logs --no-color --tail=${REDIS_LOG_TAIL_LINES} '${REDIS_SERVICE_NAME}'" 2>&1)
-redis_logs_rc=$?
-log_json "INFO" "redis_logs_capture" "Логи Redis/Valkey перед остановкой сервисов (docker compose down удалит контейнер вместе с ними)" "${redis_logs_out}" "${redis_logs_rc}"
 
 log_json "INFO" "services_stop" "Останавливаем сервисы на ${REMOTE_HOST}..."
 stop_err=$(ssh_remote \

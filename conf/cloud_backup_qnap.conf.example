@@ -63,32 +63,19 @@ MARIADB_PURGE_BINLOGS="0"
 # Очистить файл general.log перед бэкапом: 1 — да, 0 — нет
 MARIADB_TRUNCATE_GENERAL_LOG="1"
 
-# Оптимизировать Redis AOF перед архивированием: 1 — да, 0 — нет (по умолчанию)
-OPTIMIZE_REDIS_BEFORE_BACKUP="0"
-
-# Имя сервиса Redis/Valkey в docker compose
-REDIS_SERVICE_NAME="valkey"
-
-# Максимальное ожидание завершения BGREWRITEAOF (сек)
-REDIS_REWRITE_WAIT_SEC="180"
-
-# Сколько последних строк docker compose logs снимать с Redis перед
-# services_stop (docker compose down) — после down логи контейнера теряются
-REDIS_LOG_TAIL_LINES="300"
-
 # Сколько раз повторять docker compose up -d после бэкапа и сколько секунд
-# ждать между попытками. После каждой попытки проверяется docker compose ps -a.
+# ждать между попытками. После каждой попытки проверяется docker compose ps -a (Exited (0) сбоем не считается).
 SERVICES_START_RETRIES="3"
 SERVICES_START_RETRY_DELAY_SEC="15"
 
 # Раз в сколько дней реально выполнять включённые выше оптимизации БД
-# (MariaDB/Redis), даже если сам бэкап запускается ежедневно.
+# (MariaDB), даже если сам бэкап запускается ежедневно.
 # Между запусками, где интервал ещё не истёк, оптимизация пропускается —
 # отметка о последнем запуске хранится в state/cloud_backup_qnap-db-optimize.state.
 # Ежедневная оптимизация на скорость самого архивирования не влияет (узкое
 # место — локальный CPU QNAP, а не состояние удалённых БД) и создаёт лишнюю
 # нагрузку/риск на проде (MariaDB может делать recreate+analyze вместо
-# лёгкого OPTIMIZE, Redis BGREWRITEAOF может не укладываться в таймаут).
+# лёгкого OPTIMIZE).
 DB_OPTIMIZE_INTERVAL_DAYS="7"
 
 # Передача потока бэкапа через сырой TCP-сокет (nc/ncat) внутри уже

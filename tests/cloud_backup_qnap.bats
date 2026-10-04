@@ -23,7 +23,7 @@ setup() {
   cp "$REPO_ROOT/cloud_backup_qnap.sh" "$TMP_DIR/cloud_backup_qnap.sh"
   chmod +x "$TMP_DIR/cloud_backup_qnap.sh"
 
-  if [[ "${BATS_TEST_DESCRIPTION}" = "актуальные значения zstd и Valkey заданы по умолчанию" ]]; then
+  if [[ "${BATS_TEST_DESCRIPTION}" = "актуальные значения zstd и WireGuard заданы по умолчанию" ]]; then
     export TMP_DIR
     return
   fi
@@ -95,12 +95,12 @@ run_script() {
 
 # ---------------------------------------------------------------------------
 
-@test "актуальные значения zstd и Valkey заданы по умолчанию" {
+@test "актуальные значения zstd и WireGuard заданы по умолчанию" {
   run grep -F 'zstd) COMP_CMD="zstd -5 --threads=0 -c"' "$TMP_DIR/cloud_backup_qnap.sh"
   [ "$status" -eq 0 ]
 
-  run grep -F 'REDIS_SERVICE_NAME="${REDIS_SERVICE_NAME:-valkey}"' "$TMP_DIR/cloud_backup_qnap.sh"
-  [ "$status" -eq 0 ]
+  run grep -qi -E 'redis|valkey' "$TMP_DIR/cloud_backup_qnap.sh"
+  [ "$status" -ne 0 ]
 
   run grep -F 'WG_ENDPOINT="${WG_ENDPOINT:-}"' "$TMP_DIR/cloud_backup_qnap.sh"
   [ "$status" -eq 0 ]
@@ -384,6 +384,35 @@ EOF
   [ "$status" -eq 0 ]
 }
 
+@test "контейнер-сирота в статусе Exited (0) не считается сбоем запуска сервисов" {
+  cat >> "$TMP_DIR/conf/cloud_backup_qnap.conf" <<'EOF'
+SERVICES_START_RETRIES="1"
+SERVICES_START_RETRY_DELAY_SEC="0"
+EOF
+
+  cat > "$STUB_DIR/ssh" <<EOF
+#!/usr/bin/env bash
+case "\$*" in
+  *"command -v zstd >/dev/null 2>&1"*) echo gzip; exit 0 ;;
+  *"tar --create"*) printf '$GZIP_FIXTURE'; exit 0 ;;
+  *"docker compose up -d"*) exit 0 ;;
+  *"docker compose ps -a"*)
+    echo 'nextcloud Up 5 seconds (healthy)'
+    echo 'freshrss Exited (0) 6 hours ago'
+    exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+  chmod +x "$STUB_DIR/ssh"
+
+  run_script
+
+  [ "$status" -eq 0 ]
+  log_file=$(ls "$TMP_DIR/logs"/cloud_backup_qnap-*.jsonl 2>/dev/null | head -1)
+  run grep -q '"event":"services_start_ok"' "$log_file"
+  [ "$status" -eq 0 ]
+}
+
 @test "окончательная ошибка запуска сервисов делает задание неуспешным" {
   cat >> "$TMP_DIR/conf/cloud_backup_qnap.conf" <<'EOF'
 SERVICES_START_RETRIES="2"
@@ -396,7 +425,7 @@ case "\$*" in
   *"command -v zstd >/dev/null 2>&1"*) echo gzip; exit 0 ;;
   *"tar --create"*) printf '$GZIP_FIXTURE'; exit 0 ;;
   *"docker compose up -d"*) exit 1 ;;
-  *"docker compose ps -a"*) echo 'valkey exited unhealthy'; exit 0 ;;
+  *"docker compose ps -a"*) echo 'nextcloud exited (1) unhealthy'; exit 0 ;;
   *) exit 0 ;;
 esac
 EOF
