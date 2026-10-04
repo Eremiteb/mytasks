@@ -316,6 +316,42 @@ crontab /etc/config/crontab
 
 ---
 
+### `check_backups.sh`
+
+Проверяет каталоги с архивами резервных копий и пишет результат в JSONL-лог; при любой ошибке дополнительно показывает уведомление в трее (`notify-send`).
+
+**Что проверяется для каждого каталога из `BACKUP_DIRS`:**
+- каталог доступен и читаем (обращение запускает автомонтирование NFS; зависание ограничено `ACCESS_TIMEOUT_SECS`);
+- в нём есть архивы по маскам `ARCHIVE_PATTERNS` (по умолчанию `*.tar.zst *.tar.gz *.tgz *.tar *.zip *.7z`);
+- самый свежий архив не старше `MAX_AGE_DAYS` (для записи `каталог|N` — свой лимит) и не меньше `MIN_SIZE_BYTES`;
+- размер свежего архива не упал ниже `MIN_SIZE_RATIO_PCT` % от предыдущего (признак оборванной записи);
+- целостность свежего архива при `VERIFY_INTEGRITY="yes"` (по умолчанию включено; `zstd -t`, `gzip -t`, `unzip -t`, `7z t`, `tar -t`). Архив читается целиком, на NFS ~112 МБ/с архив ~33 ГБ проверяется ≈5 минут (замер 2026-10-04): проверка идёт с `nice -n 19`/`ionice -c3`, тайм-аут рассчитывается по размеру (`размер / VERIFY_MIN_SPEED_MBPS + VERIFY_TIMEOUT_BASE_SECS`, для 33 ГБ ≈28 мин; превышение — только WARN в логе), уже проверенный и неизменившийся архив повторно не читается (`state/check_backups.verified`), а изменённый менее `VERIFY_MIN_AGE_MINUTES` назад (ещё пишется) откладывается до следующего запуска.
+
+**Конфигурация:** `conf/check_backups.conf` (пример: `conf/check_backups.conf.example`).
+
+**Коды возврата:** `0` — всё в порядке, `1` — найдены проблемы с бэкапами, `2` — ошибка конфигурации, зависимостей или аргументов (уведомление показывается и в этом случае).
+
+**Использование:**
+```sh
+./check_backups.sh              # проверка + лог + уведомление при ошибках
+./check_backups.sh --no-notify  # без уведомления в трее
+```
+
+**Расписание — systemd user timer** (уведомлению нужна сессия пользователя, поэтому юниты пользовательские). Таймер срабатывает через 4 минуты после загрузки системы (если сеанс начался позже — сразу после входа) и далее раз в сутки при непрерывной работе (`OnBootSec=4min`, `OnUnitActiveSec=1d`). Юниты: `systemd/user/check-backups.{service,timer}`.
+
+```sh
+mkdir -p ~/.config/systemd/user
+cp systemd/user/check-backups.service systemd/user/check-backups.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now check-backups.timer
+
+# Проверка
+systemctl --user list-timers check-backups.timer
+journalctl --user -u check-backups.service -n 20
+```
+
+---
+
 ### `btrfs_monitor.sh`
 
 Мониторинг счётчиков ошибок Btrfs на корневом разделе (или другой точке монтирования).
@@ -758,6 +794,7 @@ Jamendo для категории `/` использует официальны�
 | `auto_delete_old_files.sh` | POSIX shell, `find`, `sort`, `awk`, `sed` |
 | `btrfs_monitor.sh` | Bash, `btrfs`, `findmnt`, `awk`; опц.: `notify-send` |
 | `check-store-mount.sh` | Bash, `mountpoint`, `timeout`; опц.: `notify-send` |
+| `check_backups.sh` | Bash, `find`, `sort`, `timeout`; опц.: `notify-send`, `zstd`/`gzip`/`unzip`/`7z`/`tar` (проверка целостности) |
 | `cloud_backup.sh` | Bash, `wg-quick`, `sshpass`, `ssh`; удалённо: `docker`, `tar`, один из `zstd`/`pigz`/`gzip` |
 | `cloud_backup_qnap.sh` | Entware Bash, `wireguard-go`, `ncat`, `xxd`, `ssh`; удалённо: `docker`, `tar`, `nc`, один из `zstd`/`pigz`/`gzip` |
 | `cp1251_to_utf8.sh` | `iconv`, `file`, `find` |

@@ -1,0 +1,10 @@
+[Unit]
+Description=Проверка каталогов с архивами резервных копий (лог + уведомление в трее)
+Documentation=file:///home/esimych/esimych-docs/mytasks/README.md
+
+[Service]
+Type=oneshot
+ExecStart=/home/esimych/esimych-docs/mytasks/check_backups.sh
+# Код 1 — найдены проблемы с бэкапами: скрипт уже записал лог и показал
+# уведомление, это штатный результат, а не сбой юнита
+SuccessExitStatus=1

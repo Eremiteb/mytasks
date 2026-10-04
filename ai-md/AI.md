@@ -101,6 +101,12 @@ music_downloader/venv/bin/ruff check music_downloader/
 - На части ядер QTS вариант QNAP не может использовать `wg`/`wg-quick` (`Protocol not supported`) и поднимает туннель вручную через userspace UAPI-сокет `wireguard-go`; см. `wg_up_userspace` и `wg_conf_get`.
 - **Перед любой работой с `cloud_backup_qnap.sh` обязательно прочитать `ai-md/cloud_backup_qnap.NOTES.md`.**
 
+## `check_backups.sh`
+
+- Проверяет каталоги из `BACKUP_DIRS` (`conf/check_backups.conf`): наличие архивов, возраст, размер, падение размера относительно предыдущего и опционально целостность; пишет JSONL-лог, при ошибке (код `1` — проблемы с бэкапами, `2` — конфигурация/зависимости) показывает уведомление через `notify-send`.
+- Расписание — systemd **user** timer `systemd/user/check-backups.{service,timer}` (`OnBootSec=4min`, `OnUnitActiveSec=1d`), установлен в `~/.config/systemd/user`; в service `SuccessExitStatus=1`. Установка и проверка — `systemctl --user` (из песочницы агента user-шина доступна).
+- Целостность свежего архива проверяется по умолчанию (`VERIFY_INTEGRITY="yes"`) с учётом размера: тайм-аут = размер / `VERIFY_MIN_SPEED_MBPS` + `VERIFY_TIMEOUT_BASE_SECS`, `nice`/`ionice`, кэш уже проверенных архивов в `state/check_backups.verified`, откладывание для архива моложе `VERIFY_MIN_AGE_MINUTES`. Замер 2026-10-04: NFS `/mnt/store` ≈112 МБ/с (узкое место — гигабит, `zstd -t` успевает), архив ~33,5 ГБ ≈ 5 мин. Тесты, не касающиеся целостности, задают `VERIFY_INTEGRITY="no"`.
+
 ## `system_monitor.sh` и systemd
 
 - `system_monitor.sh` переименован из `disk_monitor.sh`; кроме дисков он опрашивает CPU (`sensors -j`, загрузка из `/proc/stat`, `/proc/loadavg`) и каждую GPU через `nvidia-smi`. `sensors` и `nvidia-smi` необязательны: при их отсутствии нет температуры CPU или раздела GPU, но запуск не завершается ошибкой. Работа проверена на Ryzen 7 5800X и RTX 3060 Ti.
