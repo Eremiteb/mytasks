@@ -30,6 +30,10 @@ CONFIG_PATH = os.path.join(BASE_DIR, f"{SCRIPT_NAME}.json")
 DB_PATH = os.path.join(BASE_DIR, f"{SCRIPT_NAME}.db")
 
 def get_log_dir(config=None):
+    # Переопределение каталога логов (используется тестами, чтобы не засорять logs/)
+    env_dir = os.environ.get("MYTASKS_LOG_DIR")
+    if env_dir:
+        return env_dir
     if config and "log_dir" in config:
         path = config["log_dir"]
         if not os.path.isabs(path):

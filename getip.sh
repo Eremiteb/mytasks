@@ -11,7 +11,7 @@ SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P)
 
 CONFIG_DIR="${SCRIPT_DIR}/conf"
 CONFIG_FILE="${CONFIG_DIR}/${SCRIPT_BASE}.conf"
-LOG_DIR="${SCRIPT_DIR}/logs"
+LOG_DIR="${MYTASKS_LOG_DIR:-${SCRIPT_DIR}/logs}"
 TIMESTAMP="$(date '+%Y-%m-%d-%H-%M-%S')"
 LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}-${TIMESTAMP}.jsonl"
 LOG_TEMPLATE_FILE="${CONFIG_DIR}/log_template.conf"

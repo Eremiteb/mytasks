@@ -8,7 +8,7 @@ SCRIPT_NAME="$(basename -- "$0")"
 SCRIPT_BASE="${SCRIPT_NAME%.*}"
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)
 CONF_FILE="${SCRIPT_DIR}/conf/${SCRIPT_BASE}.conf"
-LOG_DIR="${SCRIPT_DIR}/logs"
+LOG_DIR="${MYTASKS_LOG_DIR:-${SCRIPT_DIR}/logs}"
 STATE_DIR="${SCRIPT_DIR}/state"
 TIMESTAMP="$(date '+%Y-%m-%d-%H-%M-%S')"
 LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}-${TIMESTAMP}.jsonl"

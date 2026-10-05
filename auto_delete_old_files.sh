@@ -12,7 +12,7 @@ SCRIPT_BASE=${SCRIPT_NAME%.*}
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P)
 
 CONFIG_DIR="${SCRIPT_DIR}/conf"
-LOG_DIR="${SCRIPT_DIR}/logs"
+LOG_DIR="${MYTASKS_LOG_DIR:-${SCRIPT_DIR}/logs}"
 mkdir -p "${CONFIG_DIR}" "${LOG_DIR}"
 
 CONFIG_FILE="${CONFIG_DIR}/${SCRIPT_BASE}.conf"

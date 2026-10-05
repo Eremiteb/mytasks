@@ -11,7 +11,7 @@ set -uo pipefail
 SCRIPT_NAME="$(basename -- "$0")"
 SCRIPT_BASE="${SCRIPT_NAME%.*}"
 SCRIPT_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-LOG_DIR="${SCRIPT_DIR}/logs"
+LOG_DIR="${MYTASKS_LOG_DIR:-${SCRIPT_DIR}/logs}"
 LOG_TEMPLATE_FILE="${SCRIPT_DIR}/conf/log_template.conf"
 mkdir -p "${LOG_DIR}"
 

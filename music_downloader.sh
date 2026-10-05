@@ -11,7 +11,7 @@ SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && 
 
 PROJECT_PATH="${SCRIPT_DIR}/music_downloader"
 VENV_PATH="${PROJECT_PATH}/venv"
-LOG_DIR="${SCRIPT_DIR}/logs"
+LOG_DIR="${MYTASKS_LOG_DIR:-${SCRIPT_DIR}/logs}"
 TIMESTAMP="$(date '+%Y-%m-%d-%H-%M-%S')"
 LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}-${TIMESTAMP}.jsonl"
 LOG_TEMPLATE_FILE="${SCRIPT_DIR}/conf/log_template.conf"

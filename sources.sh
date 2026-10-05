@@ -16,7 +16,7 @@ DEFAULT_CONFIG="${CONFIG_DIR}/${SCRIPT_BASE}.conf"
 LOG_TEMPLATE_FILE="${CONFIG_DIR}/log_template.conf"
 TODAY="$(date '+%Y-%m-%d')"
 # Указываем расширение .jsonl для соответствия формату
-LOG_DIR="${SCRIPT_DIR}/logs"
+LOG_DIR="${MYTASKS_LOG_DIR:-${SCRIPT_DIR}/logs}"
 LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}_${TODAY}-report.jsonl"
 
 # Создаем папку для логов, если её нет

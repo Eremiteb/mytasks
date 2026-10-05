@@ -8,6 +8,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+# Лог движка при импорте модуля — во временный каталог, а не в logs/ репозитория
+os.environ.setdefault("MYTASKS_LOG_DIR", tempfile.mkdtemp(prefix="music_downloader_test_logs_"))
+
 MODULE_PATH = Path(__file__).resolve().parents[1] / "music_downloader" / "music_downloader.py"
 SPEC = importlib.util.spec_from_file_location("music_downloader_engine", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None

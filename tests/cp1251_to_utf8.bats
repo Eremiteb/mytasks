@@ -1,6 +1,8 @@
 #!/usr/bin/env bats
 
 setup() {
+  # Логи скриптов — во временный каталог теста, а не в logs/ репозитория
+  export MYTASKS_LOG_DIR="$BATS_TEST_TMPDIR/logs"
   command -v iconv >/dev/null || skip "iconv is required"
   command -v file >/dev/null || skip "file is required"
   REPO_ROOT="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
