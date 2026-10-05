@@ -12,11 +12,11 @@ LOG_DIR="${MYTASKS_LOG_DIR:-${SCRIPT_DIR}/../logs}"
 TIMESTAMP="$(date '+%Y-%m-%d-%H-%M-%S')"
 LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}-${TIMESTAMP}.jsonl"
 LOG_TEMPLATE_FILE="${SCRIPT_DIR}/../conf/log_template.conf"
-mkdir -p "$LOG_DIR"
+mkdir -p "${LOG_DIR}"
 
-if [[ -r "$LOG_TEMPLATE_FILE" ]]; then
+if [[ -r "${LOG_TEMPLATE_FILE}" ]]; then
 	# shellcheck source=/dev/null
-	source "$LOG_TEMPLATE_FILE"
+	source "${LOG_TEMPLATE_FILE}"
 fi
 LOG_SCHEMA_VERSION="${LOG_SCHEMA_VERSION:-1.0}"
 LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
@@ -35,20 +35,21 @@ log_json() {
 	local event="$2"
 	local msg="$3"
 	local detail="${4:-}"
-	local level_norm msg_esc detail_esc
-	level_norm="$(printf '%s' "$level" | tr '[:upper:]' '[:lower:]')"
-	msg_esc="$(json_escape "$msg")"
-	detail_esc="$(json_escape "$detail")"
+	local level_norm msg_esc detail_esc now
+	level_norm="$(printf '%s' "${level}" | tr '[:upper:]' '[:lower:]')"
+	msg_esc="$(json_escape "${msg}")"
+	detail_esc="$(json_escape "${detail}")"
+	now="$(ts)"
 	printf '{"@timestamp":"%s","schema.version":"%s","compat.targets":"%s","log.level":"%s","message":"%s","event.action":"%s","service.name":"%s","script":"%s","event":"%s","level":"%s","msg":"%s","detail":"%s"}\n' \
-		"$(ts)" "$LOG_SCHEMA_VERSION" "$LOG_COMPAT_TARGETS" "$level_norm" "$msg_esc" "$event" "$SCRIPT_BASE" "$SCRIPT_NAME" "$event" "$level_norm" "$msg_esc" "$detail_esc" >> "$LOG_FILE"
+		"${now}" "${LOG_SCHEMA_VERSION}" "${LOG_COMPAT_TARGETS}" "${level_norm}" "${msg_esc}" "${event}" "${SCRIPT_BASE}" "${SCRIPT_NAME}" "${event}" "${level_norm}" "${msg_esc}" "${detail_esc}" >> "${LOG_FILE}"
 }
 
 ###############################################################################
 # MAIN
 ###############################################################################
-cd "$SCRIPT_DIR"
+cd "${SCRIPT_DIR}"
 
-log_json "INFO" "start" "Инициализация виртуального окружения" "$SCRIPT_DIR"
+log_json "INFO" "start" "Инициализация виртуального окружения" "${SCRIPT_DIR}"
 
 python3 -m venv venv
 
