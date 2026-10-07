@@ -41,20 +41,30 @@ fi
 ###############################################################################
 # ARGS
 ###############################################################################
-ROOT_DIR="${1:-}"
+DRY_RUN=0
+ROOT_DIR=""
+for arg in "$@"; do
+  case "${arg}" in
+    -n|--dry-run) DRY_RUN=1 ;;
+    *) [ -z "${ROOT_DIR}" ] && ROOT_DIR="${arg}" ;;
+  esac
+done
 if [ -z "${ROOT_DIR}" ] || [ ! -d "${ROOT_DIR}" ]; then
-  echo "Использование: ${SCRIPT_NAME} /путь/к/папке"
+  echo "Использование: ${SCRIPT_NAME} [-n|--dry-run] /путь/к/папке"
+  echo "  -n, --dry-run  только показать, какие файлы будут сконвертированы, без записи"
   exit 1
 fi
 
 ###############################################################################
 # MAIN
 ###############################################################################
-mkdir -p "${OUTPUT_DIR}"
+if [ "${DRY_RUN}" -eq 0 ]; then
+  mkdir -p "${OUTPUT_DIR}"
 
-current_date=$(date)
-echo "===== Ошибки | ${current_date} =====" >> "${OUTPUT_DIR}/${ERROR_LOG}"
-echo "===== Отчёт конвертации | ${current_date} =====" >> "${OUTPUT_DIR}/${REPORT_FILE}"
+  current_date=$(date)
+  echo "===== Ошибки | ${current_date} =====" >> "${OUTPUT_DIR}/${ERROR_LOG}"
+  echo "===== Отчёт конвертации | ${current_date} =====" >> "${OUTPUT_DIR}/${REPORT_FILE}"
+fi
 
 # shellcheck disable=SC2016
 process_file='
@@ -63,7 +73,6 @@ REL_PATH=$(realpath --relative-to="'"${ROOT_DIR}"'" "${FILE}" 2>/dev/null || ech
 DIRNAME=$(dirname "${REL_PATH}")
 BASENAME=$(basename "${FILE}")
 OUTPUT_DIR_FULL="'"${OUTPUT_DIR}"'/${DIRNAME}"
-mkdir -p "${OUTPUT_DIR_FULL}"
 OUTPUT="${OUTPUT_DIR_FULL}/${BASENAME%.*}.mp3"
 TMP_COVER=""
 
@@ -72,9 +81,19 @@ echo "Обрабатываю: ${REL_PATH}"
 [ -f "${OUTPUT}" ] && exit 0
 
 ffprobe -v error "${FILE}" 2>/dev/null || {
-  echo "UNSUPPORTED | ${FILE}" >> "'"${OUTPUT_DIR}/${ERROR_LOG}"'"
+  if [ '"${DRY_RUN}"' -eq 1 ]; then
+    echo "[dry-run] будет: пропуск неподдерживаемого файла: ${FILE}"
+  else
+    echo "UNSUPPORTED | ${FILE}" >> "'"${OUTPUT_DIR}/${ERROR_LOG}"'"
+  fi
   exit 0
 }
+
+if [ '"${DRY_RUN}"' -eq 1 ]; then
+  echo "[dry-run] будет: конвертация ${FILE} -> ${OUTPUT}"
+  exit 0
+fi
+mkdir -p "${OUTPUT_DIR_FULL}"
 
 COVER=""
 for name in '"${COVER_NAMES}"'; do
@@ -106,16 +125,25 @@ fi
 [ -n "${TMP_COVER:-}" ] && [ -f "${TMP_COVER}" ] && rm -f "${TMP_COVER}"
 '
 
+# Выражение для find собирается в позиционных параметрах: прежняя строка с
+# литеральными кавычками (-iname '*.ext') никогда не совпадала с файлами, и
+# обработчик запускался на пустом имени.
+set -- -type f
 if [ -n "${FORMATS}" ]; then
-  FIND_EXPR=""
+  set -- -type f '('
+  first_ext=1
   for ext in ${FORMATS}; do
-    FIND_EXPR="${FIND_EXPR} -iname '*.${ext}' -o"
+    [ "${first_ext}" -eq 1 ] || set -- "$@" -o
+    set -- "$@" -iname "*.${ext}"
+    first_ext=0
   done
-  FIND_EXPR=$(echo "${FIND_EXPR}" | sed 's/ -o$//')
-  # shellcheck disable=SC2086
-  find "${ROOT_DIR}" -type f \( ${FIND_EXPR} \) -print0 | xargs -0 -n 1 -P "${JOBS}" sh -c "${process_file}" _
-else
-  find "${ROOT_DIR}" -type f -print0 | xargs -0 -n 1 -P "${JOBS}" sh -c "${process_file}" _
+  set -- "$@" ')'
+fi
+find "${ROOT_DIR}" "$@" -print0 | xargs -0 -r -n 1 -P "${JOBS}" sh -c "${process_file}" _
+
+if [ "${DRY_RUN}" -eq 1 ]; then
+  echo "[dry-run] Изменения не выполнены."
+  exit 0
 fi
 
 TOTAL_SRC=$(find "${ROOT_DIR}" -type f -print0 | xargs -0 -n 1 ffprobe -v error 2>/dev/null | wc -l)

@@ -60,6 +60,25 @@ cleanup_logs() {
 }
 
 ###############################################################################
+# ARGS
+###############################################################################
+DRY_RUN=0
+for arg in "$@"; do
+    case "${arg}" in
+        -n|--dry-run) DRY_RUN=1 ;;
+        -h|--help)
+            echo "Использование: ${SCRIPT_NAME} [-n|--dry-run]"
+            echo "  -n, --dry-run  только показать, что будет записано, без изменения файлов"
+            exit 0
+            ;;
+        *)
+            echo "Неизвестный аргумент: ${arg}" >&2
+            exit 2
+            ;;
+    esac
+done
+
+###############################################################################
 # DEFAULT CONFIG
 ###############################################################################
 IP_SERVICE_URL="https://icanhazip.com"
@@ -88,8 +107,10 @@ if ! command -v curl >/dev/null 2>&1; then
     exit 1
 fi
 
-mkdir -p "$(dirname "${IP_FILE}")"
-mkdir -p "$(dirname "${IP_HISTORY_FILE}")"
+if [ "${DRY_RUN}" -eq 0 ]; then
+    mkdir -p "$(dirname "${IP_FILE}")"
+    mkdir -p "$(dirname "${IP_HISTORY_FILE}")"
+fi
 
 ###############################################################################
 # MAIN
@@ -106,16 +127,29 @@ if [ -z "${IP:-}" ]; then
     exit 1
 fi
 
-printf '%s\n' "${IP}" > "${IP_FILE}"
-log_json "INFO" "ip_saved" "Текущий IP сохранен" "${IP_FILE}" 0
+if [ "${DRY_RUN}" -eq 1 ]; then
+    printf '[dry-run] будет: записан IP %s в %s\n' "${IP}" "${IP_FILE}"
+    log_json "INFO" "dry_ip_saved" "[dry-run] Был бы сохранен текущий IP" "${IP_FILE}" 0
+else
+    printf '%s\n' "${IP}" > "${IP_FILE}"
+    log_json "INFO" "ip_saved" "Текущий IP сохранен" "${IP_FILE}" 0
+fi
 
 if ! grep -qF "${IP}" "${IP_HISTORY_FILE}" 2>/dev/null; then
-    printf '%s - %s\n' "$(date '+%Y-%m-%d %H:%M:%S' || true)" "${IP}" >> "${IP_HISTORY_FILE}"
-    log_json "INFO" "history_appended" "IP добавлен в историю" "${IP}" 0
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        printf '[dry-run] будет: IP %s добавлен в историю %s\n' "${IP}" "${IP_HISTORY_FILE}"
+        log_json "INFO" "dry_history_appended" "[dry-run] IP был бы добавлен в историю" "${IP}" 0
+    else
+        printf '%s - %s\n' "$(date '+%Y-%m-%d %H:%M:%S' || true)" "${IP}" >> "${IP_HISTORY_FILE}"
+        log_json "INFO" "history_appended" "IP добавлен в историю" "${IP}" 0
+    fi
 else
     log_json "INFO" "history_skip" "IP уже присутствует в истории" "${IP}" 0
 fi
 
+if [ "${DRY_RUN}" -eq 1 ]; then
+    echo "[dry-run] Изменения не выполнены."
+fi
 log_json "INFO" "done" "Скрипт завершен успешно" "ip=${IP}" 0
 cleanup_logs
 exit 0

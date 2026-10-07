@@ -206,3 +206,14 @@ last_log() {
 
   [ "$status" -eq 2 ]
 }
+
+@test "dry-run does not notify nor create state directory" {
+  write_conf
+
+  run_check --dry-run
+
+  [ "$status" -eq 1 ]
+  [ ! -e "$NOTIFY_LOG" ]
+  [ ! -e "$TMP_DIR/state" ]
+  [[ "$output" == *"[dry-run] будет: уведомление"* ]]
+}

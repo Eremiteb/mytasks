@@ -61,6 +61,25 @@ cleanup_logs() {
 }
 
 ###############################################################################
+# ARGS
+###############################################################################
+DRY_RUN=0
+for arg in "$@"; do
+    case "${arg}" in
+        -n|--dry-run) DRY_RUN=1 ;;
+        -h|--help)
+            echo "Использование: ${SCRIPT_NAME} [-n|--dry-run]"
+            echo "  -n, --dry-run  только показать план: загрузчик не запускается, сортировщик выполняется с --dry-run"
+            exit 0
+            ;;
+        *)
+            echo "Неизвестный аргумент: ${arg}" >&2
+            exit 2
+            ;;
+    esac
+done
+
+###############################################################################
 # MAIN
 ###############################################################################
 log_json "INFO" "start" "Запуск music_downloader"
@@ -72,28 +91,39 @@ if [[ ! -d "${PROJECT_PATH}" ]]; then
 fi
 
 cd "${PROJECT_PATH}"
-VENV_ACTIVE=0
-if [[ -f "${VENV_PATH}/bin/activate" ]]; then
-    # shellcheck source=/dev/null
-    source "${VENV_PATH}/bin/activate"
-    VENV_ACTIVE=1
-    log_json "INFO" "venv_activated" "Активировано виртуальное окружение" "${VENV_PATH}"
-fi
+if [[ "${DRY_RUN}" -eq 1 ]]; then
+    echo "[dry-run] будет: запуск загрузчика python3 music_downloader.py в ${PROJECT_PATH}"
+    log_json "INFO" "dry_downloader" "[dry-run] Был бы запущен загрузчик" "${PROJECT_PATH}"
+    PYTHON_EXIT_CODE=0
+else
+    VENV_ACTIVE=0
+    if [[ -f "${VENV_PATH}/bin/activate" ]]; then
+        # shellcheck source=/dev/null
+        source "${VENV_PATH}/bin/activate"
+        VENV_ACTIVE=1
+        log_json "INFO" "venv_activated" "Активировано виртуальное окружение" "${VENV_PATH}"
+    fi
 
-set +e
-python3 music_downloader.py >> "${CRON_LOG}" 2>&1
-PYTHON_EXIT_CODE=$?
-set -e
+    set +e
+    python3 music_downloader.py >> "${CRON_LOG}" 2>&1
+    PYTHON_EXIT_CODE=$?
+    set -e
 
-if [[ "${VENV_ACTIVE}" -eq 1 ]]; then
-    deactivate
+    if [[ "${VENV_ACTIVE}" -eq 1 ]]; then
+        deactivate
+    fi
 fi
 
 if [[ ${PYTHON_EXIT_CODE} -eq 0 ]]; then
     SPLIT_SCRIPT="${SCRIPT_DIR}/split_by_dash.sh"
     if [[ -f "${SPLIT_SCRIPT}" ]]; then
         log_json "INFO" "split_start" "Запуск сортировщика" "${SPLIT_SCRIPT}"
-        /bin/sh "${SPLIT_SCRIPT}" >> "${CRON_LOG}" 2>&1 || log_json "WARN" "split_failed" "Сортировщик завершился с ошибкой"
+        if [[ "${DRY_RUN}" -eq 1 ]]; then
+            echo "[dry-run] будет: запуск сортировщика (ниже — его план)"
+            /bin/sh "${SPLIT_SCRIPT}" --dry-run || log_json "WARN" "split_failed" "Сортировщик завершился с ошибкой"
+        else
+            /bin/sh "${SPLIT_SCRIPT}" >> "${CRON_LOG}" 2>&1 || log_json "WARN" "split_failed" "Сортировщик завершился с ошибкой"
+        fi
     else
         log_json "ERROR" "split_missing" "Сортировщик не найден" "${SPLIT_SCRIPT}"
     fi

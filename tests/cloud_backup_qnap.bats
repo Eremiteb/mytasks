@@ -438,3 +438,17 @@ EOF
   run grep -q '"event":"services_start_failed".*"level":"error"' "$log_file"
   [ "$status" -eq 0 ]
 }
+
+@test "dry-run выводит план и не создаёт архив" {
+  printf '#!/usr/bin/env bash\necho gzip\n' > "$STUB_DIR/ssh"
+  chmod +x "$STUB_DIR/ssh"
+
+  run env PATH="$STUB_DIR:$PATH" WG_SOCK_OVERRIDE="$WG_SOCK_PATH" \
+    bash "$TMP_DIR/cloud_backup_qnap.sh" --dry-run
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"[dry-run] будет: docker compose down"* ]]
+  [[ "$output" == *"[dry-run] будет: архивация"* ]]
+  [ -z "$(ls -A "$BACKUP_DIR")" ]
+  [ ! -e "$TMP_DIR/state" ]
+}

@@ -115,6 +115,26 @@ validate_backup_file() {
 }
 
 ###############################################################################
+# ARGS
+###############################################################################
+DRY_RUN=0
+DRY_OFFLINE=0
+for arg in "$@"; do
+  case "${arg}" in
+    -n|--dry-run) DRY_RUN=1 ;;
+    -h|--help)
+      echo "Использование: ${SCRIPT_NAME} [-n|--dry-run]"
+      echo "  -n, --dry-run  только показать план: WireGuard не поднимается, сервисы не останавливаются, архив не создаётся"
+      exit 0
+      ;;
+    *)
+      echo "Неизвестный аргумент: ${arg}" >&2
+      exit 2
+      ;;
+  esac
+done
+
+###############################################################################
 # CONFIG
 ###############################################################################
 if [[ ! -r "${CONFIG_FILE}" ]]; then
@@ -209,6 +229,10 @@ log_json "INFO" "start" "Запуск резервного копировани�
 
 if wg show "${WG_INTERFACE}" >/dev/null 2>&1; then
   log_json "INFO" "wg_status" "WireGuard ${WG_INTERFACE} уже активен"
+elif [[ "${DRY_RUN}" -eq 1 ]]; then
+  DRY_OFFLINE=1
+  echo "[dry-run] будет: поднят WireGuard ${WG_INTERFACE}; проверки удалённого сервера пропущены"
+  log_json "INFO" "dry_wg_up" "[dry-run] Был бы поднят WireGuard ${WG_INTERFACE}"
 else
   log_json "INFO" "wg_up" "Поднимаем WireGuard ${WG_INTERFACE}..."
   if [[ -n "${SUDO_PASSWORD}" ]]; then
@@ -231,6 +255,10 @@ fi
 log_json "INFO" "wg_check" "Проверяем доступность ${REMOTE_HOST} через VPN..."
 _wg_ok=0
 for _attempt in 1 2 3; do
+  if [[ "${DRY_OFFLINE}" -eq 1 ]]; then
+    _wg_ok=1
+    break
+  fi
   if ping -c 1 -W 5 "${REMOTE_HOST}" >/dev/null 2>&1; then
     _wg_ok=1
     break
@@ -243,7 +271,7 @@ if [[ "${_wg_ok}" -eq 0 ]]; then
   echo "Ошибка: ${REMOTE_HOST} недоступен через VPN" >&2
   exit 1
 fi
-log_json "INFO" "wg_connected" "Соединение с ${REMOTE_HOST} подтверждено"
+[[ "${DRY_OFFLINE}" -eq 1 ]] || log_json "INFO" "wg_connected" "Соединение с ${REMOTE_HOST} подтверждено"
 
 ###############################################################################
 # PREFLIGHT
@@ -254,8 +282,12 @@ if ! command -v sshpass >/dev/null 2>&1; then
   exit 1
 fi
 
-mkdir -p "${BACKUP_DIR}" 2>/dev/null
-if [[ ! -d "${BACKUP_DIR}" ]]; then
+if [[ "${DRY_RUN}" -eq 1 ]]; then
+  [[ -d "${BACKUP_DIR}" ]] || echo "[dry-run] будет: создана папка ${BACKUP_DIR}"
+else
+  mkdir -p "${BACKUP_DIR}" 2>/dev/null
+fi
+if [[ "${DRY_RUN}" -eq 0 && ! -d "${BACKUP_DIR}" ]]; then
   log_json "ERROR" "backup_dir_missing" "Папка назначения недоступна" "${BACKUP_DIR}"
   echo "Ошибка: папка ${BACKUP_DIR} недоступна" >&2
   exit 1
@@ -298,10 +330,13 @@ SSH_OPTS=(
 
 # Выбираем быстрейший доступный компрессор на удалённом сервере:
 # zstd --fast=1 --threads=0 > pigz -1 > gzip -1
-export SSHPASS="${REMOTE_PASSWORD}"
-REMOTE_COMP=$(sshpass -e ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" \
-  "if command -v zstd >/dev/null 2>&1; then echo zstd; elif command -v pigz >/dev/null 2>&1; then echo pigz; else echo gzip; fi" 2>/dev/null)
-unset SSHPASS
+REMOTE_COMP=""
+if [[ "${DRY_OFFLINE}" -eq 0 ]]; then
+  export SSHPASS="${REMOTE_PASSWORD}"
+  REMOTE_COMP=$(sshpass -e ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" \
+    "if command -v zstd >/dev/null 2>&1; then echo zstd; elif command -v pigz >/dev/null 2>&1; then echo pigz; else echo gzip; fi" 2>/dev/null)
+  unset SSHPASS
+fi
 case "${REMOTE_COMP}" in
   zstd) COMP_CMD="zstd --fast=1 --threads=0 -c"; BACKUP_EXT="tar.zst" ;;
   pigz) COMP_CMD="pigz -1";                       BACKUP_EXT="tar.gz"  ;;
@@ -326,7 +361,11 @@ if [[ -f "${BACKUP_PATH}" ]]; then
     if [[ "${validate_rc}" -eq 1 ]]; then
       log_json "WARN" "backup_existing_invalid" "Существующий файл бэкапа повреждён — удаляем и создаём заново" \
         "${validate_detail}" "${validate_rc}"
-      rm -f "${BACKUP_PATH}"
+      if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo "[dry-run] будет: удалён повреждённый файл ${BACKUP_PATH}"
+      else
+        rm -f "${BACKUP_PATH}"
+      fi
     else
       log_json "WARN" "backup_existing_unchecked" "Не удалось проверить существующий файл бэкапа — создаём заново без дозаписи" \
         "${validate_detail}" "${validate_rc}"
@@ -339,6 +378,30 @@ fi
 log_json "INFO" "backup_start" "Начало резервного копирования" \
   "remote=${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH} -> ${BACKUP_PATH}, comp=${REMOTE_COMP:-gzip}, append=${BACKUP_APPEND}"
 log_json "INFO" "backup_excludes" "Применены встроенные исключения tar" "count=${#REMOTE_EXCLUDES[@]}, list=${REMOTE_EXCLUDES[*]}"
+
+###############################################################################
+# DRY-RUN: план оставшихся этапов
+###############################################################################
+if [[ "${DRY_RUN}" -eq 1 ]]; then
+  echo "[dry-run] будет: occ trashbin:cleanup, пересоздание files_trashbin и occ versions:cleanup на ${REMOTE_HOST}"
+  if [[ "${OPTIMIZE_MARIADB_BEFORE_BACKUP}" -eq 1 ]]; then
+    echo "[dry-run] будет: оптимизация MariaDB (${MARIADB_SERVICE_NAME})"
+  fi
+  echo "[dry-run] будет: docker compose down в ${REMOTE_PATH} на ${REMOTE_HOST}"
+  echo "[dry-run] будет: архивация ${REMOTE_PATH} -> ${BACKUP_PATH} (компрессор: ${REMOTE_COMP:-неизвестен}, дозапись: ${BACKUP_APPEND})"
+  echo "[dry-run] будет: docker compose up -d в ${REMOTE_PATH} на ${REMOTE_HOST}"
+  _dry_old_count="$(find "${BACKUP_DIR}" -maxdepth 1 -type f -name "${SCRIPT_BASE}-*.tar.*" ! -path "${BACKUP_PATH}" 2>/dev/null | wc -l)"
+  _dry_extra=$((_dry_old_count + 1 - BACKUP_KEEP_COUNT))
+  if [[ "${_dry_extra}" -gt 0 ]]; then
+    _dry_old_list="$(find "${BACKUP_DIR}" -maxdepth 1 -type f -name "${SCRIPT_BASE}-*.tar.*" ! -path "${BACKUP_PATH}" -printf '%T@|%p\n' 2>/dev/null | sort -n)"
+    while IFS='|' read -r _ _dry_old; do
+      [[ -n "${_dry_old}" ]] && echo "[dry-run] будет: удалена старая копия ${_dry_old}"
+    done < <({ printf '%s\n' "${_dry_old_list}" | head -n "${_dry_extra}"; } || true)
+  fi
+  log_json "INFO" "dry_done" "[dry-run] План резервного копирования выведен, изменений нет" "${BACKUP_PATH}"
+  echo "[dry-run] Изменения не выполнены."
+  exit 0
+fi
 
 ###############################################################################
 # NEXTCLOUD CLEANUP (occ)

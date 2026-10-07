@@ -51,3 +51,22 @@ EOF
   [ ! -e "$TMP_DIR/old2.log" ]
   [ -f "$TMP_DIR/new.txt" ]
 }
+
+@test "dry-run lists old files but does not delete them" {
+  touch -d '10 days ago' "$TMP_DIR/old.log"
+  touch "$TMP_DIR/new.log"
+
+  cat > "$CONF_FILE" <<EOF2
+TARGET_DIR="$TMP_DIR"
+FILE_TYPES="log"
+KEEP_DAYS="7"
+EOF2
+
+  run sh "$REPO_ROOT/auto_delete_old_files.sh" --dry-run
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/old.log" ]
+  [ -f "$TMP_DIR/new.log" ]
+  [[ "$output" == *"[dry-run] будет: удалён файл: $TMP_DIR/old.log"* ]]
+  [[ "$output" != *"new.log"* ]]
+}

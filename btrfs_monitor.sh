@@ -15,7 +15,7 @@ LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}-${TIMESTAMP}.jsonl"
 STATE_FILE_DEFAULT="${STATE_DIR}/${SCRIPT_BASE}.state"
 LOG_TEMPLATE_FILE="${SCRIPT_DIR}/conf/log_template.conf"
 
-mkdir -p "${LOG_DIR}" "${STATE_DIR}"
+mkdir -p "${LOG_DIR}"
 
 if [[ -r "${LOG_TEMPLATE_FILE}" ]]; then
     # shellcheck source=/dev/null
@@ -79,11 +79,24 @@ cleanup_logs() {
     fi
 }
 
+# Сохраняет текущие счётчики как новое базовое состояние
+save_state() {
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo "[dry-run] будет: обновлено состояние ${STATE_FILE}"
+        log_json "INFO" "dry_state_saved" "[dry-run] Было бы обновлено состояние" "${STATE_FILE}"
+        return 0
+    fi
+    mkdir -p "${STATE_DIR}"
+    cp "${TMP_CURRENT}" "${STATE_FILE}"
+}
+
 notify_alert() {
     local title="$1"
     local body="$2"
 
-    if command -v notify-send >/dev/null 2>&1; then
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo "[dry-run] будет: уведомление «${title}»: ${body}"
+    elif command -v notify-send >/dev/null 2>&1; then
         notify-send -a "${APP_NAME}" -i "${ICON_NAME}" -u "${URGENCY}" "${title}" "${body}" || true
     fi
 }
@@ -120,6 +133,25 @@ load_prev_to_map() {
 }
 
 ###############################################################################
+# ARGS
+###############################################################################
+DRY_RUN=0
+for arg in "$@"; do
+    case "${arg}" in
+        -n|--dry-run) DRY_RUN=1 ;;
+        -h|--help)
+            echo "Использование: ${SCRIPT_NAME} [-n|--dry-run]"
+            echo "  -n, --dry-run  проверка без обновления файла состояния и без уведомлений"
+            exit 0
+            ;;
+        *)
+            echo "Неизвестный аргумент: ${arg}" >&2
+            exit 2
+            ;;
+    esac
+done
+
+###############################################################################
 # MAIN
 ###############################################################################
 require_cmd btrfs
@@ -146,7 +178,7 @@ trap 'rm -f "${TMP_CURRENT}"' EXIT
 printf '%s\n' "${CURRENT_RAW}" > "${TMP_CURRENT}"
 
 if [[ ! -f "${STATE_FILE}" ]]; then
-    cp "${TMP_CURRENT}" "${STATE_FILE}"
+    save_state
     echo "Инициализация: сохранено базовое состояние в ${STATE_FILE}"
     log_json "INFO" "state_initialized" "Создано базовое состояние" "${STATE_FILE}"
     cleanup_logs
@@ -174,7 +206,7 @@ while IFS=$'\t' read -r dev metric value; do
     fi
 done < "${TMP_CURRENT}"
 
-cp "${TMP_CURRENT}" "${STATE_FILE}"
+save_state
 
 if [[ ${#GROWTH_LINES[@]} -gt 0 ]]; then
     detail="$(printf '%s; ' "${GROWTH_LINES[@]}")"

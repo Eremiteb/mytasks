@@ -22,7 +22,8 @@ LOG_TEMPLATE_FILE="${SCRIPT_DIR}/conf/log_template.conf"
 STATE_DIR="${SCRIPT_DIR}/state"
 VERIFIED_FILE="${STATE_DIR}/${SCRIPT_BASE}.verified"
 
-mkdir -p "${SCRIPT_DIR}/conf" "${LOG_DIR}" "${STATE_DIR}"
+mkdir -p "${SCRIPT_DIR}/conf" "${LOG_DIR}"
+DRY_RUN=0
 
 if [[ -r "${LOG_TEMPLATE_FILE}" ]]; then
     # shellcheck source=/dev/null
@@ -114,6 +115,10 @@ notify_alert() {
     local uid runtime_dir
 
     [[ "${NOTIFY_ENABLED}" == "yes" ]] || return 0
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo "[dry-run] будет: уведомление «${title}»"
+        return 0
+    fi
     if ! command -v notify-send >/dev/null 2>&1; then
         log_json "WARN" "notify_unavailable" "notify-send не найден, уведомление не показано" "${title}"
         return 0
@@ -256,6 +261,11 @@ is_verified() {
 
 mark_verified() {
     local tmp_file
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo "[dry-run] будет: архив отмечен как проверенный в ${VERIFIED_FILE}"
+        return 0
+    fi
+    mkdir -p "${STATE_DIR}"
     tmp_file="$(mktemp)"
     { [[ -r "${VERIFIED_FILE}" ]] && cat -- "${VERIFIED_FILE}"; echo "$1"; } | tail -n 50 > "${tmp_file}"
     mv -- "${tmp_file}" "${VERIFIED_FILE}"
@@ -361,6 +371,7 @@ usage() {
 Пишет JSONL-лог в logs/, при ошибках показывает уведомление в трее.
 
   --no-notify   не показывать уведомление (только лог и код возврата)
+  -n, --dry-run не менять кэш проверенных архивов и не показывать уведомления
   -h, --help    эта справка
 
 Коды возврата: 0 — всё в порядке, 1 — проблемы с бэкапами, 2 — ошибка запуска.
@@ -373,6 +384,7 @@ EOF
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --no-notify) NOTIFY_ENABLED="no" ;;
+        -n|--dry-run) DRY_RUN=1 ;;
         -h|--help)
             usage
             exit 0

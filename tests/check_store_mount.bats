@@ -32,3 +32,16 @@ teardown() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"Все диски на месте."* ]]
 }
+
+@test "dry-run runs the check and reports success" {
+  run env PATH="$STUB_DIR:$PATH" bash "$REPO_ROOT/check-store-mount.sh" --dry-run
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Все диски на месте."* ]]
+}
+
+@test "rejects unknown argument" {
+  run env PATH="$STUB_DIR:$PATH" bash "$REPO_ROOT/check-store-mount.sh" --bogus
+
+  [ "$status" -eq 2 ]
+}

@@ -513,3 +513,23 @@ EOF
   run grep -q '"event":"start"' "$log_file"
   [ "$status" -eq 0 ]
 }
+
+@test "dry-run выводит план и не создаёт архив" {
+  run env PATH="$STUB_DIR:$PATH" bash "$TMP_DIR/cloud_backup.sh" --dry-run
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"[dry-run] будет: docker compose down"* ]]
+  [[ "$output" == *"[dry-run] будет: архивация"* ]]
+  [ -z "$(ls -A "$BACKUP_DIR")" ]
+}
+
+@test "dry-run не поднимает WireGuard, если интерфейс не активен" {
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$STUB_DIR/wg"
+  printf '#!/usr/bin/env bash\necho called >> "%s/wgquick.log"\nexit 0\n' "$TMP_DIR" > "$STUB_DIR/wg-quick"
+
+  run env PATH="$STUB_DIR:$PATH" bash "$TMP_DIR/cloud_backup.sh" --dry-run
+
+  [ "$status" -eq 0 ]
+  [ ! -e "$TMP_DIR/wgquick.log" ]
+  [[ "$output" == *"[dry-run] будет: поднят WireGuard"* ]]
+}

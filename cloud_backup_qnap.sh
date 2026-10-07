@@ -187,9 +187,33 @@ export PATH="/opt/sbin:/opt/bin:${PATH}"
 # "на загрузку" в Планировщике нет), переподключаем его здесь же — тогда
 # для работы скрипта достаточно, чтобы ОН САМ запускался по расписанию.
 ENTWARE_DATA_DIR="${ENTWARE_DATA_DIR:-/share/Public/entware}"
+
+# Режим --dry-run разбирается здесь, до ensure_entware_mount(): тот монтирует /opt,
+# то есть меняет систему.
+DRY_RUN=0
+DRY_OFFLINE=0
+for arg in "$@"; do
+  case "${arg}" in
+    -n|--dry-run) DRY_RUN=1 ;;
+    -h|--help)
+      echo "Использование: $(basename -- "$0") [-n|--dry-run]"
+      echo "  -n, --dry-run  только показать план: WireGuard не поднимается, сервисы не останавливаются, архив не создаётся"
+      exit 0
+      ;;
+    *)
+      echo "Неизвестный аргумент: ${arg}" >&2
+      exit 2
+      ;;
+  esac
+done
+
 ensure_entware_mount() {
   [[ -x /opt/bin/opkg ]] && return 0
   [[ -d "${ENTWARE_DATA_DIR}/etc" ]] || return 0
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    echo "[dry-run] будет: смонтирован ${ENTWARE_DATA_DIR} в /opt и запущен Entware"
+    return 0
+  fi
   mkdir -p /opt
   mount --bind "${ENTWARE_DATA_DIR}" /opt 2>/dev/null
   [[ -x /opt/etc/init.d/rc.unslung ]] && /opt/etc/init.d/rc.unslung start >/dev/null 2>&1
@@ -648,6 +672,10 @@ log_json "INFO" "start" "Запуск резервного копировани�
 
 if wg_is_up; then
   log_json "INFO" "wg_status" "WireGuard ${WG_INTERFACE} уже активен"
+elif [[ "${DRY_RUN}" -eq 1 ]]; then
+  DRY_OFFLINE=1
+  echo "[dry-run] будет: поднят WireGuard ${WG_INTERFACE}; проверки удалённого сервера пропущены"
+  log_json "INFO" "dry_wg_up" "[dry-run] Был бы поднят WireGuard ${WG_INTERFACE}"
 else
   log_json "INFO" "wg_up" "Поднимаем WireGuard ${WG_INTERFACE}..."
   if ! wg_up_userspace; then
@@ -664,6 +692,10 @@ fi
 log_json "INFO" "wg_check" "Проверяем доступность ${REMOTE_HOST} через VPN..."
 _wg_ok=0
 for _attempt in 1 2 3; do
+  if [[ "${DRY_OFFLINE}" -eq 1 ]]; then
+    _wg_ok=1
+    break
+  fi
   if ping -c 1 -W 5 "${REMOTE_HOST}" >/dev/null 2>&1; then
     _wg_ok=1
     break
@@ -676,7 +708,7 @@ if [[ "${_wg_ok}" -eq 0 ]]; then
   echo "Ошибка: ${REMOTE_HOST} недоступен через VPN" >&2
   exit 1
 fi
-log_json "INFO" "wg_connected" "Соединение с ${REMOTE_HOST} подтверждено"
+[[ "${DRY_OFFLINE}" -eq 1 ]] || log_json "INFO" "wg_connected" "Соединение с ${REMOTE_HOST} подтверждено"
 
 ###############################################################################
 # PREFLIGHT
@@ -694,8 +726,12 @@ if [[ -n "${REMOTE_PASSWORD}" ]] && ! command -v sshpass >/dev/null 2>&1; then
     "opkg install sshpass недоступен для этой архитектуры; настройте REMOTE_SSH_KEY"
 fi
 
-mkdir -p "${BACKUP_DIR}" 2>/dev/null
-if [[ ! -d "${BACKUP_DIR}" ]]; then
+if [[ "${DRY_RUN}" -eq 1 ]]; then
+  [[ -d "${BACKUP_DIR}" ]] || echo "[dry-run] будет: создана папка ${BACKUP_DIR}"
+else
+  mkdir -p "${BACKUP_DIR}" 2>/dev/null
+fi
+if [[ "${DRY_RUN}" -eq 0 && ! -d "${BACKUP_DIR}" ]]; then
   log_json "ERROR" "backup_dir_missing" "Папка назначения недоступна" "${BACKUP_DIR}"
   echo "Ошибка: папка ${BACKUP_DIR} недоступна" >&2
   exit 1
@@ -899,42 +935,47 @@ nohup bash -c 'dd if=/dev/zero bs=1M count=${NETWORK_SPEED_TEST_MB} 2>/dev/null 
 
 # Выбираем быстрейший доступный компрессор на удалённом сервере:
 # zstd -5 --threads=0 > pigz -1 > gzip -1
-REMOTE_COMP=$(ssh_remote \
-  "if command -v zstd >/dev/null 2>&1; then echo zstd; elif command -v pigz >/dev/null 2>&1; then echo pigz; else echo gzip; fi" 2>/dev/null)
+REMOTE_COMP=""
+if [[ "${DRY_OFFLINE}" -eq 0 ]]; then
+  REMOTE_COMP=$(ssh_remote \
+    "if command -v zstd >/dev/null 2>&1; then echo zstd; elif command -v pigz >/dev/null 2>&1; then echo pigz; else echo gzip; fi" 2>/dev/null)
+fi
 case "${REMOTE_COMP}" in
   zstd) COMP_CMD="zstd -5 --threads=0 -c";         BACKUP_EXT="tar.zst" ;;
   pigz) COMP_CMD="pigz -1";                       BACKUP_EXT="tar.gz"  ;;
   *)    COMP_CMD="gzip -1";                        BACKUP_EXT="tar.gz"  ;;
 esac
 
-# Снимок нагрузки ДО начала архивирования — baseline для сравнения с
-# показателями во время передачи (см. backup_progress/backup_metrics ниже)
-# и для расчёта probable_cause в backup_degradation.
-LOCAL_NPROC="$(get_local_nproc)"
-_local_load1_baseline="$(get_local_load1)"
-_local_mem_avail_mb_baseline="$(get_local_mem_avail_mb)"
-_remote_diag_baseline="$(get_remote_diag)"
-_remote_load1_baseline=$(printf '%s\n' "${_remote_diag_baseline}" | sed -n '1p')
-_remote_mem_avail_mb_baseline=$(printf '%s\n' "${_remote_diag_baseline}" | sed -n '2p')
-REMOTE_NPROC=$(printf '%s\n' "${_remote_diag_baseline}" | sed -n '3p')
-REMOTE_NPROC="${REMOTE_NPROC:-1}"
-RTT_BASELINE_MS="$(get_rtt_ms)"
-RTT_BASELINE_MS="${RTT_BASELINE_MS:-n/a}"
-IO_DEVICE="$(get_local_io_device)"
-log_json "INFO" "backup_env_diag" "Снимок нагрузки перед архивированием" \
-  "local_nproc=${LOCAL_NPROC}, local_load1=${_local_load1_baseline:-n/a}, local_mem_avail_mb=${_local_mem_avail_mb_baseline:-n/a}, remote_nproc=${REMOTE_NPROC}, remote_load1=${_remote_load1_baseline:-n/a}, remote_mem_avail_mb=${_remote_mem_avail_mb_baseline:-n/a}, rtt_baseline_ms=${RTT_BASELINE_MS}, io_device=${IO_DEVICE:-n/a}"
-if [[ -z "${IO_DEVICE}" ]]; then
-  # На проде (2026-08-04) io_device вышел n/a — причина неизвестна (нет
-  # прямого SSH-доступа к QNAP для живой проверки). Пишем сырой вывод df,
-  # чтобы по следующему логу понять: df вообще не нашёл BACKUP_DIR, вернул
-  # пустую строку, или вернул имя устройства, которого нет в /proc/diskstats
-  # (например, длинное имя mapper-устройства на некоторых прошивках QTS).
-  _io_debug_df="$(df "${BACKUP_DIR}" 2>&1 | tr '\n' ';')"
-  log_json "WARN" "io_diag_unavailable" "Не удалось определить блочное устройство под BACKUP_DIR — замер IO (backup_resource_diag) пропущен" \
-    "backup_dir=${BACKUP_DIR}, df_output=[${_io_debug_df:-empty}]"
-fi
+if [[ "${DRY_RUN}" -eq 0 ]]; then
+  # Снимок нагрузки ДО начала архивирования — baseline для сравнения с
+  # показателями во время передачи (см. backup_progress/backup_metrics ниже)
+  # и для расчёта probable_cause в backup_degradation.
+  LOCAL_NPROC="$(get_local_nproc)"
+  _local_load1_baseline="$(get_local_load1)"
+  _local_mem_avail_mb_baseline="$(get_local_mem_avail_mb)"
+  _remote_diag_baseline="$(get_remote_diag)"
+  _remote_load1_baseline=$(printf '%s\n' "${_remote_diag_baseline}" | sed -n '1p')
+  _remote_mem_avail_mb_baseline=$(printf '%s\n' "${_remote_diag_baseline}" | sed -n '2p')
+  REMOTE_NPROC=$(printf '%s\n' "${_remote_diag_baseline}" | sed -n '3p')
+  REMOTE_NPROC="${REMOTE_NPROC:-1}"
+  RTT_BASELINE_MS="$(get_rtt_ms)"
+  RTT_BASELINE_MS="${RTT_BASELINE_MS:-n/a}"
+  IO_DEVICE="$(get_local_io_device)"
+  log_json "INFO" "backup_env_diag" "Снимок нагрузки перед архивированием" \
+    "local_nproc=${LOCAL_NPROC}, local_load1=${_local_load1_baseline:-n/a}, local_mem_avail_mb=${_local_mem_avail_mb_baseline:-n/a}, remote_nproc=${REMOTE_NPROC}, remote_load1=${_remote_load1_baseline:-n/a}, remote_mem_avail_mb=${_remote_mem_avail_mb_baseline:-n/a}, rtt_baseline_ms=${RTT_BASELINE_MS}, io_device=${IO_DEVICE:-n/a}"
+  if [[ -z "${IO_DEVICE}" ]]; then
+    # На проде (2026-08-04) io_device вышел n/a — причина неизвестна (нет
+    # прямого SSH-доступа к QNAP для живой проверки). Пишем сырой вывод df,
+    # чтобы по следующему логу понять: df вообще не нашёл BACKUP_DIR, вернул
+    # пустую строку, или вернул имя устройства, которого нет в /proc/diskstats
+    # (например, длинное имя mapper-устройства на некоторых прошивках QTS).
+    _io_debug_df="$(df "${BACKUP_DIR}" 2>&1 | tr '\n' ';')"
+    log_json "WARN" "io_diag_unavailable" "Не удалось определить блочное устройство под BACKUP_DIR — замер IO (backup_resource_diag) пропущен" \
+      "backup_dir=${BACKUP_DIR}, df_output=[${_io_debug_df:-empty}]"
+  fi
 
-measure_network_speed
+  measure_network_speed
+fi
 
 BACKUP_FILENAME="${SCRIPT_BASE}-${BACKUP_DATE}.${BACKUP_EXT}"
 BACKUP_PATH="${BACKUP_DIR}/${BACKUP_FILENAME}"
@@ -954,7 +995,11 @@ if [[ -f "${BACKUP_PATH}" ]]; then
     if [[ ${validate_rc} -eq 1 ]]; then
       log_json "WARN" "backup_existing_invalid" "Существующий файл бэкапа повреждён — удаляем и создаём заново" \
         "${validate_detail}" "${validate_rc}"
-      rm -f "${BACKUP_PATH}"
+      if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo "[dry-run] будет: удалён повреждённый файл ${BACKUP_PATH}"
+      else
+        rm -f "${BACKUP_PATH}"
+      fi
     else
       log_json "WARN" "backup_existing_unchecked" "Не удалось проверить существующий файл бэкапа — создаём заново без дозаписи" \
         "${validate_detail}" "${validate_rc}"
@@ -967,6 +1012,31 @@ fi
 log_json "INFO" "backup_start" "Начало резервного копирования" \
   "remote=${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH} -> ${BACKUP_PATH}, comp=${REMOTE_COMP:-gzip}, append=${BACKUP_APPEND}"
 log_json "INFO" "backup_excludes" "Применены встроенные исключения tar" "count=${#REMOTE_EXCLUDES[@]}, list=${REMOTE_EXCLUDES[*]}"
+
+###############################################################################
+# DRY-RUN: план оставшихся этапов
+###############################################################################
+if [[ "${DRY_RUN}" -eq 1 ]]; then
+  echo "[dry-run] будет: очистка корзин и версий Nextcloud пропускается (приложения отключены)"
+  if [[ "${OPTIMIZE_MARIADB_BEFORE_BACKUP}" -eq 1 && "${DB_OPTIMIZE_DUE}" -eq 1 ]]; then
+    echo "[dry-run] будет: оптимизация MariaDB (${MARIADB_SERVICE_NAME}), затем отметка в ${DB_OPTIMIZE_STATE_FILE}"
+  elif [[ "${DB_OPTIMIZE_DUE}" -eq 1 ]]; then
+    echo "[dry-run] будет: отметка планового интервала оптимизации в ${DB_OPTIMIZE_STATE_FILE}"
+  fi
+  echo "[dry-run] будет: docker compose down в ${REMOTE_PATH} на ${REMOTE_HOST}"
+  echo "[dry-run] будет: архивация ${REMOTE_PATH} -> ${BACKUP_PATH} (компрессор: ${REMOTE_COMP:-неизвестен}, дозапись: ${BACKUP_APPEND})"
+  echo "[dry-run] будет: docker compose up -d в ${REMOTE_PATH} на ${REMOTE_HOST}"
+  # shellcheck disable=SC2012
+  _dry_old=$(ls -1t "${BACKUP_DIR}/${SCRIPT_BASE}-"*.tar.* 2>/dev/null | awk -v keep_path="${BACKUP_PATH}" '$0 != keep_path' | tail -n "+${BACKUP_KEEP_COUNT}")
+  while IFS= read -r _dry_file; do
+    [[ -n "${_dry_file}" ]] && echo "[dry-run] будет: удалена старая копия ${_dry_file}"
+  done <<DRY_OLD_EOF
+${_dry_old}
+DRY_OLD_EOF
+  log_json "INFO" "dry_done" "[dry-run] План резервного копирования выведен, изменений нет" "${BACKUP_PATH}"
+  echo "[dry-run] Изменения не выполнены."
+  exit 0
+fi
 
 ###############################################################################
 # NEXTCLOUD CLEANUP (occ)

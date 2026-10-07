@@ -66,3 +66,19 @@ teardown() {
   [ "$status" -eq 0 ]
   [ -n "$output" ]
 }
+
+@test "dry-run does not call sudo, lp, systemctl disable or printer GUI" {
+  CALLS="$TMP_DIR/calls.log"
+  for cmd in sudo lp system-config-printer; do
+    printf '#!/usr/bin/env bash\necho "%s $*" >> "%s"\n' "$cmd" "$CALLS" > "$STUB_DIR/$cmd"
+    chmod +x "$STUB_DIR/$cmd"
+  done
+  printf '#!/usr/bin/env bash\ncase "$*" in *disable*) echo "systemctl $*" >> "%s" ;; esac\nexit 0\n' "$CALLS" > "$STUB_DIR/systemctl"
+  chmod +x "$STUB_DIR/systemctl"
+
+  run env PATH="$STUB_DIR:$PATH" bash "$TMP_DIR/hp_p1005_garuda.sh" --dry-run
+
+  [ "$status" -eq 0 ]
+  [ ! -e "$CALLS" ]
+  [[ "$output" == *"[dry-run] будет: запуск sudo system-config-printer"* ]]
+}

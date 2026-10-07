@@ -36,6 +36,7 @@ HOSTNAME_SHORT="$(hostname -s 2>/dev/null || hostname)"
 TS_NOW="$(date '+%Y-%m-%d-%H-%M-%S')"
 LOG_FILE="${SCRIPT_DIR}/${SCRIPT_BASE}_${TS_NOW}.jsonl"
 LOG_FD=3
+DRY_RUN=0
 
 # -------------------------
 # JSON logging
@@ -197,6 +198,10 @@ check_usblp() {
 }
 
 disable_auto() {
+  if ((DRY_RUN)); then
+    info "[dry-run] будет: systemctl disable --now configure-printer@.service"
+    return 0
+  fi
   info "Disabling configure-printer@.service"
   systemctl list-unit-files | grep -q '^configure-printer@\.service' \
     && systemctl disable --now configure-printer@.service || true
@@ -205,6 +210,10 @@ disable_auto() {
 
 unload_usblp() {
   if lsmod | grep -q '^usblp'; then
+    if ((DRY_RUN)); then
+      info "[dry-run] будет: sudo rmmod usblp"
+      return 0
+    fi
     info "Unloading usblp"
     sudo rmmod usblp
     log_write info usblp_unloaded "usblp unloaded"
@@ -212,18 +221,30 @@ unload_usblp() {
 }
 
 blacklist_usblp() {
+  if ((DRY_RUN)); then
+    info "[dry-run] будет: запись «blacklist usblp» в /etc/modprobe.d/blacklist-usblp.conf"
+    return 0
+  fi
   info "Blacklisting usblp"
   echo "blacklist usblp" | sudo tee /etc/modprobe.d/blacklist-usblp.conf >/dev/null
   log_write info usblp_blacklisted "usblp blacklisted"
 }
 
 run_gui() {
+  if ((DRY_RUN)); then
+    info "[dry-run] будет: запуск sudo system-config-printer"
+    return 0
+  fi
   info "Launching system-config-printer"
   sudo system-config-printer
   log_write info gui_launched "system-config-printer launched"
 }
 
 print_test() {
+  if ((DRY_RUN)); then
+    info "[dry-run] будет: отправка двух тестовых заданий lp /etc/hostname"
+    return 0
+  fi
   info "Sending test prints"
   lp /etc/hostname || true
   sleep 2
@@ -245,13 +266,18 @@ main() {
   log_open
 
   local do_all=0
+  local other_args=0
 
-  if (($# == 0)); then
+  # Без аргументов, с --all или только с --dry-run выполняется полный набор действий
+  for arg in "${@}"; do
+    case "${arg}" in
+      --all) do_all=1 ;;
+      -n|--dry-run) DRY_RUN=1 ;;
+      *) other_args=$((other_args + 1)) ;;
+    esac
+  done
+  if ((other_args == 0)); then
     do_all=1
-  else
-    for arg in "${@}"; do
-      [[ "${arg}" == "--all" ]] && do_all=1
-    done
   fi
 
   if ((do_all)); then
@@ -269,8 +295,10 @@ main() {
     die "Only --all is supported in this version"
   fi
 
-  log_close
+  # Итоговое сообщение — до log_close: после закрытия дескриптора запись в лог
+  # падала и скрипт завершался с кодом 1 даже при успехе.
   info "Done. Log: ${LOG_FILE}"
+  log_close
 }
 
 main "${@}"

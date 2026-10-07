@@ -271,3 +271,22 @@ EOF
   count=$(ls -1 "$TMP_DIR/logs"/btrfs_monitor-*.jsonl 2>/dev/null | wc -l)
   [ "$count" -le 2 ]
 }
+
+@test "dry-run does not create or update state file and does not notify" {
+  run env PATH="$STUB_DIR:$PATH" bash "$TMP_DIR/btrfs_monitor.sh" --dry-run
+  [ "$status" -eq 0 ]
+  [ ! -e "$STATE_FILE" ]
+
+  run env PATH="$STUB_DIR:$PATH" bash "$TMP_DIR/btrfs_monitor.sh"
+  [ "$status" -eq 0 ]
+  cp "$STATE_FILE" "$TMP_DIR/state.before"
+  sed -i 's/write_io_errs    0/write_io_errs    5/' "$STATS_FILE"
+  rm -f "$NOTIFY_LOG"
+
+  run env PATH="$STUB_DIR:$PATH" bash "$TMP_DIR/btrfs_monitor.sh" --dry-run
+
+  [ "$status" -eq 1 ]
+  cmp -s "$STATE_FILE" "$TMP_DIR/state.before"
+  [ ! -e "$NOTIFY_LOG" ]
+  [[ "$output" == *"[dry-run] будет: уведомление"* ]]
+}

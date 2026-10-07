@@ -74,6 +74,22 @@ cleanup_logs() {
 # x-systemd.mount-timeout в /etc/fstab)
 MOUNT_WAIT_SECS=30
 
+DRY_RUN=0
+for arg in "$@"; do
+    case "${arg}" in
+        -n|--dry-run) DRY_RUN=1 ;;
+        -h|--help)
+            echo "Использование: ${SCRIPT_NAME} [-n|--dry-run]"
+            echo "  -n, --dry-run  проверка без отправки уведомлений"
+            exit 0
+            ;;
+        *)
+            echo "Неизвестный аргумент: ${arg}" >&2
+            exit 2
+            ;;
+    esac
+done
+
 FAILED_MOUNTS=()
 log_json "INFO" "start" "Проверка точек монтирования" "/etc/fstab"
 
@@ -103,7 +119,9 @@ done < /etc/fstab
 
 if [[ ${#FAILED_MOUNTS[@]} -gt 0 ]]; then
     FAILED_STR=$(IFS=', '; echo "${FAILED_MOUNTS[*]}")
-    if command -v notify-send >/dev/null 2>&1; then
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        echo "[dry-run] будет: уведомление «Ошибка монтирования»: ${FAILED_STR}"
+    elif command -v notify-send >/dev/null 2>&1; then
         notify-send -a "${APP_NAME}" -i "${ICON_NAME}" -u "${URGENCY}" \
             "Ошибка монтирования" "Не активны: ${FAILED_STR}"
     fi

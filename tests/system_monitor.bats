@@ -495,3 +495,13 @@ EOF
   # latest.html — фиксированное имя, ротацией не затрагивается
   [ -f "$TMP_DIR/system_reports/latest.html" ]
 }
+
+@test "dry-run polls but changes neither DB nor reports" {
+  run env PATH="$STUB_DIR:$PATH" bash "$TMP_DIR/system_monitor.sh" --dry-run
+
+  [ "$status" -eq 0 ]
+  [ ! -e "$TMP_DIR/state/system_monitor.db" ]
+  [ ! -e "$TMP_DIR/system_reports" ]
+  [[ "$output" == *"[dry-run] будет: запись в"*"disk_stats"* ]]
+  [[ "$output" == *"[dry-run] Изменения не выполнены."* ]]
+}

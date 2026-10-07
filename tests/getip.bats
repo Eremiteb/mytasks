@@ -45,3 +45,12 @@ teardown() {
   [ "$status" -eq 0 ]
   [ "$output" = "203.0.113.10" ]
 }
+
+@test "dry-run does not write IP or history files" {
+  run env PATH="$STUB_DIR:$PATH" bash -c "cd \"$WORK_DIR\" && ./getip.sh --dry-run"
+
+  [ "$status" -eq 0 ]
+  [ ! -e "$TMP_DIR/data/ip.txt" ]
+  [ ! -e "$TMP_DIR/data/ip_history.txt" ]
+  [[ "$output" == *"[dry-run] будет: записан IP 203.0.113.10"* ]]
+}

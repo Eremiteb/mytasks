@@ -44,3 +44,21 @@ EOF
   [ "$status" -eq 7 ]
   [ ! -e "$TMP_DIR/split_called" ]
 }
+
+@test "dry-run does not start downloader and runs sorter with --dry-run" {
+  cat > "$TMP_DIR/music_downloader/music_downloader.py" <<'EOF2'
+import pathlib
+pathlib.Path(__file__).with_name("downloader_called").touch()
+EOF2
+  cat > "$TMP_DIR/split_by_dash.sh" <<'EOF2'
+#!/usr/bin/env sh
+echo "$*" > "$(dirname "$0")/split_args"
+EOF2
+
+  run bash "$TMP_DIR/music_downloader.sh" --dry-run
+
+  [ "$status" -eq 0 ]
+  [ ! -e "$TMP_DIR/music_downloader/downloader_called" ]
+  [ "$(cat "$TMP_DIR/split_args")" = "--dry-run" ]
+  [[ "$output" == *"[dry-run] будет: запуск загрузчика"* ]]
+}

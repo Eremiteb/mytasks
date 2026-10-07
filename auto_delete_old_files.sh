@@ -65,6 +65,25 @@ trim() {
 }
 
 ###############################################################################
+# ARGS
+###############################################################################
+DRY_RUN=0
+for arg in "$@"; do
+  case "${arg}" in
+    -n|--dry-run) DRY_RUN=1 ;;
+    -h|--help)
+      echo "Использование: ${SCRIPT_NAME} [-n|--dry-run]"
+      echo "  -n, --dry-run  только показать, какие файлы будут удалены, без удаления"
+      exit 0
+      ;;
+    *)
+      echo "Неизвестный аргумент: ${arg}" >&2
+      exit 2
+      ;;
+  esac
+done
+
+###############################################################################
 # CONFIG
 ###############################################################################
 if [ ! -r "${CONFIG_FILE}" ]; then
@@ -110,6 +129,12 @@ FOUND_COUNT=0
 
 delete_one_file() {
   _file="$1"
+  if [ "${DRY_RUN}" -eq 1 ]; then
+    printf '[dry-run] будет: удалён файл: %s\n' "${_file}"
+    log_json "INFO" "dry_deleted" "[dry-run] Был бы удален файл" "${_file}" 0
+    DELETED_COUNT=$((DELETED_COUNT + 1))
+    return 0
+  fi
   if rm -f -- "${_file}"; then
     DELETED_COUNT=$((DELETED_COUNT + 1))
     log_json "INFO" "deleted" "Удален файл" "${_file}" 0
@@ -161,6 +186,10 @@ case "${FILE_TYPES_RAW}" in
     delete_selected_types
     ;;
 esac
+
+if [ "${DRY_RUN}" -eq 1 ]; then
+  echo "[dry-run] Изменения не выполнены: подошло файлов ${FOUND_COUNT}."
+fi
 
 log_json "INFO" "done" "Автоудаление завершено" "matched=${FOUND_COUNT}; deleted=${DELETED_COUNT}" 0
 cleanup_logs

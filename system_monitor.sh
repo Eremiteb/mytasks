@@ -17,7 +17,7 @@ TIMESTAMP="$(date '+%Y-%m-%d-%H-%M-%S')"
 LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}-${TIMESTAMP}.jsonl"
 LOG_TEMPLATE_FILE="${SCRIPT_DIR}/conf/log_template.conf"
 
-mkdir -p "${LOG_DIR}" "${STATE_DIR}"
+mkdir -p "${LOG_DIR}"
 
 if [[ -r "${LOG_TEMPLATE_FILE}" ]]; then
     # shellcheck source=/dev/null
@@ -155,7 +155,7 @@ require_cmd() {
 usage() {
     cat <<EOF
 Использование:
-  ${SCRIPT_NAME} [-r|--report] [-h|--help]
+  ${SCRIPT_NAME} [-r|--report] [-n|--dry-run] [-h|--help]
 
 Без аргументов:
   Опрашивает диски (smartctl), CPU (lm_sensors, /proc) и GPU (nvidia-smi,
@@ -166,6 +166,8 @@ usage() {
 Опции:
   -r, --report   Только пересобрать HTML-отчёт из уже накопленных в
                  SQLite данных, без повторного опроса.
+  -n, --dry-run  Опросить систему и показать, что было бы записано в SQLite и
+                 отчёт, не меняя БД, отчёты и не показывая уведомлений.
   -h, --help     Показать эту справку и выйти.
 EOF
 }
@@ -174,8 +176,13 @@ EOF
 # ARGS
 ###############################################################################
 REPORT_ONLY=0
+DRY_RUN=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        -n|--dry-run)
+            DRY_RUN=1
+            shift
+            ;;
         -r|--report)
             REPORT_ONLY=1
             shift
@@ -251,6 +258,11 @@ insert_row() {
     local q_ts q_device q_alias q_mountpoints q_model q_serial q_health
     local n_size n_temp n_poh n_realloc n_pending n_uncorrect
 
+    if ((DRY_RUN)); then
+        echo "[dry-run] будет: запись в ${DB_FILE}: disk_stats ${device} (${model}, health=${health}, temp=${temp})"
+        return 0
+    fi
+
     q_ts="$(sql_escape "${row_ts}")"
     q_device="$(sql_escape "${device}")"
     q_alias="$(sql_escape "${alias}")"
@@ -272,6 +284,11 @@ insert_cpu_row() {
     local model="$1" temp="$2" usage="$3" load1="$4" load5="$5" load15="$6" row_ts="$7"
     local q_ts q_model n_temp n_usage n_load1 n_load5 n_load15
 
+    if ((DRY_RUN)); then
+        echo "[dry-run] будет: запись в ${DB_FILE}: cpu_stats ${model} (temp=${temp}, usage=${usage}%, load1=${load1})"
+        return 0
+    fi
+
     q_ts="$(sql_escape "${row_ts}")"
     q_model="$(sql_escape "${model}")"
     n_temp="$(sql_num "${temp}")"
@@ -286,6 +303,11 @@ insert_cpu_row() {
 insert_gpu_row() {
     local device="$1" model="$2" temp="$3" usage="$4" mem_used="$5" mem_total="$6" power="$7" row_ts="$8"
     local q_ts q_device q_model n_temp n_usage n_mem_used n_mem_total n_power
+
+    if ((DRY_RUN)); then
+        echo "[dry-run] будет: запись в ${DB_FILE}: gpu_stats ${device} ${model} (temp=${temp}, usage=${usage}%)"
+        return 0
+    fi
 
     q_ts="$(sql_escape "${row_ts}")"
     q_device="$(sql_escape "${device}")"
@@ -1212,8 +1234,10 @@ HTML
 # MAIN
 ###############################################################################
 require_cmd sqlite3
-mkdir -p "${REPORT_DIR}" "$(dirname -- "${DB_FILE}")"
-init_db
+if ((DRY_RUN == 0)); then
+    mkdir -p "${REPORT_DIR}" "$(dirname -- "${DB_FILE}")"
+    init_db
+fi
 
 if ((REPORT_ONLY == 0)); then
     require_cmd smartctl
@@ -1237,7 +1261,7 @@ if ((REPORT_ONLY == 0)); then
     done
     poll_cpu "${RUN_TS}"
     poll_gpu "${RUN_TS}"
-else
+elif ((DRY_RUN == 0)); then
     ROW_COUNT="$(sqlite3 -noheader "${DB_FILE}" "SELECT COUNT(*) FROM disk_stats;" 2>/dev/null || echo 0)"
     if [[ "${ROW_COUNT}" -eq 0 ]]; then
         echo "Ошибка: в базе ${DB_FILE} ещё нет данных — сначала запустите ${SCRIPT_NAME} без ключей" >&2
@@ -1248,6 +1272,14 @@ else
 fi
 
 REPORT_FILE="${REPORT_DIR}/${SCRIPT_BASE}-${TIMESTAMP}.html"
+if ((DRY_RUN)); then
+    echo "[dry-run] будет: сформирован HTML-отчёт ${REPORT_FILE} и обновлён ${REPORT_DIR}/latest.html"
+    echo "[dry-run] будет: уведомление, если в отчёте окажутся объекты в критическом состоянии"
+    echo "[dry-run] Изменения не выполнены."
+    log_json "INFO" "dry_done" "[dry-run] Опрос выполнен, БД и отчёты не изменены" "${REPORT_FILE}"
+    cleanup_logs
+    exit 0
+fi
 if ! generate_report "${REPORT_FILE}"; then
     cleanup_logs
     exit 2

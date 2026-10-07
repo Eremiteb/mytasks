@@ -57,3 +57,11 @@ teardown() {
   [ "$status" -eq 0 ]
   [ -n "$output" ]
 }
+
+@test "dry-run reports planned conversion without writing anything" {
+  run env PATH="$STUB_DIR:$PATH" bash -c "cd \"$WORK_DIR\" && ./all_to_mp3.sh --dry-run \"$SRC_DIR\""
+
+  [ "$status" -eq 0 ]
+  [ ! -e "$TMP_DIR/out" ]
+  [[ "$output" == *"[dry-run] будет: конвертация"*"Track.wav"* ]]
+}
