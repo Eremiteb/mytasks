@@ -13,6 +13,10 @@ LOG_DIR="${MYTASKS_LOG_DIR:-${SCRIPT_DIR}/logs}"
 CONFIG_DIR="${SCRIPT_DIR}/conf"
 CONFIG_FILE="${CONFIG_DIR}/${SCRIPT_BASE}.conf"
 LOG_TEMPLATE_FILE="${CONFIG_DIR}/log_template.conf"
+# Список имён-исключений: эти имена файлов/папок win_safe() оставляет как есть
+# (по одному на строку, точное совпадение, «#» — комментарий)
+SPLIT_KEEP_FILE="${CONFIG_DIR}/${SCRIPT_BASE}.keep.conf"
+export SPLIT_KEEP_FILE
 TIMESTAMP="$(date '+%Y-%m-%d-%H-%M-%S')"
 LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}-${TIMESTAMP}.jsonl"
 mkdir -p "${LOG_DIR}" "${CONFIG_DIR}"
@@ -26,14 +30,27 @@ trap 'rm -f "${CREATED_DIRS_FILE}" "${WIN_SAFE_FILE}"' EXIT
 # не синхронизируются). Правила:
 #   - символы < > : " \ | ? * и управляющие (0x00-0x1F) заменяются на «_»;
 #   - ведущие пробелы, конечные точки и пробелы удаляются («Автор.» -> «Автор»);
+#   - «&» всегда с одним пробелом с обеих сторон («A&B», «A &B» -> «A & B»);
 #   - зарезервированные имена устройств (CON, PRN, AUX, NUL, COM1-9, LPT1-9) в
 #     любом регистре и с любым расширением получают префикс «_» (CON.mp3 -> _CON.mp3).
+# Имена из conf/split_by_dash.keep.conf (SPLIT_KEEP_FILE) не меняются вообще.
 # Длина компонента: лимит Linux (255 байт) строже лимита Windows (255 символов
 # UTF-16), поэтому отдельной обрезки не требуется; пути длиннее MAX_PATH Syncthing
 # в Windows обрабатывает через длинные пути.
 cat > "${WIN_SAFE_FILE}" <<'AWK_EOF'
+BEGIN {
+  keep_file = ENVIRON["SPLIT_KEEP_FILE"]
+  while (keep_file != "" && (getline keep_line < keep_file) > 0) {
+    if (keep_line !~ /^[[:space:]]*(#|$)/) keep[keep_line] = 1
+  }
+}
 function win_safe(n,   i, b) {
+  if (n in keep) return n
   gsub(/[<>:"\\|?*[:cntrl:]]/, "_", n)
+  sub(/^[[:space:]]+/, "", n)
+  sub(/[.[:space:]]+$/, "", n)
+  # «&» всегда с одним пробелом с обеих сторон: «10AGE&Анет Сай», «A &B» -> «10AGE & Анет Сай», «A & B»
+  gsub(/[[:space:]]*&[[:space:]]*/, " \\& ", n)
   sub(/^[[:space:]]+/, "", n)
   sub(/[.[:space:]]+$/, "", n)
   i = index(n, ".")
@@ -56,17 +73,37 @@ LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
 ###############################################################################
 DRY_RUN=0
 DIR_ARG=""
-for arg in "$@"; do
-  case "${arg}" in
+DEST_ARG=""
+while [ $# -gt 0 ]; do
+  case "$1" in
     -n|--dry-run) DRY_RUN=1 ;;
+    --dest)
+      if [ $# -lt 2 ]; then
+        echo "Ошибка: --dest требует каталог" >&2
+        exit 2
+      fi
+      DEST_ARG="$2"
+      shift
+      ;;
     -h|--help)
-      echo "Использование: ${SCRIPT_NAME} [-n|--dry-run] [каталог]"
-      echo "  -n, --dry-run  только показать, что будет создано/перемещено/удалено, без изменений"
+      echo "Использование: ${SCRIPT_NAME} [-n|--dry-run] [--dest КАТАЛОГ] [каталог]"
+      echo "  -n, --dry-run   только показать, что будет создано/перемещено/удалено, без изменений"
+      echo "  --dest КАТАЛОГ  целевой каталог для результата; DEST_DIR из конфига применяется"
+      echo "                  только при запуске без явного каталога (по списку из конфига)"
       exit 0
       ;;
-    *) [ -z "${DIR_ARG}" ] && DIR_ARG="${arg}" ;;
+    *) [ -z "${DIR_ARG}" ] && DIR_ARG="$1" ;;
   esac
+  shift
 done
+
+# Официальные имена исполнителей (MusicBrainz): включается OFFICIAL_NAMES=yes в
+# conf/split_by_dash.conf или переменной окружения. По умолчанию выключено, чтобы
+# скрипт работал без сети.
+OFFICIAL_NAMES="${OFFICIAL_NAMES:-no}"
+OFFICIAL_API="${OFFICIAL_API:-https://musicbrainz.org/ws/2/artist}"
+OFFICIAL_UA="mytasks-split_by_dash/1.0 (https://github.com/Eremiteb/mytasks)"
+OFFICIAL_CACHE="${SCRIPT_DIR}/state/${SCRIPT_BASE}_official.tsv"
 
 ###############################################################################
 # HELPERS
@@ -162,7 +199,7 @@ merge_case_siblings() {
   find "${parent}" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null \
     | LC_ALL=C.UTF-8 awk -f "${WIN_SAFE_FILE}" -e '
         { s = win_safe($0); if (s == "") next
-          k = tolower(s); n[k]++; v[k] = (k in v) ? v[k] "\n" $0 : $0; if (s != $0) dot[k] = 1 }
+          k = tolower(s); gsub(/[^[:alnum:]]/, "", k); if (k == "") next; n[k]++; v[k] = (k in v) ? v[k] "\n" $0 : $0; if (s != $0) dot[k] = 1 }
         END {
           for (k in n) if (n[k] > 1 || (k in dot)) {
             m = split(v[k], a, "\n"); asort(a)
@@ -181,11 +218,13 @@ merge_case_siblings() {
   rm -f -- "${group_file}"
 }
 
-# Оценка «внешнего вида» регистра имени: три числа через пробел —
+# Оценка «внешнего вида» имени: пять чисел через пробел —
 # 1) 1, если имя целиком в верхнем регистре (HURTS), иначе 0;
 # 2) 1, если первая буква не заглавная, иначе 0;
-# 3) число заглавных букв, кроме первого символа.
-# Чем меньше значения, тем ближе имя к виду «Первая заглавная, остальные строчные».
+# 3) число заглавных букв, кроме первого символа;
+# 4) 1, если в имени есть «_» или «+» (следы замены знаков при скачивании), иначе 0;
+# 5) приоритет разделителя соавторов: 0 — « & », 1 — «&», 2 — «, », 3 — прочее.
+# Чем меньше значения, тем лучше имя.
 case_rank() {
   printf '%s\n' "$1" | LC_ALL=C.UTF-8 awk '{
     n = length($0); up = 0; first_low = 1
@@ -194,29 +233,231 @@ case_rank() {
       if (c != tolower(c) && c == toupper(c)) { if (i == 1) first_low = 0; else up++ }
     }
     all_caps = ($0 != tolower($0) && $0 == toupper($0)) ? 1 : 0
-    print all_caps, first_low, up
+    art = ($0 ~ /[_+]/) ? 1 : 0
+    if (index($0, " & ") > 0) sep = 0
+    else if (index($0, "&") > 0) sep = 1
+    else if (index($0, ", ") > 0) sep = 2
+    else sep = 3
+    print all_caps, first_low, up, art, sep
   }'
 }
 
+# «Мягкий» ключ имени: нижний регистр без пробелов, «_», «+», «&», «,», апострофов,
+# «!», «?» и точек в конце слов. Папки с равным мягким ключом отличаются только
+# оформлением и объединяются без проверки; иначе (точки между буквами, дефисы:
+# «G.A.M.E» / «Game», «Jay-Z» / «Jay z») слияние спорное и проверяется.
+soft_key() {
+  printf '%s\n' "$1" | LC_ALL=C.UTF-8 awk '{
+    s = tolower($0)
+    gsub(/\.+([[:space:]]|$)/, " ", s)
+    gsub("[[:space:]_+&,\047`!?]", "", s)
+    gsub("\342\200\231", "", s)
+    gsub("\342\200\230", "", s)
+    print s
+  }'
+}
+
+# Печатает «trivial», если у всех имён из файла group_file одинаковый soft_key
+group_is_trivial() {
+  _gt_first=""
+  _gt_trivial="trivial"
+  while IFS= read -r _gt_name; do
+    _gt_key=$(soft_key "${_gt_name}")
+    if [ -z "${_gt_first}" ]; then
+      _gt_first="${_gt_key}"
+    elif [ "${_gt_key}" != "${_gt_first}" ]; then
+      _gt_trivial="disputed"
+    fi
+  done < "$1"
+  printf '%s\n' "${_gt_trivial}"
+}
+
+# Печатает уникальные теги исполнителя (artist, album_artist) до 5 аудиофайлов папки
+member_tag_names() {
+  command -v ffprobe >/dev/null 2>&1 || return 0
+  _mt_list="$(mktemp)"
+  find "$1" -type f \( -iname '*.mp3' -o -iname '*.flac' -o -iname '*.m4a' -o -iname '*.ogg' -o -iname '*.opus' -o -iname '*.wma' \) 2>/dev/null \
+    | sort | head -n 5 > "${_mt_list}" || true
+  while IFS= read -r _mt_file; do
+    ffprobe -v error -show_entries format_tags=artist,album_artist -of default=nw=1:nk=1 "${_mt_file}" 2>/dev/null || true
+  done < "${_mt_list}" | awk 'NF && !seen[$0]++'
+  rm -f -- "${_mt_list}"
+}
+
+# Печатает «пары id<TAB>официальное_имя» артистов MusicBrainz, у которых имя или псевдоним
+# в точности (без учёта регистра) равны name (оценка >= 90). Кэш — state/split_by_dash_mbid.tsv
+# («имя<TAB>id<TAB>официальное_имя», «-» = не найдено); при сетевой ошибке кэш не пишется.
+mb_ids() {
+  _mi_cache="${SCRIPT_DIR}/state/${SCRIPT_BASE}_mbid.tsv"
+  if [ -r "${_mi_cache}" ] && awk -F'\t' -v n="$1" '$1 == n { f = 1 } END { exit !f }' "${_mi_cache}"; then
+    awk -F'\t' -v n="$1" '$1 == n && $2 != "-" { print $2 "\t" $3 }' "${_mi_cache}"
+    return 0
+  fi
+  if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+    return 0
+  fi
+  _mi_query=$(printf '%s' "$1" | tr '_' ' ')
+  sleep 1
+  if ! _mi_resp=$(curl -sf -m 20 -A "${OFFICIAL_UA}" -G "${OFFICIAL_API}" \
+      --data-urlencode "query=artist:\"${_mi_query}\"" --data-urlencode "fmt=json" --data-urlencode "limit=5"); then
+    log_json "WARN" "official_lookup_failed" "Не удалось запросить MusicBrainz" "${_mi_query}"
+    return 0
+  fi
+  _mi_found=$(printf '%s' "${_mi_resp}" \
+    | jq -r '.artists[]? | select(.score >= 90) | [.id, .name, ([.aliases[]?.name] | join("\u0001"))] | @tsv' 2>/dev/null \
+    | LC_ALL=C.UTF-8 awk -F'\t' -v n="$1" 'BEGIN { w = tolower(n) } { ok = (tolower($2) == w); m = split($3, a, "\001"); for (i = 1; i <= m; i++) if (tolower(a[i]) == w) ok = 1; if (ok) print $1 "\t" $2 }' || true)
+  mkdir -p "$(dirname -- "${_mi_cache}")"
+  if [ -n "${_mi_found}" ]; then
+    printf '%s\n' "${_mi_found}" | awk -F'\t' -v n="$1" '{ print n "\t" $1 "\t" $2 }' >> "${_mi_cache}"
+  else
+    printf '%s\t-\t-\n' "$1" >> "${_mi_cache}"
+  fi
+  printf '%s\n' "${_mi_found}" | awk 'NF'
+}
+
+# Общая часть проверки: по файлу с «строками member<TAB>значение» определяет, есть ли
+# значение, общее для всех members_total участников. Печатает same / different / unknown:
+# unknown — у кого-то из участников нет значений; different — у всех есть, общего нет.
+common_verdict() {
+  awk -F'\t' -v total="$2" -v with="$3" '
+    BEGIN { if (with < total) { print "unknown"; exit } }
+    { if (!(($1 SUBSEP $2) in seen)) { seen[$1 SUBSEP $2] = 1; c[$2]++ } }
+    END { if (with < total) exit; for (k in c) if (c[k] == total) { print "same"; exit } print "different" }' "$1"
+}
+
+# Проверка спорной группы (имена папок — в файле group_file внутри parent). Порядок:
+# 1) по файлам: общий тег исполнителя во всех папках => слияние подтверждено;
+# 2) по официальным источникам (MusicBrainz, если OFFICIAL_NAMES=yes): у всех папок
+#    (по имени папки и тегам) есть общий артист => слияние подтверждено (имя артиста
+#    становится именем папки), у всех есть, но общего нет => отклонено;
+# 3) не удалось подтвердить => слияние отклоняется (разбирается вручную).
+# Решение кэшируется в state/split_by_dash_verdicts.tsv («ключ<TAB>merge|keep<TAB>причина»);
+# файл можно править вручную, чтобы принудительно объединить или не объединять группу.
+# Результат — переменные VERDICT (merge|keep) и VERIFIED_NAME (официальное имя или пусто).
+verify_group() {
+  VERDICT="merge"
+  VERIFIED_NAME=""
+  _vg_parent="$1"
+  _vg_group="$2"
+  _vg_trivial=$(group_is_trivial "${_vg_group}")
+  [ "${_vg_trivial}" = "trivial" ] && return 0
+
+  _vg_first=$(sed -n '1p' "${_vg_group}")
+  _vg_key=$(name_key "${_vg_first}")
+  _vg_members=$(wc -l < "${_vg_group}")
+  _vg_cache="${SCRIPT_DIR}/state/${SCRIPT_BASE}_verdicts.tsv"
+  if [ -r "${_vg_cache}" ]; then
+    _vg_hit=$(awk -F'\t' -v k="${_vg_key}" '$1 == k { print $2 "\t" $3; exit }' "${_vg_cache}")
+    if [ -n "${_vg_hit}" ]; then
+      VERDICT="${_vg_hit%%	*}"
+      VERIFIED_NAME=""
+      return 0
+    fi
+  fi
+
+  # --- 1. файлы
+  _vg_files="$(mktemp)"
+  _vg_with=0
+  _vg_idx=0
+  while IFS= read -r _vg_member; do
+    _vg_idx=$((_vg_idx+1))
+    _vg_tags=$(member_tag_names "${_vg_parent}/${_vg_member}")
+    if [ -n "${_vg_tags}" ]; then
+      _vg_with=$((_vg_with+1))
+      while IFS= read -r _vg_tag; do
+        _vg_tag_key=$(name_key "${_vg_tag}")
+        [ -z "${_vg_tag_key}" ] || printf '%s\t%s\n' "${_vg_idx}" "${_vg_tag_key}" >> "${_vg_files}"
+      done <<VG_TAGS_EOF
+${_vg_tags}
+VG_TAGS_EOF
+    fi
+  done < "${_vg_group}"
+  _vg_files_verdict=$(common_verdict "${_vg_files}" "${_vg_members}" "${_vg_with}")
+  : > "${_vg_files}"
+
+  _vg_reason="файлы: ${_vg_files_verdict}"
+  if [ "${_vg_files_verdict}" = "same" ]; then
+    VERDICT="merge"
+  else
+    # --- 2. официальные источники
+    _vg_off_verdict="unknown"
+    if [ "${OFFICIAL_NAMES}" = "yes" ]; then
+      _vg_with=0
+      _vg_idx=0
+      : > "${_vg_files}"
+      _vg_names_file="$(mktemp)"
+      while IFS= read -r _vg_member; do
+        _vg_idx=$((_vg_idx+1))
+        { printf '%s\n' "${_vg_member}"; member_tag_names "${_vg_parent}/${_vg_member}" | head -n 2; } > "${_vg_names_file}"
+        _vg_got=0
+        while IFS= read -r _vg_name; do
+          [ -n "${_vg_name}" ] || continue
+          _vg_ids=$(mb_ids "${_vg_name}")
+          if [ -n "${_vg_ids}" ]; then
+            _vg_got=1
+            printf '%s\n' "${_vg_ids}" | awk -F'\t' -v i="${_vg_idx}" '{ print i "\t" $1 "\t" $2 }' >> "${_vg_files}"
+          fi
+        done < "${_vg_names_file}"
+        _vg_with=$((_vg_with+_vg_got))
+      done < "${_vg_group}"
+      rm -f -- "${_vg_names_file}"
+      # значения для сравнения — id артиста (2-й столбец); имя хранится в 3-м
+      _vg_ids_file="$(mktemp)"
+      awk -F'\t' '{ print $1 "\t" $2 }' "${_vg_files}" > "${_vg_ids_file}"
+      _vg_off_verdict=$(common_verdict "${_vg_ids_file}" "${_vg_members}" "${_vg_with}")
+      if [ "${_vg_off_verdict}" = "same" ]; then
+        _vg_common=$(awk -F'\t' -v total="${_vg_members}" '{ if (!(($1 SUBSEP $2) in s)) { s[$1 SUBSEP $2] = 1; c[$2]++ } } END { for (k in c) if (c[k] == total) { print k; exit } }' "${_vg_ids_file}")
+        VERIFIED_NAME=$(awk -F'\t' -v id="${_vg_common}" '$2 == id { print $3; exit }' "${_vg_files}")
+      fi
+      rm -f -- "${_vg_ids_file}"
+    fi
+    _vg_reason="${_vg_reason}; MusicBrainz: ${_vg_off_verdict}"
+    if [ "${_vg_off_verdict}" = "same" ]; then
+      VERDICT="merge"
+    else
+      VERDICT="keep"
+    fi
+  fi
+  rm -f -- "${_vg_files}"
+
+  mkdir -p "$(dirname -- "${_vg_cache}")"
+  printf '%s\t%s\t%s\n' "${_vg_key}" "${VERDICT}" "${_vg_reason}" >> "${_vg_cache}"
+  _vg_list=$(tr '\n' '|' < "${_vg_group}")
+  if [ "${VERDICT}" = "keep" ]; then
+    echo "Внимание: спорное слияние отклонено (${_vg_reason}); проверьте вручную: ${_vg_list}"
+    log_json "WARN" "merge_rejected" "Спорное слияние отклонено: не подтверждено файлами и официальными источниками" "${_vg_reason}; ${_vg_list}"
+  else
+    log_json "INFO" "merge_verified" "Спорное слияние подтверждено" "${_vg_reason}; ${VERIFIED_NAME}"
+  fi
+}
+
 # Объединяет одну группу папок (имена в файле group_file) внутри parent в одну.
-# Имена сравниваются без конечных точек; итоговое имя — без них. Эталон:
-# 1) не «КАПСОМ» целиком (HURTS проигрывает Hurts даже при большем числе файлов);
-# 2) больше файлов; 3) ближе к «Первая заглавная, остальные строчные» (первая буква
-# заглавная, меньше прочих заглавных); 4) первая по кодовым точкам.
-# Группа из одной папки с конечной точкой просто переименовывается.
+# Группа — папки с одинаковым name_key (различия только в регистре, знаках, пробелах,
+# «&», апострофах). Имя результата: официальное (MusicBrainz, если OFFICIAL_NAMES=yes
+# и найдено; папка создаётся, даже если среди вариантов её нет), иначе лучший вариант:
+# 1) не «КАПСОМ» целиком; 2) без «_»/«+»; 3) приоритет «&» (« & » > «&» > «, » > прочее);
+# 4) больше файлов; 5) ближе к «Первая заглавная, остальные строчные» (первая буква
+# заглавная, меньше прочих заглавных); 6) первая по кодовым точкам.
+# Группа из одной папки с недопустимым для Windows именем просто переименовывается.
 merge_case_group() {
   parent="$1"
   group_file="$2"
+  verify_group "${parent}" "${group_file}"
+  if [ "${VERDICT}" = "keep" ]; then
+    return 0
+  fi
   best=""
   best_n=-1
   best_caps=0
   best_low=0
   best_up=0
+  best_art=0
+  best_sep=0
   while IFS= read -r member; do
     member_n=$(find "${parent}/${member}" -type f | wc -l)
     member_clean=$(win_safe_name "${member}")
     member_rank=$(case_rank "${member_clean}")
-    read -r m_caps m_low m_up <<RANK_EOF
+    read -r m_caps m_low m_up m_art m_sep <<RANK_EOF
 ${member_rank}
 RANK_EOF
     better=0
@@ -224,6 +465,10 @@ RANK_EOF
       better=1
     elif [ "${m_caps}" -ne "${best_caps}" ]; then
       [ "${m_caps}" -lt "${best_caps}" ] && better=1
+    elif [ "${m_art}" -ne "${best_art}" ]; then
+      [ "${m_art}" -lt "${best_art}" ] && better=1
+    elif [ "${m_sep}" -ne "${best_sep}" ]; then
+      [ "${m_sep}" -lt "${best_sep}" ] && better=1
     elif [ "${member_n}" -ne "${best_n}" ]; then
       [ "${member_n}" -gt "${best_n}" ] && better=1
     elif [ "${m_low}" -ne "${best_low}" ]; then
@@ -237,13 +482,37 @@ RANK_EOF
       best_caps="${m_caps}"
       best_low="${m_low}"
       best_up="${m_up}"
+      best_art="${m_art}"
+      best_sep="${m_sep}"
     fi
   done < "${group_file}"
+
+  if [ -n "${VERIFIED_NAME}" ]; then
+    verified_safe=$(printf '%s' "${VERIFIED_NAME}" | tr '/' '_')
+    verified_safe=$(win_safe_name "${verified_safe}")
+    if [ -n "${verified_safe}" ] && [ "${verified_safe}" != "${best}" ]; then
+      log_action "INFO" "official_name" "Использовано имя артиста, подтверждённое MusicBrainz" "${best} -> ${verified_safe}"
+      best="${verified_safe}"
+    fi
+  elif [ "${OFFICIAL_NAMES}" = "yes" ]; then
+    best_key=$(name_key "${best}")
+    group_names=$(cat "${group_file}")
+    official=$(official_name "${best_key}" "${best}
+${group_names}")
+    if [ -n "${official}" ]; then
+      official_safe=$(printf '%s' "${official}" | tr '/' '_')
+      official_safe=$(win_safe_name "${official_safe}")
+      if [ -n "${official_safe}" ] && [ "${official_safe}" != "${best}" ]; then
+        log_action "INFO" "official_name" "Использовано официальное имя исполнителя (MusicBrainz)" "${best} -> ${official_safe}"
+        best="${official_safe}"
+      fi
+    fi
+  fi
 
   best_dir="${parent}/${best}"
   if [ ! -d "${best_dir}" ]; then
     do_mkdir "${best_dir}"
-    log_action "INFO" "mkdir" "Создана папка без конечных точек" "${best_dir}"
+    log_action "INFO" "mkdir" "Создана папка эталонного имени" "${best_dir}"
   fi
 
   while IFS= read -r member; do
@@ -252,7 +521,7 @@ RANK_EOF
     if [ "${DRY_RUN}" -eq 0 ] && [ -d "${parent}/${member}" ]; then
       log_json "ERROR" "case_merge_failed" "Не удалось удалить папку-дубликат" "${parent}/${member}"
     else
-      log_action "INFO" "case_merged" "Папка объединена с эталонной (регистр/конечные точки)" "${parent}/${member} -> ${best_dir}"
+      log_action "INFO" "case_merged" "Папка объединена с эталонной" "${parent}/${member} -> ${best_dir}"
     fi
   done < "${group_file}"
 }
@@ -260,6 +529,68 @@ RANK_EOF
 # Приводит имя к допустимому в Windows (см. win_safe в начале файла).
 win_safe_name() {
   printf '%s\n' "$1" | LC_ALL=C.UTF-8 awk -f "${WIN_SAFE_FILE}" -e '{ print win_safe($0) }'
+}
+
+# Ключ имени для сравнения папок: нижний регистр, только буквы и цифры (знаки
+# препинания, пробелы, «_», «&», апострофы и т.п. отброшены), как normalize_db_text
+# в music_downloader: «10AGE Анет Сай» == «10AGE&Анет Сай», «Банд'Эрос» == «БандЭрос».
+name_key() {
+  printf '%s\n' "$1" | LC_ALL=C.UTF-8 awk '{ s = tolower($0); gsub(/[^[:alnum:]]/, "", s); print s }'
+}
+
+# Печатает официальное имя исполнителя по ключу key (name_key) из MusicBrainz или
+# ничего, если оно не найдено. Искомые варианты написания — в $2 (по одному в строке);
+# перебираются до 3 разных вариантов. Принимается только артист с оценкой >= 90, чьё
+# официальное имя даёт тот же ключ. Результаты (и отрицательные, «-») кэшируются в
+# state/split_by_dash_official.tsv (строка «ключ<TAB>имя»; файл можно править вручную);
+# при сетевой ошибке запись в кэш не делается. Запросы — не чаще раза в секунду.
+official_name() {
+  _on_key="$1"
+  if [ -r "${OFFICIAL_CACHE}" ]; then
+    _on_hit=$(awk -F'\t' -v k="${_on_key}" '$1 == k { print $2; exit }' "${OFFICIAL_CACHE}")
+    if [ -n "${_on_hit}" ]; then
+      [ "${_on_hit}" = "-" ] || printf '%s\n' "${_on_hit}"
+      return 0
+    fi
+  fi
+  if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+    log_json "WARN" "official_unavailable" "Для поиска официальных имён нужны curl и jq" "${_on_key}"
+    return 0
+  fi
+  _on_found=""
+  _on_tried=0
+  _on_seen=""
+  while IFS= read -r _on_variant; do
+    [ -n "${_on_variant}" ] || continue
+    _on_query=$(printf '%s' "${_on_variant}" | tr '_' ' ')
+    case "${_on_seen}" in *"|${_on_query}|"*) continue ;; *) ;; esac
+    _on_seen="${_on_seen}|${_on_query}|"
+    [ "${_on_tried}" -lt 3 ] || break
+    _on_tried=$((_on_tried+1))
+    sleep 1
+    if ! _on_resp=$(curl -sf -m 20 -A "${OFFICIAL_UA}" -G "${OFFICIAL_API}" \
+        --data-urlencode "query=artist:\"${_on_query}\"" --data-urlencode "fmt=json" --data-urlencode "limit=5"); then
+      log_json "WARN" "official_lookup_failed" "Не удалось запросить официальное имя" "${_on_query}"
+      return 0
+    fi
+    _on_names=$(printf '%s' "${_on_resp}" | jq -r '.artists[]? | select(.score >= 90) | .name' 2>/dev/null || true)
+    while IFS= read -r _on_name; do
+      [ -n "${_on_name}" ] || continue
+      _on_name_key=$(name_key "${_on_name}")
+      if [ "${_on_name_key}" = "${_on_key}" ]; then
+        _on_found="${_on_name}"
+        break
+      fi
+    done <<ON_EOF
+${_on_names}
+ON_EOF
+    [ -z "${_on_found}" ] || break
+  done <<ON_VARIANTS_EOF
+$2
+ON_VARIANTS_EOF
+  mkdir -p "$(dirname -- "${OFFICIAL_CACHE}")"
+  printf '%s\t%s\n' "${_on_key}" "${_on_found:--}" >> "${OFFICIAL_CACHE}"
+  [ -z "${_on_found}" ] || printf '%s\n' "${_on_found}"
 }
 
 # Печатает имя первой записи каталога dir, совпадающей с name без учёта регистра
@@ -488,6 +819,22 @@ DEST_DIR=""
 if [ -r "${CONFIG_FILE}" ]; then
   DEST_DIR=$(sed -n 's/^[[:space:]]*DEST_DIR[[:space:]]*=[[:space:]]*//p' "${CONFIG_FILE}" | sed 's/#.*//' | tail -n1)
   DEST_DIR=$(trim "${DEST_DIR}")
+  conf_official=$(sed -n 's/^[[:space:]]*OFFICIAL_NAMES[[:space:]]*=[[:space:]]*//p' "${CONFIG_FILE}" | sed 's/#.*//' | tail -n1)
+  conf_official=$(trim "${conf_official}")
+  [ -z "${conf_official}" ] || OFFICIAL_NAMES="${conf_official}"
+fi
+
+# При явно указанном каталоге DEST_DIR из конфига не применяется (иначе проход слияния и
+# переименования затрагивал бы целевой каталог из боевого конфига, например при
+# отладке на временной папке): целевой каталог задаётся только ключом --dest.
+if [ -n "${DIR_ARG}" ]; then
+  DEST_DIR="${DEST_ARG}"
+  if [ ! -d "${DIR_ARG}" ]; then
+    echo "Ошибка: каталог не существует: ${DIR_ARG}" >&2
+    log_json "ERROR" "dir_missing" "Указанный каталог не существует" "${DIR_ARG}"
+    cleanup_logs
+    exit 2
+  fi
 fi
 
 if [ -n "${DIR_ARG}" ] && [ -d "${DIR_ARG}" ]; then
@@ -496,7 +843,7 @@ elif [ -r "${CONFIG_FILE}" ]; then
   log_json "INFO" "config_used" "Использование конфига" "${CONFIG_FILE}"
   while IFS= read -r line || [ -n "${line}" ]; do
     case "${line}" in ""|\#*) continue ;; *) ;; esac
-    case "${line}" in *DEST_DIR=*) continue ;; *) ;; esac
+    case "${line}" in *DEST_DIR=*|*OFFICIAL_NAMES=*) continue ;; *) ;; esac
     target=$(trim "$({ printf '%s' "${line}" | sed 's/#.*//'; } || true)")
     [ -n "${target}" ] && process_directory "${target}"
   done < "${CONFIG_FILE}"
