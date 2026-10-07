@@ -166,3 +166,137 @@ teardown() {
   [ -f "$TMP_DIR/music/MD Dj&Olivia/a.mp3" ] && [ ! -e "$TMP_DIR/music/MD DJ&Olivia" ]
   [ -f "$TMP_DIR/music/In hoode/a.mp3" ] && [ ! -e "$TMP_DIR/music/in hoode" ]
 }
+
+@test "strips trailing dots from folder, artist part and file name" {
+  mkdir -p "$TMP_DIR/music"
+  touch "$TMP_DIR/music/Автор. - песня.mp3."
+
+  run bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/Автор/Автор - песня.mp3" ]
+  [ ! -e "$TMP_DIR/music/Автор." ]
+}
+
+@test "strips multiple trailing dots and merges dotted folder into the dotless one" {
+  mkdir -p "$TMP_DIR/music/Fred again.." "$TMP_DIR/music/Fred again"
+  touch "$TMP_DIR/music/Fred again../a.mp3" "$TMP_DIR/music/Fred again/b.mp3"
+  touch "$TMP_DIR/music/Fred again.. - c.mp3"
+
+  run bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/Fred again/a.mp3" ] && [ -f "$TMP_DIR/music/Fred again/b.mp3" ]
+  [ -f "$TMP_DIR/music/Fred again/Fred again - c.mp3" ]
+  [ ! -e "$TMP_DIR/music/Fred again.." ]
+}
+
+@test "renames an existing lone folder with trailing dot" {
+  mkdir -p "$TMP_DIR/music/Robin S." "$TMP_DIR/conf"
+  touch "$TMP_DIR/music/Robin S./a.mp3"
+
+  run bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/Robin S/a.mp3" ]
+  [ ! -e "$TMP_DIR/music/Robin S." ]
+}
+
+@test "dry-run reports dotted folders without renaming" {
+  mkdir -p "$TMP_DIR/music/Robin S."
+  touch "$TMP_DIR/music/Robin S./a.mp3"
+
+  run bash "$TMP_DIR/split_by_dash.sh" --dry-run "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/Robin S./a.mp3" ]
+  [ ! -e "$TMP_DIR/music/Robin S" ]
+  [[ "$output" == *"[dry-run]"*"Robin S."*"Robin S"* ]]
+}
+
+@test "windows-unsafe characters and reserved names are fixed on split" {
+  mkdir -p "$TMP_DIR/music"
+  touch "$TMP_DIR/music/AC:DC - Who? Made*Of<Me>.mp3"
+  touch "$TMP_DIR/music/CON - Song.mp3"
+
+  run bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/AC_DC/AC_DC - Who_ Made_Of_Me_.mp3" ]
+  [ -f "$TMP_DIR/music/_CON/_CON - Song.mp3" ]
+}
+
+@test "existing unsafe names at any depth are renamed, deepest first" {
+  mkdir -p "$TMP_DIR/music/Artist/Album. "
+  touch "$TMP_DIR/music/Artist/Album. /Track?.mp3" "$TMP_DIR/music/Artist/NUL.txt"
+
+  run bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/Artist/Album/Track_.mp3" ]
+  [ -f "$TMP_DIR/music/Artist/_NUL.txt" ]
+  [ ! -e "$TMP_DIR/music/Artist/Album. " ]
+}
+
+@test "renamed file keeps the larger one when names differ only by case" {
+  mkdir -p "$TMP_DIR/music/Artist"
+  printf 'aa' > "$TMP_DIR/music/Artist/song_.mp3"
+  printf 'aaaa' > "$TMP_DIR/music/Artist/SONG?.mp3"
+
+  run bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/Artist/SONG_.mp3" ]
+  [ ! -e "$TMP_DIR/music/Artist/song_.mp3" ]
+  [ "$(wc -c < "$TMP_DIR/music/Artist/SONG_.mp3")" -eq 4 ]
+}
+
+@test "case-colliding files: the larger one is kept, the smaller removed" {
+  mkdir -p "$TMP_DIR/music/Retro"
+  printf 'big-content' > "$TMP_DIR/music/Retro/Haddaway - What Is Love.mp3"
+  printf 'small' > "$TMP_DIR/music/Retro/Haddaway - What is love.mp3"
+  printf 'x' > "$TMP_DIR/music/Retro/Other.mp3"
+
+  run bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/Retro/Haddaway - What Is Love.mp3" ]
+  [ ! -e "$TMP_DIR/music/Retro/Haddaway - What is love.mp3" ]
+  [ -f "$TMP_DIR/music/Retro/Other.mp3" ]
+}
+
+@test "case-colliding files: larger lowercase variant wins over smaller uppercase" {
+  mkdir -p "$TMP_DIR/music/Retro"
+  printf 'a' > "$TMP_DIR/music/Retro/Song.mp3"
+  printf 'aaaaaa' > "$TMP_DIR/music/Retro/song.mp3"
+
+  run bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/Retro/song.mp3" ]
+  [ ! -e "$TMP_DIR/music/Retro/Song.mp3" ]
+}
+
+@test "dry-run keeps case-colliding files and reports the removal" {
+  mkdir -p "$TMP_DIR/music/Retro"
+  printf 'big-content' > "$TMP_DIR/music/Retro/A.mp3"
+  printf 'small' > "$TMP_DIR/music/Retro/a.mp3"
+
+  run bash "$TMP_DIR/split_by_dash.sh" --dry-run "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/Retro/A.mp3" ] && [ -f "$TMP_DIR/music/Retro/a.mp3" ]
+  [[ "$output" == *"[dry-run]"*"a.mp3"* ]]
+}
+
+@test "dry-run reports unsafe names without renaming" {
+  mkdir -p "$TMP_DIR/music/Artist"
+  touch "$TMP_DIR/music/Artist/Track?.mp3"
+
+  run bash "$TMP_DIR/split_by_dash.sh" --dry-run "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/Artist/Track?.mp3" ]
+  [ ! -e "$TMP_DIR/music/Artist/Track_.mp3" ]
+  [[ "$output" == *"[dry-run]"*"Track_.mp3"* ]]
+}
