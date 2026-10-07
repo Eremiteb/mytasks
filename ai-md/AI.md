@@ -60,7 +60,7 @@ music_downloader/venv/bin/python -m pytest tests/test_music_downloader.py music_
 ```
 Тесты используют временные каталоги и подменённые HTTP-ответы; покрывают общие глобальные пути загрузки, отклонение неверных, отсутствующих и заполненных каталогов до создания скрапера, атомарную запись и дедупликацию БД. Для проверки конфигурации не запускать реальное скачивание.
 
-Ruff для `music_downloader/` (`music_downloader/.ruff.toml`: Python 3.11, длина строки 120):
+Ruff для `music_downloader/` (`music_downloader/.ruff.toml`: Python 3.14, длина строки 120):
 ```sh
 music_downloader/venv/bin/ruff check music_downloader/
 ```
@@ -94,7 +94,7 @@ music_downloader/venv/bin/ruff check music_downloader/
 ## Тесты, CI и Git
 
 - `tests/` примерно один к одному соответствует корневым скриптам (`<script>.bats`) и использует bats-core. Внешние программы (`curl`, `notify-send`, `docker`, `ssh` и другие) подменяются временными исполняемыми файлами, каталог которых добавляется в начало `PATH`; образец — `tests/getip.bats`: каталог заглушек и `env PATH="$STUB_DIR:$PATH" bash -c "..."`. `tests/all_scripts_syntax.bats` автоматически проверяет каждый корневой `*.sh` через `bash -n`/`sh -n` по shebang, поэтому новые скрипты получают проверку синтаксиса без отдельной записи.
-- CI состоит из независимых workflows. `.github/workflows/shellcheck.yml` запускает `shellcheck -S error`, `shellcheck -S style`, синтаксическую проверку `bash -n`/`sh -n`, поиск переменных без скобок и `python3 -m py_compile` для корневых `.py`; срабатывает только при изменениях `*.sh`/`*.py`. `.github/workflows/bats-tests.yml` запускает все Bats-тесты при каждом push/PR. `.github/workflows/music-downloader.yml` устанавливает зависимости загрузчика, проверяет `music_downloader/` Ruff, публикует отчёты Ruff и запускает `music_downloader/tests/` вместе с `tests/test_music_downloader.py` на Python 3.12; фильтры путей включают загрузчик, общие тесты и сам workflow.
+- CI состоит из независимых workflows. `.github/workflows/shellcheck.yml` запускает `shellcheck -S error`, `shellcheck -S style`, синтаксическую проверку `bash -n`/`sh -n`, поиск переменных без скобок и `python3 -m py_compile` для корневых `.py`; срабатывает только при изменениях `*.sh`/`*.py`. `.github/workflows/bats-tests.yml` запускает все Bats-тесты при каждом push/PR. `.github/workflows/music-downloader.yml` устанавливает зависимости загрузчика, проверяет `music_downloader/` Ruff, публикует отчёты Ruff и запускает `music_downloader/tests/` вместе с `tests/test_music_downloader.py` на Python 3.14; фильтры путей включают загрузчик, общие тесты и сам workflow.
 - `music_downloader/` — отслеживаемый Python-подпроект этого репозитория, не вложенный Git checkout и не submodule. Его исходники, драйверы, тесты, README, `.ruff.toml`, requirements и `.json.example` коммитятся вместе с `mytasks`. Реальные `music_downloader.json`, SQLite-БД и резервные копии, логи и venv остаются локальными по `.gitignore`; не добавлять их или `graphify-out/` принудительно. Резервная копия прежних вложенных Git-метаданных хранится в игнорируемом `state/music_downloader-git-backup-6394179/`, не активна и не должна попадать в Git. `newline_to_space/` остаётся отдельным локальным Python-подпроектом, исключённым из Git.
 
 ## Резервное копирование QNAP

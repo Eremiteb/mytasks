@@ -123,4 +123,4 @@ music_downloader/venv/bin/python -m py_compile music_downloader/music_downloader
 music_downloader/venv/bin/python -m json.tool music_downloader/music_downloader.json.example >/dev/null
 ```
 
-CI выполняет Ruff и оба набора Python-тестов на Python 3.12 при изменениях загрузчика, общих тестов или workflow.
+CI выполняет Ruff и оба набора Python-тестов на Python 3.14 при изменениях загрузчика, общих тестов или workflow.
