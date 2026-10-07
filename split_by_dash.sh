@@ -30,7 +30,8 @@ trap 'rm -f "${CREATED_DIRS_FILE}" "${WIN_SAFE_FILE}"' EXIT
 # не синхронизируются). Правила:
 #   - символы < > : " \ | ? * и управляющие (0x00-0x1F) заменяются на «_»;
 #   - ведущие пробелы, конечные точки и пробелы удаляются («Автор.» -> «Автор»);
-#   - «&» всегда с одним пробелом с обеих сторон («A&B», «A &B» -> «A & B»);
+#   - «&» всегда с одним пробелом с обеих сторон («A&B», «A &B» -> «A & B»), кроме
+#     ведущего/конечного «&» («&ME»); «&amp;» -> «&»;
 #   - зарезервированные имена устройств (CON, PRN, AUX, NUL, COM1-9, LPT1-9) в
 #     любом регистре и с любым расширением получают префикс «_» (CON.mp3 -> _CON.mp3).
 # Имена из conf/split_by_dash.keep.conf (SPLIT_KEEP_FILE) не меняются вообще.
@@ -43,14 +44,87 @@ BEGIN {
   while (keep_file != "" && (getline keep_line < keep_file) > 0) {
     if (keep_line !~ /^[[:space:]]*(#|$)/) keep[keep_line] = 1
   }
+  # Буквы с диакритикой, «ё» и казахские буквы для ключа сравнения («Beyoncé»/«Beyonce»,
+  # «Ёлка»/«Елка», «Қайрат»/«Кайрат»; «й» и «и» не отождествляются)
+  pairs = "à:a á:a â:a ã:a ä:a å:a ā:a ă:a ą:a ç:c ć:c č:c ď:d è:e é:e ê:e ë:e ē:e ě:e ę:e ì:i í:i î:i ï:i ī:i ł:l ñ:n ń:n ň:n ò:o ó:o ô:o õ:o ö:o ø:o ō:o ő:o ř:r ś:s š:s ş:s ť:t ù:u ú:u û:u ü:u ū:u ů:u ű:u ý:y ÿ:y ž:z ź:z ż:z ё:е ә:а ғ:г қ:к ң:н ө:о ұ:у ү:у һ:х і:и"
+  np = split(pairs, pp, " ")
+  for (pi = 1; pi <= np; pi++) { split(pp[pi], kv, ":"); fold[kv[1]] = kv[2] }
 }
-function win_safe(n,   i, b) {
+# Заменяет буквы с диакритикой и «ё» на базовые (вход — нижний регистр)
+function foldchars(s,   i, n, c, out) {
+  out = ""
+  n = length(s)
+  for (i = 1; i <= n; i++) { c = substr(s, i, 1); out = out ((c in fold) ? fold[c] : c) }
+  return out
+}
+# Убирает ведущий артикль «The » в имени папки исполнителя («The Rasmus» -> «Rasmus»);
+# если после него ничего не остаётся, имя не меняется
+function strip_the(n,   r) {
+  if (tolower(substr(n, 1, 4)) == "the " ) {
+    r = substr(n, 5)
+    sub(/^[[:space:]]+/, "", r)
+    if (r != "") return r
+  }
+  return n
+}
+# 1, если в имени есть «ё/Ё» (вариант с «ё» предпочтителен)
+function has_yo(s) {
+  return (index(tolower(s), "ё") > 0) ? 1 : 0
+}
+# 1, если в имени есть латинская буква с диакритикой (Beyoncé, Måneskin): такой вариант
+# НЕ эталон, эталоном остаётся написание без диакритики
+function has_dia(s,   i, n, c) {
+  s = tolower(s)
+  n = length(s)
+  for (i = 1; i <= n; i++) { c = substr(s, i, 1); if ((c in fold) && index("ёәғқңөұүһі", c) == 0) return 1 }
+  return 0
+}
+# 1, если в имени есть казахская буква (ә ғ қ ң ө ұ ү һ і): такой вариант предпочтителен
+function has_kz(s,   i, n, c) {
+  s = tolower(s)
+  n = length(s)
+  for (i = 1; i <= n; i++) { c = substr(s, i, 1); if (index("әғқңөұүһі", c) > 0) return 1 }
+  return 0
+}
+# Ключ имени для сравнения папок: нижний регистр, самостоятельные слова «и»/«and»
+# отброшены (скачивание иногда склеивает соавторов без них: «Виктор Рыбин и Наталья
+# Сенчукова» = «Виктор РыбинНаталья Сенчукова»), только буквы и цифры.
+function nkey(s,   t, u) {
+  s = strip_the(foldchars(tolower(s)))
+  t = drop_words(s)
+  u = t
+  gsub(/[^[:alnum:]]/, "", u)
+  if (u == "") t = s   # имя целиком из служебных слов — не обнуляем
+  gsub(/[^[:alnum:]]/, "", t)
+  return t
+}
+# Убирает самостоятельные служебные слова («и», «and», «группа», «тобы», «тобі», «ансамбль»,
+# «band», «official»): «Жігіттер тобы» -> «Жігіттер»; вход — нижний регистр
+function drop_words(s) {
+  s = " " s " "
+  gsub(/[[:space:]]+(и|and|группа|тобы|тобі|ансамбль|band|official)[[:space:]]+/, " ", s)
+  gsub(/[[:space:]]+(и|and|группа|тобы|тобі|ансамбль|band|official)[[:space:]]+/, " ", s)
+  return s
+}
+# 1, если в имени есть служебное слово (группа, тобы, тобі, ансамбль, band, official):
+# такой вариант предпочтителен (Жігіттер тобы, Группа губы)
+function has_noise(s) {
+  return ((" " tolower(s) " ") ~ /[[:space:]](группа|тобы|тобі|ансамбль|band|official)[[:space:]]/) ? 1 : 0
+}
+function win_safe(n,   i, b, lead, tail) {
   if (n in keep) return n
+  # HTML-экранирование «&amp;» из названий сайтов -> «&»
+  gsub(/&amp;/, "\\&", n)
   gsub(/[<>:"\\|?*[:cntrl:]]/, "_", n)
   sub(/^[[:space:]]+/, "", n)
   sub(/[.[:space:]]+$/, "", n)
   # «&» всегда с одним пробелом с обеих сторон: «10AGE&Анет Сай», «A &B» -> «10AGE & Анет Сай», «A & B»
+  # Ведущий и конечный «&» — часть имени («&ME»), его пробелами не окружаем
+  lead = ""; tail = ""
+  if (substr(n, 1, 1) == "&") { lead = "&"; n = substr(n, 2) }
+  if (length(n) > 0 && substr(n, length(n), 1) == "&") { tail = "&"; n = substr(n, 1, length(n) - 1) }
   gsub(/[[:space:]]*&[[:space:]]*/, " \\& ", n)
+  n = lead n tail
   sub(/^[[:space:]]+/, "", n)
   sub(/[.[:space:]]+$/, "", n)
   i = index(n, ".")
@@ -168,7 +242,7 @@ merge_case_variants() {
   parent="$1"
   canon="$2"
   variants=$(find "${parent}" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null \
-    | CANON="${canon}" LC_ALL=C.UTF-8 awk -f "${WIN_SAFE_FILE}" -e 'BEGIN { c = ENVIRON["CANON"]; w = tolower(c) } { n = win_safe($0) } tolower(n) == w && $0 != c')
+    | CANON="${canon}" LC_ALL=C.UTF-8 awk -f "${WIN_SAFE_FILE}" -e 'BEGIN { c = ENVIRON["CANON"]; w = tolower(c) } { n = strip_the(win_safe($0)) } tolower(n) == w && $0 != c')
   [ -n "${variants}" ] || return 0
 
   canon_dir="${parent}/${canon}"
@@ -198,8 +272,8 @@ merge_case_siblings() {
   group_file="$(mktemp)"
   find "${parent}" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null \
     | LC_ALL=C.UTF-8 awk -f "${WIN_SAFE_FILE}" -e '
-        { s = win_safe($0); if (s == "") next
-          k = tolower(s); gsub(/[^[:alnum:]]/, "", k); if (k == "") next; n[k]++; v[k] = (k in v) ? v[k] "\n" $0 : $0; if (s != $0) dot[k] = 1 }
+        { s = strip_the(win_safe($0)); if (s == "") next
+          k = nkey(s); if (k == "") next; n[k]++; v[k] = (k in v) ? v[k] "\n" $0 : $0; if (s != $0) dot[k] = 1 }
         END {
           for (k in n) if (n[k] > 1 || (k in dot)) {
             m = split(v[k], a, "\n"); asort(a)
@@ -218,15 +292,20 @@ merge_case_siblings() {
   rm -f -- "${group_file}"
 }
 
-# Оценка «внешнего вида» имени: пять чисел через пробел —
+# Оценка «внешнего вида» имени: девять чисел через пробел —
 # 1) 1, если имя целиком в верхнем регистре (HURTS), иначе 0;
 # 2) 1, если первая буква не заглавная, иначе 0;
 # 3) число заглавных букв, кроме первого символа;
 # 4) 1, если в имени есть «_» или «+» (следы замены знаков при скачивании), иначе 0;
-# 5) приоритет разделителя соавторов: 0 — « & », 1 — «&», 2 — «, », 3 — прочее.
+# 5) приоритет разделителя соавторов: 0 — « & », 1 — «&», 2 — «, », 3 — « и »/« and »,
+#    4 — прочее;
+# 6) 0, если в имени есть «ё» (Ёлка, Серёга), иначе 1;
+# 7) 1, если есть латинская буква с диакритикой (Beyoncé), иначе 0;
+# 8) 0, если есть казахская буква (Қайрат), иначе 1;
+# 9) 0, если есть служебное слово (группа, тобы, ансамбль, band, official), иначе 1.
 # Чем меньше значения, тем лучше имя.
 case_rank() {
-  printf '%s\n' "$1" | LC_ALL=C.UTF-8 awk '{
+  printf '%s\n' "$1" | LC_ALL=C.UTF-8 awk -f "${WIN_SAFE_FILE}" -e '{
     n = length($0); up = 0; first_low = 1
     for (i = 1; i <= n; i++) {
       c = substr($0, i, 1)
@@ -237,8 +316,13 @@ case_rank() {
     if (index($0, " & ") > 0) sep = 0
     else if (index($0, "&") > 0) sep = 1
     else if (index($0, ", ") > 0) sep = 2
-    else sep = 3
-    print all_caps, first_low, up, art, sep
+    else if ($0 ~ /[[:space:]](и|and)[[:space:]]/) sep = 3
+    else sep = 4
+    no_yo = has_yo($0) ? 0 : 1
+    dia = has_dia($0)
+    no_kz = has_kz($0) ? 0 : 1
+    no_word = has_noise($0) ? 0 : 1
+    print all_caps, first_low, up, art, sep, no_yo, dia, no_kz, no_word
   }'
 }
 
@@ -247,8 +331,10 @@ case_rank() {
 # оформлением и объединяются без проверки; иначе (точки между буквами, дефисы:
 # «G.A.M.E» / «Game», «Jay-Z» / «Jay z») слияние спорное и проверяется.
 soft_key() {
-  printf '%s\n' "$1" | LC_ALL=C.UTF-8 awk '{
-    s = tolower($0)
+  printf '%s\n' "$1" | LC_ALL=C.UTF-8 awk -f "${WIN_SAFE_FILE}" -e '{
+    s = " " strip_the(foldchars(tolower($0))) " "
+    gsub(/&amp;/, "\\&", s)
+    s = drop_words(s)
     gsub(/\.+([[:space:]]|$)/, " ", s)
     gsub("[[:space:]_+&,\047`!?]", "", s)
     gsub("\342\200\231", "", s)
@@ -433,11 +519,15 @@ VG_TAGS_EOF
 
 # Объединяет одну группу папок (имена в файле group_file) внутри parent в одну.
 # Группа — папки с одинаковым name_key (различия только в регистре, знаках, пробелах,
-# «&», апострофах). Имя результата: официальное (MusicBrainz, если OFFICIAL_NAMES=yes
+# «&», апострофах, диакритике, ё/е). Имя результата: официальное (MusicBrainz, если OFFICIAL_NAMES=yes
 # и найдено; папка создаётся, даже если среди вариантов её нет), иначе лучший вариант:
 # 1) не «КАПСОМ» целиком; 2) без «_»/«+»; 3) приоритет «&» (« & » > «&» > «, » > прочее);
-# 4) больше файлов; 5) ближе к «Первая заглавная, остальные строчные» (первая буква
-# заглавная, меньше прочих заглавных); 6) первая по кодовым точкам.
+# 3a) вариант со служебным словом («Жігіттер тобы», «Группа губы») — независимо от числа файлов;
+# 4) вариант с «ё» (Ёлка, Серёга) — независимо от числа файлов; 5) вариант с казахскими
+# буквами (Қайрат, а не Кайрат) — независимо от числа файлов; 6) вариант без латинской
+# диакритики (Beyonce, а не Beyoncé); 7) больше файлов; 8) ближе к «Первая заглавная,
+# остальные строчные» (первая буква заглавная, меньше прочих заглавных); 9) первая по
+# кодовым точкам.
 # Группа из одной папки с недопустимым для Windows именем просто переименовывается.
 merge_case_group() {
   parent="$1"
@@ -453,11 +543,15 @@ merge_case_group() {
   best_up=0
   best_art=0
   best_sep=0
+  best_plain=0
+  best_dia=0
+  best_nokz=0
+  best_noise=0
   while IFS= read -r member; do
     member_n=$(find "${parent}/${member}" -type f | wc -l)
-    member_clean=$(win_safe_name "${member}")
+    member_clean=$(folder_name "${member}")
     member_rank=$(case_rank "${member_clean}")
-    read -r m_caps m_low m_up m_art m_sep <<RANK_EOF
+    read -r m_caps m_low m_up m_art m_sep m_plain m_dia m_nokz m_noise <<RANK_EOF
 ${member_rank}
 RANK_EOF
     better=0
@@ -469,6 +563,14 @@ RANK_EOF
       [ "${m_art}" -lt "${best_art}" ] && better=1
     elif [ "${m_sep}" -ne "${best_sep}" ]; then
       [ "${m_sep}" -lt "${best_sep}" ] && better=1
+    elif [ "${m_noise}" -ne "${best_noise}" ]; then
+      [ "${m_noise}" -lt "${best_noise}" ] && better=1
+    elif [ "${m_plain}" -ne "${best_plain}" ]; then
+      [ "${m_plain}" -lt "${best_plain}" ] && better=1
+    elif [ "${m_nokz}" -ne "${best_nokz}" ]; then
+      [ "${m_nokz}" -lt "${best_nokz}" ] && better=1
+    elif [ "${m_dia}" -ne "${best_dia}" ]; then
+      [ "${m_dia}" -lt "${best_dia}" ] && better=1
     elif [ "${member_n}" -ne "${best_n}" ]; then
       [ "${member_n}" -gt "${best_n}" ] && better=1
     elif [ "${m_low}" -ne "${best_low}" ]; then
@@ -484,12 +586,16 @@ RANK_EOF
       best_up="${m_up}"
       best_art="${m_art}"
       best_sep="${m_sep}"
+      best_plain="${m_plain}"
+      best_dia="${m_dia}"
+      best_nokz="${m_nokz}"
+      best_noise="${m_noise}"
     fi
   done < "${group_file}"
 
   if [ -n "${VERIFIED_NAME}" ]; then
     verified_safe=$(printf '%s' "${VERIFIED_NAME}" | tr '/' '_')
-    verified_safe=$(win_safe_name "${verified_safe}")
+    verified_safe=$(folder_name "${verified_safe}")
     if [ -n "${verified_safe}" ] && [ "${verified_safe}" != "${best}" ]; then
       log_action "INFO" "official_name" "Использовано имя артиста, подтверждённое MusicBrainz" "${best} -> ${verified_safe}"
       best="${verified_safe}"
@@ -501,7 +607,7 @@ RANK_EOF
 ${group_names}")
     if [ -n "${official}" ]; then
       official_safe=$(printf '%s' "${official}" | tr '/' '_')
-      official_safe=$(win_safe_name "${official_safe}")
+      official_safe=$(folder_name "${official_safe}")
       if [ -n "${official_safe}" ] && [ "${official_safe}" != "${best}" ]; then
         log_action "INFO" "official_name" "Использовано официальное имя исполнителя (MusicBrainz)" "${best} -> ${official_safe}"
         best="${official_safe}"
@@ -531,11 +637,16 @@ win_safe_name() {
   printf '%s\n' "$1" | LC_ALL=C.UTF-8 awk -f "${WIN_SAFE_FILE}" -e '{ print win_safe($0) }'
 }
 
+# Имя папки исполнителя: допустимое в Windows и без ведущего «The »
+folder_name() {
+  printf '%s\n' "$1" | LC_ALL=C.UTF-8 awk -f "${WIN_SAFE_FILE}" -e '{ print strip_the(win_safe($0)) }'
+}
+
 # Ключ имени для сравнения папок: нижний регистр, только буквы и цифры (знаки
-# препинания, пробелы, «_», «&», апострофы и т.п. отброшены), как normalize_db_text
-# в music_downloader: «10AGE Анет Сай» == «10AGE&Анет Сай», «Банд'Эрос» == «БандЭрос».
+# препинания, пробелы, «_», «&», апострофы, слова «и»/«and» отброшены), как
+# normalize_db_text в music_downloader: «10AGE Анет Сай» == «10AGE&Анет Сай», «Банд'Эрос» == «БандЭрос».
 name_key() {
-  printf '%s\n' "$1" | LC_ALL=C.UTF-8 awk '{ s = tolower($0); gsub(/[^[:alnum:]]/, "", s); print s }'
+  printf '%s\n' "$1" | LC_ALL=C.UTF-8 awk -f "${WIN_SAFE_FILE}" -e '{ print nkey($0) }'
 }
 
 # Печатает официальное имя исполнителя по ключу key (name_key) из MusicBrainz или
@@ -749,10 +860,11 @@ process_directory() {
     [ -z "${folder_raw}" ] && continue
     # Имена приводятся к допустимым в Windows: в имени папки («Автор.»), в части
     # «Автор» внутри имени файла и во всём имени файла («песня.mp3.»)
-    folder=$(win_safe_name "${folder_raw}")
+    folder_full=$(win_safe_name "${folder_raw}")
+    folder=$(folder_name "${folder_raw}")
     [ -z "${folder}" ] && continue
     rest="${name#"${folder_raw}"}"
-    new_name=$(win_safe_name "${folder}${rest}")
+    new_name=$(win_safe_name "${folder_full}${rest}")
     [ -z "${new_name}" ] && continue
 
     target_dir="${current_dir}/${folder}"

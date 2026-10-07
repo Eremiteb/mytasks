@@ -470,31 +470,31 @@ make_ffprobe_stub() {
   [ -f "$TMP_DIR/music/Kmaro/b.mp3" ]
 }
 
-@test "disputed merge confirmed by MusicBrainz uses the artist's official name" {
+@test "disputed merge confirmed by MusicBrainz uses the artist's official name (without 'The')" {
   make_ffprobe_stub
   mkdir -p "$TMP_DIR/music/G.A.M.E" "$TMP_DIR/music/Game"
   printf 'G.A.M.E.' > "$TMP_DIR/music/G.A.M.E/a.mp3"
-  printf 'The Game' > "$TMP_DIR/music/Game/b.mp3"
+  printf 'Taxi Dogg' > "$TMP_DIR/music/Game/b.mp3"
   cat > "$TMP_DIR/stubs/curl" <<'STUB'
 #!/usr/bin/env bash
-printf '{"artists":[{"score":100,"id":"mbid-1","name":"The Game","aliases":[{"name":"G.A.M.E"},{"name":"Game"}]}]}'
+printf '{"artists":[{"score":100,"id":"mbid-1","name":"The Game","aliases":[{"name":"G.A.M.E"},{"name":"Game"},{"name":"Taxi Dogg"}]}]}'
 STUB
   chmod +x "$TMP_DIR/stubs/curl"
 
   run env PATH="$TMP_DIR/stubs:$PATH" OFFICIAL_NAMES=yes bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
 
   [ "$status" -eq 0 ]
-  [ -f "$TMP_DIR/music/The Game/a.mp3" ]
-  [ -f "$TMP_DIR/music/The Game/b.mp3" ]
+  [ -f "$TMP_DIR/music/Game/a.mp3" ]
+  [ -f "$TMP_DIR/music/Game/b.mp3" ]
+  [ ! -e "$TMP_DIR/music/The Game" ]
   [ ! -e "$TMP_DIR/music/G.A.M.E" ]
-  [ ! -e "$TMP_DIR/music/Game" ]
 }
 
 @test "different artists per MusicBrainz are not merged" {
   make_ffprobe_stub
   mkdir -p "$TMP_DIR/music/G.A.M.E" "$TMP_DIR/music/Game"
   printf 'G.A.M.E.' > "$TMP_DIR/music/G.A.M.E/a.mp3"
-  printf 'The Game' > "$TMP_DIR/music/Game/b.mp3"
+  printf 'Gamer X' > "$TMP_DIR/music/Game/b.mp3"
   cat > "$TMP_DIR/stubs/curl" <<'STUB'
 #!/usr/bin/env bash
 case "$*" in
@@ -577,4 +577,227 @@ STUB
 
   [ "$status" -eq 0 ]
   [ -f "$TMP_DIR/music/Artist/VashKevich & Olisha - Song.mp3" ]
+}
+
+@test "merges co-author folders with and without the conjunction 'и'" {
+  mkdir -p "$TMP_DIR/music/Виктор Рыбин и Наталья Сенчукова" "$TMP_DIR/music/Виктор РыбинНаталья Сенчукова"
+  touch "$TMP_DIR/music/Виктор Рыбин и Наталья Сенчукова/a.mp3" "$TMP_DIR/music/Виктор РыбинНаталья Сенчукова/b.mp3"
+
+  run bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/Виктор Рыбин и Наталья Сенчукова/a.mp3" ]
+  [ -f "$TMP_DIR/music/Виктор Рыбин и Наталья Сенчукова/b.mp3" ]
+  [ ! -e "$TMP_DIR/music/Виктор РыбинНаталья Сенчукова" ]
+}
+
+@test "'&' variant wins over the 'и' and concatenated variants" {
+  mkdir -p "$TMP_DIR/music/Ann и Bob" "$TMP_DIR/music/AnnBob" "$TMP_DIR/music/Ann & Bob"
+  touch "$TMP_DIR/music/Ann и Bob/a.mp3" "$TMP_DIR/music/AnnBob/b.mp3" "$TMP_DIR/music/Ann & Bob/c.mp3"
+
+  run bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/Ann & Bob/a.mp3" ]
+  [ -f "$TMP_DIR/music/Ann & Bob/b.mp3" ]
+  [ -f "$TMP_DIR/music/Ann & Bob/c.mp3" ]
+  [ ! -e "$TMP_DIR/music/Ann и Bob" ]
+}
+
+@test "html-escaped ampersand &amp; becomes a spaced ampersand" {
+  mkdir -p "$TMP_DIR/music"
+  touch "$TMP_DIR/music/Tom Boxer &amp; Morena - Song.mp3"
+
+  run bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/Tom Boxer & Morena/Tom Boxer & Morena - Song.mp3" ]
+}
+
+@test "leading ampersand in a name is kept without extra space" {
+  mkdir -p "$TMP_DIR/music"
+  touch "$TMP_DIR/music/&ME&Black Coffee - Song.mp3"
+
+  run bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/&ME & Black Coffee/&ME & Black Coffee - Song.mp3" ]
+}
+
+@test "folders differing only by &amp; versus & merge without verification" {
+  mkdir -p "$TMP_DIR/music/DJ Sandro & Katrin Queen" "$TMP_DIR/music/DJ Sandro &amp; Katrin Queen"
+  touch "$TMP_DIR/music/DJ Sandro & Katrin Queen/a.mp3" "$TMP_DIR/music/DJ Sandro &amp; Katrin Queen/b.mp3"
+
+  run bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/DJ Sandro & Katrin Queen/a.mp3" ]
+  [ -f "$TMP_DIR/music/DJ Sandro & Katrin Queen/b.mp3" ]
+  [ ! -e "$TMP_DIR/music/DJ Sandro &amp; Katrin Queen" ]
+}
+
+@test "pattern 1: Latin diacritics merge, the variant without diacritics is the reference even with fewer files" {
+  mkdir -p "$TMP_DIR/music/Beyonce" "$TMP_DIR/music/Beyoncé" "$TMP_DIR/music/Maneskin" "$TMP_DIR/music/Måneskin"
+  touch "$TMP_DIR/music/Beyonce/a.mp3" "$TMP_DIR/music/Beyoncé/b.mp3" "$TMP_DIR/music/Beyoncé/c.mp3" "$TMP_DIR/music/Beyoncé/d.mp3"
+  touch "$TMP_DIR/music/Maneskin/a.mp3" "$TMP_DIR/music/Måneskin/b.mp3" "$TMP_DIR/music/Måneskin/c.mp3"
+
+  run bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/Beyonce/a.mp3" ]
+  [ -f "$TMP_DIR/music/Beyonce/b.mp3" ]
+  [ -f "$TMP_DIR/music/Beyonce/d.mp3" ]
+  [ ! -e "$TMP_DIR/music/Beyoncé" ]
+  [ -f "$TMP_DIR/music/Maneskin/a.mp3" ]
+  [ -f "$TMP_DIR/music/Maneskin/c.mp3" ]
+  [ ! -e "$TMP_DIR/music/Måneskin" ]
+}
+
+@test "pattern 1: ё has priority over е even with fewer files" {
+  mkdir -p "$TMP_DIR/music/Серега" "$TMP_DIR/music/Серёга" "$TMP_DIR/music/Ёлка" "$TMP_DIR/music/Елка"
+  touch "$TMP_DIR/music/Серега/a.mp3" "$TMP_DIR/music/Серега/b.mp3" "$TMP_DIR/music/Серёга/c.mp3"
+  touch "$TMP_DIR/music/Елка/a.mp3" "$TMP_DIR/music/Елка/b.mp3" "$TMP_DIR/music/Ёлка/c.mp3"
+
+  run bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/Серёга/a.mp3" ]
+  [ -f "$TMP_DIR/music/Серёга/c.mp3" ]
+  [ ! -e "$TMP_DIR/music/Серега" ]
+  [ -f "$TMP_DIR/music/Ёлка/a.mp3" ]
+  [ -f "$TMP_DIR/music/Ёлка/c.mp3" ]
+  [ ! -e "$TMP_DIR/music/Елка" ]
+}
+
+@test "pattern 1: й is not folded to и, unrelated names stay separate" {
+  mkdir -p "$TMP_DIR/music/Дүйсен" "$TMP_DIR/music/Дүисен" "$TMP_DIR/music/Maneskin Duo" "$TMP_DIR/music/Maneskin"
+  touch "$TMP_DIR/music/Дүйсен/a.mp3" "$TMP_DIR/music/Дүисен/b.mp3" "$TMP_DIR/music/Maneskin Duo/c.mp3" "$TMP_DIR/music/Maneskin/d.mp3"
+
+  run bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/Дүйсен/a.mp3" ]
+  [ -f "$TMP_DIR/music/Дүисен/b.mp3" ]
+  [ -f "$TMP_DIR/music/Maneskin Duo/c.mp3" ]
+  [ -f "$TMP_DIR/music/Maneskin/d.mp3" ]
+}
+
+@test "pattern 2: Kazakh letters merge with Russian spelling, the Kazakh variant wins regardless of file count" {
+  mkdir -p "$TMP_DIR/music/Кайрат Нуртас" "$TMP_DIR/music/Қайрат Нұртас"
+  touch "$TMP_DIR/music/Кайрат Нуртас/a.mp3" "$TMP_DIR/music/Кайрат Нуртас/b.mp3" "$TMP_DIR/music/Қайрат Нұртас/c.mp3"
+  mkdir -p "$TMP_DIR/music/Кенжебек Жанабилов" "$TMP_DIR/music/Кенжебек Жанабілов" "$TMP_DIR/music/Кенжебек Жанәбілов"
+  touch "$TMP_DIR/music/Кенжебек Жанабилов/a.mp3" "$TMP_DIR/music/Кенжебек Жанабілов/b.mp3" "$TMP_DIR/music/Кенжебек Жанәбілов/c.mp3"
+
+  run bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/Қайрат Нұртас/a.mp3" ]
+  [ -f "$TMP_DIR/music/Қайрат Нұртас/b.mp3" ]
+  [ -f "$TMP_DIR/music/Қайрат Нұртас/c.mp3" ]
+  [ ! -e "$TMP_DIR/music/Кайрат Нуртас" ]
+  [ "$(find "$TMP_DIR/music" -mindepth 1 -maxdepth 1 -type d -name 'Кенжебек*' | wc -l)" -eq 1 ]
+}
+
+@test "pattern 2: Kazakh letters do not make 'г' and 'ғ' folders with different letters collide" {
+  mkdir -p "$TMP_DIR/music/Қанат" "$TMP_DIR/music/Қарат"
+  touch "$TMP_DIR/music/Қанат/a.mp3" "$TMP_DIR/music/Қарат/b.mp3"
+
+  run bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/Қанат/a.mp3" ]
+  [ -f "$TMP_DIR/music/Қарат/b.mp3" ]
+}
+
+@test "leading 'The' is removed from artist folder names and merged with the plain variant" {
+  mkdir -p "$TMP_DIR/music/The Rasmus" "$TMP_DIR/music/Rasmus" "$TMP_DIR/music/The Police" "$TMP_DIR/music/The wanted" "$TMP_DIR/music/Wanted"
+  touch "$TMP_DIR/music/The Rasmus/a.mp3" "$TMP_DIR/music/The Rasmus/b.mp3" "$TMP_DIR/music/Rasmus/c.mp3"
+  touch "$TMP_DIR/music/The Police/p.mp3" "$TMP_DIR/music/The wanted/w1.mp3" "$TMP_DIR/music/Wanted/w2.mp3" "$TMP_DIR/music/Wanted/w3.mp3"
+
+  run bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/Rasmus/a.mp3" ]
+  [ -f "$TMP_DIR/music/Rasmus/b.mp3" ]
+  [ -f "$TMP_DIR/music/Rasmus/c.mp3" ]
+  [ ! -e "$TMP_DIR/music/The Rasmus" ]
+  [ -f "$TMP_DIR/music/Police/p.mp3" ]
+  [ ! -e "$TMP_DIR/music/The Police" ]
+  [ -f "$TMP_DIR/music/Wanted/w1.mp3" ]
+  [ -f "$TMP_DIR/music/Wanted/w2.mp3" ]
+  [ ! -e "$TMP_DIR/music/The wanted" ]
+}
+
+@test "file 'The Band - Song.mp3' goes into folder 'Band' and keeps its file name" {
+  mkdir -p "$TMP_DIR/music"
+  touch "$TMP_DIR/music/The Police - Roxanne.mp3"
+
+  run bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/Police/The Police - Roxanne.mp3" ]
+  [ ! -e "$TMP_DIR/music/The Police" ]
+}
+
+@test "a folder named just 'The' and names with 'the' inside are not changed" {
+  mkdir -p "$TMP_DIR/music/The" "$TMP_DIR/music/Theory of a Deadman" "$TMP_DIR/music/Eminem & The Weeknd"
+  touch "$TMP_DIR/music/The/a.mp3" "$TMP_DIR/music/Theory of a Deadman/b.mp3" "$TMP_DIR/music/Eminem & The Weeknd/c.mp3"
+
+  run bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/The/a.mp3" ]
+  [ -f "$TMP_DIR/music/Theory of a Deadman/b.mp3" ]
+  [ -f "$TMP_DIR/music/Eminem & The Weeknd/c.mp3" ]
+}
+
+@test "official name 'The Game' is used without the article" {
+  mkdir -p "$TMP_DIR/music/G.A.M.E" "$TMP_DIR/music/Game" "$TMP_DIR/stubs"
+  printf 'G.A.M.E.' > "$TMP_DIR/music/G.A.M.E/a.mp3"
+  printf 'The Game' > "$TMP_DIR/music/Game/b.mp3"
+  printf '#!/usr/bin/env bash\ncat "${!#}"\n' > "$TMP_DIR/stubs/ffprobe"
+  cat > "$TMP_DIR/stubs/curl" <<'STUB'
+#!/usr/bin/env bash
+printf '{"artists":[{"score":100,"id":"mbid-1","name":"The Game","aliases":[{"name":"G.A.M.E"},{"name":"Game"}]}]}'
+STUB
+  chmod +x "$TMP_DIR/stubs/ffprobe" "$TMP_DIR/stubs/curl"
+
+  run env PATH="$TMP_DIR/stubs:$PATH" OFFICIAL_NAMES=yes bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/Game/a.mp3" ]
+  [ -f "$TMP_DIR/music/Game/b.mp3" ]
+  [ ! -e "$TMP_DIR/music/The Game" ]
+  [ ! -e "$TMP_DIR/music/G.A.M.E" ]
+}
+
+@test "pattern 5: service words are ignored in the key and the variant WITH the service word wins regardless of file count" {
+  mkdir -p "$TMP_DIR/music/Жігіттер" "$TMP_DIR/music/Жігіттер тобы" "$TMP_DIR/music/Группа губы" "$TMP_DIR/music/Губы"
+  touch "$TMP_DIR/music/Жігіттер/a.mp3" "$TMP_DIR/music/Жігіттер/b.mp3" "$TMP_DIR/music/Жігіттер тобы/c.mp3"
+  touch "$TMP_DIR/music/Губы/d.mp3" "$TMP_DIR/music/Губы/e.mp3" "$TMP_DIR/music/Губы/f.mp3" "$TMP_DIR/music/Группа губы/g.mp3"
+
+  run bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/Жігіттер тобы/a.mp3" ]
+  [ -f "$TMP_DIR/music/Жігіттер тобы/b.mp3" ]
+  [ -f "$TMP_DIR/music/Жігіттер тобы/c.mp3" ]
+  [ ! -e "$TMP_DIR/music/Жігіттер" ]
+  [ -f "$TMP_DIR/music/Группа губы/d.mp3" ]
+  [ -f "$TMP_DIR/music/Группа губы/f.mp3" ]
+  [ -f "$TMP_DIR/music/Группа губы/g.mp3" ]
+  [ ! -e "$TMP_DIR/music/Губы" ]
+}
+
+@test "pattern 5: a name made only of service words is not emptied, words inside other words are untouched" {
+  mkdir -p "$TMP_DIR/music/Band" "$TMP_DIR/music/Bandana" "$TMP_DIR/music/Группировка" "$TMP_DIR/music/Official"
+  touch "$TMP_DIR/music/Band/a.mp3" "$TMP_DIR/music/Bandana/b.mp3" "$TMP_DIR/music/Группировка/c.mp3" "$TMP_DIR/music/Official/d.mp3"
+
+  run bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/Band/a.mp3" ]
+  [ -f "$TMP_DIR/music/Bandana/b.mp3" ]
+  [ -f "$TMP_DIR/music/Группировка/c.mp3" ]
+  [ -f "$TMP_DIR/music/Official/d.mp3" ]
 }
