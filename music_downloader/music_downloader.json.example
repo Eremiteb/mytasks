@@ -87,6 +87,14 @@
             "categories": [
                 "/ru/novinki"
             ]
+        },
+        {
+            "site_name": "beufm_kz",
+            "site_script": "drivers/music_downloader_beufm_kz.py",
+            "base_url": "https://beufm.kz",
+            "categories": [
+                "/"
+            ]
         }
     ]
 }
