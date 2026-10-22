@@ -1,6 +1,7 @@
 cloudscraper>=1.2.71
 beautifulsoup4>=4.15.0
 requests>=2.34.0
+mutagen>=1.47.0
 # Development & Testing
 pytest>=9.1.0
 ruff>=0.16.0
