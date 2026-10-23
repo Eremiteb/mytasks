@@ -2,6 +2,9 @@
 # Стартовая настройка и регулярная проверка mytasks на машине.
 #
 # Первый запуск на новой машине — из каталога, куда склонирован репозиторий:
+#   0) обязательно обновляет систему штатным средством её семейства
+#      (garuda-update/pacman, apt-get, dnf/yum/rpm-ostree, zypper,
+#      transactional-update, apk, xbps-install, emerge, eopkg, nixos-rebuild);
 #   1) прописывает себя в автозагрузку (user-юнит check-mytasks.service);
 #   2) создаёт conf/check_mytasks.conf: каталог mytasks = каталог запуска,
 #      затем проходит мастер остальных конфигов по conf/*.conf.example — окна
@@ -49,6 +52,12 @@ OS_FAMILY=""
 OS_RELEASE_FILE="/etc/os-release"
 OSTREE_FLAG="/run/ostree-booted"
 SYSTEMD_RUN_DIR="/run/systemd/system"
+# Признаки «нужна перезагрузка» после обновления: флаг Debian/Ubuntu и
+# отсутствие модулей работающего ядра (ядро обновлено, старое удалено)
+REBOOT_FLAG="/run/reboot-required"
+# Garuda: обновлять через garuda-update (auto) или чистым pacman -Syu (no)
+GARUDA_UPDATE="auto"
+KERNEL_MODULES_DIR="/usr/lib/modules"
 SUDO_CMD="auto"
 UI="auto"
 SYSTEM_UNIT_DIR="/etc/systemd/system"
@@ -161,6 +170,11 @@ OS_ID=""
 OS_LIKE=""
 OS_NOTE=""
 PKG_MGR=""
+UPDATE_MGR=""
+UPDATE_MODE=""
+UPDATE_DESC=""
+UPDATE_OK=1
+REBOOT_NEEDED=0
 CRON_UNIT=""
 FIRST_RUN=0
 CHANGED=0
@@ -243,7 +257,8 @@ usage() {
 Использование: ${SCRIPT_NAME} [опции]
 
 Стартовая настройка mytasks на машине и проверка его сервисов и заданий.
-Без опций: таблица состояния, затем для каждого отсутствующего задания —
+Без опций: таблица состояния, обязательное полное обновление системы
+штатным средством её семейства, затем для каждого отсутствующего задания —
 предупреждение с описанием и вопрос «создать?», в конце итоговая таблица.
 
   -s, --status      только таблица состояния (задания и все зависимости)
@@ -601,36 +616,55 @@ detect_family() {
     CRON_UNIT=""
     PKG_MGR=""
     case "${OS_FAMILY}" in
-        arch) PKG_MGR="pacman"; CRON_UNIT="cronie.service" ;;
-        debian) PKG_MGR="apt-get"; CRON_UNIT="cron.service" ;;
+        arch)
+            PKG_MGR="pacman"; CRON_UNIT="cronie.service"
+            if [[ "${GARUDA_UPDATE}" != "no" ]] && command -v garuda-update >/dev/null 2>&1; then
+                UPDATE_MODE="garuda"; UPDATE_DESC="garuda-update --noconfirm (зеркала, keyring, hotfix Garuda, pacman -Syu)"
+            else
+                UPDATE_DESC="pacman -Syu --noconfirm"
+            fi
+            ;;
+        debian) PKG_MGR="apt-get"; CRON_UNIT="cron.service"; UPDATE_DESC="apt-get update && apt-get -y full-upgrade" ;;
         redhat)
             CRON_UNIT="crond.service"
             if [[ -e "${OSTREE_FLAG}" ]]; then
                 # Fedora Atomic (Silverblue, Kinoite, Bazzite…): пакеты — слоями rpm-ostree
-                PKG_MGR="rpm-ostree"
+                PKG_MGR="rpm-ostree"; UPDATE_DESC="rpm-ostree upgrade (новая версия — после перезагрузки)"
                 OS_NOTE="неизменяемая система (${variant:-ostree}): пакеты ставятся слоями rpm-ostree и появятся после перезагрузки"
             elif command -v dnf >/dev/null 2>&1; then
-                PKG_MGR="dnf"
+                PKG_MGR="dnf"; UPDATE_DESC="dnf -y upgrade --refresh"
             else
-                PKG_MGR="yum"
+                PKG_MGR="yum"; UPDATE_DESC="yum -y update"
             fi
             ;;
         suse)
             PKG_MGR="zypper"; CRON_UNIT="cron.service"
-            [[ "${id}" == *microos* || "${id}" == sle-micro ]] && OS_NOTE="транзакционная система: пакеты нужно ставить через transactional-update вручную" && PKG_MGR=""
+            if [[ "${id}" == *microos* || "${id}" == sle-micro* ]]; then
+                PKG_MGR="transactional-update"; UPDATE_DESC="transactional-update --non-interactive dup (после перезагрузки)"
+                OS_NOTE="транзакционная система: обновление и пакеты применяются после перезагрузки"
+            elif [[ "${id}" == *tumbleweed* || "${id}" == *slowroll* ]]; then
+                UPDATE_MODE="dup"; UPDATE_DESC="zypper refresh && zypper dup (Tumbleweed обновляется только dup)"
+            else
+                UPDATE_MODE="update"; UPDATE_DESC="zypper refresh && zypper update"
+            fi
             ;;
-        alpine) PKG_MGR="apk" ;;
-        void) PKG_MGR="xbps-install" ;;
-        gentoo) PKG_MGR="emerge"; CRON_UNIT="cronie.service" ;;
-        solus) PKG_MGR="eopkg" ;;
+        alpine) PKG_MGR="apk"; UPDATE_DESC="apk update && apk upgrade" ;;
+        void) PKG_MGR="xbps-install"; UPDATE_DESC="xbps-install -Syu xbps && xbps-install -Syu" ;;
+        gentoo)
+            PKG_MGR="emerge"; CRON_UNIT="cronie.service"
+            UPDATE_DESC="emaint sync -a && emerge -uDN @world (сборка из исходников может занять часы)"
+            ;;
+        solus) PKG_MGR="eopkg"; UPDATE_DESC="eopkg upgrade -y" ;;
         nixos)
             CRON_UNIT="cron.service"
+            UPDATE_MGR="nixos-rebuild"; UPDATE_DESC="nixos-rebuild switch --upgrade"
             OS_NOTE="NixOS: пакеты и службы объявляются в configuration.nix — автоустановка пакетов отключена"
             ;;
         *)
             OS_NOTE="ОС «${OS_PRETTY}» (ID=${OS_ID}${like:+, ID_LIKE=${like}}) не распознана: пакеты автоматически не ставятся — установите их вручную или задайте OS_FAMILY в ${CONF_REL} (arch, debian, redhat, suse, alpine, void, gentoo, solus, nixos)"
             ;;
     esac
+    [[ -n "${UPDATE_MGR}" ]] || UPDATE_MGR="${PKG_MGR}"
     has_systemd || OS_NOTE="${OS_NOTE:+${OS_NOTE}; }systemd не запущен (${OS_FAMILY}): юниты не создаются, службы включайте средствами своего init"
     return 0
 }
@@ -720,7 +754,42 @@ root_pkg() {
         xbps-install) xbps-install -Sy -- "$@" ;;
         emerge) emerge --noreplace --ask=n -- "$@" ;;
         eopkg) eopkg install -y -- "$@" ;;
+        transactional-update) transactional-update --non-interactive pkg install -- "$@" ;;
         *) echo "Неизвестный менеджер пакетов: ${mgr}" >&2; return 2 ;;
+    esac
+}
+
+# Полное обновление системы штатным средством семейства (MODE уточняет вариант)
+root_update() {
+    local mgr="$1"
+    local mode="${2:-}"
+    case "${mgr}" in
+        pacman)
+            if [[ "${mode}" == "garuda" ]]; then
+                garuda-update --noconfirm
+            else
+                pacman -Syu --noconfirm
+            fi
+            ;;
+        apt-get) apt-get update && DEBIAN_FRONTEND=noninteractive apt-get -y full-upgrade ;;
+        dnf) dnf -y upgrade --refresh ;;
+        yum) yum -y update ;;
+        rpm-ostree) rpm-ostree upgrade ;;
+        zypper)
+            zypper --non-interactive refresh || return 1
+            if [[ "${mode}" == "dup" ]]; then
+                zypper --non-interactive dup
+            else
+                zypper --non-interactive update
+            fi
+            ;;
+        transactional-update) transactional-update --non-interactive dup ;;
+        apk) apk update && apk upgrade ;;
+        xbps-install) xbps-install -Syu xbps && xbps-install -Syu ;;
+        emerge) emaint sync -a && emerge --update --deep --newuse --ask=n @world ;;
+        eopkg) eopkg upgrade -y ;;
+        nixos-rebuild) nixos-rebuild switch --upgrade ;;
+        *) echo "Неизвестный способ обновления: ${mgr}" >&2; return 2 ;;
     esac
 }
 
@@ -1279,6 +1348,54 @@ handle_job() {
 }
 
 ###############################################################################
+# HELPERS: обновление системы
+###############################################################################
+# Нужна ли перезагрузка: флаг Debian/Ubuntu или нет модулей работающего ядра
+reboot_needed() {
+    local kver
+    [[ -e "${REBOOT_FLAG}" ]] && return 0
+    kver="$(uname -r)"
+    [[ -d "${KERNEL_MODULES_DIR}/${kver}" ]] && return 1
+    [[ -d "${KERNEL_MODULES_DIR}" ]]
+}
+
+# Обязательный первый шаг: полное обновление системы до любых изменений.
+# Без него установка пакетов в rolling-дистрибутивах (Arch и др.) — это
+# неподдерживаемое частичное обновление, поэтому при сбое пакеты не ставятся.
+system_update() {
+    local rc
+    [[ "${STOP}" -eq 1 ]] && return 0
+    if [[ -z "${UPDATE_MGR}" ]]; then
+        UPDATE_OK=0
+        warn "Обновление системы для «${OS_PRETTY}» (${OS_FAMILY}) автоматически не выполняется — обновите её вручную; пакеты не ставятся."
+        log_json "WARN" "update_unsupported" "Обновление системы не поддерживается" "${OS_FAMILY}"
+        return 0
+    fi
+    say "Обновление системы — обязательный первый шаг: ${UPDATE_DESC}"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        say "[dry-run] будет: обновить систему: ${UPDATE_DESC} (с повышением прав)"
+        return 0
+    fi
+    log_json "INFO" "update_start" "Обновление системы" "${UPDATE_DESC}"
+    as_root __root-update "${UPDATE_MGR}" "${UPDATE_MODE}"
+    rc=$?
+    if [[ "${rc}" -ne 0 ]]; then
+        UPDATE_OK=0
+        warn "Обновление системы не удалось (код ${rc}): пакеты в этом запуске не ставятся, остальное проверяется."
+        log_json "ERROR" "update_failed" "Обновление системы не удалось" "${UPDATE_DESC}" "${rc}"
+        return 0
+    fi
+    say "   ✔ система обновлена"
+    log_json "INFO" "update_done" "Система обновлена" "${UPDATE_DESC}" 0
+    if reboot_needed; then
+        REBOOT_NEEDED=1
+        warn "После обновления нужна перезагрузка (обновлено ядро или системные библиотеки)."
+        log_json "WARN" "reboot_needed" "Нужна перезагрузка после обновления" ""
+    fi
+    return 0
+}
+
+###############################################################################
 # HELPERS: зависимости
 ###############################################################################
 dep_present() {
@@ -1377,6 +1494,10 @@ handle_deps() {
     done
 
     [[ ${#pkgs[@]} -gt 0 ]] || return 0
+    if [[ "${UPDATE_OK}" -ne 1 ]]; then
+        warn "Пакеты ${pkgs[*]} не ставятся: система не обновлена (частичное обновление не поддерживается). Обновите систему и запустите скрипт снова."
+        return 0
+    fi
     if [[ "${DRY_RUN}" -eq 1 ]]; then
         say "[dry-run] будет: установить пакеты (${OS_FAMILY}, ${PKG_MGR}): ${pkgs[*]} (с повышением прав)"
         return 0
@@ -1837,6 +1958,7 @@ case "${1:-}" in
     __root-install-units) shift; root_install_units "$@"; rc=$?; exit "${rc}" ;;
     __root-enable) shift; root_enable "$@"; rc=$?; exit "${rc}" ;;
     __root-pkg) shift; root_pkg "$@"; rc=$?; exit "${rc}" ;;
+    __root-update) shift; root_update "$@"; rc=$?; exit "${rc}" ;;
     *) ;;
 esac
 
@@ -1894,6 +2016,15 @@ else
     print_deps_table missing
     say ""
 
+    # 0) Обязательное обновление системы — до любых изменений (кроме режима
+    # только предупреждений: без терминала и без --yes ничего не меняется)
+    if [[ "${UI_MODE}" != "none" || "${ASSUME_YES}" -eq 1 || "${DRY_RUN}" -eq 1 ]]; then
+        system_update
+    else
+        say "Обновление системы пропущено: нет терминала или окон для подтверждения (запустите вручную или с --yes)."
+    fi
+    say ""
+
     # 1) Автозагрузка самого скрипта и 2) собственный конфиг с каталогом mytasks.
     # Если репозиторий перенесён (каталог в конфиге другой), сначала каталог.
     FIRST_STEPS=(0 1)
@@ -1935,12 +2066,14 @@ TOTAL=$((PROBLEMS + DEP_MISSING_REQ))
 say ""
 if [[ "${TOTAL}" -eq 0 ]]; then
     say "Все сервисы и задания на месте."
+    [[ "${REBOOT_NEEDED}" -eq 1 ]] && say "Перезагрузите компьютер: обновление системы требует перезапуска."
     log_json "INFO" "done" "Все сервисы и задания на месте" "" 0
     rc=0
 else
     NAMES="$(problem_names)"
     say "Требуют внимания — заданий: ${PROBLEMS}${NAMES:+ (${NAMES})}; не хватает обязательных зависимостей: ${DEP_MISSING_REQ}."
     [[ "${STOP}" -eq 1 ]] && say "Запуск остановлен кнопкой «Стоп»; продолжить — запустить скрипт снова."
+    [[ "${REBOOT_NEEDED}" -eq 1 ]] && say "Перезагрузите компьютер: обновление системы требует перезапуска."
     say "Создать недостающее: ${SCRIPT_PATH} (вопросы в окне), без вопросов: ${SCRIPT_PATH} --yes"
     log_json "WARN" "done" "Есть проблемы" "задания: ${NAMES}; зависимостей: ${DEP_MISSING_REQ}" 1
     if [[ "${NOTIFY}" -eq 1 ]]; then

@@ -11,7 +11,8 @@ git clone git@github.com:Eremiteb/mytasks.git ~/esimych-docs/mytasks
 ```
 
 [`check_mytasks.sh`](#check_mytaskssh) определяет семейство ОС (Arch, Debian,
-Red Hat), прописывает себя в автозагрузку, записывает каталог mytasks (тот,
+Red Hat и др.), обязательно обновляет систему, прописывает себя в автозагрузку,
+записывает каталог mytasks (тот,
 откуда запущен) в `conf/check_mytasks.conf`, проводит мастер конфигов, ставит
 зависимости и создаёт юниты systemd, задания cron, ссылки и автозапуск.
 Таблица состояния — `check_mytasks.sh --status`.
@@ -394,29 +395,30 @@ journalctl --user -u check-backups.service -n 20
 **Порядок работы:**
 1. Определяет семейство ОС по `/etc/os-release` (сначала `ID`, затем `ID_LIKE`):
 
-   | Семейство | Дистрибутивы (примеры) | Пакеты | cron |
-   |---|---|---|---|
-   | `arch` | Arch, Garuda, Manjaro, EndeavourOS, CachyOS, Artix, ArcoLinux, SteamOS | `pacman` | `cronie.service` |
-   | `debian` | Debian, Ubuntu (и *buntu), Mint/LMDE, Pop!_OS, elementary, Zorin, KDE neon, MX, Kali, Deepin, Devuan, Raspberry Pi OS | `apt-get` | `cron.service` |
-   | `redhat` | Fedora, RHEL, CentOS Stream, Rocky, Alma, Oracle, Amazon, Nobara, Mageia; Fedora Atomic (Silverblue, Kinoite, Bazzite) — `rpm-ostree` с перезагрузкой | `dnf`/`yum` | `crond.service` |
-   | `suse` | openSUSE Leap/Tumbleweed/Slowroll, SLES (MicroOS — только вручную) | `zypper` | `cron.service` |
-   | `alpine` | Alpine, postmarketOS (без systemd) | `apk` | по процессу |
-   | `void` | Void (runit) | `xbps-install` | по процессу |
-   | `gentoo` | Gentoo, Funtoo, Calculate | `emerge` | `cronie.service` |
-   | `solus` | Solus | `eopkg` | — |
-   | `nixos` | NixOS — пакеты и службы объявляются в `configuration.nix`, автоустановка отключена | — | `cron.service` |
+   | Семейство | Дистрибутивы (примеры) | Пакеты | Обновление системы | cron |
+   |---|---|---|---|---|
+   | `arch` | Arch, Garuda, Manjaro, EndeavourOS, CachyOS, Artix, ArcoLinux, SteamOS | `pacman` | Garuda — `garuda-update --noconfirm`, иначе `pacman -Syu` | `cronie.service` |
+   | `debian` | Debian, Ubuntu (и *buntu), Mint/LMDE, Pop!_OS, elementary, Zorin, KDE neon, MX, Kali, Deepin, Devuan, Raspberry Pi OS | `apt-get` | `apt-get update && apt-get -y full-upgrade` | `cron.service` |
+   | `redhat` | Fedora, RHEL, CentOS Stream, Rocky, Alma, Oracle, Amazon, Nobara, Mageia; Fedora Atomic (Silverblue, Kinoite, Bazzite) | `dnf`/`yum`; Atomic — `rpm-ostree` | `dnf -y upgrade --refresh` / `yum -y update` / `rpm-ostree upgrade` | `crond.service` |
+   | `suse` | openSUSE Leap/Tumbleweed/Slowroll, SLES; MicroOS — `transactional-update` | `zypper` | Tumbleweed/Slowroll — `zypper dup`, Leap/SLES — `zypper update` | `cron.service` |
+   | `alpine` | Alpine, postmarketOS (без systemd) | `apk` | `apk update && apk upgrade` | по процессу |
+   | `void` | Void (runit) | `xbps-install` | `xbps-install -Syu xbps && xbps-install -Syu` | по процессу |
+   | `gentoo` | Gentoo, Funtoo, Calculate | `emerge` | `emaint sync -a && emerge -uDN @world` (может идти часы) | `cronie.service` |
+   | `solus` | Solus | `eopkg` | `eopkg upgrade -y` | — |
+   | `nixos` | NixOS — пакеты и службы объявляются в `configuration.nix`, автоустановка пакетов отключена | — | `nixos-rebuild switch --upgrade` | `cron.service` |
 
    Нераспознанная ОС — явное предупреждение с её `ID`/`ID_LIKE`: пакеты ставятся вручную либо семейство задаётся в `OS_FAMILY`. Без systemd юниты не создаются (службы включаются средствами своего init), демон cron проверяется по процессу.
 
    **Alpine / postmarketOS:** скрипты mytasks на Bash, а в Alpine по умолчанию только busybox — перед первым запуском выполните `apk add bash`; GNU `find`/`coreutils` (нужны `find -printf`, `stat -c` и т.п.) скрипт проверит как зависимости `gnu:find`/`gnu:stat` и предложит `findutils`/`coreutils`. **NixOS:** нет `/bin/bash`, `/usr/bin/python3`, `/usr/bin/sleep` — шебанги и юниты mytasks используют `/usr/bin/env`; пакеты объявляйте в `configuration.nix`.
-2. Первым делом прописывает себя в автозагрузку: user-юнит `check-mytasks.service` при входе в графический сеанс запускает `check_mytasks.sh --no-create --notify` (таблица в журнале и уведомление о проблемах).
-3. Записывает каталог mytasks — каталог, откуда запущен скрипт, — в `conf/check_mytasks.conf` (`MYTASKS_DIR`). Если репозиторий перенесён и каталог в конфиге другой, предупреждает и предлагает обновить его, а затем и все юниты.
-4. При первом запуске (нет `conf/check_mytasks.conf`) проводит мастер всех отсутствующих конфигов по `conf/*.conf.example` и `music_downloader/*.json.example` (кроме `cloud_backup_qnap.conf`): окна `zenity` (без него — `kdialog`), без графики — вопросы в терминале. Описание каждого значения берётся из комментариев примера, значения по умолчанию — из примера с подстановкой `@MYTASKS_DIR@`/`@HOME@`. Строки примера без изменений копируются как есть (`${HOME}` и т.п. сохраняются).
-5. Проверяет зависимости (обязательные и необязательные) и ставит пакеты менеджером своего семейства одним запросом прав.
-6. Проверяет задания и для каждого отсутствующего или неработающего выводит предупреждение с описанием и вопрос «создать?»: «да» — создаёт, «нет» — ничего не меняет и в этом запуске больше не спрашивает.
+2. **Обязательно обновляет систему** штатной командой своего семейства (столбец «Обновление системы»; одно повышение прав) — до любых изменений. Если обновление не удалось или для ОС не поддерживается, пакеты в этом запуске не ставятся (в rolling-дистрибутивах установка без обновления — неподдерживаемое частичное обновление), остальные проверки идут. После обновления ядра или при флаге `/run/reboot-required` скрипт напоминает о перезагрузке. В режимах `--status`, `--no-create` и без терминала/окон без `--yes` обновление не выполняется; `GARUDA_UPDATE="no"` — на Garuda чистый `pacman -Syu` вместо `garuda-update`.
+3. Затем прописывает себя в автозагрузку: user-юнит `check-mytasks.service` при входе в графический сеанс запускает `check_mytasks.sh --no-create --notify` (таблица в журнале и уведомление о проблемах).
+4. Записывает каталог mytasks — каталог, откуда запущен скрипт, — в `conf/check_mytasks.conf` (`MYTASKS_DIR`). Если репозиторий перенесён и каталог в конфиге другой, предупреждает и предлагает обновить его, а затем и все юниты.
+5. При первом запуске (нет `conf/check_mytasks.conf`) проводит мастер всех отсутствующих конфигов по `conf/*.conf.example` и `music_downloader/*.json.example` (кроме `cloud_backup_qnap.conf`): окна `zenity` (без него — `kdialog`), без графики — вопросы в терминале. Описание каждого значения берётся из комментариев примера, значения по умолчанию — из примера с подстановкой `@MYTASKS_DIR@`/`@HOME@`. Строки примера без изменений копируются как есть (`${HOME}` и т.п. сохраняются).
+6. Проверяет зависимости (обязательные и необязательные) и ставит пакеты менеджером своего семейства одним запросом прав.
+7. Проверяет задания и для каждого отсутствующего или неработающего выводит предупреждение с описанием и вопрос «создать?»: «да» — создаёт, «нет» — ничего не меняет и в этом запуске больше не спрашивает.
 
 Кнопки окон: **«Отмена»** относится только к текущему окну (конфиг не создаётся, поле остаётся со значением по умолчанию); **«Стоп»** (в терминале — ответ «стоп») прерывает весь процесс — дальше ничего не спрашивается и не меняется, уже сделанное остаётся, выводится итоговая таблица; продолжить — запустить скрипт снова. «Стоп» есть во всех окнах `zenity`; у `kdialog` — кнопкой в вопросах «да/нет» и пунктом «■ Стоп» в списках (в полях ввода kdialog третьей кнопки нет), поэтому `zenity` выбирается первым (`UI="kdialog"` — принудительно kdialog). Значения по умолчанию, которые можно определить на машине, мастер подставляет сам: `OS_FAMILY` — семейство по `/etc/os-release`, для `conf/llamactl.conf` — `CUDA_ARCH` (compute capability из `nvidia-smi`) и `BUILD_JOBS` (`nproc` − 2).
-7. Печатает таблицу состояния в начале и (если что-то менялось) итоговую.
+8. Печатает таблицу состояния в начале и (если что-то менялось) итоговую.
 
 **Задания по умолчанию** (массив `JOBS` в начале скрипта, переопределяется в конфиге):
 
@@ -437,7 +439,7 @@ journalctl --user -u check-backups.service -n 20
 
 **Таблица состояния** (`--status`): вид, задание, установлено (есть/нет/отличается/другой путь), автозапуск (включён, расписание cron), состояние (ожидает/работает/при событии/ошибка/не запущен), итог (`OK`, `ВНИМАНИЕ`, «не требуется») и описание; ниже — все зависимости с пакетом для текущего семейства.
 
-**Повышение прав** (системные юниты, пакеты): `SUDO_CMD="auto"` — `sudo -A` при заданном `SUDO_ASKPASS`, иначе `pkexec` в графическом сеансе, иначе `sudo` в терминале. Скрипт перезапускает сам себя с внутренней командой `__root-install-units`/`__root-enable`/`__root-pkg` — один запрос пароля на действие; эти вызовы логов не пишут.
+**Повышение прав** (обновление системы, системные юниты, пакеты): `SUDO_CMD="auto"` — `sudo -A` при заданном `SUDO_ASKPASS`, иначе `pkexec` в графическом сеансе, иначе `sudo` в терминале. Скрипт перезапускает сам себя с внутренней командой `__root-update`/`__root-install-units`/`__root-enable`/`__root-pkg` — один запрос пароля на действие; эти вызовы логов не пишут.
 
 **Конфигурация:** `conf/check_mytasks.conf` (пример `conf/check_mytasks.conf.example`, создаётся мастером): `MYTASKS_DIR`, `OS_FAMILY` (пусто — автоопределение), `SUDO_CMD`, `UI` (`auto`/`kdialog`/`tty`/`none`), каталоги `SYSTEM_UNIT_DIR`, `USER_UNIT_DIR`, `AUTOSTART_DIR`, `BIN_DIR`, `KEEP_LOGS`, параметры уведомления; при необходимости — свои массивы `JOBS` и `DEPS` (формат описан в начале скрипта). Если конфига нет, скрипт предупреждает и использует каталог запуска.
 

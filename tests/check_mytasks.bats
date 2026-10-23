@@ -107,7 +107,8 @@ else
   cat "$1" > "$STATE/crontab"
 fi
 EOT
-  for c in apt-get pacman dnf yum rpm-ostree zypper apk xbps-install emerge eopkg notify-send; do
+  mkdir -p "$STATE/modules/$(uname -r)"
+  for c in apt-get pacman dnf yum rpm-ostree zypper apk xbps-install emerge emaint eopkg garuda-update nixos-rebuild transactional-update notify-send; do
     printf '#!/usr/bin/env bash\necho "%s $*" >> "$CALLS"\nexit 0\n' "$c" > "$STUB_DIR/$c"
   done
   chmod +x "$STUB_DIR"/*
@@ -135,6 +136,9 @@ AUTOSTART_DIR="$HOME/.config/autostart"
 BIN_DIR="$HOME/.local/bin"
 SYSTEM_PYTHON="$STUB_DIR/none-python"
 SYSTEMD_RUN_DIR="${SYSTEMD_DIR:-$STATE}"
+REBOOT_FLAG="$STATE/reboot-required"
+KERNEL_MODULES_DIR="$STATE/modules"
+GARUDA_UPDATE="${GARUDA:-auto}"
 OSTREE_FLAG="$STATE/ostree-booted"
 JOBS=(
 $1
@@ -172,6 +176,7 @@ ALL_DEMO_JOBS='"user-unit|demo.timer|||Демо-таймер пользоват�
   [[ "$output" == *"[dry-run] будет: установить demo.service demo.timer"* ]]
   [[ "$output" == *"[dry-run] будет: добавить в crontab: 0 1 * * * $WORK/demo.sh"* ]]
   [[ "$output" == *"[dry-run] будет: установить пакеты (arch, pacman): demo-arch"* ]]
+  [[ "$output" == *"[dry-run] будет: обновить систему: "* ]]
   [ ! -e "$USER_UNITS/demo.timer" ]
   [ ! -e "$SYS_UNITS/sysdemo.timer" ]
   [ ! -e "$STATE/crontab" ]
@@ -188,6 +193,9 @@ ALL_DEMO_JOBS='"user-unit|demo.timer|||Демо-таймер пользоват�
   [ "$status" -eq 1 ]
   [[ "$output" == *"⚠ юнит (польз.) demo.timer"* ]]
   [[ "$output" == *"Пропущено (не создавать)."* ]]
+  [[ "$output" == *"Обновление системы пропущено"* ]]
+  run grep -qE 'garuda-update|pacman' "$CALLS"
+  [ "$status" -ne 0 ]
   [ ! -e "$USER_UNITS/demo.timer" ]
   [ ! -e "$STATE/crontab" ]
 }
@@ -272,6 +280,7 @@ ALL_DEMO_JOBS='"user-unit|demo.timer|||Демо-таймер пользоват�
   [[ "$output" == *"семейство debian, пакеты — apt-get"* ]]
   [[ "$output" == *"cron.service"* ]]
   grep -q 'apt-get install -y -- demo-deb' "$CALLS"
+  grep -q 'apt-get -y full-upgrade' "$CALLS"
   run grep -q 'opt-deb' "$CALLS"
   [ "$status" -ne 0 ]
 }
@@ -283,6 +292,7 @@ ALL_DEMO_JOBS='"user-unit|demo.timer|||Демо-таймер пользоват�
   [[ "$output" == *"семейство redhat"* ]]
   [[ "$output" == *"crond.service"* ]]
   grep -q 'dnf install -y -- demo-rh' "$CALLS"
+  grep -q 'dnf -y upgrade --refresh' "$CALLS"
 }
 
 @test "производные дистрибутивы: Mint → debian, Nobara → redhat, Tumbleweed → suse, Artix → arch" {
@@ -301,6 +311,7 @@ ALL_DEMO_JOBS='"user-unit|demo.timer|||Демо-таймер пользоват�
   run "$WORK/check_mytasks.sh" --yes --no-gui
   [[ "$output" == *"cron.service"* ]]
   grep -q 'zypper --non-interactive install -- demo-suse' "$CALLS"
+  grep -q 'zypper --non-interactive update' "$CALLS"
 }
 
 @test "Fedora Atomic: пакеты через rpm-ostree с предупреждением о перезагрузке" {
@@ -310,6 +321,7 @@ ALL_DEMO_JOBS='"user-unit|demo.timer|||Демо-таймер пользоват�
   run "$WORK/check_mytasks.sh" --yes --no-gui
   [[ "$output" == *"неизменяемая система (kinoite)"* ]]
   grep -q 'rpm-ostree install --idempotent --assumeyes -- demo-rh' "$CALLS"
+  grep -q 'rpm-ostree upgrade' "$CALLS"
 }
 
 @test "Alpine без systemd: юниты не создаются, cron проверяется по процессу" {
@@ -322,6 +334,7 @@ ALL_DEMO_JOBS='"user-unit|demo.timer|||Демо-таймер пользоват�
   [[ "$output" == *"демон cron"* ]]
   [ ! -e "$USER_UNITS/demo.timer" ]
   grep -q 'apk add -- demo-apk' "$CALLS"
+  grep -q 'apk upgrade' "$CALLS"
 }
 
 @test "NixOS: предупреждение, пакеты не ставятся" {
@@ -329,6 +342,7 @@ ALL_DEMO_JOBS='"user-unit|demo.timer|||Демо-таймер пользоват�
   printf 'ID=nixos\nPRETTY_NAME="NixOS"\n' > "$STATE/os-release"
   run "$WORK/check_mytasks.sh" --yes --no-gui
   [[ "$output" == *"NixOS: пакеты и службы объявляются в configuration.nix"* ]]
+  grep -q 'nixos-rebuild switch --upgrade' "$CALLS"
   [[ "$output" == *"установите вручную"* ]]
   run grep -qE 'pacman|apt-get|dnf|zypper|apk' "$CALLS"
   [ "$status" -ne 0 ]
@@ -340,9 +354,59 @@ ALL_DEMO_JOBS='"user-unit|demo.timer|||Демо-таймер пользоват�
   run "$WORK/check_mytasks.sh" --yes --no-gui
   [[ "$output" == *"ОС «Slackware 15.0» (ID=slackware) не распознана"* ]]
   [[ "$output" == *"задайте OS_FAMILY"* ]]
+  [[ "$output" == *"автоматически не выполняется — обновите её вручную"* ]]
   run grep -qE 'pacman|apt-get|dnf|zypper|apk' "$CALLS"
   [ "$status" -ne 0 ]
   grep -q '"event":"os_note"' "$MYTASKS_LOG_DIR"/check_mytasks-*.jsonl
+}
+
+@test "обновление системы — первый шаг: Garuda — garuda-update до автозагрузки и пакетов" {
+  rm -f "$USER_UNITS/check-mytasks.service" "$STATE/enabled/check-mytasks.service"
+  write_conf "" '"democmd|demo-arch||Демо"'
+  run "$WORK/check_mytasks.sh" --yes --no-gui
+  [[ "$output" == *"Обновление системы — обязательный первый шаг: garuda-update --noconfirm"* ]]
+  [[ "$output" == *"✔ система обновлена"* ]]
+  first="$(grep -nE 'garuda-update|systemctl --user enable|pacman -S --needed' "$CALLS" | head -1)"
+  [[ "$first" == *"garuda-update --noconfirm"* ]]
+  grep -q 'pacman -S --needed --noconfirm -- demo-arch' "$CALLS"
+}
+
+@test "обновление системы: Arch без garuda-update — pacman -Syu" {
+  export GARUDA=no
+  write_conf "" ""
+  run "$WORK/check_mytasks.sh" --yes --no-gui
+  grep -q 'pacman -Syu --noconfirm' "$CALLS"
+  run grep -q 'garuda-update' "$CALLS"
+  [ "$status" -ne 0 ]
+}
+
+@test "обновление системы: Tumbleweed — zypper dup, Void — xbps, Gentoo — emerge @world, Solus — eopkg" {
+  write_conf "" ""
+  for pair in 'opensuse-tumbleweed:zypper --non-interactive dup' 'void:xbps-install -Syu' 'gentoo:emerge --update --deep --newuse --ask=n @world' 'solus:eopkg upgrade -y' 'opensuse-microos:transactional-update --non-interactive dup'; do
+    printf 'ID=%s\nPRETTY_NAME="T"\n' "${pair%%:*}" > "$STATE/os-release"
+    : > "$CALLS"
+    "$WORK/check_mytasks.sh" --yes --no-gui >/dev/null 2>&1 || true
+    grep -qF -- "${pair#*:}" "$CALLS" || { echo "нет «${pair#*:}» для ${pair%%:*}"; cat "$CALLS"; return 1; }
+  done
+}
+
+@test "обновление не удалось: пакеты не ставятся, остальное проверяется" {
+  printf '#!/usr/bin/env bash\necho "garuda-update $*" >> "$CALLS"\nexit 1\n' > "$STUB_DIR/garuda-update"
+  write_conf '"link|demo-link|demo.sh||Демо-ссылка"' '"democmd|demo-arch||Демо"'
+  run "$WORK/check_mytasks.sh" --yes --no-gui
+  [[ "$output" == *"Обновление системы не удалось (код 1)"* ]]
+  [[ "$output" == *"не ставятся: система не обновлена"* ]]
+  run grep -q 'pacman -S --needed' "$CALLS"
+  [ "$status" -ne 0 ]
+  [ "$(readlink "$HOME/.local/bin/demo-link")" = "$WORK/demo.sh" ]
+}
+
+@test "после обновления ядра — предупреждение о перезагрузке" {
+  rm -rf "$STATE/modules/$(uname -r)"
+  write_conf "" ""
+  run "$WORK/check_mytasks.sh" --yes --no-gui
+  [[ "$output" == *"нужна перезагрузка"* ]]
+  [[ "$output" == *"Перезагрузите компьютер"* ]]
 }
 
 @test "мастер конфига: значения по умолчанию с подстановкой путей" {
@@ -414,7 +478,7 @@ ALL_DEMO_JOBS='"user-unit|demo.timer|||Демо-таймер пользоват�
   [ ! -e "$USER_UNITS/demo.timer" ]
   [ ! -e "$HOME/.local/bin/demo-link" ]
   [ ! -e "$WORK/conf/demo.conf" ]
-  run grep -q 'pacman' "$CALLS"
+  run grep -q 'pacman -S --needed' "$CALLS"
   [ "$status" -ne 0 ]
   grep -q '"event":"stopped"' "$MYTASKS_LOG_DIR"/check_mytasks-*.jsonl
 }
