@@ -622,6 +622,49 @@ sudo ./hp_p1005_garuda.sh --all
 
 ---
 
+### `llamactl.sh` и `llamactl_tray.py`
+
+Управление локальным llama.cpp независимо от редакторов (Zed, VS Code и т.п.): роутер `llama-server.service` (`:8080`, пресеты `/etc/llama.cpp/models.ini`), FIM-сервер автодополнения `llama-fim.service` (`:8012`), модели в `/var/lib/llama.cpp/models`.
+
+**`llamactl.sh`** — консольная утилита (ссылка `~/.local/bin/llamactl`). Без аргументов в терминале открывает интерактивное меню.
+
+| Команда | Что делает |
+|---|---|
+| `status [--json]` | сервисы, модели и их состояние, VRAM/RAM, процессы на GPU, сторонние `llama-server` |
+| `models`, `load М`, `unload М\|all` | список моделей; загрузка с прогрессом по VRAM; выгрузка с ожиданием освобождения памяти |
+| `free-vram` | выгрузить все модели и остановить FIM (освободить видеопамять, например под игру) |
+| `start\|stop\|restart [server\|fim\|all]`, `logs [server\|fim] [-f] [-n N]` | сервисы (с ожиданием `/health`) и их журнал |
+| `doctor` | проверка сервисов, API, файлов моделей из пресетов, сторонних `llama-server`, кешей `~/.cache/huggingface`, места на диске; код `1` — есть проблемы |
+| `kill-foreign` | завершить сторонние `llama-server`/`llama serve` (например, встроенные env `llama-vscode`) |
+| `preset list\|show М\|set М КЛЮЧ ЗНАЧ\|unset М КЛЮЧ\|edit` | правка пресетов: показ diff, резервная копия `models.ini.bak-*`, перечитывание роутера через `GET /models?reload=1` без перезапуска, откат при сбое |
+| `fit М [ОКНО]` | раскладка слоёв и экспертов MoE по GPU/CPU (`llama-fit-params`) с учётом занятой VRAM |
+| `add РЕПО ФАЙЛ.gguf [--name] [--mmproj] [--ctx]` | загрузка с Hugging Face на SSD с докачкой, прогрессом и проверкой sha256, новая секция пресета |
+| `remove М [--delete-files]` | убрать модель из пресетов (и удалить её файлы внутри `MODELS_DIR`) |
+| `bench [М]` | замер скорости генерации и обработки промпта |
+| `update [--ref REF] [--bench] [--force]` | `git fetch` исходников, сборка с CUDA (`sm_86`, RPATH `$ORIGIN/../lib`), установка в `/opt/llama.cpp.new`, проверка, замена с сохранением прежней версии в `/opt/llama.cpp.prev`, перезапуск сервисов и автоматический откат, если они не ответили |
+
+Root-шаги (systemctl, установка пресета, замена сборки) идут через `sudo -A` (графическое окно пароля), не больше одного запроса пароля на действие: скрипт перезапускает сам себя с внутренней командой `__root-*`.
+
+**Режим dry-run:** `-n, --dry-run` (до имени команды; `--dry-run` — в любом месте) — статус, проверки, `diff` пресета и сведения с Hugging Face/`git ls-remote` получаются как обычно, но ничего не загружается/выгружается, не скачивается, не правится и не перезапускается: печатаются строки `[dry-run] будет: …`, в лог пишутся события `dry_<event>`.
+
+**`llamactl_tray.py`** — иконка в трее KDE (системный `/usr/bin/python3` + `python-pyqt6`), тонкая обёртка над `llamactl.sh`: опрос `status --json` каждые 5 с; цвет — серый (остановлен), синий (ожидает), жёлтый (загрузка), зелёный (модель загружена), оранжевый (проблемы: FIM не работает, сторонние `llama-server`); подсказка — модель, VRAM, свободная RAM. Меню: модели (загрузить/выгрузить), освободить VRAM, сервисы, логи, проверка, пресеты (редактор, fit, замер), добавление модели с Hugging Face, обновление llama.cpp, консольное меню. Быстрые действия — в фоне с уведомлением, долгие и интерактивные — в терминале (`konsole --hold -e`, переопределяется `--terminal` или `LLAMACTL_TERMINAL`). Щелчок по иконке открывает веб-чат роутера. Автозапуск — `~/.config/autostart/llamactl-tray.desktop`, пункт меню — `~/.local/share/applications/llamactl-tray.desktop`. `--dry-run` передаёт режим всем действиям; `--print-menu [--status-file F]` печатает состояние и меню без графики.
+
+**Конфигурация:** `conf/llamactl.conf` (пример — `conf/llamactl.conf.example`): адреса роутера и FIM, юниты и пользователь сервисов, пути пресетов, моделей, установки и исходников, архитектура CUDA, число потоков сборки, модель для замера, тайм-ауты, команда `sudo`.
+
+**Использование:**
+```sh
+llamactl                         # интерактивное меню
+llamactl status
+llamactl load qwen3.6-35b-a3b
+llamactl free-vram
+llamactl -n preset set qwen3.5-9b ctx-size 49152   # сначала план
+llamactl preset set qwen3.5-9b ctx-size 49152
+llamactl add unsloth/Qwen3.5-4B-GGUF Qwen3.5-4B-Q4_K_M.gguf --mmproj mmproj-F16.gguf
+llamactl -n update --bench && llamactl update --bench
+```
+
+---
+
 ### `lowercase_ext.sh`
 
 Переименовывает расширения файлов в нижний регистр (`.JPG` → `.jpg`, `.MP3` → `.mp3`).
@@ -868,6 +911,8 @@ Jamendo для категории `/` использует официальны�
 | `doc2fb2.sh` | `pandoc`, `libreoffice`; опц.: `unrtf`, `antiword`, `catdoc`, `wvText` |
 | `getip.sh` | `curl` |
 | `hp_p1005_garuda.sh` | Arch/Garuda, `pacman`, `lsusb`, `systemctl`, CUPS (`lp`), `system-config-printer` |
+| `llamactl.sh` | Bash, `curl`, `jq`, `systemctl`, `journalctl`, `sudo -A` (askpass); опц.: `nvidia-smi`, `git`+`cmake`+CUDA (`update`), `sha256sum` (`add`) |
+| `llamactl_tray.py` | `/usr/bin/python3`, `python-pyqt6`, `llamactl.sh`; опц.: `konsole`, `xdg-open` |
 | `lowercase_ext.sh` | Bash, `find`, `mv` |
 | `mht_to_fb2.py` | Python 3, `pandoc` |
 | `music_downloader.sh` | Bash, Python 3, локальный проект `music_downloader/`; после успеха — `split_by_dash.sh` |

@@ -1,0 +1,40 @@
+# Конфигурация llamactl.sh и llamactl_tray.py.
+# Скопируйте в conf/llamactl.conf и измените нужное; файл подключается как shell.
+# Все значения ниже совпадают со встроенными по умолчанию.
+
+# Роутер llama-server (режим --models-preset) и FIM-сервер автодополнения
+ROUTER_URL="http://127.0.0.1:8080"
+FIM_URL="http://127.0.0.1:8012"
+
+# systemd-юниты и пользователь, от которого они работают
+# (процессы llama-server других пользователей считаются сторонними)
+SERVER_UNIT="llama-server"
+FIM_UNIT="llama-fim"
+SERVICE_USER="llama"
+
+# Пресеты моделей роутера и каталог GGUF-файлов (локальный SSD)
+PRESET_FILE="/etc/llama.cpp/models.ini"
+MODELS_DIR="/var/lib/llama.cpp/models"
+
+# Установка и исходники llama.cpp для `llamactl update`
+LLAMA_PREFIX="/opt/llama.cpp"
+LLAMA_SRC="${HOME}/.local/src/llama.cpp"
+# Архитектура CUDA (RTX 3060 Ti = 86) и число потоков сборки
+CUDA_ARCH="86"
+BUILD_JOBS="14"
+
+# Модель для `llamactl bench` и замера до/после `update --bench`
+BENCH_MODEL="qwen3.5-9b"
+
+# Hugging Face для `llamactl add`
+HF_BASE="https://huggingface.co"
+
+# Тайм-ауты: загрузка модели и ответ сервисов после (пере)запуска, секунды
+LOAD_TIMEOUT_SECS="900"
+HEALTH_TIMEOUT_SECS="90"
+
+# Сколько JSONL-логов llamactl хранить в logs/
+LOG_KEEP="10"
+
+# Команда повышения прав (графическое окно пароля через SUDO_ASKPASS)
+SUDO_CMD="sudo -A"
