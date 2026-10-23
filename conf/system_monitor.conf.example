@@ -3,10 +3,10 @@
 DISKS=""
 
 # Путь к базе SQLite с историей опросов
-DB_FILE="/home/esimych/esimych-docs/mytasks/state/system_monitor.db"
+DB_FILE="@MYTASKS_DIR@/state/system_monitor.db"
 
 # Каталог для HTML-отчётов (по умолчанию system_reports рядом со скриптом)
-REPORT_DIR="/home/esimych/esimych-docs/mytasks/system_reports"
+REPORT_DIR="@MYTASKS_DIR@/system_reports"
 
 # Сколько последних HTML-отчётов хранить
 REPORT_KEEP=5

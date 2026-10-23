@@ -1,0 +1,15 @@
+[Unit]
+Description=Уведомление, если точки монтирования из /etc/fstab не смонтированы
+Documentation=file://@MYTASKS_DIR@/README.md
+After=graphical-session.target
+Wants=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=@MYTASKS_DIR@/check-store-mount.sh
+# Код 1 — найдены несмонтированные точки: скрипт уже показал уведомление,
+# это штатный результат, а не сбой юнита
+SuccessExitStatus=1
+
+[Install]
+WantedBy=graphical-session.target

@@ -15,7 +15,7 @@ setup() {
   CALLS="$TMP_DIR/calls.log"
   STATE="$TMP_DIR/model_state"
   mkdir -p "$WORK_DIR/conf" "$STUB_DIR" "$MODELS/m9" "$TMP_DIR/prefix/bin" "$TMP_DIR/src"
-  cp "$REPO_ROOT/llamactl.sh" "$REPO_ROOT/llamactl_tray.py" "$WORK_DIR/"
+  cp "$REPO_ROOT/llamactl.sh" "$REPO_ROOT/llamactl_tray.py" "$REPO_ROOT/llamactl_status.py" "$WORK_DIR/"
   chmod +x "$WORK_DIR/llamactl.sh" "$WORK_DIR/llamactl_tray.py"
   : > "$CALLS"
   echo unloaded > "$STATE"
@@ -86,6 +86,7 @@ EOF
 #!/usr/bin/env bash
 case "$*" in
   *query-gpu*) echo "1300, 8192, 5" ;;
+  *query-compute-apps*) [ -n "${GPU_APPS:-}" ] && printf '%s\n' "$GPU_APPS" ;;
   *) ;;
 esac
 EOF
@@ -129,11 +130,34 @@ EOF
 
 teardown() {
   [ -n "${FOREIGN_PID:-}" ] && kill "$FOREIGN_PID" 2>/dev/null || true
+  [ -n "${HTTP_PID:-}" ] && kill "$HTTP_PID" 2>/dev/null || true
   rm -rf "$TMP_DIR"
 }
 
+# NVML отключён: статус берёт VRAM из заглушки nvidia-smi, а не с реальной GPU
 ctl() {
-  env PATH="$STUB_DIR:$PATH" "$WORK_DIR/llamactl.sh" "$@"
+  env PATH="$STUB_DIR:$PATH" LLAMACTL_NO_NVML=1 "$WORK_DIR/llamactl.sh" "$@"
+}
+
+# Локальный HTTP-«роутер» для статуса (llamactl_status.py ходит по HTTP, не через curl):
+# /health и /models — файлы каталога www; адрес дописывается в conf/llamactl.conf
+start_router() {
+  mkdir -p "$TMP_DIR/www"
+  echo ok > "$TMP_DIR/www/health"
+  printf '{"data":[{"id":"m9","status":{"value":"%s","args":["llama-server","--ctx-size","32768"]}}]}\n' "${1:-loaded}" > "$TMP_DIR/www/models"
+  PORT="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
+  python3 -m http.server "$PORT" --bind 127.0.0.1 --directory "$TMP_DIR/www" >/dev/null 2>&1 &
+  HTTP_PID=$!
+  python3 - "$PORT" <<'PYEOF'
+import sys, time, urllib.request
+for _ in range(100):
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/health", timeout=1)
+        break
+    except OSError:
+        time.sleep(0.05)
+PYEOF
+  printf 'ROUTER_URL="http://127.0.0.1:%s"\nFIM_URL="http://127.0.0.1:%s"\n' "$PORT" "$PORT" >> "$WORK_DIR/conf/llamactl.conf"
 }
 
 @test "help: печатает справку и завершается с кодом 0" {
@@ -148,13 +172,44 @@ ctl() {
 }
 
 @test "status --json: корректный JSON с моделями, сервисами и VRAM" {
+  start_router loaded
   run ctl status --json
   [ "$status" -eq 0 ]
   run jq -r '[.services.server, (.router.up|tostring), .models[0].id, .models[0].ctx, (.gpu.used_mib|tostring)] | join(" ")' <<<"$output"
   [ "$output" = "active true m9 32768 1300" ]
 }
 
+@test "status --json: роутер недоступен — up=false и пустой список моделей" {
+  printf 'ROUTER_URL="http://127.0.0.1:9"\nFIM_URL="http://127.0.0.1:9"\n' >> "$WORK_DIR/conf/llamactl.conf"
+  run ctl status --json
+  [ "$status" -eq 0 ]
+  run jq -r '[(.router.up|tostring), (.models|length|tostring)] | join(" ")' <<<"$output"
+  [ "$output" = "false 0" ]
+}
+
+@test "llamactl_status.py: /proc, meminfo, GPU-процессы и сторонний llama-server" {
+  P="$TMP_DIR/proc"
+  mkdir -p "$P/4242" "$P/77"
+  printf 'MemTotal:       1000 kB\nMemAvailable:    400 kB\nSwapTotal:       100 kB\nSwapFree:         40 kB\n' > "$P/meminfo"
+  printf '/opt/x/llama-server\0--port\08099\0' > "$P/4242/cmdline"
+  printf 'bash\0' > "$P/77/cmdline"
+  run env PATH="$STUB_DIR:$PATH" LLAMACTL_NO_NVML=1 GPU_APPS="4242, 512" python3 "$WORK_DIR/llamactl_status.py" \
+    --proc "$P" --router-url http://127.0.0.1:9 --fim-url http://127.0.0.1:9 --models-dir "$MODELS"
+  [ "$status" -eq 0 ]
+  run jq -r '[.ram.total, .ram.used, .ram.swap_used, .foreign[0].pid, .foreign[0].port, (.foreign|length),
+             .gpu.procs[0].kind, .gpu.procs[0].mib, .gpu.total_mib] | map(tostring) | join(" ")' <<<"$output"
+  [ "$output" = "1024000 614400 61440 4242 8099 1 foreign 512 8192" ]
+}
+
+@test "llamactl_status.py --dry-run: принимается и печатает статус" {
+  run env PATH="$STUB_DIR:$PATH" LLAMACTL_NO_NVML=1 python3 "$WORK_DIR/llamactl_status.py" --dry-run \
+    --router-url http://127.0.0.1:9 --fim-url http://127.0.0.1:9
+  [ "$status" -eq 0 ]
+  jq -e '.services and .gpu and .ram' <<<"$output"
+}
+
 @test "status: текстовый вывод перечисляет модели" {
+  start_router loaded
   run ctl status
   [ "$status" -eq 0 ]
   [[ "$output" == *"m9"* ]]
@@ -364,6 +419,15 @@ EOF
   [[ "$output" == *"state: warn"* ]]
   [[ "$output" == *"Завершить сторонние llama-server (1)"* ]]
   [[ "$output" == *"DRY-RUN"* ]]
+}
+
+@test "трей --print-menu без файла: статус модулем llamactl_status (без llamactl.sh)" {
+  start_router loaded
+  run env PATH="$STUB_DIR:$PATH" LLAMACTL_NO_NVML=1 /usr/bin/python3 "$WORK_DIR/llamactl_tray.py" --print-menu
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"state: "* ]]
+  [[ "$output" == *"m9"* ]]
+  ! grep -q 'status' "$CALLS"
 }
 
 @test "трей --print-menu: нет статуса — состояние down" {

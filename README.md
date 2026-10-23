@@ -2,6 +2,20 @@
 
 Коллекция bash/Python-скриптов для автоматизации повседневных задач.
 
+## Быстрый старт на новой машине
+
+```sh
+git clone git@github.com:Eremiteb/mytasks.git ~/esimych-docs/mytasks
+~/esimych-docs/mytasks/check_mytasks.sh --dry-run   # сначала план
+~/esimych-docs/mytasks/check_mytasks.sh             # вопросы в окне, создание
+```
+
+[`check_mytasks.sh`](#check_mytaskssh) определяет семейство ОС (Arch, Debian,
+Red Hat), прописывает себя в автозагрузку, записывает каталог mytasks (тот,
+откуда запущен) в `conf/check_mytasks.conf`, проводит мастер конфигов, ставит
+зависимости и создаёт юниты systemd, задания cron, ссылки и автозапуск.
+Таблица состояния — `check_mytasks.sh --status`.
+
 ## Лицензия
 
 Скрипты предоставляются **"AS IS"** («как есть»), без каких-либо гарантий.
@@ -21,16 +35,24 @@
 
 - `auto_delete_old_files.conf.example`;
 - `btrfs_monitor.conf.example`;
+- `check_backups.conf.example`;
+- `check_mytasks.conf.example`;
 - `cloud_backup.conf.example`;
-- `cloud_backup_qnap.conf.example`;
+- `cloud_backup_qnap.conf.example` (только для QNAP);
 - `getip.conf.example`;
+- `llamactl.conf.example`;
 - `log_template.conf.example`;
 - `sources.conf.example`;
-- `split_by_dash.conf.example`;
+- `split_by_dash.conf.example`, `split_by_dash.keep.conf.example`;
 - `system_monitor.conf.example`.
 
-Скопируйте нужный шаблон без суффикса `.example` и заполните локальными
-значениями. `all_to_mp3.sh` при необходимости читает
+Рабочие конфиги создаёт мастер `check_mytasks.sh` (при первом запуске или
+`check_mytasks.sh --configure`): для каждого отсутствующего конфига окно с
+описанием из комментариев примера и значениями по умолчанию — принять всё,
+настроить каждое значение или не создавать. Плейсхолдеры `@MYTASKS_DIR@`
+(каталог репозитория) и `@HOME@` в примерах и шаблонах `systemd/` мастер
+заменяет сам; при ручном копировании шаблона без суффикса `.example`
+замените их локальными путями. `all_to_mp3.sh` при необходимости читает
 `conf/audio_to_mp3.conf`; его параметры перечислены в разделе скрипта ниже.
 
 ---
@@ -317,7 +339,7 @@ crontab /etc/config/crontab
 - Пропускает виртуальные ФС (`/proc`, `/sys`, `/dev`, `swap` и др.)
 - При обнаружении несмонтированных точек отправляет desktop-уведомление через `notify-send`
 - Дублирует сообщение в консоль
-- Предназначен для запуска через cron или autostart
+- Запускается при входе в графический сеанс user-юнитом `systemd/user/check-store-mount.service` (устанавливает `check_mytasks.sh`)
 
 **Использование:**
 ```sh
@@ -351,11 +373,10 @@ crontab /etc/config/crontab
 
 **Расписание — systemd user timer** (уведомлению нужна сессия пользователя, поэтому юниты пользовательские). Таймер срабатывает через 4 минуты после загрузки системы (если сеанс начался позже — сразу после входа) и далее раз в сутки при непрерывной работе (`OnBootSec=4min`, `OnUnitActiveSec=1d`). Юниты: `systemd/user/check-backups.{service,timer}`.
 
+Устанавливает и включает их `check_mytasks.sh` (шаблоны с подстановкой `@MYTASKS_DIR@`).
+
 ```sh
-mkdir -p ~/.config/systemd/user
-cp systemd/user/check-backups.service systemd/user/check-backups.timer ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now check-backups.timer
+./check_mytasks.sh               # установить/обновить юниты (с вопросом)
 
 # Проверка
 systemctl --user list-timers check-backups.timer
@@ -363,6 +384,77 @@ journalctl --user -u check-backups.service -n 20
 ```
 
 **Режим dry-run:** `-n, --dry-run` — проверки выполняются как обычно, но кэш проверенных архивов (`state/check_backups.verified`) не изменяется, `state/` не создаётся, уведомление не показывается (печатается).
+
+---
+
+### `check_mytasks.sh`
+
+Стартовая настройка mytasks на машине и регулярная проверка его сервисов и заданий.
+
+**Порядок работы:**
+1. Определяет семейство ОС по `/etc/os-release` (сначала `ID`, затем `ID_LIKE`):
+
+   | Семейство | Дистрибутивы (примеры) | Пакеты | cron |
+   |---|---|---|---|
+   | `arch` | Arch, Garuda, Manjaro, EndeavourOS, CachyOS, Artix, ArcoLinux, SteamOS | `pacman` | `cronie.service` |
+   | `debian` | Debian, Ubuntu (и *buntu), Mint/LMDE, Pop!_OS, elementary, Zorin, KDE neon, MX, Kali, Deepin, Devuan, Raspberry Pi OS | `apt-get` | `cron.service` |
+   | `redhat` | Fedora, RHEL, CentOS Stream, Rocky, Alma, Oracle, Amazon, Nobara, Mageia; Fedora Atomic (Silverblue, Kinoite, Bazzite) — `rpm-ostree` с перезагрузкой | `dnf`/`yum` | `crond.service` |
+   | `suse` | openSUSE Leap/Tumbleweed/Slowroll, SLES (MicroOS — только вручную) | `zypper` | `cron.service` |
+   | `alpine` | Alpine, postmarketOS (без systemd) | `apk` | по процессу |
+   | `void` | Void (runit) | `xbps-install` | по процессу |
+   | `gentoo` | Gentoo, Funtoo, Calculate | `emerge` | `cronie.service` |
+   | `solus` | Solus | `eopkg` | — |
+   | `nixos` | NixOS — пакеты и службы объявляются в `configuration.nix`, автоустановка отключена | — | `cron.service` |
+
+   Нераспознанная ОС — явное предупреждение с её `ID`/`ID_LIKE`: пакеты ставятся вручную либо семейство задаётся в `OS_FAMILY`. Без systemd юниты не создаются (службы включаются средствами своего init), демон cron проверяется по процессу.
+
+   **Alpine / postmarketOS:** скрипты mytasks на Bash, а в Alpine по умолчанию только busybox — перед первым запуском выполните `apk add bash`; GNU `find`/`coreutils` (нужны `find -printf`, `stat -c` и т.п.) скрипт проверит как зависимости `gnu:find`/`gnu:stat` и предложит `findutils`/`coreutils`. **NixOS:** нет `/bin/bash`, `/usr/bin/python3`, `/usr/bin/sleep` — шебанги и юниты mytasks используют `/usr/bin/env`; пакеты объявляйте в `configuration.nix`.
+2. Первым делом прописывает себя в автозагрузку: user-юнит `check-mytasks.service` при входе в графический сеанс запускает `check_mytasks.sh --no-create --notify` (таблица в журнале и уведомление о проблемах).
+3. Записывает каталог mytasks — каталог, откуда запущен скрипт, — в `conf/check_mytasks.conf` (`MYTASKS_DIR`). Если репозиторий перенесён и каталог в конфиге другой, предупреждает и предлагает обновить его, а затем и все юниты.
+4. При первом запуске (нет `conf/check_mytasks.conf`) проводит мастер всех отсутствующих конфигов по `conf/*.conf.example` и `music_downloader/*.json.example` (кроме `cloud_backup_qnap.conf`): окна `zenity` (без него — `kdialog`), без графики — вопросы в терминале. Описание каждого значения берётся из комментариев примера, значения по умолчанию — из примера с подстановкой `@MYTASKS_DIR@`/`@HOME@`. Строки примера без изменений копируются как есть (`${HOME}` и т.п. сохраняются).
+5. Проверяет зависимости (обязательные и необязательные) и ставит пакеты менеджером своего семейства одним запросом прав.
+6. Проверяет задания и для каждого отсутствующего или неработающего выводит предупреждение с описанием и вопрос «создать?»: «да» — создаёт, «нет» — ничего не меняет и в этом запуске больше не спрашивает.
+
+Кнопки окон: **«Отмена»** относится только к текущему окну (конфиг не создаётся, поле остаётся со значением по умолчанию); **«Стоп»** (в терминале — ответ «стоп») прерывает весь процесс — дальше ничего не спрашивается и не меняется, уже сделанное остаётся, выводится итоговая таблица; продолжить — запустить скрипт снова. «Стоп» есть во всех окнах `zenity`; у `kdialog` — кнопкой в вопросах «да/нет» и пунктом «■ Стоп» в списках (в полях ввода kdialog третьей кнопки нет), поэтому `zenity` выбирается первым (`UI="kdialog"` — принудительно kdialog). Значения по умолчанию, которые можно определить на машине, мастер подставляет сам: `OS_FAMILY` — семейство по `/etc/os-release`, для `conf/llamactl.conf` — `CUDA_ARCH` (compute capability из `nvidia-smi`) и `BUILD_JOBS` (`nproc` − 2).
+7. Печатает таблицу состояния в начале и (если что-то менялось) итоговую.
+
+**Задания по умолчанию** (массив `JOBS` в начале скрипта, переопределяется в конфиге):
+
+| Задание | Вид | Что делает |
+|---|---|---|
+| `check-mytasks.service` | user-юнит | сам скрипт при входе в сеанс |
+| `conf/check_mytasks.conf` | конфиг | каталог mytasks, семейство ОС, способ повышения прав |
+| `system-monitor.timer` | системный юнит | `system_monitor.sh` каждые 6 ч от root |
+| `check-backups.timer` | user-юнит | `check_backups.sh` раз в сутки |
+| `check-store-mount.service` | user-юнит | `check-store-mount.sh` при входе в сеанс |
+| `cronie`/`cron`/`crond.service` | системный сервис | демон cron своего семейства ОС |
+| `music_downloader.sh`, `sources.sh`, `btrfs_monitor.sh` | cron | `0 21 * * *`, `0 23 * * *`, `0 */6 * * *` (Btrfs — только если `/` на Btrfs) |
+| `conf/check_backups.conf`, `conf/sources.conf`, `music_downloader/music_downloader.json` | конфиг | создаются мастером |
+| `music_downloader/venv` | venv | `music_downloader/setup_venv.sh` |
+| `llamactl`, `llamactl-tray`, `llamactl-tray.desktop`, `llama-server.service`, `llama-fim.service` | ссылки, автозапуск, сервисы | только если есть `/opt/llama.cpp` |
+
+Шаблоны юнитов и автозапуска лежат в `systemd/` (`systemd/*.service|timer` — системные, `systemd/user/` — пользовательские, `systemd/autostart/` — XDG autostart) и содержат плейсхолдер `@MYTASKS_DIR@`; установленный файл, отличающийся от отрисованного шаблона (старая версия или другой каталог), отмечается «отличается» и предлагается к обновлению. Строки crontab с mytasks-скриптом из другого каталога переписываются на текущий. Таймеры включаются с `--now`, сервисы входа в сеанс — только `enable`.
+
+**Таблица состояния** (`--status`): вид, задание, установлено (есть/нет/отличается/другой путь), автозапуск (включён, расписание cron), состояние (ожидает/работает/при событии/ошибка/не запущен), итог (`OK`, `ВНИМАНИЕ`, «не требуется») и описание; ниже — все зависимости с пакетом для текущего семейства.
+
+**Повышение прав** (системные юниты, пакеты): `SUDO_CMD="auto"` — `sudo -A` при заданном `SUDO_ASKPASS`, иначе `pkexec` в графическом сеансе, иначе `sudo` в терминале. Скрипт перезапускает сам себя с внутренней командой `__root-install-units`/`__root-enable`/`__root-pkg` — один запрос пароля на действие; эти вызовы логов не пишут.
+
+**Конфигурация:** `conf/check_mytasks.conf` (пример `conf/check_mytasks.conf.example`, создаётся мастером): `MYTASKS_DIR`, `OS_FAMILY` (пусто — автоопределение), `SUDO_CMD`, `UI` (`auto`/`kdialog`/`tty`/`none`), каталоги `SYSTEM_UNIT_DIR`, `USER_UNIT_DIR`, `AUTOSTART_DIR`, `BIN_DIR`, `KEEP_LOGS`, параметры уведомления; при необходимости — свои массивы `JOBS` и `DEPS` (формат описан в начале скрипта). Если конфига нет, скрипт предупреждает и использует каталог запуска.
+
+**Коды возврата:** `0` — всё на месте, `1` — есть незапущенные или не прописанные задания, конфиги или обязательные зависимости, `2` — ошибка аргументов.
+
+**Использование:**
+```sh
+./check_mytasks.sh --status       # только таблица
+./check_mytasks.sh --dry-run      # план: «[dry-run] будет: …»
+./check_mytasks.sh                # предупреждения и вопросы «создать?» в окне
+./check_mytasks.sh --yes          # создать всё без вопросов (конфиги по умолчанию, только обязательные пакеты)
+./check_mytasks.sh --configure    # мастер для всех отсутствующих конфигов
+./check_mytasks.sh --no-create --notify   # как в автозагрузке: без вопросов, уведомление о проблемах
+```
+Дополнительно: `--ask` — вопросы в терминале, даже если stdin не терминал; `--no-gui` — без окон `kdialog`/`zenity`.
+
+**Режим dry-run:** `-n, --dry-run` — проверки и таблица как обычно; юниты, crontab, ссылки, автозапуск, конфиги и пакеты не меняются, окна не открываются; печатаются строки `[dry-run] будет: …` (для конфигов — со списком значений по умолчанию), в лог пишутся события `dry_<event>`.
 
 ---
 
@@ -385,10 +477,7 @@ journalctl --user -u check-backups.service -n 20
 ./btrfs_monitor.sh
 ```
 
-**Cron (каждые 6 часов):**
-```cron
-0 */6 * * * /home/esimych/esimych-docs/mytasks/btrfs_monitor.sh >/dev/null 2>&1
-```
+**Расписание:** строка crontab `0 */6 * * *` — добавляет `check_mytasks.sh`, если `/` на Btrfs.
 
 **Режим dry-run:** `-n, --dry-run` — счётчики читаются и сравниваются как обычно, но файл состояния не создаётся и не обновляется, уведомление не отправляется (печатается).
 
@@ -455,36 +544,21 @@ sudo ./system_monitor.sh
 sudo ./system_monitor.sh -r
 ```
 
-**Важно:** для чтения SMART-атрибутов `smartctl` обычно требует root — крон-запись
-нужно добавлять в root-crontab (`sudo crontab -e`), а не в обычный пользовательский.
-Опрос CPU/GPU root не требует, но так как весь скрипт обычно запускается под
-root ради дисков, они опрашиваются в том же (привилегированном) запуске.
+**Важно:** для чтения SMART-атрибутов `smartctl` обычно требует root, поэтому
+скрипт запускается от root; CPU/GPU опрашиваются в том же запуске.
 
-**Расписание — systemd timer (рекомендуется):**
-
-Юнит-файлы лежат в `systemd/system-monitor.service` и `systemd/system-monitor.timer`.
-Таймер срабатывает в 00/06/12/18 часов, а благодаря `Persistent=true` пропущенный
-слот (машина была выключена) выполняется при первой же загрузке — и не более одного
-раза за интервал. Обычный cron `0 */6` пропуски не догоняет: если компьютер
-включают, скажем, в 18:30 и выключают до полуночи, замеры не будут попадать в базу
-вообще.
+**Расписание — системный systemd timer:** шаблоны `systemd/system-monitor.service`
+и `systemd/system-monitor.timer` (плейсхолдер `@MYTASKS_DIR@`) устанавливает в
+`/etc/systemd/system` и включает `check_mytasks.sh`. Таймер срабатывает в
+00/06/12/18 часов, а благодаря `Persistent=true` пропущенный слот (машина была
+выключена) выполняется при первой же загрузке — не более одного раза за интервал.
 
 ```sh
-sudo cp systemd/system-monitor.service systemd/system-monitor.timer /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now system-monitor.timer
+./check_mytasks.sh                         # установить/обновить и включить (с вопросом)
 
 # Проверка
 systemctl list-timers system-monitor.timer
 journalctl -u system-monitor.service -n 20
-```
-
-Если раньше скрипт стоял в root-crontab — строку `0 */6 * * * …system_monitor.sh`
-оттуда нужно убрать (`sudo crontab -e`), иначе опрос будет идти дважды.
-
-**Cron (альтернатива, без догоняния пропусков):**
-```cron
-0 */6 * * * /home/esimych/esimych-docs/mytasks/system_monitor.sh >/dev/null 2>&1
 ```
 
 Актуальный отчёт всегда доступен по стабильному пути `system_reports/latest.html`;
@@ -643,11 +717,13 @@ sudo ./hp_p1005_garuda.sh --all
 | `bench [М]` | замер скорости генерации и обработки промпта |
 | `update [--ref REF] [--bench] [--force]` | `git fetch` исходников, сборка с CUDA (`sm_86`, RPATH `$ORIGIN/../lib`), установка в `/opt/llama.cpp.new`, проверка, замена с сохранением прежней версии в `/opt/llama.cpp.prev`, перезапуск сервисов и автоматический откат, если они не ответили |
 
+**Статус** (`status`, `status --json`) собирает `llamactl_status.py` — только стандартная библиотека Python: роутер и FIM опрашиваются по HTTP, процессы, пользователи и память читаются из `/proc`, место — через `statvfs`, VRAM и процессы на GPU — напрямую из библиотеки драйвера NVML (`libnvidia-ml.so.1`, без неё — `nvidia-smi`; `LLAMACTL_NO_NVML=1` отключает NVML). Внешний процесс один — `systemctl is-active` на оба юнита. Замер 2026-10-23 на этой машине: прежний статус на bash — 61–73 процесса и ~160 мс CPU на вызов, новый в процессе трея — ~21 мс и ~20 мс CPU (примерно в 8 раз меньше; трей опрашивает каждые 5 с). JSON совпадает с прежним по всем полям. `llamactl_status.py` можно запускать и отдельно (`--conf`, `--router-url` и т.п., `--proc` — корень procfs для тестов, `-n/--dry-run` принимается — скрипт только читает).
+
 Root-шаги (systemctl, установка пресета, замена сборки) идут через `sudo -A` (графическое окно пароля), не больше одного запроса пароля на действие: скрипт перезапускает сам себя с внутренней командой `__root-*`.
 
 **Режим dry-run:** `-n, --dry-run` (до имени команды; `--dry-run` — в любом месте) — статус, проверки, `diff` пресета и сведения с Hugging Face/`git ls-remote` получаются как обычно, но ничего не загружается/выгружается, не скачивается, не правится и не перезапускается: печатаются строки `[dry-run] будет: …`, в лог пишутся события `dry_<event>`.
 
-**`llamactl_tray.py`** — иконка в трее KDE (системный `/usr/bin/python3` + `python-pyqt6`), тонкая обёртка над `llamactl.sh`: опрос `status --json` каждые 5 с; цвет — серый (остановлен), синий (ожидает), жёлтый (загрузка), зелёный (модель загружена), оранжевый (проблемы: FIM не работает, сторонние `llama-server`); подсказка — модель, VRAM, свободная RAM. Меню: модели (загрузить/выгрузить), освободить VRAM, сервисы, логи, проверка, пресеты (редактор, fit, замер), добавление модели с Hugging Face, обновление llama.cpp, консольное меню. Быстрые действия — в фоне с уведомлением, долгие и интерактивные — в терминале (`konsole --hold -e`, переопределяется `--terminal` или `LLAMACTL_TERMINAL`). Щелчок по иконке открывает веб-чат роутера. Автозапуск — `~/.config/autostart/llamactl-tray.desktop`, пункт меню — `~/.local/share/applications/llamactl-tray.desktop`. `--dry-run` передаёт режим всем действиям; `--print-menu [--status-file F]` печатает состояние и меню без графики.
+**`llamactl_tray.py`** — иконка в трее KDE (Python с PyQt6, шебанг `/usr/bin/env python3`; если у найденного `python3` нет PyQt6, например активен venv, трей перезапускается системным `/usr/bin/python3`), обёртка над `llamactl.sh`: статус каждые 5 с получает модулем `llamactl_status.py` в фоновом потоке, не запуская `llamactl.sh`; цвет — серый (остановлен), синий (ожидает), жёлтый (загрузка), зелёный (модель загружена), оранжевый (проблемы: FIM не работает, сторонние `llama-server`); подсказка — модель, VRAM, свободная RAM. Меню: модели (загрузить/выгрузить), освободить VRAM, сервисы, логи, проверка, пресеты (редактор, fit, замер), добавление модели с Hugging Face, обновление llama.cpp, консольное меню. Быстрые действия — в фоне с уведомлением, долгие и интерактивные — в терминале (`konsole --hold -e`, переопределяется `--terminal` или `LLAMACTL_TERMINAL`). Щелчок по иконке открывает веб-чат роутера. Автозапуск — `~/.config/autostart/llamactl-tray.desktop` (шаблон `systemd/autostart/llamactl-tray.desktop`; его и ссылки `~/.local/bin/llamactl`, `~/.local/bin/llamactl-tray` создаёт `check_mytasks.sh`, если есть `/opt/llama.cpp`), пункт меню — `~/.local/share/applications/llamactl-tray.desktop`. `--dry-run` передаёт режим всем действиям; `--print-menu [--status-file F]` печатает состояние и меню без графики.
 
 **Конфигурация:** `conf/llamactl.conf` (пример — `conf/llamactl.conf.example`): адреса роутера и FIM, юниты и пользователь сервисов, пути пресетов, моделей, установки и исходников, архитектура CUDA, число потоков сборки, модель для замера, тайм-ауты, команда `sudo`.
 
@@ -904,6 +980,7 @@ Jamendo для категории `/` использует официальны�
 | `btrfs_monitor.sh` | Bash, `btrfs`, `findmnt`, `awk`; опц.: `notify-send` |
 | `check-store-mount.sh` | Bash, `mountpoint`, `timeout`; опц.: `notify-send` |
 | `check_backups.sh` | Bash, `find`, `sort`, `timeout`; опц.: `notify-send`, `zstd`/`gzip`/`unzip`/`7z`/`tar` (проверка целостности) |
+| `check_mytasks.sh` | Bash, `systemctl`, `crontab`, `findmnt`, `pgrep`; опц.: `zenity`/`kdialog` (окна вопросов), `sudo -A`/`pkexec`, `notify-send`; пакеты — `pacman`/`apt-get`/`dnf`/`yum`/`rpm-ostree`/`zypper`/`apk`/`xbps-install`/`emerge`/`eopkg` |
 | `cloud_backup.sh` | Bash, `wg-quick`, `sshpass`, `ssh`; удалённо: `docker`, `tar`, один из `zstd`/`pigz`/`gzip` |
 | `cloud_backup_qnap.sh` | Entware Bash, `wireguard-go`, `ncat`, `xxd`, `ssh`; удалённо: `docker`, `tar`, `nc`, один из `zstd`/`pigz`/`gzip` |
 | `cp1251_to_utf8.sh` | `iconv`, `file`, `find` |
@@ -911,8 +988,9 @@ Jamendo для категории `/` использует официальны�
 | `doc2fb2.sh` | `pandoc`, `libreoffice`; опц.: `unrtf`, `antiword`, `catdoc`, `wvText` |
 | `getip.sh` | `curl` |
 | `hp_p1005_garuda.sh` | Arch/Garuda, `pacman`, `lsusb`, `systemctl`, CUPS (`lp`), `system-config-printer` |
-| `llamactl.sh` | Bash, `curl`, `jq`, `systemctl`, `journalctl`, `sudo -A` (askpass); опц.: `nvidia-smi`, `git`+`cmake`+CUDA (`update`), `sha256sum` (`add`) |
-| `llamactl_tray.py` | `/usr/bin/python3`, `python-pyqt6`, `llamactl.sh`; опц.: `konsole`, `xdg-open` |
+| `llamactl.sh` | Bash, `python3` (статус через `llamactl_status.py`), `curl`, `jq`, `systemctl`, `journalctl`, `sudo -A` (askpass); опц.: `nvidia-smi`, `git`+`cmake`+CUDA (`update`), `sha256sum` (`add`) |
+| `llamactl_status.py` | Python 3 (только стандартная библиотека), `systemctl`; опц.: драйвер NVIDIA (`libnvidia-ml.so.1`) или `nvidia-smi` |
+| `llamactl_tray.py` | Python 3 + PyQt6, `llamactl_status.py`, `llamactl.sh`; опц.: `konsole`, `xdg-open` |
 | `lowercase_ext.sh` | Bash, `find`, `mv` |
 | `mht_to_fb2.py` | Python 3, `pandoc` |
 | `music_downloader.sh` | Bash, Python 3, локальный проект `music_downloader/`; после успеха — `split_by_dash.sh` |
@@ -933,8 +1011,10 @@ Jamendo для категории `/` использует официальны�
 Кратко: `tests/` — по Bats-файлу на актуальный корневой скрипт плюс общий
 `all_scripts_syntax.bats` (синтаксис каждого `*.sh` по шебангу); внешние
 команды стабируются через временный `PATH` (для `system_monitor.sh`
-настоящими остаются `sqlite3` и `jq`). CI — два независимых workflow:
-`.github/workflows/bats-tests.yml` (все Bats-тесты на каждый push/PR) и
+настоящими остаются `sqlite3` и `jq`). CI — независимые workflow:
+`.github/workflows/bats-tests.yml` (все Bats-тесты на каждый push/PR),
 `.github/workflows/shellcheck.yml` (ShellCheck `error`+`style`, синтаксис
 `bash -n`/`sh -n`, сканер небракетированных `$VAR`, `py_compile` — только
-при изменении `*.sh`/`*.py`).
+при изменении `*.sh`/`*.py`), `.github/workflows/music-downloader.yml` (Ruff и
+pytest загрузчика на Python 3.14) и `.github/workflows/security-scan.yml`
+(Semgrep, Trivy, OSV-Scanner, Gitleaks, CodeQL; еженедельно и на push/PR).

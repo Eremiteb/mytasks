@@ -176,27 +176,6 @@ require_model() {
     return 0
 }
 
-# Процессы на GPU: pid|user|MiB|kind|cmd (kind: service/foreign/other)
-gpu_procs() {
-    command -v nvidia-smi >/dev/null 2>&1 || return 0
-    local apps line pid mib user args kind
-    apps="$(nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader,nounits 2>/dev/null)"
-    while IFS= read -r line; do
-        [[ -z "${line}" ]] && continue
-        pid="${line%%,*}"; pid="${pid// /}"
-        mib="${line#*,}"; mib="${mib// /}"
-        user="$(ps -o user= -p "${pid}" 2>/dev/null)"; user="${user// /}"
-        args="$(ps -o args= -p "${pid}" 2>/dev/null)"
-        kind="other"
-        if [[ "${user}" == "${SERVICE_USER}" ]]; then
-            kind="service"
-        elif [[ "${args}" =~ (^|/)llama-server([[:space:]]|$) || "${args}" == *"llama serve"* ]]; then
-            kind="foreign"
-        fi
-        printf '%s|%s|%s|%s|%s\n' "${pid}" "${user}" "${mib}" "${kind}" "${args:0:160}"
-    done <<<"${apps}"
-}
-
 # Сторонние llama-server (не сервисные): pid|user|port|cmd
 foreign_procs() {
     local list pid user args port
@@ -248,70 +227,48 @@ confirm() {
 ###############################################################################
 # КОМАНДЫ: статус
 ###############################################################################
-cmd_status() {
-    local srv fim rup=false fup=false mj gm used total util ram_total ram_used ram_avail swap_used disk_avail
-    srv="$(unit_state "${SERVER_UNIT}")"
-    fim="$(unit_state "${FIM_UNIT}")"
-    router_up && rup=true
-    fim_up && fup=true
-    mj="$(models_json)" || true
-    gm="$(gpu_mem)"
-    IFS='|' read -r used total util <<<"${gm}"
-    local freeb memline
-    freeb="$(free -b)"
-    memline="$(awk '/^Mem:/ { print $2, $3, $7 }' <<<"${freeb}")"
-    read -r ram_total ram_used ram_avail <<<"${memline}"
-    swap_used="$(awk '/^Swap:/ { print $3 }' <<<"${freeb}")"
-    disk_avail="$(df -B1 --output=avail "${MODELS_DIR}" 2>/dev/null | tail -1 | tr -d ' ')"
-    local gp fp
-    gp="$(gpu_procs)"
-    fp="$(foreign_procs)"
+# Статус собирает llamactl_status.py (HTTP, /proc, NVML — без десятков
+# процессов curl/jq/ps на вызов); здесь — только вывод
+status_json() {
+    local py
+    py="$(command -v python3)" || die "для статуса нужен python3" 2
+    "${py}" "${SCRIPT_DIR}/llamactl_status.py" --router-url "${ROUTER_URL}" --fim-url "${FIM_URL}" \
+        --server-unit "${SERVER_UNIT}" --fim-unit "${FIM_UNIT}" --service-user "${SERVICE_USER}" \
+        --models-dir "${MODELS_DIR}"
+}
 
+cmd_status() {
+    local sj lines nums foreign_lines
+    local srv fim rup fup used total util ram_total ram_used ram_avail swap_used disk_avail
+    sj="$(status_json)" || die "не удалось получить статус" 1
     if [[ "${JSON_OUT}" -eq 1 ]]; then
-        local gpj fpj
-        gpj="$(jq -R -s -c 'split("\n") | map(select(length > 0) | split("|") | {pid: (.[0]|tonumber), user: .[1], mib: (.[2]|tonumber), kind: .[3], cmd: .[4]})' <<<"${gp}")"
-        fpj="$(jq -R -s -c 'split("\n") | map(select(length > 0) | split("|") | {pid: (.[0]|tonumber), user: .[1], port: .[2], cmd: .[3]})' <<<"${fp}")"
-        # Значения передаются через окружение (env.X), без jq-переменных.
-        S_SRV="${srv}" S_FIM="${fim}" S_RUP="${rup}" S_FUP="${fup}" S_MODELS="${mj:-[]}" \
-            S_GP="${gpj}" S_FP="${fpj}" S_USED="${used:-0}" S_TOTAL="${total:-0}" S_UTIL="${util:-0}" \
-            S_RT="${ram_total:-0}" S_RU="${ram_used:-0}" S_RA="${ram_avail:-0}" S_SU="${swap_used:-0}" \
-            S_DA="${disk_avail:-0}" S_RURL="${ROUTER_URL}" S_FURL="${FIM_URL}" \
-            jq -n -c '{services: {server: env.S_SRV, fim: env.S_FIM},
-              router: {up: (env.S_RUP == "true"), url: env.S_RURL}, fim: {up: (env.S_FUP == "true"), url: env.S_FURL},
-              models: (env.S_MODELS | fromjson),
-              gpu: {used_mib: (env.S_USED | tonumber), total_mib: (env.S_TOTAL | tonumber), util: (env.S_UTIL | tonumber),
-                    procs: (env.S_GP | fromjson)},
-              ram: {total: (env.S_RT | tonumber), used: (env.S_RU | tonumber), available: (env.S_RA | tonumber),
-                    swap_used: (env.S_SU | tonumber)},
-              disk: {models_avail: (env.S_DA | tonumber)}, foreign: (env.S_FP | fromjson)}'
+        printf '%s\n' "${sj}"
         return 0
     fi
 
+    nums="$(jq -r '[.services.server, .services.fim, .router.up, .fim.up, .gpu.used_mib, .gpu.total_mib, .gpu.util,
+        .ram.total, .ram.used, .ram.available, .ram.swap_used, .disk.models_avail] | map(tostring) | join("|")' <<<"${sj}")"
+    IFS='|' read -r srv fim rup fup used total util ram_total ram_used ram_avail swap_used disk_avail <<<"${nums}"
     info "Сервисы: ${SERVER_UNIT}=${srv} (API ${rup}), ${FIM_UNIT}=${fim} (API ${fup})"
     info "Модели роутера (${ROUTER_URL}):"
-    if [[ "${mj:-[]}" == "[]" ]]; then
+    lines="$(jq -r '.models[] | "  \(if .status == "loaded" then "●" elif .status == "sleeping" then "◐" elif .status == "loading" then "…" else "○" end) \(.id)  [\(.status)\(if .ctx then ", окно \(.ctx)" else "" end)]"' <<<"${sj}")"
+    if [[ -z "${lines}" ]]; then
         info "  — нет данных (роутер недоступен?)"
     else
-        jq -r '.[] | "  \(if .status == "loaded" then "●" elif .status == "sleeping" then "◐" elif .status == "loading" then "…" else "○" end) \(.id)  [\(.status)\(if .ctx then ", окно \(.ctx)" else "" end)]"' <<<"${mj}"
+        printf '%s\n' "${lines}"
     fi
+    info "GPU: ${used}/${total} МиБ VRAM, загрузка ${util}%"
+    lines="$(jq -r '.gpu.procs[] | "  \(.mib) МиБ  \(.kind)  pid \(.pid) (\(.user)): \(.cmd[0:90])"' <<<"${sj}")"
+    [[ -n "${lines}" ]] && printf '%s\n' "${lines}"
     local ram_u ram_t ram_a sw da
     ram_u="$(human_bytes "${ram_used}")"; ram_t="$(human_bytes "${ram_total}")"; ram_a="$(human_bytes "${ram_avail}")"
-    sw="$(human_bytes "${swap_used}")"; da="$(human_bytes "${disk_avail:-0}")"
-    info "GPU: ${used:-?}/${total:-?} МиБ VRAM, загрузка ${util:-?}%"
-    if [[ -n "${gp}" ]]; then
-        local pid user mib kind cmd
-        while IFS='|' read -r pid user mib kind cmd; do
-            info "  ${mib} МиБ  ${kind}  pid ${pid} (${user}): ${cmd:0:90}"
-        done <<<"${gp}"
-    fi
+    sw="$(human_bytes "${swap_used}")"; da="$(human_bytes "${disk_avail}")"
     info "RAM: занято ${ram_u} из ${ram_t}, доступно ${ram_a}; swap ${sw}"
     info "Диск моделей ${MODELS_DIR}: свободно ${da}"
-    if [[ -n "${fp}" ]]; then
+    foreign_lines="$(jq -r '.foreign[] | "  pid \(.pid) (\(.user)) порт \(.port): \(.cmd[0:100])"' <<<"${sj}")"
+    if [[ -n "${foreign_lines}" ]]; then
         warn "сторонние llama-server (не сервисы, мешают VRAM):"
-        local fpid fuser fport fcmd
-        while IFS='|' read -r fpid fuser fport fcmd; do
-            printf '  pid %s (%s) порт %s: %s\n' "${fpid}" "${fuser}" "${fport}" "${fcmd:0:100}" >&2
-        done <<<"${fp}"
+        printf '%s\n' "${foreign_lines}" >&2
         info "  убрать: llamactl kill-foreign"
     fi
     return 0

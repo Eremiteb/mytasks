@@ -1,7 +1,8 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 """Иконка llama.cpp в системном трее — графическая обёртка над llamactl.sh.
 
-Каждые несколько секунд опрашивает `llamactl.sh status --json` и показывает
+Каждые несколько секунд получает статус модулем llamactl_status.py (в фоновом
+потоке, без запуска llamactl.sh: HTTP, /proc и NVML) и показывает
 состояние цветом иконки, VRAM/RAM в подсказке и меню действий: загрузка и
 выгрузка моделей, освобождение VRAM, сервисы, логи, проверка, пресеты,
 добавление моделей, замер скорости и обновление llama.cpp.
@@ -10,13 +11,16 @@
 интерактивные (обновление, добавление модели, редактор пресетов, логи)
 открываются в терминале, где виден их прогресс.
 
-Используется системный Python (`/usr/bin/python3`) с пакетом python-pyqt6.
+Нужен Python с PyQt6 (python-pyqt6). Шебанг — `/usr/bin/env python3` (есть и
+в NixOS); если у найденного python3 нет PyQt6 (например, активен venv), трей
+перезапускается системным /usr/bin/python3.
 `--print-menu` печатает меню без графики (для тестов и отладки).
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import shlex
@@ -27,6 +31,19 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 LLAMACTL = SCRIPT_DIR / "llamactl.sh"
+CONF_FILE = SCRIPT_DIR / "conf" / "llamactl.conf"
+SYSTEM_PYTHON = "/usr/bin/python3"
+
+
+def _load_status_module():
+    """llamactl_status.py рядом со скриптом (по пути: каталог не в sys.path)."""
+    spec = importlib.util.spec_from_file_location("llamactl_status", SCRIPT_DIR / "llamactl_status.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+STATUS = _load_status_module()
 DEFAULT_TERMINAL = "konsole --hold -e"
 GIB = 1024 ** 3
 
@@ -200,19 +217,28 @@ def llamactl_cmd(args: list[str], dry_run: bool) -> list[str]:
 
 
 def read_status(status_file: str | None) -> dict | None:
-    """Статус из файла (тесты) или из llamactl status --json."""
+    """Статус из файла (тесты) или модулем llamactl_status (как llamactl status --json)."""
     try:
         if status_file:
             return json.loads(Path(status_file).read_text(encoding="utf-8"))
-        res = subprocess.run([str(LLAMACTL), "status", "--json"], capture_output=True, text=True, timeout=20, check=False)
-        return json.loads(res.stdout) if res.returncode == 0 and res.stdout.strip() else None
+        return STATUS.collect(STATUS.load_conf(CONF_FILE))
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
 
 
 def run_gui(opts: argparse.Namespace) -> int:
     """Графический режим (PyQt6 импортируется только здесь)."""
-    from PyQt6.QtCore import QProcess, Qt, QTimer
+    try:
+        import PyQt6  # noqa: F401
+    except ImportError:
+        # python3 из PATH без PyQt6 (venv и т.п.) — перезапуск системным Python
+        if Path(SYSTEM_PYTHON).exists() and Path(sys.executable).resolve() != Path(SYSTEM_PYTHON).resolve():
+            os.execv(SYSTEM_PYTHON, [SYSTEM_PYTHON, str(Path(__file__).resolve()), *sys.argv[1:]])
+        print("Нужен PyQt6 (пакет python-pyqt6 / python3-pyqt6)", file=sys.stderr)
+        return 1
+    import threading
+
+    from PyQt6.QtCore import QObject, QProcess, Qt, QTimer, pyqtSignal
     from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
     from PyQt6.QtWidgets import QApplication, QInputDialog, QMenu, QSystemTrayIcon
 
@@ -329,24 +355,33 @@ def run_gui(opts: argparse.Namespace) -> int:
             menu.clear()
             fill(menu, build_menu(status, opts.dry_run))
 
+    class Bridge(QObject):
+        """Передача статуса из фонового потока в главный (сигнал Qt — в очередь)."""
+
+        ready = pyqtSignal(object)
+
+    bridge = Bridge()
+
+    def on_ready(status: dict | None) -> None:
+        st["poll"] = None
+        apply_status(status)
+
+    bridge.ready.connect(on_ready)
+
+    def poll_worker() -> None:
+        try:
+            status = STATUS.collect(STATUS.load_conf(CONF_FILE))
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+            # Сбой опроса = «нет статуса», трей не падает
+            status = None
+        bridge.ready.emit(status)
+
     def refresh() -> None:
         if st["poll"] is not None:
             return
-        proc = QProcess(app)
-        st["poll"] = proc
-
-        def done(code: int, _status) -> None:
-            raw = bytes(proc.readAllStandardOutput()).decode("utf-8", "replace")
-            st["poll"] = None
-            try:
-                status = json.loads(raw) if code == 0 and raw.strip() else None
-            except ValueError:
-                status = None
-            apply_status(status)
-            proc.deleteLater()
-
-        proc.finished.connect(done)
-        proc.start(str(LLAMACTL), ["status", "--json"])
+        # HTTP-запросы с тайм-аутами не блокируют меню: опрос в фоновом потоке
+        st["poll"] = threading.Thread(target=poll_worker, name="llamactl-status", daemon=True)
+        st["poll"].start()
 
     def on_activated(reason) -> None:
         if reason == QSystemTrayIcon.ActivationReason.Trigger:

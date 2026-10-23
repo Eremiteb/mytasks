@@ -1,0 +1,51 @@
+# Конфигурация check_mytasks.sh — стартовой настройки и проверки mytasks.
+# Создаётся самим скриптом при первом запуске (мастер в окне с описанием и
+# значениями по умолчанию); вручную копировать не нужно.
+
+# Каталог проекта mytasks. По умолчанию — каталог, откуда запущен скрипт.
+# Подставляется вместо @MYTASKS_DIR@ в юниты systemd, задания cron, ссылки
+# ~/.local/bin и файлы автозапуска. Если репозиторий перенесён, скрипт
+# предупредит о расхождении и предложит обновить значение и юниты.
+MYTASKS_DIR="@MYTASKS_DIR@"
+
+# Семейство ОС: arch (pacman), debian (apt-get), redhat (dnf/yum, Fedora
+# Atomic — rpm-ostree), suse (zypper), alpine (apk), void (xbps-install),
+# gentoo (emerge), solus (eopkg), nixos (без автоустановки пакетов).
+# Мастер подставляет семейство, определённое по /etc/os-release (ID и
+# ID_LIKE, в том числе производные: Garuda, Mint, Pop!_OS, Nobara, Rocky и
+# т.п.); пусто — определять при каждом запуске. Нераспознанная ОС —
+# предупреждение, пакеты ставятся вручную.
+OS_FAMILY=""
+
+# Команда повышения прав для системных юнитов и пакетов.
+# auto — sudo -A при заданном SUDO_ASKPASS, иначе pkexec в графическом
+# сеансе, иначе sudo в терминале; пусто — выполнять без повышения прав.
+SUDO_CMD="auto"
+
+# Окна вопросов: auto — zenity (кнопки «Отмена» и «Стоп» во всех окнах), без
+# него kdialog («Стоп» в вопросах и пунктом списка), без графики — терминал;
+# kdialog — всегда kdialog; tty — только терминал; none — без вопросов.
+UI="auto"
+
+# Каталог системных юнитов systemd
+SYSTEM_UNIT_DIR="/etc/systemd/system"
+
+# Каталог пользовательских юнитов systemd
+USER_UNIT_DIR="@HOME@/.config/systemd/user"
+
+# Каталог автозапуска графического сеанса (XDG autostart)
+AUTOSTART_DIR="@HOME@/.config/autostart"
+
+# Каталог для команд-ссылок (llamactl и т.п.)
+BIN_DIR="@HOME@/.local/bin"
+
+# Сколько последних JSONL-логов хранить
+KEEP_LOGS=10
+
+# Параметры уведомления о проблемах (режим --notify)
+APP_NAME="MytasksCheck"
+ICON_NAME="dialog-warning"
+URGENCY="normal"
+
+# Список заданий и зависимостей можно переопределить массивами JOBS и DEPS
+# (формат и значения по умолчанию — в начале check_mytasks.sh).

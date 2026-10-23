@@ -1,0 +1,18 @@
+[Unit]
+Description=Проверка сервисов и заданий mytasks при входе в сеанс (уведомление в трее)
+Documentation=file://@MYTASKS_DIR@/README.md
+After=graphical-session.target
+Wants=graphical-session.target
+
+[Service]
+Type=oneshot
+# Пауза, чтобы таймеры, автозапуск и сервисы сеанса успели подняться
+ExecStartPre=/usr/bin/env sleep 60
+# Без вопросов: таблица состояния в журнале и уведомление о проблемах
+ExecStart=@MYTASKS_DIR@/check_mytasks.sh --no-create --notify
+# Код 1 — найдены незапущенные или не прописанные задания: штатный результат
+# проверки, а не сбой юнита
+SuccessExitStatus=1
+
+[Install]
+WantedBy=graphical-session.target

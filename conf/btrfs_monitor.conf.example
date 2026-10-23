@@ -2,7 +2,7 @@
 ROOT_PATH="/"
 
 # Файл состояния для сравнения счетчиков между запусками
-STATE_FILE="/home/esimych/esimych-docs/mytasks/state/btrfs_monitor.state"
+STATE_FILE="@MYTASKS_DIR@/state/btrfs_monitor.state"
 
 # Сколько последних JSONL-логов хранить
 KEEP_LOGS=10

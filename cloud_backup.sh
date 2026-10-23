@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Резервное копирование /opt/esimych-cloud с удалённого сервера через WireGuard VPN
 
 set -uo pipefail

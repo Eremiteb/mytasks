@@ -10,7 +10,7 @@
 IP_SERVICE_URL="https://icanhazip.com"
 
 # Файл для хранения текущего IP
-IP_FILE="/path/to/ip.txt"
+IP_FILE="@MYTASKS_DIR@/state/ip.txt"
 
 # Файл истории IP-адресов
-IP_HISTORY_FILE="/path/to/ip_history.txt"
+IP_HISTORY_FILE="@MYTASKS_DIR@/state/ip_history.txt"

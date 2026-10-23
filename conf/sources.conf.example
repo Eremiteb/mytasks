@@ -2,6 +2,6 @@
 # Скопируйте этот файл в sources.conf и заполните своими значениями.
 # Формат каждой строки: SRC|DST|RSYNC_OPTS
 
-/home/user/documents/|/mnt/backup/documents/|-arvhWP --delete
-/home/user/music/|/mnt/backup/music/|-arvhWP --delete
-/home/user/photos/|/mnt/backup/photos/|-arvhWP
+@HOME@/documents/|/mnt/backup/documents/|-arvhWP --delete
+@HOME@/music/|/mnt/backup/music/|-arvhWP --delete
+@HOME@/photos/|/mnt/backup/photos/|-arvhWP
