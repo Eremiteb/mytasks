@@ -81,7 +81,11 @@ URGENCY="normal"
 #        autostart — файл из systemd/autostart/ в AUTOSTART_DIR; conf — конфиг
 #        (параметр — пример); venv — окружение Python (параметр — модули);
 #        linger — loginctl enable-linger для пользователя: его user-службы
-#        (beufm-recorder.service) работают и без входа в сеанс, с загрузки.
+#        (beufm-recorder.service) работают и без входа в сеанс, с загрузки;
+#        health — служба действительно работает (имя — user-служба без
+#        .service, параметр МАСКА_ЛОГА:МИНУТЫ): последняя запись самого свежего
+#        лога в LOG_DIR не старше МИНУТ и без ERROR в последних 200 строках;
+#        исправление — systemctl --user restart.
 #   условие: пусто — всегда; path:ПУТЬ, cmd:КОМАНДА, fs:ТОЧКА=ТИП,
 #        family:СЕМЕЙСТВО через запятую; при невыполненном — «не требуется».
 #   имя @CRON_UNIT@ — демон cron своего семейства ОС (cronie/cron/crond).
@@ -89,6 +93,7 @@ JOBS=(
     "system-unit|system-monitor.timer|||Опрос SMART дисков, CPU и GPU каждые 6 ч (00, 06, 12, 18 ч; пропущенный запуск догоняется после загрузки), запись в SQLite и HTML-отчёт system_reports/latest.html. Скрипт system_monitor.sh, запуск от root."
     "user-unit|check-backups.timer|||Ежедневная проверка каталогов с архивами резервных копий (наличие, возраст, размер, целостность) с уведомлением в трее. Скрипт check_backups.sh, настройки — conf/check_backups.conf."
     "user-unit|beufm-recorder.service|||Постоянная запись эфира Beu FM: каждый выход песни сохраняется дублем, из трёх дублей собирается лучшая запись (общий участок по отпечаткам fpcalc). Загрузчик берёт её, только если песни нет в источниках MP3. Скрипт music_downloader/beufm_recorder.py, настройки — блок recorder сайта beufm_kz в music_downloader/music_downloader.json."
+    "health|beufm-recorder|beufm_recorder-*.jsonl:20|cmd:systemctl|Запись эфира Beu FM действительно идёт: служба пишет в лог logs/beufm_recorder-*.jsonl хотя бы раз в 20 мин (смена трека в эфире) и без ошибок. Иначе — перезапуск службы."
     "linger|enable-linger||cmd:loginctl|Пользовательские службы без входа в сеанс (loginctl enable-linger): запись эфира beufm-recorder.service работает с загрузки системы, а не только пока вы в сеансе."
     "user-unit|check-store-mount.service|||При входе в графический сеанс проверяет, смонтированы ли точки из /etc/fstab, и показывает уведомление о несмонтированных. Скрипт check-store-mount.sh."
     "system-ext|@CRON_UNIT@||cmd:crontab|Демон cron: запускает задания из crontab пользователя (скачивание музыки, синхронизация каталогов, мониторинг Btrfs)."
@@ -838,6 +843,7 @@ kind_label() {
         conf) printf 'конфиг' ;;
         venv) printf 'venv' ;;
         linger) printf 'linger' ;;
+        health) printf 'работа службы' ;;
         *) printf '%s' "$1" ;;
     esac
 }
@@ -1041,6 +1047,36 @@ eval_linger() {
     fi
 }
 
+# Работа долгоживущей user-службы по её логу (вид health)
+eval_health() {
+    local i="$1" name="$2" arg="$3"
+    local mask="${arg%:*}" max_minutes="${arg##*:}" newest last ts epoch now age errors
+    newest="$(find "${LOG_DIR}" -maxdepth 1 -type f -name "${mask}" -printf '%T@|%p\n' 2>/dev/null \
+        | sort -nr | awk -F'|' 'NR == 1 { print $2 }')"
+    if [[ -z "${newest}" ]]; then
+        set_row "${i}" "—" "—" "нет лога" "ВНИМАНИЕ" "в ${LOG_DIR} нет лога ${mask}: служба ${name} не запускалась" "restart" "systemctl --user restart ${name}.service"
+        return 0
+    fi
+    last="$(tail -n 1 -- "${newest}")"
+    ts="$(F="${LOG_FIELD_TS:-@timestamp}" jq -r '.[env.F] // empty' <<<"${last}" 2>/dev/null)"
+    epoch="$(date -d "${ts}" +%s 2>/dev/null)"
+    now="$(date +%s)"
+    errors="$(tail -n 200 -- "${newest}" | F="${LOG_FIELD_LEVEL:-log.level}" jq -r '.[env.F] // empty' 2>/dev/null \
+        | grep -ciE '^(error|critical)$')"
+    if [[ -z "${epoch}" ]]; then
+        set_row "${i}" "есть" "—" "?" "ВНИМАНИЕ" "не удалось прочитать время последней записи ${newest}" "none" ""
+        return 0
+    fi
+    age=$(( (now - epoch) / 60 ))
+    if (( age > max_minutes )); then
+        set_row "${i}" "есть" "—" "молчит ${age} мин" "ВНИМАНИЕ" "служба ${name} не писала в лог ${age} мин (норма — до ${max_minutes})" "restart" "systemctl --user restart ${name}.service"
+    elif (( errors > 0 )); then
+        set_row "${i}" "есть" "—" "ошибки: ${errors}" "ВНИМАНИЕ" "в последних строках ${newest##*/} ошибок: ${errors}" "restart" "systemctl --user restart ${name}.service"
+    else
+        set_row "${i}" "есть" "—" "работает, ${age} мин назад" "OK" "" "none" ""
+    fi
+}
+
 eval_autostart() {
     local i="$1" name="$2"
     local tpl="${TEMPLATE_DIR}/autostart/${name}" dest="${AUTOSTART_DIR}/${name}" tmp exec_line state="не запущен"
@@ -1140,6 +1176,7 @@ eval_job() {
         conf) eval_conf "${i}" "${name}" "${arg}" ;;
         venv) eval_venv "${i}" "${name}" "${arg}" ;;
         linger) eval_linger "${i}" ;;
+        health) eval_health "${i}" "${name}" "${arg}" ;;
         *) set_row "${i}" "—" "—" "—" "ВНИМАНИЕ" "неизвестный вид задания «${kind}»" "none" "" ;;
     esac
 }
@@ -1271,6 +1308,16 @@ fix_venv() {
     bash "${setup}"
 }
 
+# Перезапуск зависшей или не писавшей в лог user-службы (вид health)
+fix_health() {
+    local i="$1"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        say "[dry-run] будет: ${R_ACTION[${i}]}"
+        return 0
+    fi
+    systemctl --user restart -- "${R_NAME[${i}]}.service"
+}
+
 # Linger для себя polkit обычно разрешает без пароля в локальном сеансе;
 # при отказе — тот же шаг с повышением прав
 fix_linger() {
@@ -1315,6 +1362,7 @@ fix_job() {
         autostart) fix_autostart "${i}" ;;
         venv) fix_venv "${i}" ;;
         linger) fix_linger "${i}" ;;
+        restart) fix_health "${i}" ;;
         conf-dir) fix_conf_dir ;;
         conf)
             IFS='|' read -r _ name arg _ <<<"${ALL_JOBS[${i}]}"

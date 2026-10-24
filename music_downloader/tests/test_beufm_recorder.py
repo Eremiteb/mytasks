@@ -217,3 +217,24 @@ def test_dry_run_changes_nothing(tmp_path, monkeypatch, capsys):
     output = capsys.readouterr().out
     assert "[dry-run] будет:" in output and "Duman - Бiр, eкі, үш" in output
     assert not (tmp_path / "rec").exists()
+
+
+def test_log_switches_to_new_day_file(tmp_path, monkeypatch):
+    days = iter(["2026-10-24", "2026-10-25"])
+    current = {"day": next(days)}
+
+    class FakeDatetime(recorder.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return recorder.datetime.fromisoformat(current["day"] + "T23:59:00")
+
+    monkeypatch.setattr(recorder, "datetime", FakeDatetime)
+    monkeypatch.setattr(recorder.logger, "handlers", [])
+    recorder.setup_logging(str(tmp_path), max_files=10)
+    recorder.logger.info("до полуночи")
+    current["day"] = next(days)
+    recorder.logger.info("после полуночи")
+    for handler in recorder.logger.handlers:
+        handler.close()
+    assert "до полуночи" in (tmp_path / "beufm_recorder-2026-10-24.jsonl").read_text(encoding="utf-8")
+    assert "после полуночи" in (tmp_path / "beufm_recorder-2026-10-25.jsonl").read_text(encoding="utf-8")

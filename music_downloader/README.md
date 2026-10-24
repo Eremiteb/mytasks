@@ -176,7 +176,7 @@ def get_tracks(session, base_url, category):
 music_downloader/venv/bin/python music_downloader/beufm_recorder.py --dry-run
 ```
 
-Лог — суточный `logs/beufm_recorder-ГГГГ-ММ-ДД.jsonl` (10 файлов). Служба пользовательская; чтобы она писала эфир и без входа в сеанс, `check_mytasks.sh` включает для пользователя linger (`loginctl enable-linger`, задание `enable-linger`).
+Лог — суточный `logs/beufm_recorder-ГГГГ-ММ-ДД.jsonl` (10 файлов; при смене даты служба сама переходит в новый файл). `check_mytasks.sh` проверяет, что запись действительно идёт (задание `beufm-recorder`: лог не старше 20 мин и без ошибок, иначе перезапуск службы). Служба пользовательская; чтобы она писала эфир и без входа в сеанс, `check_mytasks.sh` включает для пользователя linger (`loginctl enable-linger`, задание `enable-linger`).
 
 ## База данных и дедупликация
 

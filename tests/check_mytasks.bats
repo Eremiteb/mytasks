@@ -260,6 +260,41 @@ ALL_DEMO_JOBS='"user-unit|demo.timer|||Демо-таймер пользоват�
   [[ "$output" == *"Не удалось: loginctl enable-linger"* ]]
 }
 
+health_log() {  # $1 — время последней записи (date -d), $2 — уровень
+  mkdir -p "$MYTASKS_LOG_DIR"
+  printf '{"@timestamp": "%s", "log.level": "%s", "message": "В эфире: A - B"}\n' \
+    "$(date -d "$1" +%Y-%m-%dT%H:%M:%S)" "${2:-INFO}" > "$MYTASKS_LOG_DIR/demo_rec-2026-10-25.jsonl"
+}
+
+@test "health: свежий лог без ошибок — OK" {
+  write_conf '"health|demo-rec|demo_rec-*.jsonl:20||Демо-проверка"' ""
+  health_log "5 minutes ago"
+  run "$WORK/check_mytasks.sh" --status
+  [[ "$output" == *"demo-rec"*"работает, 5 мин назад"*"OK"* ]]
+}
+
+@test "health: молчащая служба — ВНИМАНИЕ, --dry-run только план, --yes перезапускает" {
+  write_conf '"health|demo-rec|demo_rec-*.jsonl:20||Демо-проверка"' ""
+  health_log "45 minutes ago"
+  run "$WORK/check_mytasks.sh" --status
+  [[ "$output" == *"молчит 45 мин"*"ВНИМАНИЕ"* ]]
+  run "$WORK/check_mytasks.sh" --dry-run --no-gui
+  [[ "$output" == *"[dry-run] будет: systemctl --user restart demo-rec.service"* ]]
+  run grep -q 'restart' "$CALLS"
+  [ "$status" -ne 0 ]
+  run "$WORK/check_mytasks.sh" --yes --no-gui
+  grep -q 'systemctl --user restart -- demo-rec.service' "$CALLS"
+}
+
+@test "health: ошибки в логе и отсутствие лога — ВНИМАНИЕ" {
+  write_conf '"health|demo-rec|demo_rec-*.jsonl:20||Демо-проверка"' ""
+  run "$WORK/check_mytasks.sh" --status
+  [[ "$output" == *"нет лога"*"ВНИМАНИЕ"* ]]
+  health_log "1 minute ago" ERROR
+  run "$WORK/check_mytasks.sh" --status
+  [[ "$output" == *"ошибки: 1"*"ВНИМАНИЕ"* ]]
+}
+
 @test "--yes создаёт юниты, cron, ссылку и автозапуск; итог OK" {
   write_conf "$ALL_DEMO_JOBS" ""
   touch "$STATE/ext/cronie.service" "$STATE/enabled/cronie.service"

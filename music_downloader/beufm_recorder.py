@@ -755,18 +755,41 @@ def _with_site(record):
     return True
 
 
+def _daily_path(log_dir, day=None):
+    return os.path.join(log_dir, f"{SCRIPT_NAME}-{day or datetime.now():%Y-%m-%d}.jsonl")
+
+
+def _rotate_logs(log_dir, max_files):
+    logs = sorted(name for name in os.listdir(log_dir) if name.startswith(f"{SCRIPT_NAME}-") and name.endswith(".jsonl"))
+    for name in logs[:-max_files]:
+        os.remove(os.path.join(log_dir, name))
+
+
 def setup_logging(log_dir, max_files):
-    """Суточный JSONL-лог в формате движка (ECS-поля из conf/log_template.conf)."""
+    """Суточный JSONL-лог в формате движка (ECS-поля из conf/log_template.conf).
+
+    Служба работает сутками: при смене даты запись переходит в файл нового дня,
+    старые файлы сверх `max_files` удаляются.
+    """
     os.makedirs(log_dir, exist_ok=True)
-    path = os.path.join(log_dir, f"{SCRIPT_NAME}-{datetime.now():%Y-%m-%d}.jsonl")
-    handler = _engine().JSONLHandler(path, encoding="utf-8")
+    base = _engine().JSONLHandler
+
+    class DailyJSONLHandler(base):
+        def emit(self, record):
+            path = _daily_path(log_dir)
+            if self.baseFilename != os.path.abspath(path):
+                self.close()
+                self.baseFilename = os.path.abspath(path)
+                self.stream = None
+                _rotate_logs(log_dir, max_files)
+            super().emit(record)
+
+    handler = DailyJSONLHandler(_daily_path(log_dir), encoding="utf-8", delay=True)
     handler.addFilter(_with_site)
     logger.addHandler(handler)
     logger.addHandler(logging.StreamHandler(sys.stderr))
     logger.setLevel(logging.INFO)
-    logs = sorted(name for name in os.listdir(log_dir) if name.startswith(f"{SCRIPT_NAME}-") and name.endswith(".jsonl"))
-    for name in logs[:-max_files]:
-        os.remove(os.path.join(log_dir, name))
+    _rotate_logs(log_dir, max_files)
 
 
 def main(argv=None):
