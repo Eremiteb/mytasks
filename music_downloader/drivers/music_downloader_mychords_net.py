@@ -1,4 +1,6 @@
+import importlib.util
 import logging
+import os
 import re
 import time
 from html import unescape
@@ -9,6 +11,20 @@ from bs4 import BeautifulSoup
 logger = logging.LoggerAdapter(logging.getLogger("Engine"), {"site": "mychords_net"})
 
 _TRACK_ID_RE = re.compile(r"/(\d+)-[^/]+\.html?$")
+
+
+def _load_driver(name):
+    """Загружает соседний драйвер по пути: движок не добавляет каталог загрузчика в sys.path."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"{name}.py")
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Не удалось загрузить драйвер {name} из {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+audio_search = _load_driver("music_downloader_audio_search")
 
 
 def parse_listing(html, base_url):
@@ -75,9 +91,8 @@ def get_tracks(session, base_url, category_path):
     return tracks
 
 
-def resolve_track(session, track):
-    """Открывает страницу трека и плеер, возвращает ссылку на аудио или None."""
-    page_url = track["src"]
+def _resolve_player(session, page_url):
+    """Открывает страницу трека и плеер Xpleer; возвращает ответ для движка или None."""
     try:
         page = session.get(page_url, timeout=(5, 20))
         page.raise_for_status()
@@ -97,3 +112,12 @@ def resolve_track(session, track):
     finally:
         time.sleep(1)
     return {"download_url": download_url, "referer": player_url, "src": page_url}
+
+
+def resolve_track(session, track):
+    """Берёт аудио из плеера MyChords, а без плеера ищет трек в общих `search_sources`."""
+    resolved = _resolve_player(session, track["src"])
+    if resolved is not None:
+        return resolved
+    logger.info(f"MyChords: ищу {track.get('artist')} - {track.get('title')} в общих источниках")
+    return audio_search.find_audio(session, track, "MyChords", logger)

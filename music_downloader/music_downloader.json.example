@@ -18,6 +18,23 @@
         }
     ],
 
+    "search_sources": [
+        {
+            "name": "sefon.pro",
+            "enabled": true,
+            "driver": "drivers/music_downloader_sefon_pro.py",
+            "base_url": "https://sefon.pro",
+            "search_path": "/search/?q={query}"
+        },
+        {
+            "name": "lmusic_kz",
+            "enabled": true,
+            "driver": "drivers/music_downloader_lmusic_kz.py",
+            "base_url": "https://lmusic.kz",
+            "search_path": "/search?q={query}"
+        }
+    ],
+
     "sites": [
         {
             "site_name": "sefon.pro",

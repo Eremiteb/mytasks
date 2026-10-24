@@ -64,3 +64,10 @@ def get_tracks(session, base_url, category_path):
     time.sleep(total_wait)
     
     return tracks
+
+def search_tracks(session, base_url, search_path):
+    """Поисковая выдача LMusic (`/search?q=`) без PJAX-прогрева и пауз раздела."""
+    url = urljoin(base_url, search_path)
+    response = session.get(url, timeout=(5, 15))
+    response.raise_for_status()
+    return parse_tracks(response.text, base_url, url)

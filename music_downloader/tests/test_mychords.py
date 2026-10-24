@@ -3,6 +3,8 @@ import logging
 from pathlib import Path
 from unittest.mock import Mock
 
+import pytest
+
 MODULE_PATH = Path(__file__).resolve().parents[1] / "drivers" / "music_downloader_mychords_net.py"
 SPEC = importlib.util.spec_from_file_location("mychords", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
@@ -63,6 +65,7 @@ def test_resolve_track_returns_download_and_referer(monkeypatch):
 def test_resolve_track_reports_missing_player_or_errors(monkeypatch, caplog):
     monkeypatch.setattr(mychords.time, "sleep", lambda _: None)
     track = {"id": "1", "artist": "A", "title": "B", "src": f"{BASE_URL}/ru/x/1-a.html"}
+    monkeypatch.setattr(mychords.audio_search, "find_audio", lambda *args: None)
     session = Mock()
     session.get.return_value = Mock(text="<html></html>")
     assert mychords.resolve_track(session, track) is None
@@ -81,3 +84,26 @@ def test_get_tracks_logs_empty_and_failed_listing(caplog):
     assert mychords.get_tracks(session, BASE_URL, "/ru/novinki") == []
     levels = {r.levelno for r in caplog.records if r.site == "mychords_net"}
     assert levels == {logging.WARNING, logging.ERROR}
+
+
+def test_resolve_track_without_player_searches_common_sources(monkeypatch):
+    monkeypatch.setattr(mychords.time, "sleep", lambda _: None)
+    found = {"download_url": "https://sefon.pro/ok.mp3", "referer": "r", "src": "s"}
+    calls = []
+    monkeypatch.setattr(
+        mychords.audio_search, "find_audio", lambda session, track, label, log: calls.append((track, label)) or found
+    )
+    session = Mock()
+    session.get.return_value = Mock(text="<html></html>")
+    track = {"id": "1", "artist": "Kazka", "title": "Нічна", "src": f"{BASE_URL}/ru/kazka/1-kazka.html"}
+    assert mychords.resolve_track(session, track) == found
+    assert calls == [(track, "MyChords")]
+
+
+def test_resolve_track_with_player_does_not_search(monkeypatch):
+    monkeypatch.setattr(mychords.time, "sleep", lambda _: None)
+    monkeypatch.setattr(mychords.audio_search, "find_audio", lambda *args: pytest.fail("плеер уже дал ссылку"))
+    session = Mock()
+    session.get.side_effect = [Mock(text=TRACK_PAGE), Mock(text=PLAYER_PAGE)]
+    track = {"id": "2", "artist": "A", "title": "B", "src": f"{BASE_URL}/ru/x/2-a.html"}
+    assert mychords.resolve_track(session, track)["download_url"] == "https://storage.xpleer.com/get_file/?fileId=1"

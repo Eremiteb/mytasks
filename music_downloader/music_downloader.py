@@ -748,6 +748,10 @@ def run():
     logger.info("Конфигурация загружена")
 
     perm_cfg = config.get("file_permissions")
+    search_sources = config.get("search_sources")
+    if search_sources is not None and not isinstance(search_sources, list):
+        logger.error("Настройка search_sources должна быть списком источников")
+        raise SystemExit(2)
 
     download_paths = config.get("download_paths")
     if not isinstance(download_paths, list) or not download_paths:
@@ -864,6 +868,8 @@ def run():
                     title = capitalize_first(t.get("title")) or "Unknown Title"
                     resolver = getattr(site_data["provider"], "resolve_track", None)
                     if resolver is not None:
+                        # Общий список источников MP3 для драйверов без собственного аудио.
+                        t["_search_sources"] = search_sources
                         resolved = resolver(scraper, t)
                         if resolved is None:
                             queued_tracks.discard(track_identity(artist, title))

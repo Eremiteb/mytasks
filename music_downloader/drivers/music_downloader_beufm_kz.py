@@ -2,9 +2,8 @@ import hashlib
 import importlib.util
 import logging
 import os
-import time
 import unicodedata
-from urllib.parse import urlencode, urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit
 
 from bs4 import BeautifulSoup
 
@@ -22,8 +21,7 @@ def _load_driver(name):
     return module
 
 
-sefon = _load_driver("music_downloader_sefon_pro")
-lmusic = _load_driver("music_downloader_lmusic_kz")
+audio_search = _load_driver("music_downloader_audio_search")
 
 # Имя трека на странице радио заполняет не сервер, а `template/Player.js`: раз в 10 с
 # он читает `1.txt` и вставляет содержимое в `<span id="track_org">`. В исходном HTML
@@ -98,48 +96,6 @@ def get_tracks(session, base_url, category_path):
     return [{"id": _track_id(artist, title), "artist": artist, "title": title, "src": page_url}]
 
 
-def _search_sefon(session, query):
-    path = "/search/?" + urlencode({"q": query})
-    return sefon.get_tracks(session, "https://sefon.pro", path), urljoin("https://sefon.pro", path)
-
-
-def _search_lmusic(session, query):
-    url = "https://lmusic.kz/search?" + urlencode({"q": query})
-    response = session.get(url, timeout=(5, 15))
-    response.raise_for_status()
-    return lmusic.parse_tracks(response.text, "https://lmusic.kz", url), url
-
-
 def resolve_track(session, track):
-    """Ищет проигрываемую песню в публичных источниках MP3 по точному совпадению исполнителя и названия."""
-    artist, title = track["artist"], track["title"]
-    expected = (_match_key(artist), _match_key(title))
-    if not all(expected):
-        logger.warning("Beu FM: нельзя искать трек без исполнителя или названия")
-        return None
-    for source, search in (("sefon.pro", _search_sefon), ("lmusic_kz", _search_lmusic)):
-        try:
-            candidates, search_url = search(session, f"{artist} {title}")
-            for candidate in candidates:
-                actual = (_match_key(candidate.get("artist")), _match_key(candidate.get("title")))
-                download_url = candidate.get("download_url") or ""
-                if actual != expected or urlsplit(download_url).scheme not in ("http", "https"):
-                    continue
-                referer = candidate.get("referer") or search_url
-                # Проверяем доступность ссылки, не скачивая тело повторно.
-                with session.get(download_url, headers={"Referer": referer}, stream=True, timeout=(5, 15)) as response:
-                    if response.status_code != 200:
-                        logger.warning(f"Beu FM: {source}, ссылка недоступна (HTTP {response.status_code})")
-                        continue
-                logger.info(f"Beu FM: {artist} - {title}: найдено совпадение в {source}")
-                return {
-                    "download_url": download_url,
-                    "referer": referer,
-                    "src": candidate.get("src") or search_url,
-                }
-        except Exception as error:
-            logger.warning(f"Beu FM: поиск {artist} - {title} в {source} не удался: {error}")
-        finally:
-            time.sleep(1)
-    logger.warning(f"Beu FM: {artist} - {title}: совпадение с доступной ссылкой не найдено")
-    return None
+    """Ищет проигрываемую песню в источниках `search_sources` из конфига (точное совпадение)."""
+    return audio_search.find_audio(session, track, "Beu FM", logger)

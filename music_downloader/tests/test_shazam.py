@@ -5,12 +5,22 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
+import requests
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "drivers" / "music_downloader_shazam.py"
 SPEC = importlib.util.spec_from_file_location("shazam", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 shazam = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(shazam)
+
+
+def _patch_sources(monkeypatch, module, sefon, lmusic):
+    """Подменяет поиск в общих источниках (`search_sources` по умолчанию: Sefon, затем LMusic)."""
+    by_name = {"sefon.pro": sefon, "lmusic_kz": lmusic}
+    monkeypatch.setattr(module.audio_search.time, "sleep", lambda _: None)
+    monkeypatch.setattr(
+        module.audio_search, "_query_source", lambda session, source, query: by_name[source["name"]](session, query)
+    )
 
 CANONICAL = '<link rel="canonical" href="https://www.shazam.com/charts/top-200/world">'
 
@@ -135,14 +145,33 @@ def test_get_tracks_falls_back_to_rsc_stream_when_html_poisoned(monkeypatch, cap
     assert not any(record.levelno == logging.ERROR for record in caplog.records)
 
 
+def test_get_tracks_decodes_rsc_stream_without_charset_as_utf8(monkeypatch):
+    """`text/x-component` без charset не должен читаться как ISO-8859-1 (mojibake «Ã©»)."""
+    monkeypatch.setattr(shazam.time, "sleep", lambda _: None)
+    body = _flight_body().replace("Artist 1\"", "Naté Ледяное\"", 1)
+    rsc = requests.Response()
+    rsc.status_code = 200
+    rsc.headers["Content-Type"] = "text/x-component"
+    rsc.encoding = "ISO-8859-1"  # так HTTPAdapter выбирает кодировку для text/* без charset
+    rsc._content = body.encode("utf-8")
+    session = Mock()
+    session.get.side_effect = [Mock(status_code=200, text="<html></html>"), rsc]
+    tracks = shazam.get_tracks(session, "https://www.shazam.com", "/ru-ru/charts/top-200/world")
+    assert tracks[0]["artist"] == "Naté Ледяное"
+
+
 def test_resolve_track_requires_exact_match_and_reachable_link(monkeypatch, caplog):
     monkeypatch.setattr(shazam.time, "sleep", lambda _: None)
     sefon_results = [
         {"artist": "Bruno Mars", "title": "I Just Might (Remix)", "download_url": "https://sefon.pro/remix.mp3"},
         {"artist": "bruno mars", "title": "I just might!", "download_url": "https://sefon.pro/ok.mp3", "referer": "r"},
     ]
-    monkeypatch.setattr(shazam, "_search_sefon", lambda session, query: (sefon_results, "https://sefon.pro/search/?q=x"))
-    monkeypatch.setattr(shazam, "_search_lmusic", lambda session, query: pytest.fail("Sefon уже дал совпадение"))
+    _patch_sources(
+        monkeypatch,
+        shazam,
+        lambda session, query: (sefon_results, "https://sefon.pro/search/?q=x"),
+        lambda session, query: pytest.fail("Sefon уже дал совпадение"),
+    )
     session = Mock()
     session.get.return_value.__enter__ = lambda self: Mock(status_code=200)
     session.get.return_value.__exit__ = lambda self, *args: None
@@ -158,10 +187,14 @@ def test_resolve_track_requires_exact_match_and_reachable_link(monkeypatch, capl
 
 
 def test_resolve_track_falls_back_to_lmusic_and_reports_missing(monkeypatch, caplog):
-    monkeypatch.setattr(shazam.time, "sleep", lambda _: None)
-    monkeypatch.setattr(shazam, "_search_sefon", lambda session, query: (_ for _ in ()).throw(RuntimeError("503")))
     calls = []
-    monkeypatch.setattr(shazam, "_search_lmusic", lambda session, query: calls.append(query) or ([], "https://lmusic.kz/search?q=x"))
+    monkeypatch.setattr(shazam.time, "sleep", lambda _: None)
+    _patch_sources(
+        monkeypatch,
+        shazam,
+        lambda session, query: (_ for _ in ()).throw(RuntimeError("503")),
+        lambda session, query: calls.append(query) or ([], "https://lmusic.kz/search?q=x"),
+    )
     assert shazam.resolve_track(Mock(), {"id": "adam_2", "artist": "Yung Miami", "title": "Spend Dat"}) is None
     assert calls == ["Yung Miami Spend Dat"]
     messages = [record.getMessage() for record in caplog.records if record.levelno == logging.WARNING]

@@ -51,3 +51,7 @@ def get_tracks(session, base_url, category_path):
             'download_url': urljoin(base_url, path)
         })
     return tracks
+
+def search_tracks(session, base_url, search_path):
+    """Поисковая выдача Sefon (`/search/?q=`) размечена так же, как разделы: те же карточки `div.mp3`."""
+    return get_tracks(session, base_url, search_path)

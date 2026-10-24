@@ -11,6 +11,15 @@ assert SPEC is not None and SPEC.loader is not None
 beufm = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(beufm)
 
+
+def _patch_sources(monkeypatch, module, sefon, lmusic):
+    """Подменяет поиск в общих источниках (`search_sources` по умолчанию: Sefon, затем LMusic)."""
+    by_name = {"sefon.pro": sefon, "lmusic_kz": lmusic}
+    monkeypatch.setattr(module.audio_search.time, "sleep", lambda _: None)
+    monkeypatch.setattr(
+        module.audio_search, "_query_source", lambda session, source, query: by_name[source["name"]](session, query)
+    )
+
 # Страница в исходном виде: спан пуст, его наполняет Player.js из 1.txt.
 EMPTY_PAGE = '<div class="tags"><span id="track_org"></span></div>'
 FILLED_PAGE = '<div class="tags"><span id="track_org">Ellaya - Среди Алматы</span></div>'
@@ -80,13 +89,16 @@ def test_get_tracks_logs_jingle_and_failures(caplog):
 
 
 def test_resolve_track_requires_exact_match_and_reachable_link(monkeypatch):
-    monkeypatch.setattr(beufm.time, "sleep", lambda _: None)
     sefon_results = [
         {"artist": "Ellaya", "title": "Среди Алматы (Remix)", "download_url": "https://sefon.pro/remix.mp3"},
         {"artist": "ellaya", "title": "среди алматы", "download_url": "https://sefon.pro/ok.mp3", "referer": "r"},
     ]
-    monkeypatch.setattr(beufm, "_search_sefon", lambda session, query: (sefon_results, "https://sefon.pro/search/?q=x"))
-    monkeypatch.setattr(beufm, "_search_lmusic", lambda session, query: pytest.fail("Sefon уже дал совпадение"))
+    _patch_sources(
+        monkeypatch,
+        beufm,
+        lambda session, query: (sefon_results, "https://sefon.pro/search/?q=x"),
+        lambda session, query: pytest.fail("Sefon уже дал совпадение"),
+    )
     session = Mock()
     session.get.return_value.__enter__ = lambda self: Mock(status_code=200)
     session.get.return_value.__exit__ = lambda self, *args: None
@@ -102,11 +114,12 @@ def test_resolve_track_requires_exact_match_and_reachable_link(monkeypatch):
 
 
 def test_resolve_track_falls_back_to_lmusic_and_reports_missing(monkeypatch, caplog):
-    monkeypatch.setattr(beufm.time, "sleep", lambda _: None)
-    monkeypatch.setattr(beufm, "_search_sefon", lambda session, query: (_ for _ in ()).throw(RuntimeError("503")))
     calls = []
-    monkeypatch.setattr(
-        beufm, "_search_lmusic", lambda session, query: calls.append(query) or ([], "https://lmusic.kz/search?q=x")
+    _patch_sources(
+        monkeypatch,
+        beufm,
+        lambda session, query: (_ for _ in ()).throw(RuntimeError("503")),
+        lambda session, query: calls.append(query) or ([], "https://lmusic.kz/search?q=x"),
     )
     assert beufm.resolve_track(Mock(), {"id": "fm_2", "artist": "Abik Jeksen", "title": "Сүйем мен"}) is None
     assert calls == ["Abik Jeksen Сүйем мен"]
@@ -116,10 +129,13 @@ def test_resolve_track_falls_back_to_lmusic_and_reports_missing(monkeypatch, cap
 
 
 def test_resolve_track_skips_unreachable_link(monkeypatch):
-    monkeypatch.setattr(beufm.time, "sleep", lambda _: None)
     candidates = [{"artist": "A", "title": "B", "download_url": "https://x.test/a.mp3"}]
-    monkeypatch.setattr(beufm, "_search_sefon", lambda session, query: (candidates, "https://sefon.pro/search/?q=x"))
-    monkeypatch.setattr(beufm, "_search_lmusic", lambda session, query: ([], "https://lmusic.kz/search?q=x"))
+    _patch_sources(
+        monkeypatch,
+        beufm,
+        lambda session, query: (candidates, "https://sefon.pro/search/?q=x"),
+        lambda session, query: ([], "https://lmusic.kz/search?q=x"),
+    )
     session = Mock()
     session.get.return_value.__enter__ = lambda self: Mock(status_code=404)
     session.get.return_value.__exit__ = lambda self, *args: None
