@@ -79,7 +79,9 @@ URGENCY="normal"
 #        проверка и включение); cron — строка crontab пользователя (параметр —
 #        расписание); link — ссылка в BIN_DIR (параметр — цель в mytasks);
 #        autostart — файл из systemd/autostart/ в AUTOSTART_DIR; conf — конфиг
-#        (параметр — пример); venv — окружение Python (параметр — модули).
+#        (параметр — пример); venv — окружение Python (параметр — модули);
+#        linger — loginctl enable-linger для пользователя: его user-службы
+#        (beufm-recorder.service) работают и без входа в сеанс, с загрузки.
 #   условие: пусто — всегда; path:ПУТЬ, cmd:КОМАНДА, fs:ТОЧКА=ТИП,
 #        family:СЕМЕЙСТВО через запятую; при невыполненном — «не требуется».
 #   имя @CRON_UNIT@ — демон cron своего семейства ОС (cronie/cron/crond).
@@ -87,6 +89,7 @@ JOBS=(
     "system-unit|system-monitor.timer|||Опрос SMART дисков, CPU и GPU каждые 6 ч (00, 06, 12, 18 ч; пропущенный запуск догоняется после загрузки), запись в SQLite и HTML-отчёт system_reports/latest.html. Скрипт system_monitor.sh, запуск от root."
     "user-unit|check-backups.timer|||Ежедневная проверка каталогов с архивами резервных копий (наличие, возраст, размер, целостность) с уведомлением в трее. Скрипт check_backups.sh, настройки — conf/check_backups.conf."
     "user-unit|beufm-recorder.service|||Постоянная запись эфира Beu FM: каждый выход песни сохраняется дублем, из трёх дублей собирается лучшая запись (общий участок по отпечаткам fpcalc). Загрузчик берёт её, только если песни нет в источниках MP3. Скрипт music_downloader/beufm_recorder.py, настройки — блок recorder сайта beufm_kz в music_downloader/music_downloader.json."
+    "linger|enable-linger||cmd:loginctl|Пользовательские службы без входа в сеанс (loginctl enable-linger): запись эфира beufm-recorder.service работает с загрузки системы, а не только пока вы в сеансе."
     "user-unit|check-store-mount.service|||При входе в графический сеанс проверяет, смонтированы ли точки из /etc/fstab, и показывает уведомление о несмонтированных. Скрипт check-store-mount.sh."
     "system-ext|@CRON_UNIT@||cmd:crontab|Демон cron: запускает задания из crontab пользователя (скачивание музыки, синхронизация каталогов, мониторинг Btrfs)."
     "cron|music_downloader.sh|0 21 * * *||Ежедневно в 21:00: скачивание новой музыки с сайтов из music_downloader/music_downloader.json и раскладка по папкам исполнителей (split_by_dash.sh)."
@@ -754,6 +757,10 @@ root_enable() {
     systemctl enable --now -- "$1"
 }
 
+root_linger() {
+    loginctl enable-linger -- "$1"
+}
+
 root_pkg() {
     local mgr="$1"
     shift
@@ -830,6 +837,7 @@ kind_label() {
         autostart) printf 'автозапуск' ;;
         conf) printf 'конфиг' ;;
         venv) printf 'venv' ;;
+        linger) printf 'linger' ;;
         *) printf '%s' "$1" ;;
     esac
 }
@@ -1021,6 +1029,18 @@ eval_link() {
     fi
 }
 
+# Linger: user-службы пользователя запускаются с загрузки, без входа в сеанс
+eval_linger() {
+    local i="$1" user state
+    user="$(id -un)"
+    state="$(loginctl show-user "${user}" --property=Linger --value 2>/dev/null)"
+    if [[ "${state}" == "yes" ]]; then
+        set_row "${i}" "да" "да" "—" "OK" "" "none" ""
+    else
+        set_row "${i}" "нет" "нет" "—" "ВНИМАНИЕ" "linger выключен: user-службы ${user} работают только в сеансе" "linger" "loginctl enable-linger ${user}"
+    fi
+}
+
 eval_autostart() {
     local i="$1" name="$2"
     local tpl="${TEMPLATE_DIR}/autostart/${name}" dest="${AUTOSTART_DIR}/${name}" tmp exec_line state="не запущен"
@@ -1119,6 +1139,7 @@ eval_job() {
         autostart) eval_autostart "${i}" "${name}" ;;
         conf) eval_conf "${i}" "${name}" "${arg}" ;;
         venv) eval_venv "${i}" "${name}" "${arg}" ;;
+        linger) eval_linger "${i}" ;;
         *) set_row "${i}" "—" "—" "—" "ВНИМАНИЕ" "неизвестный вид задания «${kind}»" "none" "" ;;
     esac
 }
@@ -1250,6 +1271,19 @@ fix_venv() {
     bash "${setup}"
 }
 
+# Linger для себя polkit обычно разрешает без пароля в локальном сеансе;
+# при отказе — тот же шаг с повышением прав
+fix_linger() {
+    local i="$1" user
+    user="$(id -un)"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        say "[dry-run] будет: ${R_ACTION[${i}]} (при отказе polkit — с повышением прав)"
+        return 0
+    fi
+    loginctl enable-linger -- "${user}" 2>/dev/null && return 0
+    as_root __root-linger "${user}"
+}
+
 # Замена MYTASKS_DIR в собственном конфиге на каталог запуска
 fix_conf_dir() {
     local tmp line re='^MYTASKS_DIR='
@@ -1280,6 +1314,7 @@ fix_job() {
         link) fix_link "${i}" ;;
         autostart) fix_autostart "${i}" ;;
         venv) fix_venv "${i}" ;;
+        linger) fix_linger "${i}" ;;
         conf-dir) fix_conf_dir ;;
         conf)
             IFS='|' read -r _ name arg _ <<<"${ALL_JOBS[${i}]}"
@@ -1971,6 +2006,7 @@ notify_alert() {
 case "${1:-}" in
     __root-install-units) shift; root_install_units "$@"; rc=$?; exit "${rc}" ;;
     __root-enable) shift; root_enable "$@"; rc=$?; exit "${rc}" ;;
+    __root-linger) shift; root_linger "$@"; rc=$?; exit "${rc}" ;;
     __root-pkg) shift; root_pkg "$@"; rc=$?; exit "${rc}" ;;
     __root-update) shift; root_update "$@"; rc=$?; exit "${rc}" ;;
     *) ;;

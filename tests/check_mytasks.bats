@@ -107,6 +107,16 @@ else
   cat "$1" > "$STATE/crontab"
 fi
 EOT
+  # loginctl: состояние linger — файл $STATE/linger; enable-linger может «отказать» ($STATE/linger-denied)
+  cat > "$STUB_DIR/loginctl" <<'EOT'
+#!/usr/bin/env bash
+echo "loginctl $*" >> "$CALLS"
+case "$1" in
+  show-user) [[ -f "$STATE/linger" ]] && echo yes || echo no ;;
+  enable-linger) [[ -f "$STATE/linger-denied" ]] && exit 1; touch "$STATE/linger" ;;
+  *) ;;
+esac
+EOT
   mkdir -p "$STATE/modules/$(uname -r)"
   for c in apt-get pacman dnf yum rpm-ostree zypper apk xbps-install emerge emaint eopkg garuda-update nixos-rebuild transactional-update notify-send; do
     printf '#!/usr/bin/env bash\necho "%s $*" >> "$CALLS"\nexit 0\n' "$c" > "$STUB_DIR/$c"
@@ -226,6 +236,28 @@ ALL_DEMO_JOBS='"user-unit|demo.timer|||Демо-таймер пользоват�
   grep -q 'systemctl --user enable -- logindemo.service' "$CALLS"
   run grep -q 'enable --now -- logindemo.service' "$CALLS"
   [ "$status" -ne 0 ]
+}
+
+@test "linger: dry-run не включает, --yes включает, включённый — OK" {
+  write_conf '"linger|enable-linger||cmd:loginctl|Демо-linger"' ""
+  run "$WORK/check_mytasks.sh" --dry-run --no-gui
+  [[ "$output" == *"[dry-run] будет: loginctl enable-linger"* ]]
+  [ ! -e "$STATE/linger" ]
+  run "$WORK/check_mytasks.sh" --yes --no-gui
+  [ -e "$STATE/linger" ]
+  grep -q "loginctl enable-linger -- $(id -un)" "$CALLS"
+  run "$WORK/check_mytasks.sh" --status
+  [[ "$output" == *"enable-linger"*"OK"* ]]
+}
+
+@test "linger: отказ и без прав, и с повышением — предупреждение, не сбой" {
+  write_conf '"linger|enable-linger||cmd:loginctl|Демо-linger"' ""
+  touch "$STATE/linger-denied"
+  run "$WORK/check_mytasks.sh" --yes --no-gui
+  [ "$status" -eq 1 ]
+  [ ! -e "$STATE/linger" ]
+  [ "$(grep -c "loginctl enable-linger -- $(id -un)" "$CALLS")" -eq 2 ]  # сам и через __root-linger
+  [[ "$output" == *"Не удалось: loginctl enable-linger"* ]]
 }
 
 @test "--yes создаёт юниты, cron, ссылку и автозапуск; итог OK" {
