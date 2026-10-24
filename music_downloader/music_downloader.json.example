@@ -53,6 +53,13 @@
             "driver": "drivers/music_downloader_hitmotop.py",
             "base_url": "https://rus.hitmotop.com",
             "search_path": "/search?q={query}"
+        },
+        {
+            "name": "youtube_music",
+            "enabled": true,
+            "driver": "drivers/music_downloader_youtube_music.py",
+            "base_url": "https://music.youtube.com",
+            "search_path": "/search?q={query}#songs"
         }
     ],
 

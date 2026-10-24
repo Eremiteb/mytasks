@@ -877,8 +877,12 @@ def run():
                         t.update(resolved)
                     logger.info(f"Загружаю: {artist} - {title}", extra={"site": s_name})
                     headers = {"Referer": t.get("referer", s_cfg["base_url"])}
-                    with scraper.get(
-                        t["download_url"], timeout=60, headers=headers, stream=True
+                    # Источник без прямой HTTP-ссылки (YouTube Music через yt-dlp) отдаёт
+                    # fetch(): готовый файл в виде потокового ответа с теми же полями.
+                    fetch = t.get("fetch")
+                    with (
+                        fetch() if callable(fetch)
+                        else scraper.get(t["download_url"], timeout=60, headers=headers, stream=True)
                     ) as r:
                         if r.status_code == 200:
                             # Получаем размер файла из заголовка Content-Length

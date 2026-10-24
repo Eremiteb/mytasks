@@ -95,7 +95,9 @@ bash ../music_downloader.sh
     {"name": "drivemusic", "enabled": true, "driver": "drivers/music_downloader_drivemusic.py",
      "base_url": "https://drivemusic.me", "search_path": "/?do=search&subaction=search&story={query}"},
     {"name": "hitmotop", "enabled": true, "driver": "drivers/music_downloader_hitmotop.py",
-     "base_url": "https://rus.hitmotop.com", "search_path": "/search?q={query}"}
+     "base_url": "https://rus.hitmotop.com", "search_path": "/search?q={query}"},
+    {"name": "youtube_music", "enabled": true, "driver": "drivers/music_downloader_youtube_music.py",
+     "base_url": "https://music.youtube.com", "search_path": "/search?q={query}#songs"}
   ]
 ```
 
@@ -105,7 +107,10 @@ bash ../music_downloader.sh
 | `lmusic_kz` | `div.c-card-mp3[data-download_url]` | обычно 320 кбит/с |
 | `muzofond` | `li.item` → `li.play[data-url]`, `span.artist`, `span.track` | ≈320 кбит/с; пустую выдачу отдаёт как HTTP 404 (= «не найдено») |
 | `drivemusic` | `.music-popular__item` → `[data-url]`, `a.popular-play-author`, `.popular-play-composition a` | ссылка с меткой времени, берётся прямо перед скачиванием |
-| `hitmotop` | `li[data-musmeta]` (JSON: artist, title, url), переадресация на зеркало `hitmoz` | лучший охват, но 128 кбит/с — поэтому последний |
+| `hitmotop` | `li[data-musmeta]` (JSON: artist, title, url), переадресация на зеркало `hitmoz` | лучший охват среди MP3-сайтов, но 128 кбит/с |
+| `youtube_music` | системный `yt-dlp`: поиск песен `#songs`, у первых 3 результатов полные метаданные `artists`/`track` | последняя страховка для нишевых релизов; opus перекодируется `ffmpeg` в MP3 VBR ~190 кбит/с; медленно (несколько вызовов `yt-dlp` на запрос); нет `yt-dlp`/`ffmpeg` — источник пуст |
+
+Кандидат источника может вместо прямой ссылки нести `fetch` — функцию без аргументов, возвращающую потоковый ответ (`status_code`, `headers`, `iter_content`, контекстный менеджер). Тогда `find_audio` не проверяет ссылку HTTP-запросом, а движок вызывает `fetch()` вместо `scraper.get`; лимиты каталогов, очистка тегов и `filehash` работают как обычно. Так устроен `youtube_music`: файл скачивается и перекодируется во временный каталог только для выбранного трека, каталог удаляется после сохранения.
 
 Порядок — по качеству файла, а не по охвату. Проверено 2026-10-24 на 132 треках, не найденных прежней схемой (Shazam, Beu FM, MyChords); mp3party.net отклонён — его CDN отдаёт вместо файла текст `failed`.
 

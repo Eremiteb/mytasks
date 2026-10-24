@@ -256,6 +256,48 @@ class TestMusicDownloader(unittest.TestCase):
                     ("shazam_old", None, "Artist - Old.mp3", 4),
                 ])
 
+    def test_run_downloads_through_driver_fetch_without_http(self):
+        """Источник без HTTP-ссылки (yt-dlp) отдаёт fetch(): движок не вызывает scraper.get."""
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            destination = root / "music"
+            destination.mkdir()
+            driver = root / "driver.py"
+            driver.write_text(
+                "def get_tracks(scraper, base_url, category):\n"
+                "    return [{'id': 'yt', 'artist': 'Artist', 'title': 'Song'}]\n"
+                "def resolve_track(session, track):\n"
+                "    return session.resolve_track(session, track.copy())\n",
+                encoding="utf-8",
+            )
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps({
+                "download_paths": [{"path": str(destination)}],
+                "sites": [{"site_name": "shazam", "site_script": str(driver),
+                           "base_url": "https://chart.example", "categories": ["/"]}],
+            }), encoding="utf-8")
+            response = MagicMock(status_code=200, headers={"content-length": "4"})
+            response.iter_content.return_value = [b"opus"]
+            fetch = MagicMock()
+            fetch.return_value.__enter__.return_value = response
+            scraper = MagicMock()
+            scraper.resolve_track.return_value = {
+                "download_url": "https://music.youtube.com/watch?v=x", "referer": "r",
+                "src": "https://music.youtube.com/watch?v=x", "fetch": fetch,
+            }
+            with (
+                patch.multiple(music_downloader, CONFIG_PATH=str(config_path), DB_PATH=str(root / "db.sqlite")),
+                patch.object(music_downloader, "setup_logging"),
+                patch.object(music_downloader, "cleanup_old_logs"),
+                patch.object(music_downloader.time, "sleep"),
+                patch.object(music_downloader.cloudscraper, "create_scraper", return_value=scraper),
+            ):
+                music_downloader.run()
+
+            fetch.assert_called_once_with()
+            scraper.get.assert_not_called()
+            self.assertEqual((destination / "Artist - Song.mp3").read_bytes(), b"opus")
+
     def test_run_skips_unresolved_chart_track_and_continues(self):
         for outcome in (None, RuntimeError("Сбой resolver")):
             with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as root:

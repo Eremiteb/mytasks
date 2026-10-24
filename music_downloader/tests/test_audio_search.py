@@ -126,3 +126,18 @@ def test_strict_match_in_later_source_beats_relaxed_in_earlier(monkeypatch):
     assert audio_search.find_audio(_reachable_session(), track, "Тест")["download_url"] == "https://b.test/2.mp3"
     track["_search_sources"] = sources[:1]
     assert audio_search.find_audio(_reachable_session(), track, "Тест")["download_url"] == "https://a.test/1.mp3"
+
+
+def test_fetch_candidate_skips_http_check_and_reaches_engine(monkeypatch):
+    monkeypatch.setattr(audio_search.time, "sleep", lambda _: None)
+    fetch = Mock()
+    source = {"name": "ytm", "driver": "x", "base_url": "https://music.youtube.com", "search_path": "/search?q={query}"}
+    monkeypatch.setattr(audio_search, "_query_source", lambda session, src, query: (
+        [{"artist": "A", "title": "B", "download_url": "https://music.youtube.com/watch?v=1", "fetch": fetch}],
+        "https://music.youtube.com/search?q=x",
+    ))
+    session = Mock()
+    result = audio_search.find_audio(session, {"artist": "A", "title": "B", "_search_sources": [source]}, "Тест")
+    assert result["fetch"] is fetch
+    session.get.assert_not_called()
+    fetch.assert_not_called()

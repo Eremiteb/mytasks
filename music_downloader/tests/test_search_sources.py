@@ -2,6 +2,8 @@ import importlib.util
 from pathlib import Path
 from unittest.mock import Mock
 
+import pytest
+
 DRIVERS = Path(__file__).resolve().parents[1] / "drivers"
 
 
@@ -84,3 +86,58 @@ def test_muzofond_treats_404_as_empty_result():
     session = Mock()
     session.get.return_value = Mock(status_code=404, text="", url="https://muzofond.fm/music/x")
     assert muzofond.search_tracks(session, "https://muzofond.fm", "/search/x") == []
+
+
+youtube_music = _load("youtube_music")
+
+SONG_INFO = {
+    "track": "Setembro",
+    "artists": ["Cynthia Luz", "2B", "OGBEATZZ"],
+    "webpage_url": "https://music.youtube.com/watch?v=M9DAsczLQtc",
+}
+
+
+def test_youtube_music_parse_info_requires_song_metadata():
+    candidate = youtube_music.parse_info(SONG_INFO)
+    assert {key: candidate[key] for key in ("artist", "title", "download_url")} == {
+        "artist": "Cynthia Luz, 2B, OGBEATZZ",
+        "title": "Setembro",
+        "download_url": "https://music.youtube.com/watch?v=M9DAsczLQtc",
+    }
+    assert callable(candidate["fetch"])
+    # обычное видео без полей песни не принимается
+    assert youtube_music.parse_info({"title": "Setembro (clipe)", "webpage_url": "https://youtube.com/x"}) is None
+
+
+def test_youtube_music_search_reads_full_metadata_of_top_results(monkeypatch):
+    monkeypatch.setattr(youtube_music, "available", lambda: True)
+    calls = []
+
+    def run_json(args, timeout):
+        calls.append(args)
+        if "--flat-playlist" in args:
+            return {"entries": [{"url": "https://music.youtube.com/watch?v=a"}, {"url": None}]}
+        return SONG_INFO
+
+    monkeypatch.setattr(youtube_music, "_run_json", run_json)
+    tracks = youtube_music.search_tracks(None, "https://music.youtube.com", "/search?q=Cynthia+Luz#songs")
+    assert [track["title"] for track in tracks] == ["Setembro"]
+    assert calls[0][-1] == "https://music.youtube.com/search?q=Cynthia+Luz#songs"
+    assert calls[1] == ["--skip-download", "-J", "https://music.youtube.com/watch?v=a"]
+
+
+def test_youtube_music_is_empty_without_tools(monkeypatch):
+    monkeypatch.setattr(youtube_music, "available", lambda: False)
+    monkeypatch.setattr(youtube_music, "_run_json", lambda *args: pytest.fail("yt-dlp не должен вызываться"))
+    assert youtube_music.search_tracks(None, "https://music.youtube.com", "/search?q=x#songs") == []
+
+
+def test_youtube_music_file_response_streams_and_removes_workdir(tmp_path):
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    (workdir / "track.mp3").write_bytes(b"ID3data")
+    with youtube_music.FileResponse(str(workdir / "track.mp3"), str(workdir)) as response:
+        assert response.status_code == 200
+        assert response.headers["content-length"] == "7"
+        assert b"".join(response.iter_content(3)) == b"ID3data"
+    assert not workdir.exists()

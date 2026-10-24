@@ -134,7 +134,9 @@ def _query_source(session, source, query):
 
 
 def _reachable(session, candidate, label, name, log):
-    """Проверяет ссылку запросом без чтения тела."""
+    """Проверяет ссылку запросом без чтения тела; у кандидата с `fetch` её уже проверил драйвер."""
+    if candidate.get("fetch"):
+        return True
     with session.get(
         candidate["download_url"], headers={"Referer": candidate["referer"]}, stream=True, timeout=(5, 15)
     ) as response:
@@ -145,11 +147,15 @@ def _reachable(session, candidate, label, name, log):
 
 
 def _result(candidate):
-    return {
+    result = {
         "download_url": candidate["download_url"],
         "referer": candidate["referer"],
         "src": candidate.get("src") or candidate["search_url"],
     }
+    if candidate.get("fetch"):
+        # Драйвер сам скачивает файл (yt-dlp): движок вызовет fetch() вместо HTTP-запроса.
+        result["fetch"] = candidate["fetch"]
+    return result
 
 
 def find_audio(session, track, label, log=logger, sources=None):
