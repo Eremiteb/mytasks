@@ -32,6 +32,27 @@
             "driver": "drivers/music_downloader_lmusic_kz.py",
             "base_url": "https://lmusic.kz",
             "search_path": "/search?q={query}"
+        },
+        {
+            "name": "muzofond",
+            "enabled": true,
+            "driver": "drivers/music_downloader_muzofond.py",
+            "base_url": "https://muzofond.fm",
+            "search_path": "/search/{query_path}"
+        },
+        {
+            "name": "drivemusic",
+            "enabled": true,
+            "driver": "drivers/music_downloader_drivemusic.py",
+            "base_url": "https://drivemusic.me",
+            "search_path": "/?do=search&subaction=search&story={query}"
+        },
+        {
+            "name": "hitmotop",
+            "enabled": true,
+            "driver": "drivers/music_downloader_hitmotop.py",
+            "base_url": "https://rus.hitmotop.com",
+            "search_path": "/search?q={query}"
         }
     ],
 

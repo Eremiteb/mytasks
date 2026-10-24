@@ -61,7 +61,14 @@ def test_query_source_loads_driver_and_quotes_query(tmp_path):
     assert candidates == [{"artist": "https://t.test", "title": url.removeprefix("https://t.test")}]
 
 
-@pytest.mark.parametrize("name", ["music_downloader.json.example", "music_downloader.json"])
+def test_query_path_placeholder_quotes_query_for_url_path(tmp_path):
+    driver = tmp_path / "driver.py"
+    driver.write_text("def search_tracks(session, base_url, search_path):\n    return []\n", encoding="utf-8")
+    source = {"name": "t", "driver": str(driver), "base_url": "https://t.test", "search_path": "/search/{query_path}"}
+    assert audio_search._query_source(Mock(), source, "AC/DC Цой")[1] == "https://t.test/search/AC%2FDC%20%D0%A6%D0%BE%D0%B9"
+
+
+@pytest.mark.parametrize("name",["music_downloader.json.example", "music_downloader.json"])
 def test_config_sources_point_to_drivers_with_search(name):
     path = ROOT / name
     if not path.exists():
@@ -69,5 +76,53 @@ def test_config_sources_point_to_drivers_with_search(name):
     sources = json.loads(path.read_text(encoding="utf-8"))["search_sources"]
     assert sources
     for source in sources:
-        assert "{query}" in source["search_path"]
+        assert "{query}" in source["search_path"] or "{query_path}" in source["search_path"]
         assert hasattr(audio_search._load_driver(source["driver"]), "search_tracks")
+
+
+@pytest.mark.parametrize(
+    ("artist", "title", "candidate_artist", "candidate_title", "expected"),
+    [
+        ("Blaqbonez", "IKEBE 3000 (feat. Asake)", "Blaqbonez & Asake", "IKEBE 3000", True),
+        ("Keane", "Somewhere Only We Know (Remastered 2024)", "Keane", "Somewhere Only We Know", True),
+        ("Scorpions", "Still Loving You (2015 - Remaster)", "Scorpions", "Still Loving You", True),
+        ("JAMALA, ONUKA", "Людина", "Jamala", "Людина", True),
+        ("Tame Impala", "Dracula (with JENNIE)", "Tame Impala", "Dracula", False),
+        ("Lykke Li", "I Follow Rivers (The Magician Remix)", "Lykke Li", "I Follow Rivers", False),
+        ("Stromae", "Alors on danse", "Другой", "Alors on danse", False),
+        ("JAŸ-Z", "Empire State Of Mind (feat. Alicia Keys)", "JAY-Z", "Empire State Of Mind", True),
+    ],
+)
+def test_relaxed_match_ignores_feat_and_remaster_only(artist, title, candidate_artist, candidate_title, expected):
+    assert audio_search.relaxed_match(artist, title, candidate_artist, candidate_title) is expected
+
+
+def test_search_queries_add_first_artist_and_clean_title():
+    assert audio_search.search_queries("Akon & Snoop Dogg", "I Wanna Love You (feat. Snoop Dogg)") == [
+        "Akon & Snoop Dogg I Wanna Love You (feat. Snoop Dogg)",
+        "Akon I Wanna Love You",
+    ]
+    assert audio_search.search_queries("Stromae", "Alors on danse") == ["Stromae Alors on danse"]
+    assert audio_search.search_queries("JAŸ-Z", "Encore")[-1] == "JAY-Z Encore"
+    assert audio_search.search_queries("Abik Jeksen", "Сүйем мён") == ["Abik Jeksen Сүйем мён"]
+    assert audio_search.match_key("JAŸ-Z") != audio_search.match_key("JAY-Z")  # строгий проход не ослаблен
+
+
+def test_strict_match_in_later_source_beats_relaxed_in_earlier(monkeypatch):
+    monkeypatch.setattr(audio_search.time, "sleep", lambda _: None)
+    sources = [
+        {"name": "a", "driver": "x", "base_url": "https://a.test", "search_path": "/?q={query}"},
+        {"name": "b", "driver": "x", "base_url": "https://b.test", "search_path": "/?q={query}"},
+    ]
+    found = {
+        "a": [{"artist": "Keane", "title": "Somewhere Only We Know", "download_url": "https://a.test/1.mp3"}],
+        "b": [{"artist": "Keane", "title": "Somewhere Only We Know (Remastered 2024)",
+               "download_url": "https://b.test/2.mp3"}],
+    }
+    monkeypatch.setattr(
+        audio_search, "_query_source", lambda session, source, query: (found[source["name"]], f"{source['base_url']}/s")
+    )
+    track = {"artist": "Keane", "title": "Somewhere Only We Know (Remastered 2024)", "_search_sources": sources}
+    assert audio_search.find_audio(_reachable_session(), track, "Тест")["download_url"] == "https://b.test/2.mp3"
+    track["_search_sources"] = sources[:1]
+    assert audio_search.find_audio(_reachable_session(), track, "Тест")["download_url"] == "https://a.test/1.mp3"

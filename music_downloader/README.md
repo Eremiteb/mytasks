@@ -89,11 +89,27 @@ bash ../music_downloader.sh
     {"name": "sefon.pro", "enabled": true, "driver": "drivers/music_downloader_sefon_pro.py",
      "base_url": "https://sefon.pro", "search_path": "/search/?q={query}"},
     {"name": "lmusic_kz", "enabled": true, "driver": "drivers/music_downloader_lmusic_kz.py",
-     "base_url": "https://lmusic.kz", "search_path": "/search?q={query}"}
+     "base_url": "https://lmusic.kz", "search_path": "/search?q={query}"},
+    {"name": "muzofond", "enabled": true, "driver": "drivers/music_downloader_muzofond.py",
+     "base_url": "https://muzofond.fm", "search_path": "/search/{query_path}"},
+    {"name": "drivemusic", "enabled": true, "driver": "drivers/music_downloader_drivemusic.py",
+     "base_url": "https://drivemusic.me", "search_path": "/?do=search&subaction=search&story={query}"},
+    {"name": "hitmotop", "enabled": true, "driver": "drivers/music_downloader_hitmotop.py",
+     "base_url": "https://rus.hitmotop.com", "search_path": "/search?q={query}"}
   ]
 ```
 
-`{query}` заменяется на URL-кодированную строку «Исполнитель Название». Драйвер источника обязан предоставить `search_tracks(session, base_url, search_path)` и вернуть кандидатов с `artist`, `title`, `download_url` (и при необходимости `referer`, `src`). Общий код — `drivers/music_downloader_audio_search.py` (`find_audio`): принимается только точное совпадение нормализованных исполнителя и названия (регистр и пунктуация игнорируются, `remix`/`live` различаются), ссылка проверяется запросом без чтения тела, между источниками пауза 1 с. Чтобы добавить сайт, напишите для него `search_tracks` в драйвере и добавьте запись в `search_sources` — код мостов менять не нужно. Не-список в `search_sources` даёт код `2`.
+| Источник | Разбор выдачи | Замечания |
+|---|---|---|
+| `sefon.pro` | карточки `div.mp3`, расшифровка ссылки | обычно 320 кбит/с |
+| `lmusic_kz` | `div.c-card-mp3[data-download_url]` | обычно 320 кбит/с |
+| `muzofond` | `li.item` → `li.play[data-url]`, `span.artist`, `span.track` | ≈320 кбит/с; пустую выдачу отдаёт как HTTP 404 (= «не найдено») |
+| `drivemusic` | `.music-popular__item` → `[data-url]`, `a.popular-play-author`, `.popular-play-composition a` | ссылка с меткой времени, берётся прямо перед скачиванием |
+| `hitmotop` | `li[data-musmeta]` (JSON: artist, title, url), переадресация на зеркало `hitmoz` | лучший охват, но 128 кбит/с — поэтому последний |
+
+Порядок — по качеству файла, а не по охвату. Проверено 2026-10-24 на 132 треках, не найденных прежней схемой (Shazam, Beu FM, MyChords); mp3party.net отклонён — его CDN отдаёт вместо файла текст `failed`.
+
+`{query}` заменяется на URL-кодированную для параметра строку «Исполнитель Название» (`Кино+Цой`), `{query_path}` — на закодированный сегмент пути (`Кино%20Цой`). Драйвер источника обязан предоставить `search_tracks(session, base_url, search_path)` и вернуть кандидатов с `artist`, `title`, `download_url` (и при необходимости `referer`, `src`). Общий код — `drivers/music_downloader_audio_search.py` (`find_audio`). Каждый источник получает полный запрос и, если он отличается, запасной «первый исполнитель + название без feat». Сначала во **всех** источниках ищется точное совпадение нормализованных исполнителя и названия (регистр и пунктуация игнорируются). Только если его нет нигде, берётся мягкое совпадение `relaxed_match`: название без `(feat. …)`/`[ft. …]` и пометок ремастеринга (`(Remastered 2024)`, `- 2015 Remaster`) плюс хотя бы один общий исполнитель («JAMALA, ONUKA» ↔ «Jamala»), диакритика не учитывается («JAŸ-Z» ↔ «JAY-Z»; в поиск добавляется запрос без диакритики). `(with X)`, `remix`, `live`, версии и миксы по-прежнему различаются. Ссылка проверяется запросом без чтения тела, после каждого запроса пауза 1 с. Чтобы добавить сайт, напишите для него `search_tracks` в драйвере и добавьте запись в `search_sources` — код мостов менять не нужно. Не-список в `search_sources` даёт код `2`.
 
 ## Контракт мостов
 
