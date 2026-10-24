@@ -429,6 +429,7 @@ journalctl --user -u check-backups.service -n 20
 | `system-monitor.timer` | системный юнит | `system_monitor.sh` каждые 6 ч от root |
 | `check-backups.timer` | user-юнит | `check_backups.sh` раз в сутки |
 | `check-store-mount.service` | user-юнит | `check-store-mount.sh` при входе в сеанс |
+| `beufm-recorder.service` | user-юнит | `music_downloader/beufm_recorder.py` постоянно: запись эфира Beu FM |
 | `cronie`/`cron`/`crond.service` | системный сервис | демон cron своего семейства ОС |
 | `music_downloader.sh`, `sources.sh`, `btrfs_monitor.sh` | cron | `0 21 * * *`, `0 23 * * *`, `0 */6 * * *` (Btrfs — только если `/` на Btrfs) |
 | `conf/check_backups.conf`, `conf/sources.conf`, `music_downloader/music_downloader.json` | конфиг | создаются мастером |
@@ -806,7 +807,7 @@ python3 mht_to_fb2.py /архивы --dry-run
 
 Jamendo для категории `/` использует официальный API последних треков вместо HTML главной страницы, выбирая только записи с разрешённым скачиванием. Пустые результаты и ошибки явно логируются; подробности — в README загрузчика.
 
-Мосты `shazam_com` (мировой Top 200; аудио ищется по точному совпадению в общем списке `search_sources`), `beufm_kz` (текущий эфирный трек радио Beu FM; аудио ищется так же) и `mychords_net` (новинки, аудио из встроенного плеера xpleer, без плеера — в `search_sources`) получают ссылку на файл только перед скачиванием нового трека (`resolve_track`), поэтому уже скачанные позиции не вызывают лишних запросов.
+Мосты `shazam_com` (мировой Top 200; аудио ищется по точному совпадению в общем списке `search_sources`), `beufm_kz` (текущий эфирный трек радио Beu FM и готовые записи эфира; аудио ищется так же, а песни, которых нет нигде, записываются из эфира службой `beufm-recorder.service` — лучший из трёх выходов в эфир, см. `music_downloader/README.md`) и `mychords_net` (новинки, аудио из встроенного плеера xpleer, без плеера — в `search_sources`) получают ссылку на файл только перед скачиванием нового трека (`resolve_track`), поэтому уже скачанные позиции не вызывают лишних запросов.
 
 Перед сохранением движок чистит теги ID3 скачанного MP3 (`mutagen`): в названии, исполнителе, альбоме и других полях остаются только данные о песне, ссылки на сайты и служебные кадры (URL-кадры, кодировщик, Windows Media, реклама в copyright/издателе/TXXX) переносятся в один оптимизированный комментарий без повторов; MusicBrainz, ReplayGain, ISRC и прочие данные релиза сохраняются. Правила — в разделе «Очистка тегов ID3» README загрузчика.
 

@@ -36,6 +36,37 @@ _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _DRIVERS = {}
 
 
+class FileResponse:
+    """Готовый файл на диске в виде потокового HTTP-ответа для движка (`fetch()`).
+
+    Поля `status_code`, `headers`, `iter_content` и контекстный менеджер — как у
+    `requests`, поэтому лимиты каталогов, очистка тегов и `filehash` работают без
+    изменений. `on_close` вызывается при закрытии (например, удалить временный каталог).
+    """
+
+    status_code = 200
+
+    def __init__(self, path, on_close=None):
+        self._path, self._on_close = path, on_close
+        self.headers = {"content-length": str(os.path.getsize(path)), "content-type": "audio/mpeg"}
+
+    def iter_content(self, chunk_size=131072):
+        with open(self._path, "rb") as source:
+            while chunk := source.read(chunk_size):
+                yield chunk
+
+    def close(self):
+        if self._on_close is not None:
+            self._on_close()
+            self._on_close = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
 def match_key(value):
     """Игнорирует регистр и пунктуацию, но не удаляет слова remix, live и другие версии."""
     text = unicodedata.normalize("NFKC", unescape(value or "")).casefold()
@@ -152,14 +183,41 @@ def artist_aliases(artist, alias_groups=()):
     return aliases
 
 
+_WITH_RE = re.compile(r"\s*[\(\[]with\s([^\)\]]*)[\)\]]", re.I)
+_GUEST_RE = re.compile(r"[\(\[](?:feat\.?|ft\.?|featuring|with)\s([^\)\]]*)[\)\]]", re.I)
+
+
+def _with_guests(title):
+    """Гости из `(with X)`: это отдельная запись, их нельзя отбрасывать, как `(feat. X)`."""
+    return set().union(*(artist_keys(guest) for guest in _WITH_RE.findall(title or "")))
+
+
+def _people(artist, title, alias_groups=()):
+    """Все участники записи: исполнители и гости из `(feat. …)` / `(with …)` в названии."""
+    keys = artist_keys(artist, alias_groups)
+    for guest in _GUEST_RE.findall(title or ""):
+        keys |= artist_keys(guest)
+    return keys
+
+
 def relaxed_match(expected_artist, expected_title, artist, title, alias_groups=()):
     """Мягкое совпадение: то же название без feat/remaster/диакритики/различия письменности
-    и хотя бы один общий исполнитель (с учётом синонимов `artist_aliases`)."""
-    expected_key = fold_key(clean_title(expected_title))
+    и хотя бы один общий исполнитель (с учётом синонимов `artist_aliases`).
+
+    `(with X)` — другая запись, чем сольная: гость X должен быть у кандидата среди
+    исполнителей или в названии. Так «Tame Impala, JENNIE — Dracula» совпадает с
+    «Tame Impala — Dracula (with JENNIE)», а сольная «Tame Impala — Dracula» — нет
+    (замер отпечатков 2026-10-24: доля различий 0.30 при 0.0 у одной записи).
+    """
+    expected_key = fold_key(_WITH_RE.sub("", clean_title(expected_title)))
+    if not expected_key or fold_key(_WITH_RE.sub("", clean_title(title))) != expected_key:
+        return False
+    expected_people = _people(expected_artist, expected_title, alias_groups)
+    candidate_people = _people(artist, title)
     return (
-        bool(expected_key)
-        and fold_key(clean_title(title)) == expected_key
-        and bool(artist_keys(expected_artist, alias_groups) & artist_keys(artist))
+        bool(artist_keys(expected_artist, alias_groups) & artist_keys(artist))
+        and _with_guests(expected_title) <= candidate_people
+        and _with_guests(title) <= expected_people
     )
 
 

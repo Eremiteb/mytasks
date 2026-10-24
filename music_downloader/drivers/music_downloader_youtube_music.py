@@ -8,10 +8,10 @@
 
 Аудио — opus/m4a, поэтому кандидат несёт `fetch`: скачивание `bestaudio` и
 перекодирование в MP3 через `ffmpeg` во временный каталог только для одного
-выбранного трека. Ответ `fetch()` имитирует потоковый HTTP-ответ (status_code,
-headers, iter_content), так что лимиты каталогов, очистка тегов и `filehash`
-в движке работают без изменений. Нет `yt-dlp` или `ffmpeg` — источник молча пуст.
+выбранного трека. `fetch()` возвращает `audio_search.FileResponse`, который
+удаляет временный каталог при закрытии. Нет `yt-dlp` или `ffmpeg` — источник молча пуст.
 """
+import importlib.util
 import json
 import logging
 import os
@@ -21,6 +21,20 @@ import tempfile
 from urllib.parse import urljoin
 
 logger = logging.getLogger("Engine")
+
+
+def _load_driver(name):
+    """Загружает соседний модуль по пути: движок не добавляет каталог загрузчика в sys.path."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"{name}.py")
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Не удалось загрузить {name} из {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+audio_search = _load_driver("music_downloader_audio_search")
 
 MAX_CANDIDATES = 3
 SEARCH_TIMEOUT = 60
@@ -43,30 +57,6 @@ def _run_json(args, timeout):
     return json.loads(result.stdout)
 
 
-class FileResponse:
-    """Готовый MP3 на диске в виде потокового ответа; временный каталог удаляется при закрытии."""
-
-    status_code = 200
-
-    def __init__(self, path, workdir):
-        self._path, self._workdir = path, workdir
-        self.headers = {"content-length": str(os.path.getsize(path)), "content-type": "audio/mpeg"}
-
-    def iter_content(self, chunk_size=131072):
-        with open(self._path, "rb") as source:
-            while chunk := source.read(chunk_size):
-                yield chunk
-
-    def close(self):
-        shutil.rmtree(self._workdir, ignore_errors=True)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.close()
-
-
 def download_mp3(url):
     """Скачивает `bestaudio` и перекодирует в MP3; возвращает `FileResponse`."""
     workdir = tempfile.mkdtemp(prefix="music_downloader_ytm_")
@@ -82,7 +72,7 @@ def download_mp3(url):
         path = os.path.join(workdir, "track.mp3")
         if result.returncode != 0 or not os.path.isfile(path):
             raise RuntimeError(f"yt-dlp не скачал {url}: {result.stderr.strip()[-200:]}")
-        return FileResponse(path, workdir)
+        return audio_search.FileResponse(path, on_close=lambda: shutil.rmtree(workdir, ignore_errors=True))
     except BaseException:
         shutil.rmtree(workdir, ignore_errors=True)
         raise

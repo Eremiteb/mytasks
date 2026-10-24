@@ -136,7 +136,8 @@ def test_youtube_music_file_response_streams_and_removes_workdir(tmp_path):
     workdir = tmp_path / "work"
     workdir.mkdir()
     (workdir / "track.mp3").write_bytes(b"ID3data")
-    with youtube_music.FileResponse(str(workdir / "track.mp3"), str(workdir)) as response:
+    remove = lambda: __import__("shutil").rmtree(workdir)  # noqa: E731
+    with youtube_music.audio_search.FileResponse(str(workdir / "track.mp3"), on_close=remove) as response:
         assert response.status_code == 200
         assert response.headers["content-length"] == "7"
         assert b"".join(response.iter_content(3)) == b"ID3data"

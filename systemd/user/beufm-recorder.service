@@ -1,0 +1,15 @@
+[Unit]
+Description=Запись эфира Beu FM для песен, которых нет в источниках MP3
+Documentation=file://@MYTASKS_DIR@/music_downloader/README.md
+
+[Service]
+# Долгоживущая служба: читает поток и пишет дубли песен в state/beufm_recordings
+Type=simple
+ExecStart=@MYTASKS_DIR@/music_downloader/venv/bin/python @MYTASKS_DIR@/music_downloader/beufm_recorder.py
+# Сбой сети или конфига — повтор через 30 с; SIGTERM — штатная остановка
+Restart=on-failure
+RestartSec=30
+Nice=10
+
+[Install]
+WantedBy=default.target

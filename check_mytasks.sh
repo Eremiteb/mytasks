@@ -86,6 +86,7 @@ URGENCY="normal"
 JOBS=(
     "system-unit|system-monitor.timer|||Опрос SMART дисков, CPU и GPU каждые 6 ч (00, 06, 12, 18 ч; пропущенный запуск догоняется после загрузки), запись в SQLite и HTML-отчёт system_reports/latest.html. Скрипт system_monitor.sh, запуск от root."
     "user-unit|check-backups.timer|||Ежедневная проверка каталогов с архивами резервных копий (наличие, возраст, размер, целостность) с уведомлением в трее. Скрипт check_backups.sh, настройки — conf/check_backups.conf."
+    "user-unit|beufm-recorder.service|||Постоянная запись эфира Beu FM: каждый выход песни сохраняется дублем, из трёх дублей собирается лучшая запись (общий участок по отпечаткам fpcalc). Загрузчик берёт её, только если песни нет в источниках MP3. Скрипт music_downloader/beufm_recorder.py, настройки — блок recorder сайта beufm_kz в music_downloader/music_downloader.json."
     "user-unit|check-store-mount.service|||При входе в графический сеанс проверяет, смонтированы ли точки из /etc/fstab, и показывает уведомление о несмонтированных. Скрипт check-store-mount.sh."
     "system-ext|@CRON_UNIT@||cmd:crontab|Демон cron: запускает задания из crontab пользователя (скачивание музыки, синхронизация каталогов, мониторинг Btrfs)."
     "cron|music_downloader.sh|0 21 * * *||Ежедневно в 21:00: скачивание новой музыки с сайтов из music_downloader/music_downloader.json и раскладка по папкам исполнителей (split_by_dash.sh)."
@@ -130,8 +131,9 @@ DEPS=(
     "btrfs|btrfs-progs|fs:/=btrfs|btrfs_monitor.sh: счётчики ошибок Btrfs"
     "zenity,kdialog|zenity|opt|Окна вопросов этого скрипта (кнопка «Стоп» во всех окнах — только у zenity) и графический askpass для sudo"
     "sensors|lm_sensors;debian=lm-sensors;suse=sensors;alpine=lm-sensors;gentoo=sys-apps/lm-sensors|opt|system_monitor.sh: температура CPU"
-    "ffmpeg|ffmpeg;redhat=ffmpeg-free|opt|all_to_mp3.sh, music_downloader (YouTube Music): перекодирование в MP3"
+    "ffmpeg|ffmpeg;redhat=ffmpeg-free|opt|all_to_mp3.sh, music_downloader (YouTube Music): перекодирование в MP3; beufm_recorder.py: проверка дублей"
     "yt-dlp|yt-dlp;gentoo=net-misc/yt-dlp|opt|music_downloader: последний источник MP3 — песни YouTube Music"
+    "fpcalc|chromaprint;debian=libchromaprint-tools;redhat=chromaprint-tools;suse=chromaprint-fpcalc;gentoo=media-libs/chromaprint|opt|beufm_recorder.py: сравнение дублей эфира по акустическим отпечаткам"
     "pandoc|pandoc;arch=pandoc-cli;alpine=pandoc-cli;gentoo=app-text/pandoc-bin|opt|doc2fb2.sh, mht_to_fb2.py: преобразование документов"
     "sshpass|sshpass|opt|cloud_backup.sh: вход на сервер по паролю"
     "wg-quick|wireguard-tools|opt|cloud_backup.sh: туннель WireGuard"
@@ -716,14 +718,25 @@ when_label() {
 ###############################################################################
 # HELPERS: root-шаги (вызываются через sudo/pkexec, логи не пишут)
 ###############################################################################
-# Аргументы включения юнита в ENABLE_ARGS: таймер — сразу запустить,
-# сервис по событию (вход в сеанс) — только включить
+# Аргументы включения юнита в ENABLE_ARGS: таймер и долгоживущая служба (шаблон
+# не Type=oneshot, например beufm-recorder.service) — сразу запустить; сервис по
+# событию (вход в сеанс, oneshot) — только включить, иначе enable --now ждёт его sleep
 unit_enable_args() {
-    if [[ "$1" == *.timer ]]; then
+    local unit="$1" tpl
+    ENABLE_ARGS=(enable)
+    if [[ "${unit}" == *.timer ]]; then
         ENABLE_ARGS=(enable --now)
-    else
-        ENABLE_ARGS=(enable)
+        return 0
     fi
+    for tpl in "${TEMPLATE_DIR}/user/${unit}" "${TEMPLATE_DIR}/${unit}"; do
+        if [[ -r "${tpl}" ]]; then
+            if ! grep -q '^Type=oneshot' -- "${tpl}"; then
+                ENABLE_ARGS=(enable --now)
+            fi
+            return 0
+        fi
+    done
+    return 0
 }
 
 root_install_units() {

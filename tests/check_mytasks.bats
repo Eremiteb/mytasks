@@ -213,6 +213,21 @@ ALL_DEMO_JOBS='"user-unit|demo.timer|||Демо-таймер пользоват�
   [ ! -e "$HOME/.local/bin/demo-link" ]
 }
 
+@test "долгоживущая служба (не oneshot) включается сразу, oneshot — только enable" {
+  printf '[Unit]\nDescription=daemon\n\n[Service]\nType=simple\nExecStart=@MYTASKS_DIR@/demo.sh\n\n[Install]\nWantedBy=default.target\n' \
+    > "$WORK/systemd/user/daemondemo.service"
+  printf '[Unit]\nDescription=login\n\n[Service]\nType=oneshot\nExecStart=@MYTASKS_DIR@/demo.sh\n\n[Install]\nWantedBy=default.target\n' \
+    > "$WORK/systemd/user/logindemo.service"
+  write_conf '"user-unit|daemondemo.service|||Демо-служба"
+"user-unit|logindemo.service|||Демо-вход"' ""
+  run "$WORK/check_mytasks.sh" --yes --no-gui
+  [ -f "$USER_UNITS/daemondemo.service" ]
+  grep -q 'systemctl --user enable --now -- daemondemo.service' "$CALLS"
+  grep -q 'systemctl --user enable -- logindemo.service' "$CALLS"
+  run grep -q 'enable --now -- logindemo.service' "$CALLS"
+  [ "$status" -ne 0 ]
+}
+
 @test "--yes создаёт юниты, cron, ссылку и автозапуск; итог OK" {
   write_conf "$ALL_DEMO_JOBS" ""
   touch "$STATE/ext/cronie.service" "$STATE/enabled/cronie.service"

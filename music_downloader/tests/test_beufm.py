@@ -12,6 +12,13 @@ beufm = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(beufm)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_recordings(monkeypatch):
+    """Тесты не читают рабочий каталог записей эфира."""
+    monkeypatch.setattr(beufm, "_recorded_tracks", lambda skip_ids: [])
+    monkeypatch.setattr(beufm, "_recordings_dir", lambda: (_ for _ in ()).throw(FileNotFoundError("нет")))
+
+
 def _patch_sources(monkeypatch, module, sefon, lmusic):
     """Подменяет поиск в общих источниках (`search_sources` по умолчанию: Sefon, затем LMusic)."""
     by_name = {"sefon.pro": sefon, "lmusic_kz": lmusic}
@@ -141,3 +148,42 @@ def test_resolve_track_skips_unreachable_link(monkeypatch):
     session.get.return_value.__enter__ = lambda self: Mock(status_code=404)
     session.get.return_value.__exit__ = lambda self, *args: None
     assert beufm.resolve_track(session, {"id": "fm_3", "artist": "A", "title": "B"}) is None
+
+
+def test_get_tracks_adds_ready_air_recordings(monkeypatch):
+    recorded = [{"id": "fm_x", "artist": "Сара Амангелді", "title": "Көздерің", "_recording": "/r/fm_x.mp3"}]
+    monkeypatch.setattr(beufm, "_recorded_tracks", lambda skip_ids: recorded)
+    session = Mock()
+    session.get.return_value = _response(FILLED_PAGE)
+    tracks = beufm.get_tracks(session, "https://beufm.kz", "/")
+    assert [track["artist"] for track in tracks] == ["Ellaya", "Сара Амангелді"]
+
+
+def test_recorded_tracks_skip_current_and_mark_path(monkeypatch, tmp_path):
+    recorder = Mock()
+    recorder.list_recordings.return_value = [
+        {"artist": "Ellaya", "title": "Среди Алматы", "path": str(tmp_path / "a.mp3")},
+        {"artist": "Сара Амангелді", "title": "Көздерің", "path": str(tmp_path / "b.mp3")},
+    ]
+    monkeypatch.undo()
+    monkeypatch.setattr(beufm, "_recordings_dir", lambda: (str(tmp_path), recorder))
+    skip = {beufm._track_id("Ellaya", "Среди Алматы")}
+    tracks = beufm._recorded_tracks(skip)
+    assert [(t["artist"], t["_recording"]) for t in tracks] == [("Сара Амангелді", str(tmp_path / "b.mp3"))]
+    assert tracks[0]["id"] == beufm._track_id("Сара Амангелді", "Көздерің")
+
+
+def test_resolve_track_prefers_sources_then_air_recording(monkeypatch, tmp_path):
+    recording = tmp_path / "fm.mp3"
+    recording.write_bytes(b"ID3air")
+    track = {"id": "fm_1", "artist": "Сара Амангелді", "title": "Көздерің", "_recording": str(recording)}
+    found = {"download_url": "https://sefon.pro/ok.mp3", "referer": "r", "src": "s"}
+    monkeypatch.setattr(beufm.audio_search, "find_audio", lambda *args: found)
+    assert beufm.resolve_track(Mock(), track) is found
+    monkeypatch.setattr(beufm.audio_search, "find_audio", lambda *args: None)
+    resolved = beufm.resolve_track(Mock(), track)
+    assert resolved["download_url"] == f"file://{recording}"
+    with resolved["fetch"]() as response:
+        assert b"".join(response.iter_content()) == b"ID3air"
+    assert recording.exists()  # запись остаётся до очистки кэша рекордером
+    assert beufm.resolve_track(Mock(), {"id": "fm_2", "artist": "A", "title": "B"}) is None
