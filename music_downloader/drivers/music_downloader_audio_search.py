@@ -61,9 +61,70 @@ def strip_latin_marks(text):
     return unicodedata.normalize("NFC", "".join(result))
 
 
+# Кириллица → латиница для сравнения без учёта письменности (русские и казахские
+# буквы). Ключ грубый намеренно: сравниваются и исполнитель, и название сразу.
+_CYR_TO_LAT = str.maketrans({
+    "а": "a", "ә": "a", "б": "b", "в": "v", "г": "g", "ғ": "g", "д": "d", "е": "e", "ё": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "i", "і": "i", "к": "k", "қ": "k", "л": "l", "м": "m",
+    "н": "n", "ң": "n", "о": "o", "ө": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ұ": "u", "ү": "u", "ф": "f", "х": "h", "һ": "h", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sh",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+})
+# Латинские написания тех же звуков сводятся к одному: q/k, kh/h, j/zh, ı/i.
+_LAT_FOLD = (("kh", "h"), ("q", "k"), ("j", "zh"), ("ı", "i"), ("w", "u"))
+
+
 def fold_key(value):
-    """`match_key` без латинской диакритики (только для мягкого прохода)."""
-    return match_key(strip_latin_marks(unescape(value or "")))
+    """Ключ мягкого прохода без латинской диакритики и без учёта письменности.
+
+    «Мәди Сыздықов» и «Madi Syzdykov» → «madisyzdykov», «аi ómir-ai» → «aiomirai».
+    Строгий проход использует `match_key` и этим ключом не ослабляется.
+    """
+    text = strip_latin_marks(unicodedata.normalize("NFKC", unescape(value or "")).casefold())
+    text = text.translate(_CYR_TO_LAT)
+    for old, new in _LAT_FOLD:
+        text = text.replace(old, new)
+    return match_key(strip_latin_marks(text))
+
+
+# Латиница → кириллица «по-русски» для поисковых запросов (Beu FM пишет казахские
+# песни латиницей, а сайты хранят их кириллицей). Точность не нужна: поиск
+# сайтов нечёткий, а сверка идёт по `fold_key`.
+_LAT_DIGRAPHS = (("shch", "щ"), ("sh", "ш"), ("ch", "ч"), ("zh", "ж"), ("kh", "х"), ("ts", "ц"),
+                 ("ya", "я"), ("yu", "ю"), ("yo", "ё"))
+_LAT_TO_CYR = str.maketrans({
+    "a": "а", "b": "б", "c": "к", "d": "д", "e": "е", "f": "ф", "g": "г", "h": "х", "i": "и",
+    "j": "ж", "k": "к", "l": "л", "m": "м", "n": "н", "o": "о", "p": "п", "q": "к", "r": "р",
+    "s": "с", "t": "т", "u": "у", "v": "в", "w": "в", "x": "кс", "y": "ы", "z": "з",
+})
+_VOWELS_CYR = "аеёиоуыэюя"
+
+
+def to_cyrillic(text):
+    """«Madi Syzdykov Ai Omir ai» → «Мади Сыздыков Ай Омир ай»; не-латиница не меняется."""
+    words = []
+    for word in strip_latin_marks(text or "").split(" "):
+        lower = word.casefold()
+        for old, new in _LAT_DIGRAPHS:
+            lower = lower.replace(old, new)
+        chars = list(lower.translate(_LAT_TO_CYR))
+        # «и»/«ы» после гласной и не перед гласной — это «й»: Ai → Ай, Kairat → Кайрат.
+        for index, char in enumerate(chars):
+            following = chars[index + 1] if index + 1 < len(chars) else ""
+            if char in "иы" and index and chars[index - 1] in _VOWELS_CYR and not (following and following in _VOWELS_CYR):
+                chars[index] = "й"
+        converted = "".join(chars)
+        words.append(converted[:1].upper() + converted[1:] if word[:1].isupper() else converted)
+    return " ".join(words)
+
+
+def to_latin(text):
+    """«Сара Амангелді Көздерің» → «Sara Amangeldi Kozderin»; латиница не меняется."""
+    words = []
+    for word in (text or "").split(" "):
+        converted = word.casefold().translate(_CYR_TO_LAT)
+        words.append(converted[:1].upper() + converted[1:] if word[:1].isupper() else converted)
+    return " ".join(words)
 
 
 def clean_title(title):
@@ -71,23 +132,40 @@ def clean_title(title):
     return _REMASTER_RE.sub("", _FEAT_RE.sub("", title or "")).strip()
 
 
-def artist_keys(artist):
-    """Ключи отдельных исполнителей: «A, B & C feat. D» → {a, b, c, d}."""
-    return {key for part in _ARTIST_SPLIT_RE.split(artist or "") if (key := fold_key(part))}
+def artist_keys(artist, alias_groups=()):
+    """Ключи исполнителей «A, B & C feat. D» → {a, b, c, d} плюс синонимы из `artist_aliases`."""
+    keys = {key for part in _ARTIST_SPLIT_RE.split(artist or "") if (key := fold_key(part))}
+    for group in alias_groups or ():
+        group_keys = {fold_key(name) for name in group} - {""}
+        if keys & group_keys:
+            keys |= group_keys
+    return keys
 
 
-def relaxed_match(expected_artist, expected_title, artist, title):
-    """Мягкое совпадение: то же название без feat/remaster/диакритики и хотя бы один общий исполнитель."""
+def artist_aliases(artist, alias_groups=()):
+    """Синонимы исполнителя из конфига (без него самого), в порядке записи."""
+    keys = artist_keys(artist)
+    aliases = []
+    for group in alias_groups or ():
+        if keys & {fold_key(name) for name in group}:
+            aliases += [name for name in group if fold_key(name) not in keys and name not in aliases]
+    return aliases
+
+
+def relaxed_match(expected_artist, expected_title, artist, title, alias_groups=()):
+    """Мягкое совпадение: то же название без feat/remaster/диакритики/различия письменности
+    и хотя бы один общий исполнитель (с учётом синонимов `artist_aliases`)."""
     expected_key = fold_key(clean_title(expected_title))
     return (
         bool(expected_key)
         and fold_key(clean_title(title)) == expected_key
-        and bool(artist_keys(expected_artist) & artist_keys(artist))
+        and bool(artist_keys(expected_artist, alias_groups) & artist_keys(artist))
     )
 
 
-def search_queries(artist, title):
-    """Полный запрос и запасной «первый исполнитель + чистое название»."""
+def search_queries(artist, title, alias_groups=(), translit=False):
+    """Полный запрос, запасной «первый исполнитель + чистое название», вариант без диакритики,
+    при `translit` — в другой письменности (латиница ↔ кириллица), и по запросу на каждый синоним."""
     queries = [f"{artist} {title}"]
     first_artist = _ARTIST_SPLIT_RE.split(artist)[0].strip()
     fallback = f"{first_artist} {clean_title(title)}"
@@ -95,8 +173,14 @@ def search_queries(artist, title):
         queries.append(fallback)
     # Поиск сайтов часто не сопоставляет «Ÿ»/«À» с «Y»/«A»: добавляем вариант без диакритики.
     plain = strip_latin_marks(queries[-1])
-    if plain not in queries:
-        queries.append(plain)
+    extra = [plain]
+    if translit:
+        # Казахские песни: латиница ↔ кириллица (Beu FM пишет то так, то так, сайты — по-своему).
+        extra.append(to_cyrillic(plain) if plain.isascii() else to_latin(plain))
+    extra += [f"{alias} {clean_title(title)}" for alias in artist_aliases(artist, alias_groups)]
+    for query in extra:
+        if query not in queries:
+            queries.append(query)
     return queries
 
 
@@ -172,11 +256,13 @@ def find_audio(session, track, label, log=logger, sources=None):
     if not all(expected):
         log.warning(f"{label}: нельзя искать трек без исполнителя или названия")
         return None
+    alias_groups = track.get("_artist_aliases") or ()
+    queries = search_queries(artist, title, alias_groups, bool(track.get("search_translit")))
     relaxed = []
     for source in enabled_sources(sources if sources is not None else track.get("_search_sources")):
         name = source["name"]
         try:
-            for query in search_queries(artist, title):
+            for query in queries:
                 candidates, search_url = _query_source(session, source, query)
                 time.sleep(1)
                 for candidate in candidates:
@@ -188,7 +274,7 @@ def find_audio(session, track, label, log=logger, sources=None):
                         if _reachable(session, found, label, name, log):
                             log.info(f"{label}: {artist} — {title}: найдено совпадение в {name}")
                             return _result(found)
-                    elif relaxed_match(artist, title, candidate.get("artist"), candidate.get("title")):
+                    elif relaxed_match(artist, title, candidate.get("artist"), candidate.get("title"), alias_groups):
                         relaxed.append((name, found))
         except Exception as error:
             log.warning(f"{label}: поиск {artist} — {title} в {name} не удался: {error}")
@@ -196,7 +282,7 @@ def find_audio(session, track, label, log=logger, sources=None):
         try:
             if _reachable(session, found, label, name, log):
                 log.info(
-                    f"{label}: {artist} — {title}: найдено в {name} без пометок feat/remaster "
+                    f"{label}: {artist} — {title}: мягкое совпадение в {name} "
                     f"как {found.get('artist')} — {found.get('title')}"
                 )
                 return _result(found)

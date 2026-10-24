@@ -141,3 +141,51 @@ def test_fetch_candidate_skips_http_check_and_reaches_engine(monkeypatch):
     assert result["fetch"] is fetch
     session.get.assert_not_called()
     fetch.assert_not_called()
+
+
+MADI = [["Madi Syzdykov", "Мәди Сыздықов", "Мади Сыздыков", "Madi Syzdyq", "Madistation"]]
+
+
+def test_fold_key_ignores_script_for_kazakh_names():
+    assert audio_search.fold_key("Мәди Сыздықов") == audio_search.fold_key("Madi Syzdykov")
+    assert audio_search.fold_key("аi ómir-ai") == audio_search.fold_key("Ai Omir ai")  # кириллическая «а»
+    assert audio_search.fold_key("Қайрат") == audio_search.fold_key("Qairat")
+    assert audio_search.match_key("Мәди Сыздықов") != audio_search.match_key("Madi Syzdykov")  # строгий не ослаблен
+
+
+@pytest.mark.parametrize(
+    ("latin", "cyrillic"),
+    [
+        ("Madi Syzdykov Ai Omir ai", "Мади Сыздыков Ай Омир ай"),
+        ("WinL Keshire almadyn", "Винл Кешире алмадын"),
+        ("Mona Songz onay kelmeydi", "Мона Сонгз онай келмейди"),
+    ],
+)
+def test_to_cyrillic_for_search_queries(latin, cyrillic):
+    assert audio_search.to_cyrillic(latin) == cyrillic
+
+
+def test_to_latin_for_search_queries():
+    assert audio_search.to_latin("Сара Амангелді Көздерің") == "Sara Amangeldi Kozderin"
+
+
+def test_translit_and_alias_queries():
+    assert audio_search.search_queries("Madi Syzdykov", "Ai Omir ai", MADI, translit=True) == [
+        "Madi Syzdykov Ai Omir ai",
+        "Мади Сыздыков Ай Омир ай",
+        "Madi Syzdyq Ai Omir ai",
+        "Madistation Ai Omir ai",
+    ]
+    assert audio_search.search_queries("Сара Амангелді", "Тыңда", translit=True)[-1] == "Sara Amangeldi Tynda"
+    # без пометки translit и без синонимов лишних запросов нет
+    assert audio_search.search_queries("Madi Syzdykov", "Ai Omir ai") == ["Madi Syzdykov Ai Omir ai"]
+
+
+def test_relaxed_match_uses_artist_aliases_only_from_config():
+    assert audio_search.relaxed_match("Madi Syzdykov", "Ai Omir ai", "Madistation", "аi ómir-ai", MADI)
+    assert not audio_search.relaxed_match("Madi Syzdykov", "Ai Omir ai", "Madistation", "аi ómir-ai")
+    # тот же текст в исполнении другого певца — другая запись
+    assert not audio_search.relaxed_match(
+        "Сара Амангелді", "Көздерің сенің сондай әп-әдемі", "Кайрат Нуртас, Argonya",
+        "Көздерің Сенің Сондай Әп Әдемі (feat. Argonya)",
+    )

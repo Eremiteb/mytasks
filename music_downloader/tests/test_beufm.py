@@ -58,6 +58,7 @@ def test_get_tracks_uses_span_when_filled():
         "artist": "Ellaya",
         "title": "Среди Алматы",
         "src": "https://beufm.kz/",
+        "search_translit": True,
     }]
     assert tracks[0]["id"].startswith("fm_")
     session.get.assert_called_once()

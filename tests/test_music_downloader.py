@@ -566,5 +566,26 @@ class TestMusicDownloader(unittest.TestCase):
             ])
 
 
+    def test_run_rejects_malformed_search_settings(self):
+        """Неверные search_sources / artist_aliases дают код 2 до создания скрапера."""
+        for bad in ({"search_sources": {"name": "x"}}, {"artist_aliases": ["Madi"]}, {"artist_aliases": [[1]]}):
+            with self.subTest(bad=bad), tempfile.TemporaryDirectory() as root:
+                root = Path(root)
+                destination = root / "music"
+                destination.mkdir()
+                config_path = root / "config.json"
+                config_path.write_text(json.dumps({"download_paths": [{"path": str(destination)}], "sites": [], **bad}),
+                                       encoding="utf-8")
+                with (
+                    patch.multiple(music_downloader, CONFIG_PATH=str(config_path), DB_PATH=str(root / "db.sqlite")),
+                    patch.object(music_downloader, "setup_logging"),
+                    patch.object(music_downloader.cloudscraper, "create_scraper") as create_scraper,
+                    self.assertRaises(SystemExit) as error,
+                ):
+                    music_downloader.run()
+                self.assertEqual(error.exception.code, 2)
+                create_scraper.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

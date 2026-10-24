@@ -752,6 +752,12 @@ def run():
     if search_sources is not None and not isinstance(search_sources, list):
         logger.error("Настройка search_sources должна быть списком источников")
         raise SystemExit(2)
+    artist_aliases = config.get("artist_aliases") or []
+    if not isinstance(artist_aliases, list) or not all(
+        isinstance(group, list) and all(isinstance(name, str) for name in group) for group in artist_aliases
+    ):
+        logger.error("Настройка artist_aliases должна быть списком групп имён одного исполнителя")
+        raise SystemExit(2)
 
     download_paths = config.get("download_paths")
     if not isinstance(download_paths, list) or not download_paths:
@@ -870,6 +876,7 @@ def run():
                     if resolver is not None:
                         # Общий список источников MP3 для драйверов без собственного аудио.
                         t["_search_sources"] = search_sources
+                        t["_artist_aliases"] = artist_aliases
                         resolved = resolver(scraper, t)
                         if resolved is None:
                             queued_tracks.discard(track_identity(artist, title))

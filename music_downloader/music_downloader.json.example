@@ -63,6 +63,10 @@
         }
     ],
 
+    "artist_aliases": [
+        ["Madi Syzdykov", "Мәди Сыздықов", "Мади Сыздыков", "Madi Syzdyq", "Madistation"]
+    ],
+
     "sites": [
         {
             "site_name": "sefon.pro",

@@ -93,7 +93,10 @@ def get_tracks(session, base_url, category_path):
         return []
     artist, title = parsed
     logger.info(f"Beu FM: в эфире {artist} - {title}")
-    return [{"id": _track_id(artist, title), "artist": artist, "title": title, "src": page_url}]
+    # Казахские песни в эфире подписаны латиницей, а сайты хранят их кириллицей:
+    # `search_translit` добавляет в общий поиск запрос в кириллице.
+    return [{"id": _track_id(artist, title), "artist": artist, "title": title, "src": page_url,
+             "search_translit": True}]
 
 
 def resolve_track(session, track):
