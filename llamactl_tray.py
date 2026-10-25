@@ -278,7 +278,7 @@ def run_gui(opts: argparse.Namespace) -> int:
         tray.showMessage(title, text[-600:] or "готово", icon, 8000)
 
     def router_url() -> str:
-        return ((st["status"] or {}).get("router", {}) or {}).get("url", "http://127.0.0.1:8080")
+        return ((st["status"] or {}).get("router", {}) or {}).get("url", STATUS.DEFAULTS["ROUTER_URL"])
 
     def run_bg(args: list[str], label: str) -> None:
         key = " ".join(args)

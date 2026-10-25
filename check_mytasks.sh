@@ -57,6 +57,9 @@ SYSTEMD_RUN_DIR="/run/systemd/system"
 REBOOT_FLAG="/run/reboot-required"
 # Garuda: обновлять через garuda-update (auto) или чистым pacman -Syu (no)
 GARUDA_UPDATE="auto"
+# Каталог установки llama.cpp: условие «есть llama.cpp» для заданий llamactl, трея и сервисов.
+# Пусто — берётся LLAMA_PREFIX из conf/llamactl.conf, иначе /opt/llama.cpp
+LLAMA_PREFIX=""
 KERNEL_MODULES_DIR="/usr/lib/modules"
 SUDO_CMD="auto"
 UI="auto"
@@ -104,11 +107,11 @@ JOBS=(
     "conf|conf/sources.conf|conf/sources.conf.example||Список каталогов для sources.sh: строки «источник, назначение, опции rsync» через вертикальную черту."
     "conf|music_downloader/music_downloader.json|music_downloader/music_downloader.json.example||Настройки загрузчика музыки: сайты, общий список каталогов download_paths, лимит размера."
     "venv|music_downloader/venv|requests,bs4,cloudscraper||Виртуальное окружение Python загрузчика музыки: music_downloader/setup_venv.sh ставит зависимости из requirements.txt."
-    "link|llamactl|llamactl.sh|path:/opt/llama.cpp|Команда llamactl в ~/.local/bin: управление локальным llama.cpp (модели, VRAM, сервисы, пресеты, обновление)."
-    "link|llamactl-tray|llamactl_tray.py|path:/opt/llama.cpp|Команда llamactl-tray в ~/.local/bin: значок llama.cpp в трее."
-    "autostart|llamactl-tray.desktop||path:/opt/llama.cpp|Автозапуск значка llama.cpp в трее при входе в графический сеанс."
-    "system-ext|llama-server.service||path:/opt/llama.cpp|Роутер llama.cpp на 127.0.0.1:8080: веб-интерфейс и OpenAI-совместимый API. Юнит ставится вне mytasks."
-    "system-ext|llama-fim.service||path:/opt/llama.cpp|FIM-автодополнение llama.cpp на 127.0.0.1:8012 для VS Code и Zed. Юнит ставится вне mytasks."
+    "link|llamactl|llamactl.sh|path:@LLAMA_PREFIX@|Команда llamactl в ~/.local/bin: управление локальным llama.cpp (модели, VRAM, сервисы, пресеты, обновление)."
+    "link|llamactl-tray|llamactl_tray.py|path:@LLAMA_PREFIX@|Команда llamactl-tray в ~/.local/bin: значок llama.cpp в трее."
+    "autostart|llamactl-tray.desktop||path:@LLAMA_PREFIX@|Автозапуск значка llama.cpp в трее при входе в графический сеанс."
+    "system-ext|llama-server.service||path:@LLAMA_PREFIX@|Роутер llama.cpp на 127.0.0.1:8080: веб-интерфейс и OpenAI-совместимый API. Юнит ставится вне mytasks."
+    "system-ext|llama-fim.service||path:@LLAMA_PREFIX@|FIM-автодополнение llama.cpp на 127.0.0.1:8012 для VS Code и Zed. Юнит ставится вне mytasks."
 )
 
 # Зависимости: «команда|пакеты|условие|описание».
@@ -145,7 +148,7 @@ DEPS=(
     "pandoc|pandoc;arch=pandoc-cli;alpine=pandoc-cli;gentoo=app-text/pandoc-bin|opt|doc2fb2.sh, mht_to_fb2.py: преобразование документов"
     "sshpass|sshpass|opt|cloud_backup.sh: вход на сервер по паролю"
     "wg-quick|wireguard-tools|opt|cloud_backup.sh: туннель WireGuard"
-    "py:PyQt6|python3-pyqt6;arch=python-pyqt6;suse=python3-PyQt6;alpine=py3-pyqt6;void=python3-PyQt6;gentoo=dev-python/pyqt6|path:/opt/llama.cpp|llamactl_tray.py: значок в трее (PyQt6 в системном Python)"
+    "py:PyQt6|python3-pyqt6;arch=python-pyqt6;suse=python3-PyQt6;alpine=py3-pyqt6;void=python3-PyQt6;gentoo=dev-python/pyqt6|path:@LLAMA_PREFIX@|llamactl_tray.py: значок в трее (PyQt6 в системном Python)"
     "shellcheck|shellcheck;redhat=ShellCheck;suse=ShellCheck;gentoo=dev-util/shellcheck-bin|opt|Разработка: проверка shell-скриптов"
     "bats|bats|opt|Разработка: тесты tests/*.bats"
 )
@@ -688,7 +691,7 @@ has_systemd() {
 # Проверка условия «path:…,cmd:…,fs:ТОЧКА=ТИП,family:…» (opt пропускается)
 check_when() {
     local when="$1"
-    local token mnt want fstype
+    local token mnt want fstype path_value
     local tokens=()
 
     [[ -z "${when}" ]] && return 0
@@ -696,7 +699,11 @@ check_when() {
     for token in "${tokens[@]}"; do
         case "${token}" in
             opt|"") ;;
-            path:*) [[ -e "${token#path:}" ]] || return 1 ;;
+            path:*)
+                path_value="${token#path:}"
+                path_value="${path_value//@LLAMA_PREFIX@/${LLAMA_PREFIX}}"
+                [[ -e "${path_value}" ]] || return 1
+                ;;
             cmd:*) command -v "${token#cmd:}" >/dev/null 2>&1 || return 1 ;;
             family:*) [[ "${OS_FAMILY}" == "${token#family:}" ]] || return 1 ;;
             fs:*)
@@ -1906,6 +1913,12 @@ reload_conf() {
 
 apply_defaults() {
     MYTASKS_DIR="${MYTASKS_DIR:-${SCRIPT_DIR}}"
+    if [[ -z "${LLAMA_PREFIX}" && -r "${CONF_DIR}/llamactl.conf" ]]; then
+        LLAMA_PREFIX="$(conf_value "${CONF_DIR}/llamactl.conf" LLAMA_PREFIX)" || LLAMA_PREFIX=""
+        # Значение со ссылками на переменные (${HOME} и т.п.) здесь не раскрывается
+        [[ "${LLAMA_PREFIX}" == *'$'* ]] && LLAMA_PREFIX=""
+    fi
+    LLAMA_PREFIX="${LLAMA_PREFIX:-/opt/llama.cpp}"
     if [[ -z "${SYSTEM_PYTHON}" ]]; then
         SYSTEM_PYTHON="/usr/bin/python3"
         [[ -x "${SYSTEM_PYTHON}" ]] || SYSTEM_PYTHON="$(command -v python3 || printf '%s' "${SYSTEM_PYTHON}")"

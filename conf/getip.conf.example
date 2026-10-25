@@ -14,3 +14,6 @@ IP_FILE="@MYTASKS_DIR@/state/ip.txt"
 
 # Файл истории IP-адресов
 IP_HISTORY_FILE="@MYTASKS_DIR@/state/ip_history.txt"
+
+# Тайм-аут запроса к сервису внешнего IP, с
+IP_TIMEOUT_SECS=10

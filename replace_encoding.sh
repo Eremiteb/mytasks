@@ -49,7 +49,7 @@ cleanup_logs() {
     mapfile -t old_logs < <(
         { find "${LOG_DIR}" -maxdepth 1 -type f -name "${SCRIPT_BASE}-*.jsonl" -printf '%T@|%p\n' 2>/dev/null \
             | sort -nr \
-            | awk -F'|' 'NR > 10 { print $2 }'; } || true
+            | awk -F'|' -v keep="${KEEP_LOGS:-10}" 'NR > keep { print $2 }'; } || true
     )
     if ((${#old_logs[@]} > 0)); then
         rm -f -- "${old_logs[@]}"

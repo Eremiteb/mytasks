@@ -30,6 +30,30 @@ teardown() {
   rm -rf "$TMP_DIR"
 }
 
+@test "IP_TIMEOUT_SECS из конфигурации передаётся curl как --max-time" {
+  printf 'IP_TIMEOUT_SECS=7\n' >> "$WORK_DIR/conf/getip.conf"
+  cat > "$STUB_DIR/curl" <<EOT
+#!/usr/bin/env bash
+printf '%s\n' "\$*" > "$TMP_DIR/curl_args.txt"
+printf '203.0.113.10\n'
+EOT
+
+  run env PATH="$STUB_DIR:$PATH" bash -c "cd \"$WORK_DIR\" && ./getip.sh"
+
+  [ "$status" -eq 0 ]
+  grep -q -- '--max-time 7 ' "$TMP_DIR/curl_args.txt"
+}
+
+@test "без IP_FILE в конфигурации файлы кладутся в state/ рядом со скриптом" {
+  printf 'IP_SERVICE_URL="https://example.invalid/ip"\n' > "$WORK_DIR/conf/getip.conf"
+
+  run env PATH="$STUB_DIR:$PATH" bash -c "cd \"$WORK_DIR\" && ./getip.sh"
+
+  [ "$status" -eq 0 ]
+  [ "$(cat "$WORK_DIR/state/ip.txt")" = "203.0.113.10" ]
+  [ -f "$WORK_DIR/state/ip_history.txt" ]
+}
+
 @test "writes current IP and appends one history entry for same IP" {
   run env PATH="$STUB_DIR:$PATH" bash -c "cd \"$WORK_DIR\" && ./getip.sh"
   [ "$status" -eq 0 ]

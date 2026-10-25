@@ -54,7 +54,7 @@ log_json() {
 cleanup_logs() {
   find "${LOG_DIR}" -maxdepth 1 -type f -name "${SCRIPT_BASE}-*.jsonl" -printf '%T@|%p\n' 2>/dev/null \
     | sort -nr \
-    | awk -F'|' 'NR > 10 { print $2 }' \
+    | awk -F'|' -v keep="${KEEP_LOGS:-10}" 'NR > keep { print $2 }' \
     | while IFS= read -r old_log; do
         [ -n "${old_log}" ] && rm -f -- "${old_log}"
       done

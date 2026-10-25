@@ -80,6 +80,10 @@ Shell-скрипты с JSONL-логированием читают его, ес
 (`script`, `event`, `msg`, `detail`, `rc` и т.д.), чтобы не ломать
 существующие разборщики.
 
+В том же файле задаётся `KEEP_LOGS` — сколько последних JSONL-логов каждого
+скрипта хранить (по умолчанию 10); скрипт может переопределить значение в своём
+`conf/<скрипт>.conf`.
+
 ---
 
 ## Скрипты
@@ -142,6 +146,8 @@ Shell-скрипты с JSONL-логированием читают его, ес
 | `SUDO_PASSWORD`   | *(пусто)*               | Пароль для неинтерактивного `sudo wg-quick`; при пустом значении `wg-quick` вызывается напрямую |
 | `REMOTE_SSH_PORT` | `22`                    | Порт SSH                                       |
 | `REMOTE_PATH`     | `/opt/esimych-cloud`    | Путь к папке на удалённой системе              |
+| `NEXTCLOUD_CONTAINER` | `esimych-cloud-app` | Имя контейнера Nextcloud на удалённой системе (команды `occ`: очистка корзины и версий) |
+| `NEXTCLOUD_EXEC_USER` | `www-data`          | Пользователь, от которого выполняется `occ` в контейнере |
 | `BACKUP_DIR`      | *(обязательно)*         | Локальная папка для резервных копий            |
 | `WG_KEEP_UP`      | `0`                     | Оставить WireGuard активным после завершения   |
 | `BACKUP_KEEP_COUNT` | `5`                   | Сколько последних резервных копий и логов хранить |
@@ -228,6 +234,8 @@ QNAP-версия `cloud_backup.sh` — то же резервное копир�
 | Параметр          | По умолчанию               | Описание                                       |
 |-------------------|-----------------------------|------------------------------------------------|
 | `WG_INTERFACE`    | *(обязательно)*             | Имя WireGuard-интерфейса (напр. `wg0-qnap`)    |
+| `WG_CONF_FILE`    | `/opt/etc/wireguard/<WG_INTERFACE>.conf` | Путь к конфигу WireGuard на QNAP |
+| `WG_SOCK`         | `/var/run/wireguard/<WG_INTERFACE>.sock` | UAPI-сокет `wireguard-go` (его же подменяют тесты) |
 | `WG_ENDPOINT`     | *(пусто)*                   | Необязательное переопределение публичного endpoint WireGuard в формате `IPv4:port`; если пусто, берётся `Endpoint` из `/opt/etc/wireguard/<WG_INTERFACE>.conf` |
 | `ENTWARE_DATA_DIR`| `/share/Public/entware`     | Постоянный каталог Entware, который скрипт при необходимости подключает в `/opt` |
 | `REMOTE_HOST`     | *(обязательно)*             | Внутренний VPN-адрес удалённого сервера; при смене публичного IP не меняется |
@@ -342,6 +350,16 @@ crontab /etc/config/crontab
 - Дублирует сообщение в консоль
 - Запускается при входе в графический сеанс user-юнитом `systemd/user/check-store-mount.service` (устанавливает `check_mytasks.sh`)
 
+**Конфигурация** (необязательно, `conf/check-store-mount.conf`, пример — `conf/check-store-mount.conf.example`; значения можно передать и окружением):
+
+| Параметр | По умолчанию | Назначение |
+|---|---|---|
+| `MOUNT_WAIT_SECS` | `30` | Максимальное ожидание монтирования точки, с (должно совпадать с `x-systemd.mount-timeout` в `/etc/fstab`) |
+| `MOUNT_PROBE_TIMEOUT_SECS` | `5` | Тайм-аут обращения к каталогу (запускает автомонтирование), с |
+| `MOUNT_POLL_SECS` | `3` | Пауза между проверками точки, с |
+| `MOUNT_IGNORE_REGEX` | `^/(proc\|sys\|dev\|run\|tmp\|boot)` | Точки из `/etc/fstab`, которые не проверяются (расширенное регулярное выражение) |
+| `KEEP_LOGS`, `APP_NAME`, `ICON_NAME`, `URGENCY` | `10`, `MountCheck`, `drive-harddisk`, `critical` | Хранение логов и параметры уведомления |
+
 **Использование:**
 ```sh
 ./check-store-mount.sh
@@ -436,7 +454,7 @@ journalctl --user -u check-backups.service -n 20
 | `music_downloader.sh`, `sources.sh`, `btrfs_monitor.sh` | cron | `0 21 * * *`, `0 23 * * *`, `0 */6 * * *` (Btrfs — только если `/` на Btrfs) |
 | `conf/check_backups.conf`, `conf/sources.conf`, `music_downloader/music_downloader.json` | конфиг | создаются мастером |
 | `music_downloader/venv` | venv | `music_downloader/setup_venv.sh` |
-| `llamactl`, `llamactl-tray`, `llamactl-tray.desktop`, `llama-server.service`, `llama-fim.service` | ссылки, автозапуск, сервисы | только если есть `/opt/llama.cpp` |
+| `llamactl`, `llamactl-tray`, `llamactl-tray.desktop`, `llama-server.service`, `llama-fim.service` | ссылки, автозапуск, сервисы | только если есть каталог `LLAMA_PREFIX` (из `conf/check_mytasks.conf`, иначе из `conf/llamactl.conf`, иначе `/opt/llama.cpp`) |
 
 Шаблоны юнитов и автозапуска лежат в `systemd/` (`systemd/*.service|timer` — системные, `systemd/user/` — пользовательские, `systemd/autostart/` — XDG autostart) и содержат плейсхолдер `@MYTASKS_DIR@`; установленный файл, отличающийся от отрисованного шаблона (старая версия или другой каталог), отмечается «отличается» и предлагается к обновлению. Строки crontab с mytasks-скриптом из другого каталога переписываются на текущий. Таймеры включаются с `--now`, сервисы входа в сеанс — только `enable`.
 
@@ -444,7 +462,7 @@ journalctl --user -u check-backups.service -n 20
 
 **Повышение прав** (обновление системы, системные юниты, пакеты): `SUDO_CMD="auto"` — `sudo -A` при заданном `SUDO_ASKPASS`, иначе `pkexec` в графическом сеансе, иначе `sudo` в терминале. Скрипт перезапускает сам себя с внутренней командой `__root-update`/`__root-install-units`/`__root-enable`/`__root-pkg` — один запрос пароля на действие; эти вызовы логов не пишут.
 
-**Конфигурация:** `conf/check_mytasks.conf` (пример `conf/check_mytasks.conf.example`, создаётся мастером): `MYTASKS_DIR`, `OS_FAMILY` (пусто — автоопределение), `SUDO_CMD`, `UI` (`auto`/`kdialog`/`tty`/`none`), каталоги `SYSTEM_UNIT_DIR`, `USER_UNIT_DIR`, `AUTOSTART_DIR`, `BIN_DIR`, `KEEP_LOGS`, параметры уведомления; при необходимости — свои массивы `JOBS` и `DEPS` (формат описан в начале скрипта). Если конфига нет, скрипт предупреждает и использует каталог запуска.
+**Конфигурация:** `conf/check_mytasks.conf` (пример `conf/check_mytasks.conf.example`, создаётся мастером): `MYTASKS_DIR`, `LLAMA_PREFIX`, `OS_FAMILY` (пусто — автоопределение), `SUDO_CMD`, `UI` (`auto`/`kdialog`/`tty`/`none`), каталоги `SYSTEM_UNIT_DIR`, `USER_UNIT_DIR`, `AUTOSTART_DIR`, `BIN_DIR`, `KEEP_LOGS`, параметры уведомления; при необходимости — свои массивы `JOBS` и `DEPS` (формат описан в начале скрипта). Если конфига нет, скрипт предупреждает и использует каталог запуска.
 
 **Коды возврата:** `0` — всё на месте, `1` — есть незапущенные или не прописанные задания, конфиги или обязательные зависимости, `2` — ошибка аргументов.
 
@@ -667,8 +685,9 @@ journalctl -u system-monitor.service -n 20
 | Параметр          | По умолчанию                                              |
 |-------------------|-----------------------------------------------------------|
 | `IP_SERVICE_URL`  | `https://icanhazip.com`                                   |
-| `IP_FILE`         | `/var/downloads/clouddata/nextcloud/work/ip.txt`          |
-| `IP_HISTORY_FILE` | `/var/downloads/clouddata/nextcloud/work/ip_history.txt`  |
+| `IP_FILE`         | `state/ip.txt` рядом со скриптом                          |
+| `IP_HISTORY_FILE` | `state/ip_history.txt` рядом со скриптом                  |
+| `IP_TIMEOUT_SECS` | `10` (тайм-аут запроса к сервису, с)                      |
 
 Примеры совместимых сервисов: `https://api.ipify.org`, `https://ifconfig.me/ip`, `https://checkip.amazonaws.com`
 
@@ -728,7 +747,7 @@ Root-шаги (systemctl, установка пресета, замена сбо
 
 **Режим dry-run:** `-n, --dry-run` (до имени команды; `--dry-run` — в любом месте) — статус, проверки, `diff` пресета и сведения с Hugging Face/`git ls-remote` получаются как обычно, но ничего не загружается/выгружается, не скачивается, не правится и не перезапускается: печатаются строки `[dry-run] будет: …`, в лог пишутся события `dry_<event>`.
 
-**`llamactl_tray.py`** — иконка в трее KDE (Python с PyQt6, шебанг `/usr/bin/env python3`; если у найденного `python3` нет PyQt6, например активен venv, трей перезапускается системным `/usr/bin/python3`), обёртка над `llamactl.sh`: статус каждые 5 с получает модулем `llamactl_status.py` в фоновом потоке, не запуская `llamactl.sh`; цвет — серый (остановлен), синий (ожидает), жёлтый (загрузка), зелёный (модель загружена), оранжевый (проблемы: FIM не работает, сторонние `llama-server`); подсказка — модель, VRAM, свободная RAM. Меню: модели (загрузить/выгрузить), освободить VRAM, сервисы, логи, проверка, пресеты (редактор, fit, замер), добавление модели с Hugging Face, обновление llama.cpp, консольное меню. Быстрые действия — в фоне с уведомлением, долгие и интерактивные — в терминале (`konsole --hold -e`, переопределяется `--terminal` или `LLAMACTL_TERMINAL`). Щелчок по иконке открывает веб-чат роутера. Автозапуск — `~/.config/autostart/llamactl-tray.desktop` (шаблон `systemd/autostart/llamactl-tray.desktop`; его и ссылки `~/.local/bin/llamactl`, `~/.local/bin/llamactl-tray` создаёт `check_mytasks.sh`, если есть `/opt/llama.cpp`), пункт меню — `~/.local/share/applications/llamactl-tray.desktop`. `--dry-run` передаёт режим всем действиям; `--print-menu [--status-file F]` печатает состояние и меню без графики.
+**`llamactl_tray.py`** — иконка в трее KDE (Python с PyQt6, шебанг `/usr/bin/env python3`; если у найденного `python3` нет PyQt6, например активен venv, трей перезапускается системным `/usr/bin/python3`), обёртка над `llamactl.sh`: статус каждые 5 с получает модулем `llamactl_status.py` в фоновом потоке, не запуская `llamactl.sh`; цвет — серый (остановлен), синий (ожидает), жёлтый (загрузка), зелёный (модель загружена), оранжевый (проблемы: FIM не работает, сторонние `llama-server`); подсказка — модель, VRAM, свободная RAM. Меню: модели (загрузить/выгрузить), освободить VRAM, сервисы, логи, проверка, пресеты (редактор, fit, замер), добавление модели с Hugging Face, обновление llama.cpp, консольное меню. Быстрые действия — в фоне с уведомлением, долгие и интерактивные — в терминале (`konsole --hold -e`, переопределяется `--terminal` или `LLAMACTL_TERMINAL`). Щелчок по иконке открывает веб-чат роутера. Автозапуск — `~/.config/autostart/llamactl-tray.desktop` (шаблон `systemd/autostart/llamactl-tray.desktop`; его и ссылки `~/.local/bin/llamactl`, `~/.local/bin/llamactl-tray` создаёт `check_mytasks.sh`, если есть каталог установки llama.cpp), пункт меню — `~/.local/share/applications/llamactl-tray.desktop`. `--dry-run` передаёт режим всем действиям; `--print-menu [--status-file F]` печатает состояние и меню без графики.
 
 **Конфигурация:** `conf/llamactl.conf` (пример — `conf/llamactl.conf.example`): адреса роутера и FIM, юниты и пользователь сервисов, пути пресетов, моделей, установки и исходников, архитектура CUDA, число потоков сборки, модель для замера, тайм-ауты, команда `sudo`.
 

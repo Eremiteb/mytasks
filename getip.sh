@@ -53,7 +53,7 @@ log_json() {
 cleanup_logs() {
     find "${LOG_DIR}" -maxdepth 1 -type f -name "${SCRIPT_BASE}-*.jsonl" -printf '%T@|%p\n' 2>/dev/null \
         | sort -nr \
-        | awk -F'|' 'NR > 10 { print $2 }' \
+        | awk -F'|' -v keep="${KEEP_LOGS:-10}" 'NR > keep { print $2 }' \
         | while IFS= read -r old_log; do
                 [ -n "${old_log}" ] && rm -f -- "${old_log}"
             done
@@ -82,8 +82,9 @@ done
 # DEFAULT CONFIG
 ###############################################################################
 IP_SERVICE_URL="https://icanhazip.com"
-IP_FILE="/var/downloads/clouddata/nextcloud/work/ip.txt"
-IP_HISTORY_FILE="/var/downloads/clouddata/nextcloud/work/ip_history.txt"
+IP_FILE="${SCRIPT_DIR}/state/ip.txt"
+IP_HISTORY_FILE="${SCRIPT_DIR}/state/ip_history.txt"
+IP_TIMEOUT_SECS=10
 
 ###############################################################################
 # LOAD CONFIG
@@ -117,7 +118,7 @@ fi
 ###############################################################################
 log_json "INFO" "start" "Запуск проверки внешнего IP" "service=${IP_SERVICE_URL}; ip_file=${IP_FILE}; history=${IP_HISTORY_FILE}" 0
 
-IP=$(curl -fsS --max-time 10 "${IP_SERVICE_URL}" 2>/dev/null | tr -d '[:space:]' || true)
+IP=$(curl -fsS --max-time "${IP_TIMEOUT_SECS}" "${IP_SERVICE_URL}" 2>/dev/null | tr -d '[:space:]' || true)
 
 if [ -z "${IP:-}" ]; then
     err_msg="Не удалось получить IP от ${IP_SERVICE_URL}"

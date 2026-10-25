@@ -11,3 +11,7 @@ LOG_FIELD_MESSAGE="message"
 LOG_FIELD_EVENT_ACTION="event.action"
 LOG_FIELD_SERVICE_NAME="service.name"
 LOG_FIELD_SCHEMA_VERSION="schema.version"
+
+# Сколько последних JSONL-логов каждого скрипта хранить (по умолчанию 10). Значение общее для всех
+# скриптов; скрипт может переопределить его в своём conf/<скрипт>.conf (KEEP_LOGS).
+KEEP_LOGS="10"

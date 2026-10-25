@@ -452,6 +452,28 @@ EOF
   [ "$status" -eq 0 ]
 }
 
+@test "NEXTCLOUD_CONTAINER и NEXTCLOUD_EXEC_USER из окружения попадают в команды occ" {
+  ssh_cmd_file="$TMP_DIR/ssh_cmd.txt"
+  cat > "$STUB_DIR/ssh" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$ssh_cmd_file"
+case "\$*" in
+  *"occ config:system:get datadirectory"*) echo "/var/www/html/data"; exit 0 ;;
+  *"occ user:list"*) printf '  - clouduser: Cloud User\n'; exit 0 ;;
+  *"mkdir -p"*) exit 0 ;;
+  *) printf '\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00'; exit 0 ;;
+esac
+EOF
+  chmod +x "$STUB_DIR/ssh"
+
+  run env PATH="$STUB_DIR:$PATH" NEXTCLOUD_CONTAINER=my-nc NEXTCLOUD_EXEC_USER=ncuser bash "$TMP_DIR/cloud_backup.sh"
+
+  [ "$status" -eq 0 ]
+  grep -qF "docker exec -u ncuser my-nc php occ trashbin:cleanup" "$ssh_cmd_file"
+  run grep -c "esimych-cloud-app" "$ssh_cmd_file"
+  [ "$output" = "0" ]
+}
+
 @test "если не удалось получить datadirectory, логирует occ_trashbin_repair_failed" {
   cat > "$STUB_DIR/ssh" <<'EOF'
 #!/usr/bin/env bash

@@ -9,6 +9,11 @@
 # Имя WireGuard-интерфейса на QNAP (файл конфига: /opt/etc/wireguard/<имя>.conf)
 WG_INTERFACE="wg0-qnap"
 
+# Необязательно: пути конфига WireGuard и UAPI-сокета wireguard-go, если отличаются от стандартных
+# (по умолчанию /opt/etc/wireguard/<WG_INTERFACE>.conf и /var/run/wireguard/<WG_INTERFACE>.sock)
+# WG_CONF_FILE="/opt/etc/wireguard/wg0-qnap.conf"
+# WG_SOCK="/var/run/wireguard/wg0-qnap.sock"
+
 # Необязательное переопределение внешнего endpoint сервера WireGuard.
 # Если оставить пустым, Endpoint читается из /opt/etc/wireguard/<WG_INTERFACE>.conf.
 # Укажите актуальный публичный IPv4-адрес и порт, например:

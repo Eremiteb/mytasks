@@ -27,6 +27,10 @@ SUDO_CMD="auto"
 # чистым pacman -Syu — no
 GARUDA_UPDATE="auto"
 
+# Каталог установки llama.cpp: по нему определяется, нужны ли на этой машине llamactl, значок в
+# трее и сервисы llama.cpp. Пусто — берётся LLAMA_PREFIX из conf/llamactl.conf, иначе /opt/llama.cpp
+LLAMA_PREFIX=""
+
 # Окна вопросов: auto — zenity (кнопки «Отмена» и «Стоп» во всех окнах), без
 # него kdialog («Стоп» в вопросах и пунктом списка), без графики — терминал;
 # kdialog — всегда kdialog; tty — только терминал; none — без вопросов.

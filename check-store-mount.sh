@@ -12,7 +12,8 @@ LOG_DIR="${MYTASKS_LOG_DIR:-${SCRIPT_DIR}/logs}"
 TIMESTAMP="$(date '+%Y-%m-%d-%H-%M-%S')"
 LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}-${TIMESTAMP}.jsonl"
 LOG_TEMPLATE_FILE="${SCRIPT_DIR}/conf/log_template.conf"
-mkdir -p "${LOG_DIR}"
+CONFIG_FILE="${SCRIPT_DIR}/conf/${SCRIPT_BASE}.conf"
+mkdir -p "${SCRIPT_DIR}/conf" "${LOG_DIR}"
 
 if [[ -r "${LOG_TEMPLATE_FILE}" ]]; then
     # shellcheck source=/dev/null
@@ -21,9 +22,22 @@ fi
 LOG_SCHEMA_VERSION="${LOG_SCHEMA_VERSION:-1.0}"
 LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
 
-APP_NAME="MountCheck"
-ICON_NAME="drive-harddisk"
-URGENCY="critical"
+# Значения по умолчанию; переопределяются окружением или conf/check-store-mount.conf
+APP_NAME="${APP_NAME:-MountCheck}"
+ICON_NAME="${ICON_NAME:-drive-harddisk}"
+URGENCY="${URGENCY:-critical}"
+# Максимальное ожидание монтирования (должно совпадать с x-systemd.mount-timeout в /etc/fstab)
+MOUNT_WAIT_SECS="${MOUNT_WAIT_SECS:-30}"
+# Тайм-аут обращения к каталогу (обращение запускает автомонтирование) и пауза между проверками
+MOUNT_PROBE_TIMEOUT_SECS="${MOUNT_PROBE_TIMEOUT_SECS:-5}"
+MOUNT_POLL_SECS="${MOUNT_POLL_SECS:-3}"
+# Точки монтирования из /etc/fstab, которые не проверяются (расширенное регулярное выражение)
+MOUNT_IGNORE_REGEX="${MOUNT_IGNORE_REGEX:-^/(proc|sys|dev|run|tmp|boot)}"
+
+if [[ -r "${CONFIG_FILE}" ]]; then
+    # shellcheck source=/dev/null
+    source "${CONFIG_FILE}"
+fi
 
 ###############################################################################
 # HELPERS
@@ -55,7 +69,7 @@ cleanup_logs() {
     old_logs_file="$(mktemp)"
     if find "${LOG_DIR}" -maxdepth 1 -type f -name "${SCRIPT_BASE}-*.jsonl" -printf '%T@|%p\n' 2>/dev/null \
         | sort -nr \
-        | awk -F'|' 'NR > 10 { print $2 }' > "${old_logs_file}"; then
+        | awk -F'|' -v keep="${KEEP_LOGS:-10}" 'NR > keep { print $2 }' > "${old_logs_file}"; then
         while IFS= read -r old_log; do
             [[ -n "${old_log}" ]] && old_logs+=("${old_log}")
         done < "${old_logs_file}"
@@ -70,10 +84,6 @@ cleanup_logs() {
 ###############################################################################
 # MAIN
 ###############################################################################
-# Максимальное время ожидания монтирования (должно совпадать с
-# x-systemd.mount-timeout в /etc/fstab)
-MOUNT_WAIT_SECS=30
-
 DRY_RUN=0
 for arg in "$@"; do
     case "${arg}" in
@@ -95,7 +105,7 @@ log_json "INFO" "start" "Проверка точек монтирования" "
 
 while read -r device mount_point type _options _dump _pass; do
     [[ "${device}" =~ ^(#|$) ]] && continue
-    [[ "${mount_point}" =~ ^/(proc|sys|dev|run|tmp|boot) ]] && continue
+    [[ "${mount_point}" =~ ${MOUNT_IGNORE_REGEX} ]] && continue
     [[ "${type}" == "swap" || "${type}" == "none" ]] && continue
 
     MP_CLEAN=$(printf '%b' "${mount_point//\\/\\\\}")
@@ -104,11 +114,11 @@ while read -r device mount_point type _options _dump _pass; do
     # Повторяем до MOUNT_WAIT_SECS секунд — сеть может стать доступной чуть позже.
     ELAPSED=0
     while true; do
-        timeout 5 ls -- "${MP_CLEAN}" >/dev/null 2>&1 || true
+        timeout "${MOUNT_PROBE_TIMEOUT_SECS}" ls -- "${MP_CLEAN}" >/dev/null 2>&1 || true
         mountpoint -q -- "${MP_CLEAN}" && break
         [[ ${ELAPSED} -ge ${MOUNT_WAIT_SECS} ]] && break
-        sleep 3
-        ELAPSED=$(( ELAPSED + 3 ))
+        sleep "${MOUNT_POLL_SECS}"
+        ELAPSED=$(( ELAPSED + MOUNT_POLL_SECS ))
     done
 
     if ! mountpoint -q -- "${MP_CLEAN}"; then

@@ -163,6 +163,8 @@ done
 SUDO_PASSWORD="${SUDO_PASSWORD:-}"
 
 REMOTE_PATH="${REMOTE_PATH:-/opt/esimych-cloud}"
+NEXTCLOUD_CONTAINER="${NEXTCLOUD_CONTAINER:-esimych-cloud-app}"
+NEXTCLOUD_EXEC_USER="${NEXTCLOUD_EXEC_USER:-www-data}"
 REMOTE_SSH_PORT="${REMOTE_SSH_PORT:-22}"
 WG_KEEP_UP="${WG_KEEP_UP:-0}"
 BACKUP_KEEP_COUNT="${BACKUP_KEEP_COUNT:-5}"
@@ -409,7 +411,7 @@ fi
 log_json "INFO" "occ_cleanup_start" "Очистка корзин пользователей (occ trashbin:cleanup)..."
 export SSHPASS="${REMOTE_PASSWORD}"
 occ_trash_err=$(sshpass -e ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" \
-  "docker exec -u www-data esimych-cloud-app php occ trashbin:cleanup --all-users" 2>&1)
+  "docker exec -u ${NEXTCLOUD_EXEC_USER} ${NEXTCLOUD_CONTAINER} php occ trashbin:cleanup --all-users" 2>&1)
 occ_trash_rc=$?
 unset SSHPASS
 if [[ "${occ_trash_rc}" -ne 0 ]]; then
@@ -429,9 +431,9 @@ occ_trash_repair_detail=""
 occ_trash_repair_rc=0
 export SSHPASS="${REMOTE_PASSWORD}"
 remote_datadir=$(sshpass -e ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" \
-  "docker exec -u www-data esimych-cloud-app php occ config:system:get datadirectory" 2>/dev/null | tr -d '\r\n')
+  "docker exec -u ${NEXTCLOUD_EXEC_USER} ${NEXTCLOUD_CONTAINER} php occ config:system:get datadirectory" 2>/dev/null | tr -d '\r\n')
 remote_users=$(sshpass -e ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" \
-  "docker exec -u www-data esimych-cloud-app php occ user:list" 2>/dev/null)
+  "docker exec -u ${NEXTCLOUD_EXEC_USER} ${NEXTCLOUD_CONTAINER} php occ user:list" 2>/dev/null)
 unset SSHPASS
 log_json "INFO" "occ_user_list" "Получен список пользователей Nextcloud (occ user:list)" "${remote_users:-<пусто>}"
 if [[ -z "${remote_datadir}" || -z "${remote_users}" ]]; then
@@ -442,7 +444,7 @@ else
     [[ -z "${_uid}" ]] && continue
     export SSHPASS="${REMOTE_PASSWORD}"
     _repair_err=$(sshpass -e ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" \
-      "docker exec -u www-data esimych-cloud-app mkdir -p '${remote_datadir}/${_uid}/files_trashbin'" 2>&1)
+      "docker exec -u ${NEXTCLOUD_EXEC_USER} ${NEXTCLOUD_CONTAINER} mkdir -p '${remote_datadir}/${_uid}/files_trashbin'" 2>&1)
     _repair_rc=$?
     unset SSHPASS
     if [[ "${_repair_rc}" -ne 0 ]]; then
@@ -455,7 +457,7 @@ else
     # результат логируется отдельно для каждого пользователя.
     export SSHPASS="${REMOTE_PASSWORD}"
     sshpass -e ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" \
-      "docker exec -u www-data esimych-cloud-app test -d '${remote_datadir}/${_uid}/files_trashbin'" >/dev/null 2>&1
+      "docker exec -u ${NEXTCLOUD_EXEC_USER} ${NEXTCLOUD_CONTAINER} test -d '${remote_datadir}/${_uid}/files_trashbin'" >/dev/null 2>&1
     _verify_rc=$?
     unset SSHPASS
     if [[ "${_verify_rc}" -eq 0 ]]; then
@@ -476,7 +478,7 @@ fi
 log_json "INFO" "occ_versions_start" "Очистка версий файлов (occ versions:cleanup)..."
 export SSHPASS="${REMOTE_PASSWORD}"
 occ_ver_err=$(sshpass -e ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" \
-  "docker exec -u www-data esimych-cloud-app php occ versions:cleanup" 2>&1)
+  "docker exec -u ${NEXTCLOUD_EXEC_USER} ${NEXTCLOUD_CONTAINER} php occ versions:cleanup" 2>&1)
 occ_ver_rc=$?
 unset SSHPASS
 if [[ "${occ_ver_rc}" -ne 0 ]]; then

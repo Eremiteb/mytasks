@@ -454,11 +454,11 @@ fi
 # и без полного tunnel'я через 0.0.0.0/0) — значение AllowedIPs из конфига на
 # это не влияет, используется намеренно только REMOTE_HOST.
 ###############################################################################
-WG_CONF_FILE="/opt/etc/wireguard/${WG_INTERFACE:-wg0-qnap}.conf"
-# WG_SOCK_OVERRIDE существует только для тестов (bats не может создавать
-# сокет-файлы под /var/run без root) — в проде переменная не задаётся, путь
-# всегда фактический.
-WG_SOCK="${WG_SOCK_OVERRIDE:-/var/run/wireguard/${WG_INTERFACE:-wg0-qnap}.sock}"
+# Пути конфига WireGuard и UAPI-сокета wireguard-go; по умолчанию выводятся из WG_INTERFACE,
+# переопределяются в conf/cloud_backup_qnap.conf (WG_SOCK используют и тесты: bats не может
+# создавать сокет-файлы под /var/run без root).
+WG_CONF_FILE="${WG_CONF_FILE:-/opt/etc/wireguard/${WG_INTERFACE:-wg0-qnap}.conf}"
+WG_SOCK="${WG_SOCK:-/var/run/wireguard/${WG_INTERFACE:-wg0-qnap}.sock}"
 WG_BROUGHT_UP=0
 SERVICES_STOPPED=0
 

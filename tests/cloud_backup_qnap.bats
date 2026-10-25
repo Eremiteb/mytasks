@@ -4,7 +4,7 @@
 # потока бэкапа через nc/ncat в обход SSH-шифрования). Всё, что происходит
 # ДО этого блока (подъём WireGuard, occ cleanup, optimize БД), обходится
 # стабами по минимуму, необходимому чтобы дойти до передачи:
-#   - WG_SOCK_OVERRIDE указывает wg_is_up() на заранее созданный AF_UNIX
+#   - WG_SOCK указывает wg_is_up() на заранее созданный AF_UNIX
 #     сокет в $TMP_DIR (реальный /var/run/wireguard недоступен без root),
 #     а стаб ip печатает "state UP" — весь путь wg_up_userspace (wireguard-go,
 #     UAPI-обмен через ncat -U) целиком пропускается.
@@ -89,7 +89,7 @@ teardown() {
 GZIP_FIXTURE='\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00'
 
 run_script() {
-  run env PATH="$STUB_DIR:$PATH" WG_SOCK_OVERRIDE="$WG_SOCK_PATH" \
+  run env PATH="$STUB_DIR:$PATH" WG_SOCK="$WG_SOCK_PATH" \
     bash "$TMP_DIR/cloud_backup_qnap.sh"
 }
 
@@ -443,7 +443,7 @@ EOF
   printf '#!/usr/bin/env bash\necho gzip\n' > "$STUB_DIR/ssh"
   chmod +x "$STUB_DIR/ssh"
 
-  run env PATH="$STUB_DIR:$PATH" WG_SOCK_OVERRIDE="$WG_SOCK_PATH" \
+  run env PATH="$STUB_DIR:$PATH" WG_SOCK="$WG_SOCK_PATH" \
     bash "$TMP_DIR/cloud_backup_qnap.sh" --dry-run
 
   [ "$status" -eq 0 ]

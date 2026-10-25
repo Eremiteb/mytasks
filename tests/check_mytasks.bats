@@ -590,6 +590,28 @@ health_log() {  # $1 — время последней записи (date -d), $
   [[ "$output" == *"не требуется"* ]]
 }
 
+@test "LLAMA_PREFIX из конфига: условие path:@LLAMA_PREFIX@ включает задания llama.cpp" {
+  write_conf '"link|demo-link|demo.sh|path:@LLAMA_PREFIX@|Демо-ссылка"' ""
+  printf 'LLAMA_PREFIX="%s"\n' "$TMP_DIR/llama" >> "$WORK/conf/check_mytasks.conf"
+  run "$WORK/check_mytasks.sh" --status
+  [[ "$output" == *"не требуется"* ]]
+  [ "$status" -eq 0 ]
+
+  mkdir -p "$TMP_DIR/llama"
+  run "$WORK/check_mytasks.sh" --status
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"demo-link"*"ВНИМАНИЕ"* ]]
+}
+
+@test "LLAMA_PREFIX берётся из conf/llamactl.conf, если не задан в check_mytasks.conf" {
+  write_conf '"link|demo-link|demo.sh|path:@LLAMA_PREFIX@|Демо-ссылка"' ""
+  mkdir -p "$TMP_DIR/llama-from-llamactl"
+  printf 'LLAMA_PREFIX="%s"\n' "$TMP_DIR/llama-from-llamactl" > "$WORK/conf/llamactl.conf"
+  run "$WORK/check_mytasks.sh" --status
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"demo-link"*"ВНИМАНИЕ"* ]]
+}
+
 @test "неизвестный аргумент — код 2" {
   write_conf "" ""
   run "$WORK/check_mytasks.sh" --bogus

@@ -1,0 +1,24 @@
+# Конфигурация check-store-mount.sh
+# Скопируйте этот файл в check-store-mount.conf и при необходимости измените значения.
+# Все значения необязательны: без файла используются указанные здесь.
+
+# Максимальное ожидание монтирования точки, с (должно совпадать с x-systemd.mount-timeout
+# в /etc/fstab: сеть и NFS могут подняться чуть позже)
+MOUNT_WAIT_SECS=30
+
+# Тайм-аут обращения к каталогу, с (обращение запускает автомонтирование x-systemd.automount)
+MOUNT_PROBE_TIMEOUT_SECS=5
+
+# Пауза между проверками точки, с
+MOUNT_POLL_SECS=3
+
+# Точки из /etc/fstab, которые не проверяются (расширенное регулярное выражение по пути точки)
+MOUNT_IGNORE_REGEX='^/(proc|sys|dev|run|tmp|boot)'
+
+# Сколько последних JSONL-логов хранить (по умолчанию — общее значение из conf/log_template.conf, 10)
+# KEEP_LOGS=10
+
+# Параметры desktop-уведомления (если есть notify-send)
+APP_NAME="MountCheck"
+ICON_NAME="drive-harddisk"
+URGENCY="critical"

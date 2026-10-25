@@ -19,6 +19,11 @@ REMOTE_SSH_PORT="22"
 # Путь к папке на удалённой системе (необязательно, по умолчанию /opt/esimych-cloud)
 REMOTE_PATH="/opt/esimych-cloud"
 
+# Имя контейнера Nextcloud на удалённой системе и пользователь, от которого выполняется occ
+# (очистка корзины и версий; необязательно, по умолчанию esimych-cloud-app и www-data)
+NEXTCLOUD_CONTAINER="esimych-cloud-app"
+NEXTCLOUD_EXEC_USER="www-data"
+
 # Локальная папка для резервных копий
 BACKUP_DIR="/mnt/store/backups"
 
