@@ -1,0 +1,5 @@
+# Устройства, на которые install_agent_skills.sh ставит навык model-routing.
+# local — это устройство; остальное — имена из ~/.ssh/config или адреса (вход по ключу).
+HOSTS=(local hoster 109.235.117.160 194.146.43.196)
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10)
+KEEP_LOGS=10

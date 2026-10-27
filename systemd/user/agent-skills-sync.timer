@@ -1,0 +1,11 @@
+[Unit]
+Description=Синхронизация навыка model-routing: через 6 минут после запуска системы и далее раз в сутки
+
+[Timer]
+OnBootSec=6min
+# При непрерывной работе системы — повтор раз в сутки после предыдущего запуска
+OnUnitActiveSec=1d
+Unit=agent-skills-sync.service
+
+[Install]
+WantedBy=timers.target

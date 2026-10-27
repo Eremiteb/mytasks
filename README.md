@@ -446,6 +446,7 @@ journalctl --user -u check-backups.service -n 20
 | `conf/check_mytasks.conf` | конфиг | каталог mytasks, семейство ОС, способ повышения прав |
 | `system-monitor.timer` | системный юнит | `system_monitor.sh` каждые 6 ч от root |
 | `check-backups.timer` | user-юнит | `check_backups.sh` раз в сутки |
+| `agent-skills-sync.timer` | user-юнит | `install_agent_skills.sh --apply` раз в сутки: навык `model-routing` на всех устройствах |
 | `check-store-mount.service` | user-юнит | `check-store-mount.sh` при входе в сеанс |
 | `beufm-recorder.service` | user-юнит | `music_downloader/beufm_recorder.py` постоянно: запись эфира Beu FM |
 | `enable-linger` | linger | `loginctl enable-linger` пользователя: user-службы (запись эфира) работают с загрузки, без входа в сеанс |
@@ -719,6 +720,27 @@ sudo ./hp_p1005_garuda.sh --all
 **Режим dry-run:** `-n, --dry-run` — проверки (пакеты, USB, CUPS) выполняются, а отключение `configure-printer@`, выгрузка и чёрный список `usblp`, запуск `system-config-printer` и тестовая печать только описываются строками `[dry-run] будет: …`. Без других аргументов, как и раньше, выполняется полный набор (`--all`).
 
 ---
+
+### `install_agent_skills.sh`
+
+Ставит навык `model-routing` (выбор модели под шаг: механика — лёгкой, типовая разработка — средней,
+решения и необратимое — старшей; пороги лимитов плана и размера контекста; политика расходов без зашитых
+цен) и одноимённый раздел в инструкции агентов: Claude Code (`~/.claude/skills`, `~/.claude/CLAUDE.md`),
+Codex и Gemini CLI (`~/.agents/skills`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md`). Источники — каталог
+`agent-skills/model-routing/` (`claude.SKILL.md`, `agents.SKILL.md`, `section.*.md`), правятся только там.
+
+```bash
+./install_agent_skills.sh --dry-run          # план для хостов из HOSTS, на хостах только чтение
+./install_agent_skills.sh --apply hoster     # записать только на указанный хост
+```
+
+- Хосты — массив `HOSTS` в `conf/install_agent_skills.conf` (шаблон `.example`): `local` — это устройство,
+  остальные — имена из `~/.ssh/config` (вход по ключу, `BatchMode`). Недоступный хост пропускается, код 1.
+- Повторный запуск идемпотентен: файл записывается, только если отличается; раздел в инструкциях лежит между
+  `<!-- model-routing:begin/end -->`, а уже имеющийся раздел без маркеров не дублируется.
+- Агент ставится там, где есть его каталог (`~/.claude`, `~/.codex`, `~/.gemini`, `~/.agents`).
+- Постоянно — `agent-skills-sync.timer` (задание `check_mytasks.sh`): через 6 мин после загрузки и раз в сутки.
+- Тесты — `tests/install_agent_skills.bats`.
 
 ### `llamactl.sh` и `llamactl_tray.py`
 
