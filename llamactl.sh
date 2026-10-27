@@ -44,6 +44,10 @@ LOAD_TIMEOUT_SECS="900"
 HEALTH_TIMEOUT_SECS="90"
 LOG_KEEP="10"
 SUDO_CMD="sudo -A"
+# Блокировка записи models.ini (flock): параллельные add/remove/preset ждут
+# друг друга и не затирают чужие правки
+PRESET_LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/llamactl-models-ini.lock"
+PRESET_LOCK_TIMEOUT_SECS="600"
 
 if [[ -r "${CONF_FILE}" ]]; then
     # shellcheck source=/dev/null
@@ -62,6 +66,7 @@ RPATH_LIT="$(printf '%sORIGIN/../lib' '$')"
 DRY_RUN=0
 JSON_OUT=0
 NO_LOG=0
+PRESET_LOCK_FD=""
 
 ###############################################################################
 # HELPERS
@@ -590,6 +595,54 @@ preset_apply() {
     die "пресет откатан из ${backup}"
 }
 
+# Эксклюзивная блокировка записи пресетов. Чтение models.ini для новой версии
+# и её установка должны идти между preset_lock и preset_unlock, иначе
+# параллельный llamactl затрёт правку. При die блокировка снимается с выходом
+# процесса. В dry-run файл не меняется, поэтому блокировка не берётся.
+preset_lock() {
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        return 0
+    fi
+    need_cmd flock
+    exec {PRESET_LOCK_FD}>>"${PRESET_LOCK_FILE}" || die "не удалось открыть ${PRESET_LOCK_FILE}"
+    flock -w "${PRESET_LOCK_TIMEOUT_SECS}" "${PRESET_LOCK_FD}" \
+        || die "пресеты заняты другим llamactl дольше ${PRESET_LOCK_TIMEOUT_SECS} с"
+}
+
+preset_unlock() {
+    if [[ -n "${PRESET_LOCK_FD}" ]]; then
+        exec {PRESET_LOCK_FD}>&-
+        PRESET_LOCK_FD=""
+    fi
+}
+
+# Секция проверяется и пресет строится по актуальному файлу под блокировкой
+preset_set_key() {
+    local section="$1" key="$2" value="$3" mode="$4" tmp rc=0
+    preset_lock
+    preset_has_section "${section}" || die "секции [${section}] нет в ${PRESET_FILE}" 2
+    tmp="$(mktemp)"
+    preset_render_set "${section}" "${key}" "${value}" "${mode}" > "${tmp}"
+    preset_apply "${tmp}" "${mode} [${section}] ${key}" || rc=$?
+    rm -f -- "${tmp}"
+    preset_unlock
+    return "${rc}"
+}
+
+# Правка в редакторе длится сколько угодно, поэтому блокировка берётся только
+# на установку. Если за это время models.ini изменил кто-то другой, правка не
+# применяется (иначе затёрла бы чужие изменения) и остаётся во временном файле.
+preset_apply_edit() {
+    local tmp="$1" before="$2" now rc=0
+    preset_lock
+    now="$(sha256sum < "${PRESET_FILE}")"
+    [[ "${now}" == "${before}" ]] \
+        || die "${PRESET_FILE} изменился во время правки — она не применена и сохранена в ${tmp}; повторите preset edit"
+    preset_apply "${tmp}" "ручная правка" || rc=$?
+    preset_unlock
+    return "${rc}"
+}
+
 cmd_preset() {
     local sub="${1:-list}"
     shift || true
@@ -609,19 +662,15 @@ cmd_preset() {
             [[ "${sub}" == "set" && -z "${value}" ]] && die "llamactl preset set МОДЕЛЬ КЛЮЧ ЗНАЧЕНИЕ" 2
             [[ "${key}" =~ ^[A-Za-z0-9_-]+$ ]] || die "недопустимый ключ «${key}»" 2
             [[ "${value}" != *$'\n'* ]] || die "значение не может содержать перевод строки" 2
-            preset_has_section "${section}" || die "секции [${section}] нет в ${PRESET_FILE}" 2
-            local tmp
-            tmp="$(mktemp)"
-            preset_render_set "${section}" "${key}" "${value}" "${sub}" > "${tmp}"
-            preset_apply "${tmp}" "${sub} [${section}] ${key}"
-            rm -f -- "${tmp}"
+            preset_set_key "${section}" "${key}" "${value}" "${sub}"
             ;;
         edit)
-            local tmp
+            local tmp before
             tmp="$(mktemp --suffix=.ini)"
             cp -- "${PRESET_FILE}" "${tmp}"
+            before="$(sha256sum < "${PRESET_FILE}")"
             "${EDITOR:-nano}" "${tmp}"
-            preset_apply "${tmp}" "ручная правка"
+            preset_apply_edit "${tmp}" "${before}"
             rm -f -- "${tmp}"
             ;;
         *)
@@ -710,6 +759,53 @@ hf_download() {
     info "Готово: ${dest}"
 }
 
+# Пишет в stdout актуальный models.ini с новой секцией модели
+add_render_preset() {
+    local name="$1" repo="$2" ctx="$3" dest="$4" mm_dest="$5" today
+    today="$(date '+%F')"
+    cat -- "${PRESET_FILE}"
+    printf '\n[%s]\n; Добавлено llamactl %s из %s\n' "${name}" "${today}" "${repo}"
+    [[ -n "${ctx}" ]] && printf 'ctx-size = %s\n' "${ctx}"
+    printf 'model = %s\n' "${dest}"
+    if [[ -n "${mm_dest}" ]]; then
+        printf 'mmproj = %s\n' "${mm_dest}"
+        printf '; Проектор изображений на CPU: не отнимает VRAM у весов.\nno-mmproj-offload = true\n'
+    fi
+}
+
+# Под блокировкой и уже после загрузки: секция дописывается к текущему
+# models.ini, а не к копии, прочитанной до загрузки, — иначе пропали бы
+# правки, сделанные за время загрузки.
+add_apply_preset() {
+    local name="$1" tmp rc=0
+    preset_lock
+    preset_has_section "${name}" && die "модель [${name}] уже есть в ${PRESET_FILE}" 2
+    tmp="$(mktemp)"
+    add_render_preset "$@" > "${tmp}"
+    preset_apply "${tmp}" "добавление [${name}]" || rc=$?
+    rm -f -- "${tmp}"
+    preset_unlock
+    return "${rc}"
+}
+
+# Под блокировкой: секция (с пустой строкой перед ней) вырезается из текущего models.ini
+remove_apply_preset() {
+    local name="$1" tmp rc=0
+    preset_lock
+    preset_has_section "${name}" || die "секции [${name}] нет в ${PRESET_FILE}" 2
+    tmp="$(mktemp)"
+    awk -v s="[${name}]" '
+        $0 == s { skip = 1; next }
+        skip && /^\[/ { skip = 0 }
+        skip { next }
+        { lines[++n] = $0 }
+        END { while (n > 0 && lines[n] == "") n--; for (i = 1; i <= n; i++) print lines[i] }' "${PRESET_FILE}" > "${tmp}"
+    preset_apply "${tmp}" "удаление [${name}]" || rc=$?
+    rm -f -- "${tmp}"
+    preset_unlock
+    return "${rc}"
+}
+
 cmd_add() {
     local repo="" file="" name="" mmproj="" ctx=""
     while (($# > 0)); do
@@ -746,30 +842,15 @@ cmd_add() {
     dest="${dir}/$(basename -- "${file}")"
     [[ -n "${mmproj}" ]] && mm_dest="${dir}/$(basename -- "${mmproj}")"
 
-    local tmp today
-    tmp="$(mktemp)"
-    today="$(date '+%F')"
-    {
-        cat -- "${PRESET_FILE}"
-        printf '\n[%s]\n; Добавлено llamactl %s из %s\n' "${name}" "${today}" "${repo}"
-        [[ -n "${ctx}" ]] && printf 'ctx-size = %s\n' "${ctx}"
-        printf 'model = %s\n' "${dest}"
-        if [[ -n "${mm_dest}" ]]; then
-            printf 'mmproj = %s\n' "${mm_dest}"
-            printf '; Проектор изображений на CPU: не отнимает VRAM у весов.\nno-mmproj-offload = true\n'
-        fi
-    } > "${tmp}"
     if [[ "${DRY_RUN}" -eq 1 ]]; then
         act "download" "скачать ${repo}/${file} → ${dest} (sha256 ${sha:0:12}…)" || true
         [[ -n "${mm_dest}" ]] && { act "download" "скачать ${repo}/${mmproj} → ${mm_dest}" || true; }
-        preset_apply "${tmp}" "добавление [${name}]"
-        rm -f -- "${tmp}"
+        add_apply_preset "${name}" "${repo}" "${ctx}" "${dest}" "${mm_dest}"
         return 0
     fi
     act "download" "скачать ${repo}/${file} → ${dest}" && hf_download "${repo}" "${file}" "${dest}" "${sha}"
     [[ -n "${mm_dest}" ]] && hf_download "${repo}" "${mmproj}" "${mm_dest}" "${mm_sha}"
-    preset_apply "${tmp}" "добавление [${name}]"
-    rm -f -- "${tmp}"
+    add_apply_preset "${name}" "${repo}" "${ctx}" "${dest}" "${mm_dest}"
     cmd_fit "${name}" || true
     info "Модель ${name} добавлена: llamactl load ${name}"
 }
@@ -794,17 +875,7 @@ cmd_remove() {
     if [[ "${mst}" != "unloaded" && "${mst}" != "absent" ]]; then
         cmd_unload "${name}"
     fi
-    local tmp
-    tmp="$(mktemp)"
-    # Секция удаляется вместе с пустой строкой перед ней
-    awk -v s="[${name}]" '
-        $0 == s { skip = 1; next }
-        skip && /^\[/ { skip = 0 }
-        skip { next }
-        { lines[++n] = $0 }
-        END { while (n > 0 && lines[n] == "") n--; for (i = 1; i <= n; i++) print lines[i] }' "${PRESET_FILE}" > "${tmp}"
-    preset_apply "${tmp}" "удаление [${name}]"
-    rm -f -- "${tmp}"
+    remove_apply_preset "${name}"
     ((del == 1)) || { info "файлы модели оставлены (удалить: --delete-files)"; return 0; }
     for f in "${files[@]}"; do
         case "${f}" in

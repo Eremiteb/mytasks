@@ -47,21 +47,27 @@ LLAMA_SRC="$TMP_DIR/src"
 SUDO_CMD=""
 HEALTH_TIMEOUT_SECS="4"
 LOAD_TIMEOUT_SECS="6"
+PRESET_LOCK_FILE="$TMP_DIR/models.ini.lock"
 EOF
 
-  # Заглушка curl: роутер, FIM и Hugging Face
+  # Заглушка curl: роутер, FIM и Hugging Face. Загрузка (-o) пишет GGUF_DATA;
+  # если есть файл edit_during_download — во время «загрузки» models.ini
+  # меняет посторонний писатель (как параллельный llamactl preset set).
   cat > "$STUB_DIR/curl" <<EOF
 #!/usr/bin/env bash
 echo "curl \$*" >> "$CALLS"
-url="" data=""
+url="" data="" out=""
 while (( \$# > 0 )); do
   case "\$1" in
     -d) shift; data="\$1" ;;
+    -o) shift; out="\$1" ;;
     http*) url="\$1" ;;
     *) ;;
   esac
   shift
 done
+oid="abc"
+[ -f "$TMP_DIR/oid" ] && oid="\$(cat "$TMP_DIR/oid")"
 case "\$url" in
   */health) [ -e "$TMP_DIR/down" ] && exit 7; exit 0 ;;
   */models/load) echo loaded > "$STATE"; echo '{"success":true}' ;;
@@ -70,7 +76,11 @@ case "\$url" in
     st="\$(cat "$STATE")"
     printf '{"data":[{"id":"m9","status":{"value":"%s","args":["llama-server","--ctx-size","32768"]}}]}\n' "\$st" ;;
   */v1/chat/completions) echo '{"timings":{"predicted_per_second":42.42,"prompt_per_second":900.4}}' ;;
-  */api/models/*) echo '[{"path":"x.gguf","size":1000,"lfs":{"oid":"abc"}}]' ;;
+  */api/models/*) printf '[{"path":"x.gguf","size":1000,"lfs":{"oid":"%s"}}]\n' "\$oid" ;;
+  */resolve/main/*)
+    printf 'gguf-data' > "\$out"
+    [ -e "$TMP_DIR/edit_during_download" ] && sed -i 's/^temp = 0.6\$/temp = 0.9/' "$PRESET"
+    exit 0 ;;
   *) exit 22 ;;
 esac
 EOF
@@ -354,6 +364,44 @@ PYEOF
 @test "add: существующее имя модели — код 2" {
   run ctl add user/repo x.gguf --name m9
   [ "$status" -eq 2 ]
+}
+
+@test "add: правка models.ini во время загрузки не затирается" {
+  printf 'gguf-data' | sha256sum | cut -d' ' -f1 > "$TMP_DIR/oid"
+  touch "$TMP_DIR/edit_during_download"
+  run ctl add user/repo x.gguf --name newm
+  [ "$status" -eq 0 ]
+  [ "$(cat "$MODELS/newm/x.gguf")" = "gguf-data" ]
+  grep -q '^\[newm\]$' "$PRESET"
+  grep -q "^model = $MODELS/newm/x.gguf$" "$PRESET"
+  # Правка постороннего писателя, сделанная во время загрузки, сохранилась
+  grep -q '^temp = 0.9$' "$PRESET"
+  ! grep -q '^temp = 0.6$' "$PRESET"
+}
+
+@test "preset set: параллельные правки разных ключей обе сохраняются" {
+  ctl preset set m9 a-key 1 >/dev/null 2>&1 &
+  p1=$!
+  ctl preset set m9 b-key 2 >/dev/null 2>&1 &
+  p2=$!
+  wait "$p1"
+  wait "$p2"
+  grep -q '^a-key = 1$' "$PRESET"
+  grep -q '^b-key = 2$' "$PRESET"
+}
+
+@test "preset edit: models.ini изменился во время правки — правка не применяется" {
+  cat > "$TMP_DIR/editor" <<EOF
+#!/usr/bin/env bash
+sed -i 's/^temp = 0.6\$/temp = 0.5/' "\$1"
+sed -i 's/^fit-target = 512\$/fit-target = 256/' "$PRESET"
+EOF
+  chmod +x "$TMP_DIR/editor"
+  EDITOR="$TMP_DIR/editor" run ctl preset edit
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"изменился во время правки"* ]]
+  grep -q '^fit-target = 256$' "$PRESET"
+  grep -q '^temp = 0.6$' "$PRESET"
 }
 
 @test "kill-foreign: dry-run не трогает, боевой режим завершает сторонний llama-server" {

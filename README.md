@@ -734,9 +734,9 @@ sudo ./hp_p1005_garuda.sh --all
 | `start\|stop\|restart [server\|fim\|all]`, `logs [server\|fim] [-f] [-n N]` | сервисы (с ожиданием `/health`) и их журнал |
 | `doctor` | проверка сервисов, API, файлов моделей из пресетов, сторонних `llama-server`, кешей `~/.cache/huggingface`, места на диске; код `1` — есть проблемы |
 | `kill-foreign` | завершить сторонние `llama-server`/`llama serve` (например, встроенные env `llama-vscode`) |
-| `preset list\|show М\|set М КЛЮЧ ЗНАЧ\|unset М КЛЮЧ\|edit` | правка пресетов: показ diff, резервная копия `models.ini.bak-*`, перечитывание роутера через `GET /models?reload=1` без перезапуска, откат при сбое |
+| `preset list\|show М\|set М КЛЮЧ ЗНАЧ\|unset М КЛЮЧ\|edit` | правка пресетов: показ diff, резервная копия `models.ini.bak-*`, перечитывание роутера через `GET /models?reload=1` без перезапуска, откат при сбое; `edit` не применяет правку, если `models.ini` изменился, пока был открыт редактор (временный файл с правкой остаётся) |
 | `fit М [ОКНО]` | раскладка слоёв и экспертов MoE по GPU/CPU (`llama-fit-params`) с учётом занятой VRAM |
-| `add РЕПО ФАЙЛ.gguf [--name] [--mmproj] [--ctx]` | загрузка с Hugging Face на SSD с докачкой, прогрессом и проверкой sha256, новая секция пресета |
+| `add РЕПО ФАЙЛ.gguf [--name] [--mmproj] [--ctx]` | загрузка с Hugging Face на SSD с докачкой, прогрессом и проверкой sha256, новая секция пресета (дописывается к `models.ini` после загрузки, поэтому правки, сделанные за время загрузки, сохраняются) |
 | `remove М [--delete-files]` | убрать модель из пресетов (и удалить её файлы внутри `MODELS_DIR`) |
 | `bench [М]` | замер скорости генерации и обработки промпта |
 | `update [--ref REF] [--bench] [--force]` | `git fetch` исходников, сборка с CUDA (`sm_86`, RPATH `$ORIGIN/../lib`), установка в `/opt/llama.cpp.new`, проверка, замена с сохранением прежней версии в `/opt/llama.cpp.prev`, перезапуск сервисов и автоматический откат, если они не ответили |
@@ -745,11 +745,13 @@ sudo ./hp_p1005_garuda.sh --all
 
 Root-шаги (systemctl, установка пресета, замена сборки) идут через `sudo -A` (графическое окно пароля), не больше одного запроса пароля на действие: скрипт перезапускает сам себя с внутренней командой `__root-*`.
 
+**Параллельные правки пресетов.** Все записи `models.ini` (`add`, `remove`, `preset set/unset/edit`, в том числе из меню и трея) идут под эксклюзивной блокировкой `flock` на `PRESET_LOCK_FILE`: новая версия файла строится из текущего содержимого и устанавливается внутри одной блокировки, второй вызов ждёт до `PRESET_LOCK_TIMEOUT_SECS` (600 с). `add` берёт блокировку только после загрузки модели, поэтому `preset set` во время многоминутной загрузки не ждёт и не теряется. Раньше `add` строил `models.ini` до загрузки и после неё затирал правки, сделанные за это время (2026-10-27 так пропала строка `embeddings = true`). В dry-run блокировка не берётся.
+
 **Режим dry-run:** `-n, --dry-run` (до имени команды; `--dry-run` — в любом месте) — статус, проверки, `diff` пресета и сведения с Hugging Face/`git ls-remote` получаются как обычно, но ничего не загружается/выгружается, не скачивается, не правится и не перезапускается: печатаются строки `[dry-run] будет: …`, в лог пишутся события `dry_<event>`.
 
 **`llamactl_tray.py`** — иконка в трее KDE (Python с PyQt6, шебанг `/usr/bin/env python3`; если у найденного `python3` нет PyQt6, например активен venv, трей перезапускается системным `/usr/bin/python3`), обёртка над `llamactl.sh`: статус каждые 5 с получает модулем `llamactl_status.py` в фоновом потоке, не запуская `llamactl.sh`; цвет — серый (остановлен), синий (ожидает), жёлтый (загрузка), зелёный (модель загружена), оранжевый (проблемы: FIM не работает, сторонние `llama-server`); подсказка — модель, VRAM, свободная RAM. Меню: модели (загрузить/выгрузить), освободить VRAM, сервисы, логи, проверка, пресеты (редактор, fit, замер), добавление модели с Hugging Face, обновление llama.cpp, консольное меню. Быстрые действия — в фоне с уведомлением, долгие и интерактивные — в терминале (`konsole --hold -e`, переопределяется `--terminal` или `LLAMACTL_TERMINAL`). Щелчок по иконке открывает веб-чат роутера. Автозапуск — `~/.config/autostart/llamactl-tray.desktop` (шаблон `systemd/autostart/llamactl-tray.desktop`; его и ссылки `~/.local/bin/llamactl`, `~/.local/bin/llamactl-tray` создаёт `check_mytasks.sh`, если есть каталог установки llama.cpp), пункт меню — `~/.local/share/applications/llamactl-tray.desktop`. `--dry-run` передаёт режим всем действиям; `--print-menu [--status-file F]` печатает состояние и меню без графики.
 
-**Конфигурация:** `conf/llamactl.conf` (пример — `conf/llamactl.conf.example`): адреса роутера и FIM, юниты и пользователь сервисов, пути пресетов, моделей, установки и исходников, архитектура CUDA, число потоков сборки, модель для замера, тайм-ауты, команда `sudo`.
+**Конфигурация:** `conf/llamactl.conf` (пример — `conf/llamactl.conf.example`): адреса роутера и FIM, юниты и пользователь сервисов, пути пресетов, моделей, установки и исходников, архитектура CUDA, число потоков сборки, модель для замера, тайм-ауты, команда `sudo`, файл и тайм-аут блокировки пресетов (`PRESET_LOCK_FILE`, `PRESET_LOCK_TIMEOUT_SECS`).
 
 **Использование:**
 ```sh
@@ -1012,7 +1014,7 @@ Jamendo для категории `/` использует официальны�
 | `doc2fb2.sh` | `pandoc`, `libreoffice`; опц.: `unrtf`, `antiword`, `catdoc`, `wvText` |
 | `getip.sh` | `curl` |
 | `hp_p1005_garuda.sh` | Arch/Garuda, `pacman`, `lsusb`, `systemctl`, CUPS (`lp`), `system-config-printer` |
-| `llamactl.sh` | Bash, `python3` (статус через `llamactl_status.py`), `curl`, `jq`, `systemctl`, `journalctl`, `sudo -A` (askpass); опц.: `nvidia-smi`, `git`+`cmake`+CUDA (`update`), `sha256sum` (`add`) |
+| `llamactl.sh` | Bash, `python3` (статус через `llamactl_status.py`), `curl`, `jq`, `flock` (util-linux), `systemctl`, `journalctl`, `sudo -A` (askpass); опц.: `nvidia-smi`, `git`+`cmake`+CUDA (`update`), `sha256sum` (`add`) |
 | `llamactl_status.py` | Python 3 (только стандартная библиотека), `systemctl`; опц.: драйвер NVIDIA (`libnvidia-ml.so.1`) или `nvidia-smi` |
 | `llamactl_tray.py` | Python 3 + PyQt6, `llamactl_status.py`, `llamactl.sh`; опц.: `konsole`, `xdg-open` |
 | `lowercase_ext.sh` | Bash, `find`, `mv` |

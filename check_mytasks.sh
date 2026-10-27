@@ -133,6 +133,7 @@ DEPS=(
     "sqlite3|sqlite3;arch=sqlite;redhat=sqlite;alpine=sqlite;void=sqlite;gentoo=dev-db/sqlite||system_monitor.sh: база истории опросов"
     "smartctl|smartmontools||system_monitor.sh: SMART-атрибуты дисков"
     "curl|curl||getip.sh, llamactl.sh"
+    "flock|util-linux;gentoo=sys-apps/util-linux||llamactl.sh: блокировка записи пресетов models.ini"
     "rsync|rsync||sources.sh: синхронизация каталогов"
     "zstd|zstd||check_backups.sh (проверка .tar.zst), cloud_backup.sh"
     "unzip|unzip||unpack-fb2zip.sh, check_backups.sh (проверка .zip)"

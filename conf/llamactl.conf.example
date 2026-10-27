@@ -38,3 +38,8 @@ LOG_KEEP="10"
 
 # Команда повышения прав (графическое окно пароля через SUDO_ASKPASS)
 SUDO_CMD="sudo -A"
+
+# Блокировка записи пресетов (flock): add/remove/preset set|unset|edit ждут
+# друг друга и не затирают чужие правки models.ini; тайм-аут ожидания, секунды
+PRESET_LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/llamactl-models-ini.lock"
+PRESET_LOCK_TIMEOUT_SECS="600"
