@@ -16,7 +16,7 @@ SPEC.loader.exec_module(beufm)
 def _no_real_recordings(monkeypatch):
     """Тесты не читают рабочий каталог записей эфира."""
     monkeypatch.setattr(beufm, "_recorded_tracks", lambda skip_ids: [])
-    monkeypatch.setattr(beufm, "_recordings_dir", lambda: (_ for _ in ()).throw(FileNotFoundError("нет")))
+    monkeypatch.setattr(beufm, "_recorder_settings", lambda: (_ for _ in ()).throw(FileNotFoundError("нет")))
 
 
 def _patch_sources(monkeypatch, module, sefon, lmusic):
@@ -165,8 +165,10 @@ def test_recorded_tracks_skip_current_and_mark_path(monkeypatch, tmp_path):
         {"artist": "Ellaya", "title": "Среди Алматы", "path": str(tmp_path / "a.mp3")},
         {"artist": "Сара Амангелді", "title": "Көздерің", "path": str(tmp_path / "b.mp3")},
     ]
+    recorder.list_aired.return_value = []
     monkeypatch.undo()
-    monkeypatch.setattr(beufm, "_recordings_dir", lambda: (str(tmp_path), recorder))
+    settings = {"dir": str(tmp_path), "aired_file": "aired.jsonl", "aired_lookback_days": 2}
+    monkeypatch.setattr(beufm, "_recorder_settings", lambda: (settings, recorder))
     skip = {beufm._track_id("Ellaya", "Среди Алматы")}
     tracks = beufm._recorded_tracks(skip)
     assert [(t["artist"], t["_recording"]) for t in tracks] == [("Сара Амангелді", str(tmp_path / "b.mp3"))]
@@ -187,3 +189,22 @@ def test_resolve_track_prefers_sources_then_air_recording(monkeypatch, tmp_path)
         assert b"".join(response.iter_content()) == b"ID3air"
     assert recording.exists()  # запись остаётся до очистки кэша рекордером
     assert beufm.resolve_track(Mock(), {"id": "fm_2", "artist": "A", "title": "B"}) is None
+
+
+def test_recorded_tracks_add_aired_journal_without_duplicates(monkeypatch, tmp_path):
+    recorder = Mock()
+    recorder.list_recordings.return_value = [
+        {"artist": "Сара Амангелді", "title": "Көздерің", "path": str(tmp_path / "b.mp3")},
+    ]
+    recorder.list_aired.return_value = [
+        {"artist": "Сара Амангелді", "title": "Көздерің", "ts": 1},  # уже есть готовая запись
+        {"artist": "FAVOR1TE", "title": "Qyzganshaq", "ts": 2},
+        {"artist": "Ellaya", "title": "Среди Алматы", "ts": 3},  # звучит сейчас
+    ]
+    monkeypatch.undo()
+    settings = {"dir": str(tmp_path), "aired_file": "aired.jsonl", "aired_lookback_days": 2}
+    monkeypatch.setattr(beufm, "_recorder_settings", lambda: (settings, recorder))
+    tracks = beufm._recorded_tracks({beufm._track_id("Ellaya", "Среди Алматы")})
+    assert [(t["artist"], "_recording" in t) for t in tracks] == [("Сара Амангелді", True), ("FAVOR1TE", False)]
+    since = recorder.list_aired.call_args.args[2]
+    assert abs(since - (beufm.time.time() - 2 * 86400)) < 5

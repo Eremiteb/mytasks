@@ -3,6 +3,7 @@ import importlib.util
 import json
 import logging
 import os
+import time
 import unicodedata
 from urllib.parse import urljoin, urlsplit
 
@@ -112,34 +113,50 @@ def _recorder():
     return module
 
 
-def _recordings_dir():
+def _recorder_settings():
+    """Настройки рекордера из music_downloader.json и сам модуль рекордера."""
     recorder = _recorder()
     with open(recorder.CONFIG_PATH, encoding="utf-8") as source:
-        return recorder.load_settings(json.load(source))["dir"], recorder
+        return recorder.load_settings(json.load(source)), recorder
 
 
 def _recorded_tracks(skip_ids):
-    """Готовые записи эфира (`beufm_recorder.py`) — песни, сыгранные с прошлого запуска.
+    """Песни из эфира, сыгранные с прошлого запуска, — от рекордера `beufm_recorder.py`.
 
-    Нет конфига, рекордера или записей — пусто: Beu FM работает как раньше.
+    Готовые записи эфира плюс все песни журнала эфира за `aired_lookback_days`:
+    загрузчик ищет их в `search_sources`, уже скачанные пропускает сам. Нет
+    конфига, рекордера или журнала — пусто: Beu FM работает как раньше.
     """
     try:
-        directory, recorder = _recordings_dir()
-        recordings = recorder.list_recordings(directory)
+        settings, recorder = _recorder_settings()
+        recordings = recorder.list_recordings(settings["dir"])
+        since = time.time() - settings["aired_lookback_days"] * 86400
+        aired = recorder.list_aired(settings["dir"], settings["aired_file"], since)
     except Exception as error:
         logger.info(f"Beu FM: записи эфира недоступны: {error}")
         return []
-    tracks = []
+    tracks, seen = [], set(skip_ids)
     for meta in recordings:
         track_id = _track_id(meta["artist"], meta["title"])
-        if track_id in skip_ids:
+        if track_id in seen:
             continue
+        seen.add(track_id)
         tracks.append({
             "id": track_id, "artist": meta["artist"], "title": meta["title"],
             "src": "https://beufm.kz/", "search_translit": True, "_recording": meta["path"],
         })
+    ready = len(tracks)
+    for entry in aired:
+        track_id = _track_id(entry["artist"], entry["title"])
+        if track_id in seen:
+            continue
+        seen.add(track_id)
+        tracks.append({
+            "id": track_id, "artist": entry["artist"], "title": entry["title"],
+            "src": "https://beufm.kz/", "search_translit": True,
+        })
     if tracks:
-        logger.info(f"Beu FM: готовых записей эфира — {len(tracks)}")
+        logger.info(f"Beu FM: готовых записей эфира — {ready}, песен из журнала эфира — {len(tracks) - ready}")
     return tracks
 
 
@@ -148,10 +165,10 @@ def _find_recording(track):
     if path and os.path.isfile(path):
         return path
     try:
-        directory, _ = _recordings_dir()
+        settings, _ = _recorder_settings()
     except Exception:
         return None
-    path = os.path.join(directory, f"{_track_id(track['artist'], track['title'])}.mp3")
+    path = os.path.join(settings["dir"], f"{_track_id(track['artist'], track['title'])}.mp3")
     return path if os.path.isfile(path) else None
 
 

@@ -150,7 +150,11 @@
                 "min_takes": 2,
                 "max_wait_days": 7,
                 "keep_days": 14,
-                "max_mb": 2048
+                "max_mb": 2048,
+                "aired_file": "aired.jsonl",
+                "aired_lookback_days": 2,
+                "aired_keep_days": 14,
+                "maintenance_minutes": 60
             },
             "categories": [
                 "/"

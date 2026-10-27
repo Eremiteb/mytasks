@@ -75,6 +75,14 @@ DEFAULTS = {
     "max_seconds": 900,
     "keep_days": 14,
     "max_mb": 2048,
+    # Журнал эфира: каждая прозвучавшая песня — строка в aired.jsonl. Драйвер Beu FM
+    # отдаёт загрузчику песни за aired_lookback_days, строки старше aired_keep_days
+    # выбрасываются при обслуживании (раз в maintenance_minutes вместе с очисткой
+    # дублей песен, уже скачанных в библиотеку).
+    "aired_file": "aired.jsonl",
+    "aired_lookback_days": 2,
+    "aired_keep_days": 14,
+    "maintenance_minutes": 60,
     "log_max_files": 10,
 }
 
@@ -104,7 +112,8 @@ def load_settings(config):
     if not os.path.isabs(settings["dir"]):
         settings["dir"] = os.path.normpath(os.path.join(BASE_DIR, settings["dir"]))
     for key in ("bitrate_kbps", "poll_seconds", "window_seconds", "tail_seconds", "takes", "min_takes",
-                "max_wait_days", "match_ber", "min_seconds", "max_seconds", "keep_days", "max_mb"):
+                "max_wait_days", "match_ber", "min_seconds", "max_seconds", "keep_days", "max_mb",
+                "aired_lookback_days", "aired_keep_days", "maintenance_minutes"):
         if not isinstance(settings[key], (int, float)) or isinstance(settings[key], bool) or settings[key] <= 0:
             raise ValueError(f"recorder.{key} должно быть положительным числом")
     if not 2 <= settings["min_takes"] <= settings["takes"]:
@@ -524,6 +533,133 @@ def finalize_overdue(directory, settings, now=None):
             finalize(directory, name, settings, force=True)
 
 
+def log_aired(directory, aired_file, artist, title, now=None):
+    """Дописывает прозвучавшую песню в журнал эфира (для загрузчика)."""
+    now = time.time() if now is None else now
+    os.makedirs(directory, exist_ok=True)
+    entry = {
+        "id": recording_id(artist, title), "artist": artist, "title": title,
+        "aired": datetime.fromtimestamp(now).isoformat(timespec="seconds"), "ts": round(now, 1),
+    }
+    with open(os.path.join(directory, aired_file), "a", encoding="utf-8") as target:
+        target.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def _read_aired(path):
+    entries = []
+    with contextlib.suppress(FileNotFoundError), open(path, encoding="utf-8") as source:
+        for line in source:
+            with contextlib.suppress(ValueError):
+                entry = json.loads(line)
+                if entry.get("artist") and entry.get("title") and isinstance(entry.get("ts"), (int, float)):
+                    entries.append(entry)
+    return entries
+
+
+def list_aired(directory, aired_file, since):
+    """Уникальные песни журнала эфира после `since` (по последнему выходу), старые первыми."""
+    latest = {}
+    for entry in _read_aired(os.path.join(directory, aired_file)):
+        if entry["ts"] >= since:
+            latest[entry["id"]] = entry
+    return sorted(latest.values(), key=lambda entry: entry["ts"])
+
+
+def prune_aired(directory, aired_file, keep_days, now=None):
+    """Оставляет в журнале эфира строки моложе keep_days; возвращает число удалённых."""
+    now = time.time() if now is None else now
+    path = os.path.join(directory, aired_file)
+    entries = _read_aired(path)
+    kept = [entry for entry in entries if entry["ts"] >= now - keep_days * 86400]
+    if len(kept) == len(entries):
+        return 0
+    with open(f"{path}.part", "w", encoding="utf-8") as target:
+        target.writelines(json.dumps(entry, ensure_ascii=False) + "\n" for entry in kept)
+    os.replace(f"{path}.part", path)
+    return len(entries) - len(kept)
+
+
+def seed_aired_from_takes(directory, aired_file):
+    """Добавляет в журнал эфира выходы песен из дублей, которых в журнале ещё нет.
+
+    Дубли появились раньше журнала (переход со старой схемы): без этого загрузчик
+    не увидел бы песни, прозвучавшие до него. Идемпотентно — выход песни узнаётся
+    по ID и времени, поэтому безопасно при каждом обслуживании. Возвращает число
+    добавленных строк.
+    """
+    if not os.path.isdir(directory):
+        return 0
+    known = {(entry["id"], round(entry["ts"])) for entry in _read_aired(os.path.join(directory, aired_file))}
+    count = 0
+    for name in sorted(os.listdir(directory)):
+        for _, meta in list_takes(os.path.join(directory, name)):
+            if not (meta.get("artist") and meta.get("title") and isinstance(meta.get("recorded"), (int, float))):
+                continue
+            key = (recording_id(meta["artist"], meta["title"]), round(meta["recorded"]))
+            if key in known:
+                continue
+            log_aired(directory, aired_file, meta["artist"], meta["title"], now=meta["recorded"])
+            known.add(key)
+            count += 1
+    return count
+
+
+def purge_in_library(directory, library=None):
+    """Удаляет дубли песен, уже скачанных в библиотеку (нашлись в источниках); возвращает их ID."""
+    library = in_library if library is None else library
+    removed = []
+    if not os.path.isdir(directory):
+        return removed
+    for name in sorted(os.listdir(directory)):
+        track_dir = os.path.join(directory, name)
+        takes = list_takes(track_dir)
+        if takes and library(takes[0][1]["artist"], takes[0][1]["title"]):
+            shutil.rmtree(track_dir, ignore_errors=True)
+            removed.append(name)
+    return removed
+
+
+def _missing_aired(directory, aired_file):
+    """Сколько выходов из дублей ещё нет в журнале (для плана dry-run, без записи)."""
+    if not os.path.isdir(directory):
+        return 0
+    known = {(entry["id"], round(entry["ts"])) for entry in _read_aired(os.path.join(directory, aired_file))}
+    return sum(
+        (recording_id(meta["artist"], meta["title"]), round(meta["recorded"])) not in known
+        for name in os.listdir(directory)
+        for _, meta in list_takes(os.path.join(directory, name))
+        if meta.get("artist") and meta.get("title") and isinstance(meta.get("recorded"), (int, float))
+    )
+
+
+def _takes_in_library(directory):
+    """Песни с дублями, уже скачанные в библиотеку (для плана dry-run, без удаления)."""
+    found = []
+    if os.path.isdir(directory):
+        for name in sorted(os.listdir(directory)):
+            takes = list_takes(os.path.join(directory, name))
+            if takes and in_library(takes[0][1]["artist"], takes[0][1]["title"]):
+                found.append(name)
+    return found
+
+
+def maintenance(settings, now=None):
+    """Обслуживание раз в maintenance_minutes: найденные песни, просроченные сборки, журнал, место."""
+    directory = settings["dir"]
+    seeded = seed_aired_from_takes(directory, settings["aired_file"])
+    if seeded:
+        logger.info(f"Журнал эфира заполнен из накопленных дублей: {seeded}")
+    purged = purge_in_library(directory)
+    if purged:
+        logger.info(f"Удалены дубли песен, уже скачанных в библиотеку: {len(purged)}")
+    finalize_overdue(directory, settings, now=now)
+    dropped = prune_aired(directory, settings["aired_file"], settings["aired_keep_days"], now=now)
+    if dropped:
+        logger.info(f"Из журнала эфира удалено старых строк: {dropped}")
+    for path in cleanup(directory, settings["keep_days"], settings["max_mb"], now=now):
+        logger.info(f"Удалена старая запись {path}")
+
+
 def cleanup(directory, keep_days, max_mb, now=None):
     """Удаляет записи и дубли старше keep_days и самые старые сверх max_mb; возвращает удалённое."""
     now = time.time() if now is None else now
@@ -679,7 +815,7 @@ def run_service(settings):
     logger.info(f"Запись эфира Beu FM запущена, записи — {settings['dir']}")
     pending = []
     first_poll = True
-    last_overdue = 0.0
+    last_maintenance = 0.0
     while not stop.is_set():
         try:
             parsed, modified_at = read_now_playing(settings["now_playing_url"])
@@ -697,6 +833,10 @@ def run_service(settings):
             pending.append(finished)
         if parsed and parsed != previous:
             logger.info(f"В эфире: {parsed[0]} - {parsed[1]}")
+            try:
+                log_aired(settings["dir"], settings["aired_file"], *parsed)
+            except OSError as error:
+                logger.warning(f"Не удалось записать журнал эфира: {error}")
         # Дубль режем, когда в буфер пришёл и хвост после смены названия.
         for item in list(pending):
             if time.time() < item[3] + settings["tail_seconds"] + 1:
@@ -704,9 +844,9 @@ def run_service(settings):
             pending.remove(item)
             status = handle_finished(settings, buffer, *item)
             logger.info(f"{item[0]} - {item[1]}: {status}")
-        if now - last_overdue > 3600:
-            finalize_overdue(settings["dir"], settings)
-            last_overdue = now
+        if now - last_maintenance > settings["maintenance_minutes"] * 60:
+            maintenance(settings)
+            last_maintenance = now
         stop.wait(settings["poll_seconds"])
     logger.info("Запись эфира Beu FM остановлена")
 
@@ -731,6 +871,11 @@ def dry_run(settings):
         f"(fpcalc: {'есть' if tools['fpcalc'] else 'НЕТ'}, ffmpeg: {'есть' if tools['ffmpeg'] else 'НЕТ'})",
         f"готовых записей: {len(list_recordings(settings['dir']))}; очистка старше {settings['keep_days']} дн. "
         f"и сверх {settings['max_mb']} МиБ",
+        f"журнал эфира {settings['aired_file']}: песен за {settings['aired_lookback_days']} дн. для загрузчика — "
+        f"{len(list_aired(settings['dir'], settings['aired_file'], time.time() - settings['aired_lookback_days'] * 86400))}"
+        + f"; из накопленных дублей будет добавлено: {_missing_aired(settings['dir'], settings['aired_file'])}",
+        f"раз в {settings['maintenance_minutes']} мин удаление дублей песен из библиотеки: сейчас таких — "
+        f"{len(_takes_in_library(settings['dir']))}",
     ]
     for line in plan:
         print(f"[dry-run] будет: {line}")

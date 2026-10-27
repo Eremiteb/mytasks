@@ -212,6 +212,7 @@ def test_dry_run_changes_nothing(tmp_path, monkeypatch, capsys):
     response.read.return_value = FRAME * 20
     monkeypatch.setattr(recorder.urllib.request, "urlopen", lambda *args, **kwargs: response)
     monkeypatch.setattr(recorder, "read_now_playing", lambda url: (("Duman", "Бiр, eкі, үш"), None))
+    monkeypatch.setattr(recorder, "in_library", lambda artist, title: False)
     monkeypatch.setattr(recorder.shutil, "which", lambda name: f"/usr/bin/{name}")
     assert recorder.dry_run(cfg) == 0
     output = capsys.readouterr().out
@@ -238,3 +239,53 @@ def test_log_switches_to_new_day_file(tmp_path, monkeypatch):
         handler.close()
     assert "до полуночи" in (tmp_path / "beufm_recorder-2026-10-24.jsonl").read_text(encoding="utf-8")
     assert "после полуночи" in (tmp_path / "beufm_recorder-2026-10-25.jsonl").read_text(encoding="utf-8")
+
+
+def test_aired_journal_lists_latest_and_prunes_old(tmp_path):
+    for artist, title, ts in (("A", "1", 1000), ("B", "2", 5000), ("A", "1", 9000), ("C", "3", 20000)):
+        recorder.log_aired(str(tmp_path), "aired.jsonl", artist, title, now=ts)
+    (tmp_path / "aired.jsonl").open("a", encoding="utf-8").write("не json\n")
+    aired = recorder.list_aired(str(tmp_path), "aired.jsonl", since=4000)
+    assert [(e["artist"], e["ts"]) for e in aired] == [("B", 5000), ("A", 9000), ("C", 20000)]
+    assert aired[1]["id"] == recorder.recording_id("A", "1")
+    # 3 старые строки; нечитаемая строка тоже выпадает при перезаписи, но не считается
+    assert recorder.prune_aired(str(tmp_path), "aired.jsonl", keep_days=1, now=20000 + 86400 - 100) == 3
+    assert "не json" not in (tmp_path / "aired.jsonl").read_text(encoding="utf-8")
+    assert [e["artist"] for e in recorder.list_aired(str(tmp_path), "aired.jsonl", since=0)] == ["C"]
+    assert recorder.list_aired(str(tmp_path / "нет"), "aired.jsonl", since=0) == []
+
+
+def test_purge_in_library_removes_takes_of_found_songs(tmp_path):
+    recorder.save_take(str(tmp_path), "FAVOR1TE", "Qyzganshaq", 1, 2, FRAME, now=10)
+    recorder.save_take(str(tmp_path), "Сара Амангелді", "Көздерің", 1, 2, FRAME, now=11)
+    removed = recorder.purge_in_library(str(tmp_path), library=lambda artist, title: artist == "FAVOR1TE")
+    assert removed == [recorder.recording_id("FAVOR1TE", "Qyzganshaq")]
+    assert not (tmp_path / removed[0]).exists()
+    assert (tmp_path / recorder.recording_id("Сара Амангелді", "Көздерің")).exists()
+
+
+def test_maintenance_purges_finalizes_and_prunes(tmp_path, monkeypatch):
+    cfg = settings(tmp_path)
+    calls = []
+    monkeypatch.setattr(recorder, "purge_in_library", lambda directory: calls.append("purge") or ["x"])
+    monkeypatch.setattr(recorder, "finalize_overdue", lambda directory, s, now=None: calls.append("overdue"))
+    monkeypatch.setattr(recorder, "prune_aired", lambda *args, **kwargs: calls.append("aired") or 0)
+    monkeypatch.setattr(recorder, "cleanup", lambda *args, **kwargs: calls.append("cleanup") or [])
+    recorder.maintenance(cfg)
+    monkeypatch.setattr(recorder, "seed_aired_from_takes", lambda *args: calls.append("seed") or 0)
+    calls.clear()
+    recorder.maintenance(cfg)
+    assert calls == ["seed", "purge", "overdue", "aired", "cleanup"]
+
+
+def test_seed_aired_from_takes_is_idempotent_and_keeps_new_entries(tmp_path):
+    recorder.save_take(str(tmp_path), "WinL", "Keshire almadyn", 1, 2, FRAME, now=100)
+    recorder.save_take(str(tmp_path), "WinL", "Keshire almadyn", 1, 2, FRAME, now=200)
+    recorder.save_take(str(tmp_path), "Umay", "Ән", 1, 2, FRAME, now=150)
+    # журнал уже начат службой (текущая песня записана раньше обслуживания)
+    recorder.log_aired(str(tmp_path), "aired.jsonl", "Mr.Kuna", "Zhanym", now=300)
+    assert recorder._missing_aired(str(tmp_path), "aired.jsonl") == 3
+    assert recorder.seed_aired_from_takes(str(tmp_path), "aired.jsonl") == 3
+    aired = recorder.list_aired(str(tmp_path), "aired.jsonl", since=0)
+    assert [(e["artist"], e["ts"]) for e in aired] == [("Umay", 150), ("WinL", 200), ("Mr.Kuna", 300)]
+    assert recorder.seed_aired_from_takes(str(tmp_path), "aired.jsonl") == 0  # повтор ничего не добавляет
