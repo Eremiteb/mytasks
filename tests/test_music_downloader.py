@@ -624,6 +624,104 @@ class TestMusicDownloader(unittest.TestCase):
             ])
 
 
+    def test_run_writes_metrics_to_log_and_runs_table(self):
+        """Итог запуска: строки по мостам, источникам поиска и месту в логе и запись в таблице runs."""
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            destination = root / "music"
+            destination.mkdir()
+            driver = root / "driver.py"
+            driver.write_text(
+                "def get_tracks(scraper, base_url, category):\n"
+                "    return [{'id': str(n), 'artist': 'A', 'title': f'T{n}',\n"
+                "             'download_url': f'https://x/{n}.mp3'} for n in range(3)]\n"
+                "def resolve_track(session, track):\n"
+                "    if track['title'] == 'T2':\n"
+                "        return None\n"
+                "    session.search_stats_seen = track['_search_stats']\n"
+                "    track['_search_stats'].setdefault('src', {'queries': 0, 'chosen': 0})\n"
+                "    track['_search_stats']['src']['queries'] += 1\n"
+                "    track['_search_stats']['src']['chosen'] += 1\n"
+                "    return {'download_url': track['download_url'], 'referer': 'r', 'src': 's'}\n",
+                encoding="utf-8",
+            )
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps({
+                "download_paths": [{"path": str(destination), "max_size_mb": 100}],
+                "sites": [{"site_name": "S", "site_script": str(driver), "base_url": "b", "categories": ["/"]}],
+            }), encoding="utf-8")
+
+            def get(url, **kwargs):
+                body = url.encode()
+                response = MagicMock(status_code=200, headers={"content-length": str(len(body))})
+                response.iter_content.return_value = [body]
+                context = MagicMock()
+                context.__enter__.return_value = response
+                return context
+
+            scraper = MagicMock()
+            scraper.get.side_effect = get
+            with (
+                patch.multiple(music_downloader, CONFIG_PATH=str(config_path), DB_PATH=str(root / "db.sqlite")),
+                patch.object(music_downloader, "setup_logging"),
+                patch.object(music_downloader, "cleanup_old_logs"),
+                patch.object(music_downloader.time, "sleep"),
+                patch.object(music_downloader.cloudscraper, "create_scraper", return_value=scraper),
+                self.assertLogs("Engine", level="INFO") as logs,
+            ):
+                music_downloader.run()
+
+            text = "\n".join(logs.output)
+            self.assertIn("Итог S: в списках 3, новых в очереди 3, скачано 2", text)
+            self.assertIn("не найдено 1", text)
+            self.assertIn("Итог поиска src: запросов 2, кандидатов", text.replace("кандидатов 0", "кандидатов"))
+            self.assertIn("Место:", text)
+            self.assertIn("Итог запуска: скачано 2", text)
+            self.assertIn("bari: S=2, total=2", text)  # прежняя строка итога сохранена
+            with sqlite3.connect(root / "db.sqlite") as conn:
+                row = conn.execute(
+                    "SELECT exit_code, downloaded, bytes, sites, sources, destinations FROM runs"
+                ).fetchone()
+            self.assertEqual((row[0], row[1]), (0, 2))
+            self.assertGreater(row[2], 0)
+            self.assertEqual(json.loads(row[3])["S"]["not_found"], 1)
+            self.assertEqual(json.loads(row[4])["src"]["chosen"], 2)
+            self.assertEqual(json.loads(row[5])[0]["limit"], 100 * 1048576)
+
+    def test_run_records_exit_code_when_limit_stops_run(self):
+        """Остановка по лимиту папки (код 2) всё равно сохраняет итог запуска в runs."""
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            destination = root / "music"
+            destination.mkdir()
+            driver = root / "driver.py"
+            driver.write_text(
+                "def get_tracks(scraper, base_url, category):\n"
+                "    return [{'id': '1', 'artist': 'A', 'title': 'one', 'download_url': 'https://x/1.mp3'}]\n",
+                encoding="utf-8",
+            )
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps({
+                "download_paths": [{"path": str(destination), "max_size_mb": 2 / 1048576}],
+                "sites": [{"site_name": "S", "site_script": str(driver), "base_url": "b", "categories": ["/"]}],
+            }), encoding="utf-8")
+            response = MagicMock(status_code=200, headers={})
+            response.iter_content.return_value = [b"abc"]
+            scraper = MagicMock()
+            scraper.get.return_value.__enter__.return_value = response
+            with (
+                patch.multiple(music_downloader, CONFIG_PATH=str(config_path), DB_PATH=str(root / "db.sqlite")),
+                patch.object(music_downloader, "setup_logging"),
+                patch.object(music_downloader, "cleanup_old_logs"),
+                patch.object(music_downloader.time, "sleep"),
+                patch.object(music_downloader.cloudscraper, "create_scraper", return_value=scraper),
+                self.assertRaises(SystemExit) as error,
+            ):
+                music_downloader.run()
+            self.assertEqual(error.exception.code, 2)
+            with sqlite3.connect(root / "db.sqlite") as conn:
+                self.assertEqual(conn.execute("SELECT exit_code, downloaded FROM runs").fetchone(), (2, 0))
+
     def test_run_rejects_malformed_search_settings(self):
         """Неверные search_sources / artist_aliases дают код 2 до создания скрапера."""
         for bad in ({"search_sources": {"name": "x"}}, {"artist_aliases": ["Madi"]}, {"artist_aliases": [[1]]}):

@@ -193,3 +193,53 @@ def test_relaxed_match_uses_artist_aliases_only_from_config():
         "Сара Амангелді", "Көздерің сенің сондай әп-әдемі", "Кайрат Нуртас, Argonya",
         "Көздерің Сенің Сондай Әп Әдемі (feat. Argonya)",
     )
+
+
+def test_every_source_query_is_logged_even_when_empty(monkeypatch, caplog):
+    import logging
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(audio_search.time, "sleep", lambda _: None)
+    sources = [
+        {"name": "empty", "driver": "x", "base_url": "https://e.test", "search_path": "/?q={query}"},
+        {"name": "broken", "driver": "x", "base_url": "https://b.test", "search_path": "/?q={query}"},
+        {"name": "hit", "driver": "x", "base_url": "https://h.test", "search_path": "/?q={query}"},
+        {"name": "never", "driver": "x", "base_url": "https://n.test", "search_path": "/?q={query}"},
+    ]
+
+    def query(session, source, text):
+        if source["name"] == "broken":
+            raise RuntimeError("503")
+        if source["name"] == "empty":
+            return [], "https://e.test/s"
+        return [{"artist": "A", "title": "B", "download_url": "https://h.test/b.mp3"}], "https://h.test/s"
+
+    monkeypatch.setattr(audio_search, "_query_source", query)
+    track = {"artist": "A", "title": "B", "_search_sources": sources}
+    assert audio_search.find_audio(_reachable_session(), track, "Тест")["download_url"] == "https://h.test/b.mp3"
+    lines = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO and ": запросов " in r.getMessage()]
+    assert len(lines) == 3  # источник «never» не опрашивался: остановились на «hit»
+    assert "empty: запросов 1, кандидатов 0, точных 0, мягких 0 — не найдено" in lines[0]
+    assert "broken: запросов 0" in lines[1] and "ошибка: 503" in lines[1]
+    assert "hit: запросов 1, кандидатов 1, точных 1, мягких 0 — точное совпадение, ссылка рабочая" in lines[2]
+
+
+def test_run_stats_accumulate_per_source_across_tracks(monkeypatch):
+    monkeypatch.setattr(audio_search.time, "sleep", lambda _: None)
+    sources = [
+        {"name": "empty", "driver": "x", "base_url": "https://e.test", "search_path": "/?q={query}"},
+        {"name": "hit", "driver": "x", "base_url": "https://h.test", "search_path": "/?q={query}"},
+    ]
+
+    def query(session, source, text):
+        if source["name"] == "empty":
+            return [], "https://e.test/s"
+        return [{"artist": "A", "title": "B", "download_url": "https://h.test/b.mp3"}], "https://h.test/s"
+
+    monkeypatch.setattr(audio_search, "_query_source", query)
+    run_stats = {}
+    for _ in range(2):
+        track = {"artist": "A", "title": "B", "_search_sources": sources, "_search_stats": run_stats}
+        assert audio_search.find_audio(_reachable_session(), track, "Тест") is not None
+    assert run_stats["empty"]["queries"] == 2 and run_stats["empty"]["chosen"] == 0
+    assert run_stats["hit"]["candidates"] == 2 and run_stats["hit"]["exact"] == 2 and run_stats["hit"]["chosen"] == 2
+    assert run_stats["hit"]["errors"] == 0 and run_stats["hit"]["seconds"] >= 0

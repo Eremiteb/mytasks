@@ -300,6 +300,20 @@ def _result(candidate):
     return result
 
 
+def _add_run_stats(run_stats, name, call_stats, seconds, chosen=False):
+    """Складывает счётчики одного обращения к источнику в итог запуска (`track["_search_stats"]`)."""
+    if run_stats is None:
+        return
+    total = run_stats.setdefault(name, {
+        "queries": 0, "candidates": 0, "exact": 0, "relaxed": 0, "chosen": 0, "errors": 0, "seconds": 0.0,
+    })
+    for key in ("queries", "candidates", "exact", "relaxed"):
+        total[key] += call_stats[key]
+    total["errors"] += call_stats["result"].startswith("ошибка")
+    total["chosen"] += chosen
+    total["seconds"] += seconds
+
+
 def find_audio(session, track, label, log=logger, sources=None):
     """Ищет трек в источниках из конфига и возвращает `download_url/referer/src` либо `None`.
 
@@ -317,11 +331,19 @@ def find_audio(session, track, label, log=logger, sources=None):
     alias_groups = track.get("_artist_aliases") or ()
     queries = search_queries(artist, title, alias_groups, bool(track.get("search_translit")))
     relaxed = []
+    run_stats = track.get("_search_stats")
     for source in enabled_sources(sources if sources is not None else track.get("_search_sources")):
         name = source["name"]
+        # Статистика обращения к источнику пишется в лог всегда, в том числе при пустой
+        # выдаче: так видно, какие источники реально опрашиваются и какие что-то находят.
+        stats = {"queries": 0, "candidates": 0, "exact": 0, "relaxed": 0, "result": "не найдено"}
+        source_started = time.monotonic()
+        chosen = False
         try:
             for query in queries:
                 candidates, search_url = _query_source(session, source, query)
+                stats["queries"] += 1
+                stats["candidates"] += len(candidates)
                 time.sleep(1)
                 for candidate in candidates:
                     download_url = candidate.get("download_url") or ""
@@ -329,13 +351,25 @@ def find_audio(session, track, label, log=logger, sources=None):
                         continue
                     found = {**candidate, "referer": candidate.get("referer") or search_url, "search_url": search_url}
                     if (match_key(candidate.get("artist")), match_key(candidate.get("title"))) == expected:
+                        stats["exact"] += 1
                         if _reachable(session, found, label, name, log):
+                            stats["result"] = "точное совпадение, ссылка рабочая"
+                            chosen = True
                             log.info(f"{label}: {artist} — {title}: найдено совпадение в {name}")
                             return _result(found)
+                        stats["result"] = "точное совпадение, ссылка недоступна"
                     elif relaxed_match(artist, title, candidate.get("artist"), candidate.get("title"), alias_groups):
+                        stats["relaxed"] += 1
                         relaxed.append((name, found))
         except Exception as error:
+            stats["result"] = f"ошибка: {error}"
             log.warning(f"{label}: поиск {artist} — {title} в {name} не удался: {error}")
+        finally:
+            _add_run_stats(run_stats, name, stats, time.monotonic() - source_started, chosen)
+            log.info(
+                f"{label}: {artist} — {title}: {name}: запросов {stats['queries']}, кандидатов "
+                f"{stats['candidates']}, точных {stats['exact']}, мягких {stats['relaxed']} — {stats['result']}"
+            )
     for name, found in relaxed:
         try:
             if _reachable(session, found, label, name, log):
@@ -343,6 +377,8 @@ def find_audio(session, track, label, log=logger, sources=None):
                     f"{label}: {artist} — {title}: мягкое совпадение в {name} "
                     f"как {found.get('artist')} — {found.get('title')}"
                 )
+                if run_stats is not None and name in run_stats:
+                    run_stats[name]["chosen"] += 1
                 return _result(found)
         except Exception as error:
             log.warning(f"{label}: проверка ссылки {name} не удалась: {error}")
