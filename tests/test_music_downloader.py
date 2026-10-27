@@ -193,6 +193,64 @@ class TestMusicDownloader(unittest.TestCase):
                     [("artist", "First"), ("artist", "Second")],
                 )
 
+    def test_run_round_robin_refills_each_site_without_waiting_for_big_queue(self):
+        """Большая очередь одного сайта не задерживает следующие категории других сайтов.
+
+        Категория читается только когда очередь её сайта опустела (ссылки со страниц
+        бывают с меткой времени), а сайты по кругу отдают по одной песне.
+        """
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            destination = root / "music"
+            destination.mkdir()
+            events = []
+            driver = root / "driver.py"
+            driver.write_text(
+                "def get_tracks(scraper, base_url, category):\n"
+                "    scraper.events.append(f'list {base_url}{category}')\n"
+                "    count = 5 if base_url == 'Big' else 1\n"
+                "    return [{'id': f'{category}{n}', 'artist': base_url, 'title': f'{category}{n}',\n"
+                "             'download_url': f'https://x/{base_url}{category}{n}.mp3'} for n in range(count)]\n",
+                encoding="utf-8",
+            )
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps({
+                "download_paths": [{"path": str(destination)}],
+                "sites": [
+                    {"site_name": "Big", "site_script": str(driver), "base_url": "Big", "categories": ["a"]},
+                    {"site_name": "Two", "site_script": str(driver), "base_url": "Two", "categories": ["a", "b"]},
+                ],
+            }), encoding="utf-8")
+            scraper = MagicMock()
+            scraper.events = events
+
+            def get(url, **kwargs):
+                events.append(f"get {url.rsplit('/', 1)[1]}")
+                body = url.encode()  # разное содержимое — без дедупа по хешу
+                response = MagicMock(status_code=200, headers={"content-length": str(len(body))})
+                response.iter_content.return_value = [body]
+                context = MagicMock()
+                context.__enter__.return_value = response
+                return context
+
+            scraper.get.side_effect = get
+            with (
+                patch.multiple(music_downloader, CONFIG_PATH=str(config_path), DB_PATH=str(root / "db.sqlite")),
+                patch.object(music_downloader, "setup_logging"),
+                patch.object(music_downloader, "cleanup_old_logs"),
+                patch.object(music_downloader.time, "sleep"),
+                patch.object(music_downloader.cloudscraper, "create_scraper", return_value=scraper),
+            ):
+                music_downloader.run()
+
+            self.assertEqual(events, [
+                "list Biga", "get Biga0.mp3",
+                "list Twoa", "get Twoa0.mp3",
+                "get Biga1.mp3",
+                "list Twob", "get Twob0.mp3",  # вторая категория — не дожидаясь конца Big
+                "get Biga2.mp3", "get Biga3.mp3", "get Biga4.mp3",
+            ])
+
     def test_run_resolves_only_new_chart_track_after_deduplication(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)

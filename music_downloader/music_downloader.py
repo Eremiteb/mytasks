@@ -806,152 +806,161 @@ def run():
             "provider": provider,
             "categories": site_cfg["categories"],
             "current_queue": [],
+            "next_category": 0,
             "processed_count": 0
         })
 
-    # Обработка по кругу: сначала разделы 0 всех сайтов, потом разделы 1 и т. д.
-    max_categories = max(len(s["categories"]) for s in sites_data) if sites_data else 0
-    
-    for category_level in range(max_categories):
-        for site_data in sites_data:
-            if category_level >= len(site_data["categories"]):
-                continue  # Этот сайт не имеет столько разделов
-            
-            s_cfg = site_data["site_cfg"]
-            s_name = s_cfg["site_name"]
-            cat = site_data["categories"][category_level]
+    def fill_queue(site_data):
+        """Пока очередь сайта пуста, читает его следующую категорию (по порядку из конфига)."""
+        while not site_data["current_queue"] and site_data["next_category"] < len(site_data["categories"]):
+            read_category(site_data)
 
-            logger.info(f"Подключаюсь к {cat}...", extra={"site": s_name})
-            # Вся специфика сайта скрыта в драйвере; сбой одного источника не
-            # должен мешать обработке остальных.
-            try:
-                tracks = site_data["provider"].get_tracks(scraper, s_cfg["base_url"], cat)
-            except Exception:
-                logger.exception("Ошибка получения списка треков", extra={"site": s_name})
-                continue
-            logger.info(f"Получено ответов: {len(tracks) if isinstance(tracks, list) else 'ошибка'}", extra={"site": s_name})
-            
-            if isinstance(tracks, list):
-                logger.info(f"Обрабатываю {len(tracks)} треков...", extra={"site": s_name})
-                new_tracks_count = 0
-                for t in tracks:
-                    track_key = f"{s_name}_{t['id']}"
-                    if db.is_downloaded(track_key):
-                        continue
-                    # Проверка на существование только по artist/title (в нижнем регистре)
-                    original_artist = (t.get("artist") or "").strip()
-                    original_title = (t.get("title") or "").strip()
-                    artist = capitalize_first(original_artist) or "Unknown Artist"
-                    title = capitalize_first(original_title) or "Unknown Title"
-                    t["artist"] = artist
-                    t["title"] = title
-                    t["_original_artist"] = original_artist or artist
-                    t["_original_title"] = original_title or title
-                    identity = track_identity(artist, title)
-                    if identity not in queued_tracks and not db.is_downloaded_by_artist_title(artist, title):
-                        t["_site_cfg"] = s_cfg
-                        site_data["current_queue"].append(t)
-                        queued_tracks.add(identity)
-                        new_tracks_count += 1
-                logger.info(f"В очередь добавлено {new_tracks_count} новых треков", extra={"site": s_name})
+    def read_category(site_data):
+        s_cfg = site_data["site_cfg"]
+        s_name = s_cfg["site_name"]
+        cat = site_data["categories"][site_data["next_category"]]
+        site_data["next_category"] += 1
 
-        # Скачивание по кругу: по одной песне от каждого сайта
-        while any(site_data["current_queue"] for site_data in sites_data):
-            for site_data in sites_data:
-                if not site_data["current_queue"]:
-                    continue
-                
-                t = site_data["current_queue"].pop(0)
-                s_cfg = t["_site_cfg"]
-                s_name = s_cfg["site_name"]
+        logger.info(f"Подключаюсь к {cat}...", extra={"site": s_name})
+        # Вся специфика сайта скрыта в драйвере; сбой одного источника не
+        # должен мешать обработке остальных.
+        try:
+            tracks = site_data["provider"].get_tracks(scraper, s_cfg["base_url"], cat)
+        except Exception:
+            logger.exception("Ошибка получения списка треков", extra={"site": s_name})
+            return
+        logger.info(f"Получено ответов: {len(tracks) if isinstance(tracks, list) else 'ошибка'}", extra={"site": s_name})
+        
+        if isinstance(tracks, list):
+            logger.info(f"Обрабатываю {len(tracks)} треков...", extra={"site": s_name})
+            new_tracks_count = 0
+            for t in tracks:
                 track_key = f"{s_name}_{t['id']}"
-
-                if db.is_downloaded(track_key) or db.is_downloaded_by_artist_title(t["artist"], t["title"]):
+                if db.is_downloaded(track_key):
                     continue
+                # Проверка на существование только по artist/title (в нижнем регистре)
+                original_artist = (t.get("artist") or "").strip()
+                original_title = (t.get("title") or "").strip()
+                artist = capitalize_first(original_artist) or "Unknown Artist"
+                title = capitalize_first(original_title) or "Unknown Title"
+                t["artist"] = artist
+                t["title"] = title
+                t["_original_artist"] = original_artist or artist
+                t["_original_title"] = original_title or title
+                identity = track_identity(artist, title)
+                if identity not in queued_tracks and not db.is_downloaded_by_artist_title(artist, title):
+                    t["_site_cfg"] = s_cfg
+                    site_data["current_queue"].append(t)
+                    queued_tracks.add(identity)
+                    new_tracks_count += 1
+            logger.info(f"В очередь добавлено {new_tracks_count} новых треков", extra={"site": s_name})
 
-                try:
-                    artist = capitalize_first(t.get("artist")) or "Unknown Artist"
-                    title = capitalize_first(t.get("title")) or "Unknown Title"
-                    resolver = getattr(site_data["provider"], "resolve_track", None)
-                    if resolver is not None:
-                        # Общий список источников MP3 для драйверов без собственного аудио.
-                        t["_search_sources"] = search_sources
-                        t["_artist_aliases"] = artist_aliases
-                        resolved = resolver(scraper, t)
-                        if resolved is None:
-                            queued_tracks.discard(track_identity(artist, title))
-                            continue
-                        t.update(resolved)
-                    logger.info(f"Загружаю: {artist} - {title}", extra={"site": s_name})
-                    headers = {"Referer": t.get("referer", s_cfg["base_url"])}
-                    # Источник без прямой HTTP-ссылки (YouTube Music через yt-dlp) отдаёт
-                    # fetch(): готовый файл в виде потокового ответа с теми же полями.
-                    fetch = t.get("fetch")
-                    with (
-                        fetch() if callable(fetch)
-                        else scraper.get(t["download_url"], timeout=60, headers=headers, stream=True)
-                    ) as r:
-                        if r.status_code == 200:
-                            # Получаем размер файла из заголовка Content-Length
-                            raw_cl = r.headers.get('content-length', 0)
-                            try:
-                                content_length = int(raw_cl or 0)
-                            except ValueError:
-                                logger.warning(f"Некорректный content-length: {raw_cl}", extra={"site": s_name})
-                                content_length = 0
-                            clean_fn = safe_filename(
-                                f"{artist} - {title}.mp3"
+    # Скачивание по кругу: по одной песне от каждого сайта, пока у кого-то есть
+    # треки. Опустевшая очередь сайта пополняется его следующей категорией, а
+    # остальные сайты не ждут: большая очередь одного сайта (журнал эфира Beu FM —
+    # сотни песен) не задерживает вторые категории Sefon/LMusic. Категория читается
+    # только когда нужна — ссылки на файлы со страниц бывают с меткой времени.
+    while True:
+        active = False
+        for site_data in sites_data:
+            fill_queue(site_data)
+            if not site_data["current_queue"]:
+                continue
+            active = True
+            
+            t = site_data["current_queue"].pop(0)
+            s_cfg = t["_site_cfg"]
+            s_name = s_cfg["site_name"]
+            track_key = f"{s_name}_{t['id']}"
+
+            if db.is_downloaded(track_key) or db.is_downloaded_by_artist_title(t["artist"], t["title"]):
+                continue
+
+            try:
+                artist = capitalize_first(t.get("artist")) or "Unknown Artist"
+                title = capitalize_first(t.get("title")) or "Unknown Title"
+                resolver = getattr(site_data["provider"], "resolve_track", None)
+                if resolver is not None:
+                    # Общий список источников MP3 для драйверов без собственного аудио.
+                    t["_search_sources"] = search_sources
+                    t["_artist_aliases"] = artist_aliases
+                    resolved = resolver(scraper, t)
+                    if resolved is None:
+                        queued_tracks.discard(track_identity(artist, title))
+                        continue
+                    t.update(resolved)
+                logger.info(f"Загружаю: {artist} - {title}", extra={"site": s_name})
+                headers = {"Referer": t.get("referer", s_cfg["base_url"])}
+                # Источник без прямой HTTP-ссылки (YouTube Music через yt-dlp) отдаёт
+                # fetch(): готовый файл в виде потокового ответа с теми же полями.
+                fetch = t.get("fetch")
+                with (
+                    fetch() if callable(fetch)
+                    else scraper.get(t["download_url"], timeout=60, headers=headers, stream=True)
+                ) as r:
+                    if r.status_code == 200:
+                        # Получаем размер файла из заголовка Content-Length
+                        raw_cl = r.headers.get('content-length', 0)
+                        try:
+                            content_length = int(raw_cl or 0)
+                        except ValueError:
+                            logger.warning(f"Некорректный content-length: {raw_cl}", extra={"site": s_name})
+                            content_length = 0
+                        clean_fn = safe_filename(
+                            f"{artist} - {title}.mp3"
+                        )
+                        logger.info(f"Соединение установлено (код: {r.status_code})", extra={"site": s_name})
+
+                        logger.info(f"Сохраняю файл: {clean_fn}", extra={"site": s_name})
+                        downloaded_bytes, saved_paths, filehash = save_response(
+                            r, download_paths, clean_fn, content_length
+                        )
+
+                        # Тот же файл уже скачан (другое имя/источник): физические
+                        # копии удаляем. ID фиксируем, чтобы не качать снова, но с
+                        # filehash=NULL — иначе нарушится частичный UNIQUE-индекс.
+                        duplicate = db.is_downloaded_by_hash(filehash)
+                        if duplicate:
+                            for saved_path in saved_paths:
+                                with suppress(OSError):
+                                    os.remove(saved_path)
+                            logger.info(
+                                f"Дубликат по содержимому, копии удалены: {clean_fn}",
+                                extra={"site": s_name},
                             )
-                            logger.info(f"Соединение установлено (код: {r.status_code})", extra={"site": s_name})
-
-                            logger.info(f"Сохраняю файл: {clean_fn}", extra={"site": s_name})
-                            downloaded_bytes, saved_paths, filehash = save_response(
-                                r, download_paths, clean_fn, content_length
-                            )
-
-                            # Тот же файл уже скачан (другое имя/источник): физические
-                            # копии удаляем. ID фиксируем, чтобы не качать снова, но с
-                            # filehash=NULL — иначе нарушится частичный UNIQUE-индекс.
-                            duplicate = db.is_downloaded_by_hash(filehash)
-                            if duplicate:
-                                for saved_path in saved_paths:
-                                    with suppress(OSError):
-                                        os.remove(saved_path)
-                                logger.info(
-                                    f"Дубликат по содержимому, копии удалены: {clean_fn}",
-                                    extra={"site": s_name},
-                                )
-                            else:
-                                # Применение прав доступа к файлу без смены владельца
-                                for saved_path in saved_paths:
-                                    apply_file_permissions(saved_path, perm_cfg)
-
-                            db.add_record(
-                                track_key,
-                                artist,
-                                title,
-                                s_name,
-                                t.get("src") or t.get("referer") or t.get("download_url"),
-                                clean_fn,
-                                downloaded_bytes,
-                                None if duplicate else filehash,
-                                t["_original_artist"],
-                                t["_original_title"],
-                            )
-                            if not duplicate:
-                                site_data["processed_count"] += 1
-                                logger.info(f"Успешно скачан: {clean_fn} ({downloaded_bytes} байт)", extra={"site": s_name})
-                                time.sleep(1.2)
                         else:
-                            logger.error(f"Ошибка соединения (код: {r.status_code})", extra={"site": s_name})
-                except DownloadLimitExceeded as e:
-                    logger.error(f"Загрузка остановлена: {e}", extra={"site": s_name})
-                    raise SystemExit(2) from e
-                except Exception as e:
-                    queued_tracks.discard(track_identity(t["artist"], t["title"]))
-                    logger.error(
-                        f"Ошибка скачивания {t.get('title')}: {e}", extra={"site": s_name}
-                    )
+                            # Применение прав доступа к файлу без смены владельца
+                            for saved_path in saved_paths:
+                                apply_file_permissions(saved_path, perm_cfg)
+
+                        db.add_record(
+                            track_key,
+                            artist,
+                            title,
+                            s_name,
+                            t.get("src") or t.get("referer") or t.get("download_url"),
+                            clean_fn,
+                            downloaded_bytes,
+                            None if duplicate else filehash,
+                            t["_original_artist"],
+                            t["_original_title"],
+                        )
+                        if not duplicate:
+                            site_data["processed_count"] += 1
+                            logger.info(f"Успешно скачан: {clean_fn} ({downloaded_bytes} байт)", extra={"site": s_name})
+                            time.sleep(1.2)
+                    else:
+                        logger.error(f"Ошибка соединения (код: {r.status_code})", extra={"site": s_name})
+            except DownloadLimitExceeded as e:
+                logger.error(f"Загрузка остановлена: {e}", extra={"site": s_name})
+                raise SystemExit(2) from e
+            except Exception as e:
+                queued_tracks.discard(track_identity(t["artist"], t["title"]))
+                logger.error(
+                    f"Ошибка скачивания {t.get('title')}: {e}", extra={"site": s_name}
+                )
+        if not active:
+            break
 
     # Итоговая статистика
     stats_parts = []
