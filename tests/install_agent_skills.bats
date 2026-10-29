@@ -30,6 +30,40 @@ teardown() {
   [[ "$output" == *"[dry-run] будет: записать"* ]]
   [ ! -e "$HOME/.claude/skills" ]
   [ ! -e "$HOME/.claude/CLAUDE.md" ]
+  [[ "$output" == *"[dry-run] будет: подключить хук плана"* ]]
+  [ ! -e "$HOME/.claude/settings.json" ]
+  [ ! -e "$HOME/.claude/hooks" ]
+}
+
+@test "--apply подключает хук плана, не трогая прочие настройки и хуки, без дублей" {
+  cat > "$HOME/.claude/settings.json" <<'EOF'
+{
+  "theme": "dark",
+  "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "echo свой"}]}]}
+}
+EOF
+  run "$TMP_DIR/install_agent_skills.sh" --apply local
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"[готово] подключён хук плана"* ]]
+  [ -f "$HOME/.claude/hooks/model-routing-plan-guard.py" ]
+  [ -f "$HOME/.claude/settings.json.bak-model-routing" ]
+  run python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); p=d["hooks"]["PreToolUse"]; print(d["theme"], len(p), p[0]["matcher"], p[1]["matcher"], p[1]["hooks"][0]["command"])' "$HOME/.claude/settings.json"
+  [ "$output" = "dark 2 Bash mcp__ccd_turn__update_plan python3 -I $HOME/.claude/hooks/model-routing-plan-guard.py" ]
+  run "$TMP_DIR/install_agent_skills.sh" --apply local
+  [[ "$output" == *"[ok] хук плана подключён"* ]]
+  run python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["hooks"]["PreToolUse"]))' "$HOME/.claude/settings.json"
+  [ "$output" = "2" ]
+}
+
+@test "хук плана: шаг без метки модели отклоняется, с метками и advance — пропускаются" {
+  guard="$TMP_DIR/agent-skills/model-routing/plan-guard.py"
+  run bash -c "printf '%s' '{\"tool_input\":{\"items\":[{\"content\":\"[Haiku] Коммит\"},{\"content\":\"Написать код\"}]}}' | python3 -I '$guard'"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"«Написать код»"* ]]
+  run bash -c "printf '%s' '{\"tool_input\":{\"items\":[{\"content\":\"[Haiku] Коммит\"},{\"content\":\"[Opus] Таймер\"}]}}' | python3 -I '$guard'"
+  [ "$status" -eq 0 ]
+  run bash -c "printf '%s' '{\"tool_input\":{\"advance\":true}}' | python3 -I '$guard'"
+  [ "$status" -eq 0 ]
 }
 
 @test "--apply ставит навыки и раздел, повторный запуск идемпотентен" {

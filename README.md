@@ -727,7 +727,14 @@ sudo ./hp_p1005_garuda.sh --all
 решения и необратимое — старшей; пороги лимитов плана и размера контекста; политика расходов без зашитых
 цен) и одноимённый раздел в инструкции агентов: Claude Code (`~/.claude/skills`, `~/.claude/CLAUDE.md`),
 Codex и Gemini CLI (`~/.agents/skills`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md`). Источники — каталог
-`agent-skills/model-routing/` (`claude.SKILL.md`, `agents.SKILL.md`, `section.*.md`), правятся только там.
+`agent-skills/model-routing/` (`claude.SKILL.md`, `agents.SKILL.md`, `section.*.md`, `plan-guard.py`), правятся только там.
+
+Для Claude Code ставится и хук `~/.claude/hooks/model-routing-plan-guard.py` (PreToolUse на
+`mcp__ccd_turn__update_plan` в `~/.claude/settings.json`): план, у шага которого нет метки `[Haiku]`,
+`[Sonnet]` или `[Opus]`, отклоняется, и агент получает причину. Так выбор модели под шаг не держится на памяти
+агента. Запись хука одна, без дублей, остальные настройки и хуки не меняются, перед записью — копия
+`settings.json.bak-model-routing`; без `python3` на хосте хук пропускается. Хук работает только с планом
+приложения Claude (вкладка Code, SSH-сессии из него); в терминальном `claude` такого инструмента нет.
 
 ```bash
 ./install_agent_skills.sh --dry-run          # план для хостов из HOSTS, на хостах только чтение

@@ -115,6 +115,7 @@ music_downloader/venv/bin/ruff check music_downloader/
 
 - Источники навыка и раздела инструкций — `agent-skills/model-routing/`; правки вносить только там, затем `./install_agent_skills.sh --dry-run`, `--apply`. Локальные `~/.claude/skills/model-routing`, `~/.agents/skills/model-routing` и разделы в `CLAUDE.md`/`AGENTS.md`/`GEMINI.md` — результат установки, а не источник.
 - Устройства — `HOSTS` в `conf/install_agent_skills.conf` (`local` + имена из `~/.ssh/config`); ставится в `~/.claude`, `~/.codex`, `~/.gemini`, `~/.agents` там, где каталог есть. Постоянно — `agent-skills-sync.timer` (задание `check_mytasks.sh`). Новое устройство добавлять в `HOSTS`, не копировать файлы вручную.
+- Хук `plan-guard.py` (ставится в `~/.claude/hooks/model-routing-plan-guard.py` и в `settings.json` функцией `hook` сценария на хосте, через `python3`) отклоняет `update_plan` без меток `[Haiku]`/`[Sonnet]`/`[Opus]` у шагов: код 2, причина — в stderr агенту; вызовы без `items` и собственные ошибки хука — код 0. Добавлен 2026-10-29, после того как агент пропустил правило «Выбор модели под шаг» при составлении плана. Метки не убирать и хук не отключать ради экономии вызовов.
 - Политика навыка: подстраивается под тариф (лимиты окон через `get_usage`, иначе осторожные значения по умолчанию), цены не зашиты, правила безопасности (необратимое — старшей модели) выше экономии.
 
 ## `check_mytasks.sh`: стартовая настройка и проверка
