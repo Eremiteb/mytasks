@@ -109,39 +109,39 @@ build_payload() {
   cat <<'PAYLOAD'
 put() {
   local dest="$1" b64="$2"
-  if [ -f "$dest" ] && printf '%s' "$b64" | base64 -d | cmp -s - "$dest"; then
-    echo "[ok] актуален: $dest"; return 0
+  if [ -f "${dest}" ] && printf '%s' "${b64}" | base64 -d | cmp -s - "${dest}"; then
+    echo "[ok] актуален: ${dest}"; return 0
   fi
-  if [ "$DRY" -eq 1 ]; then echo "[dry-run] будет: записать $dest"; return 0; fi
-  mkdir -p "$(dirname "$dest")"
-  printf '%s' "$b64" | base64 -d > "$dest"
-  echo "[готово] записан: $dest"
+  if [ "$DRY" -eq 1 ]; then echo "[dry-run] будет: записать ${dest}"; return 0; fi
+  mkdir -p "$(dirname "${dest}")"
+  printf '%s' "${b64}" | base64 -d > "${dest}"
+  echo "[готово] записан: ${dest}"
 }
 section() {
   local file="$1" b64="$2" tmp
-  if [ -f "$file" ] && grep -q '^## Выбор модели под шаг' "$file" && ! grep -q 'model-routing:begin' "$file"; then
-    echo "[ok] раздел уже есть (без маркеров): $file"; return 0
+  if [ -f "${file}" ] && grep -q '^## Выбор модели под шаг' "${file}" && ! grep -q 'model-routing:begin' "${file}"; then
+    echo "[ok] раздел уже есть (без маркеров): ${file}"; return 0
   fi
   tmp="$(mktemp)"
   {
-    if [ -f "$file" ]; then
-      sed '/<!-- model-routing:begin -->/,/<!-- model-routing:end -->/d' "$file" \
+    if [ -f "${file}" ]; then
+      sed '/<!-- model-routing:begin -->/,/<!-- model-routing:end -->/d' "${file}" \
         | awk '{l[NR]=$0} END{n=NR; while(n>0 && l[n]=="") n--; for(i=1;i<=n;i++) print l[i]}'
     fi
     printf '\n<!-- model-routing:begin -->\n'
-    printf '%s' "$b64" | base64 -d
+    printf '%s' "${b64}" | base64 -d
     printf '<!-- model-routing:end -->\n'
-  } > "$tmp"
-  if [ -f "$file" ] && cmp -s "$tmp" "$file"; then
-    echo "[ok] актуален: $file"
+  } > "${tmp}"
+  if [ -f "${file}" ] && cmp -s "${tmp}" "${file}"; then
+    echo "[ok] актуален: ${file}"
   elif [ "$DRY" -eq 1 ]; then
-    echo "[dry-run] будет: обновить раздел в $file"
+    echo "[dry-run] будет: обновить раздел в ${file}"
   else
-    mkdir -p "$(dirname "$file")"
-    cat "$tmp" > "$file"
-    echo "[готово] обновлён раздел: $file"
+    mkdir -p "$(dirname "${file}")"
+    cat "${tmp}" > "${file}"
+    echo "[готово] обновлён раздел: ${file}"
   fi
-  rm -f "$tmp"
+  rm -f "${tmp}"
 }
 # Хук PreToolUse на update_plan в ~/.claude/settings.json: одна запись, без дублей,
 # остальные настройки и хуки не трогаются; перед записью — копия settings.json.bak-model-routing

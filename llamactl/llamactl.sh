@@ -19,9 +19,12 @@ SCRIPT_NAME="$(basename -- "$0")"
 SCRIPT_BASE="llamactl"
 SCRIPT_PATH="$(readlink -f -- "$0")"
 SCRIPT_DIR="$(dirname -- "${SCRIPT_PATH}")"
-CONF_DIR="${SCRIPT_DIR}/conf"
+# Код llamactl — в подкаталоге llamactl/, а conf/, logs/ и state/ общие для
+# всех скриптов и лежат в корне репозитория
+REPO_DIR="$(dirname -- "${SCRIPT_DIR}")"
+CONF_DIR="${REPO_DIR}/conf"
 CONF_FILE="${CONF_DIR}/llamactl.conf"
-LOG_DIR="${MYTASKS_LOG_DIR:-${SCRIPT_DIR}/logs}"
+LOG_DIR="${MYTASKS_LOG_DIR:-${REPO_DIR}/logs}"
 TIMESTAMP="$(date '+%Y-%m-%d-%H-%M-%S')"
 LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}-${TIMESTAMP}.jsonl"
 LOG_TEMPLATE_FILE="${CONF_DIR}/log_template.conf"
@@ -48,6 +51,21 @@ SUDO_CMD="sudo -A"
 # друг друга и не затирают чужие правки
 PRESET_LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/llamactl-models-ini.lock"
 PRESET_LOCK_TIMEOUT_SECS="600"
+# `llamactl logcheck`: отчёт scripts/check-logs.py с сервера разбирает локальная
+# модель (замер 2026-10-29 на отчёте за сутки: Gemma 4 точнее Qwen3.6 и Qwen3.5-9B)
+LOGCHECK_SSH_HOST="root@10.66.66.1"
+LOGCHECK_REMOTE_DIR="/opt/esimych-cloud"
+LOGCHECK_MODEL="gemma-4-26b-a4b"
+LOGCHECK_PROMPT_FILE="${SCRIPT_DIR}/logcheck_prompt.txt"
+LOGCHECK_STATE_DIR="${REPO_DIR}/state/llamactl-logcheck"
+LOGCHECK_KEEP="30"
+LOGCHECK_MIN_FREE_VRAM_MIB="5000"
+LOGCHECK_WAIT_SECS="1800"
+LOGCHECK_POLL_SECS="60"
+LOGCHECK_MAX_TOKENS="1500"
+LOGCHECK_TIMEOUT_SECS="900"
+LOGCHECK_SSH_TIMEOUT_SECS="20"
+LOGCHECK_MAX_REPORT_BYTES="100000"
 
 if [[ -r "${CONF_FILE}" ]]; then
     # shellcheck source=/dev/null
@@ -896,6 +914,225 @@ cmd_remove() {
 }
 
 ###############################################################################
+# КОМАНДЫ: проверка логов сервера локальной моделью
+###############################################################################
+# Коды logcheck: 0 — в порядке, 1 — модель нашла проблемы, 2 — конфигурация,
+# 3 — пропущено (GPU занята), 4 — сбой (сервер, роутер или модель не ответили).
+
+# status.json для трея (llamactl_status.py → поле logcheck); в dry-run не пишется
+logcheck_status() {
+    local state="$1" reason="${2:-}" verdict="${3:-}" report="${4:-}" now tmp
+    [[ "${DRY_RUN}" -eq 1 ]] && return 0
+    mkdir -p -- "${LOGCHECK_STATE_DIR}"
+    now="$(date '+%F %T')"
+    tmp="$(mktemp -p "${LOGCHECK_STATE_DIR}" .status.XXXXXX)"
+    S="${state}" R="${reason}" V="${verdict}" P="${report}" T="${now}" W="${LOGCHECK_WAIT_SECS}" \
+        jq -n '{state: env.S, reason: env.R, verdict: env.V, report: env.P, updated: env.T,
+                wait_secs: (env.W | tonumber)}' > "${tmp}"
+    mv -f -- "${tmp}" "${LOGCHECK_STATE_DIR}/status.json"
+}
+
+# Уведомление на рабочем столе. Из systemd user-сервиса шины сеанса в окружении
+# может не быть — тогда берётся стандартный сокет пользователя.
+logcheck_notify() {
+    local urgency="$1" title="$2" body="$3" uid bus
+    command -v notify-send >/dev/null 2>&1 || return 0
+    act "notify" "уведомление «${title}»" || return 0
+    uid="$(id -u)"
+    bus="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR:-/run/user/${uid}}/bus}"
+    if ! DBUS_SESSION_BUS_ADDRESS="${bus}" notify-send -a llamactl -u "${urgency}" -i network-server "${title}" "${body}"; then
+        warn "уведомление не показано"
+    fi
+}
+
+logcheck_fail() {
+    warn "$1"
+    log_json "ERROR" "logcheck_fail" "$1"
+    logcheck_status "error" "$1"
+    logcheck_notify "critical" "Логи сервера: проверка не выполнена" "$1"
+}
+
+# Почему GPU занята (пусто — свободна): в роутере загружена другая модель (вы с
+# ней работаете) или свободной VRAM меньше LOGCHECK_MIN_FREE_VRAM_MIB (игра и т.п.)
+logcheck_gpu_busy() {
+    local mj others own gm used total free
+    mj="$(models_json)"
+    others="$(M="${LOGCHECK_MODEL}" jq -r '[.[] | select((.status == "loaded" or .status == "loading")
+        and .id != env.M) | .id] | join(", ")' <<<"${mj}")"
+    if [[ -n "${others}" ]]; then
+        printf 'загружена модель %s' "${others}"
+        return 0
+    fi
+    own="$(M="${LOGCHECK_MODEL}" jq -r '(.[] | select(.id == env.M) | .status) // "absent"' <<<"${mj}")"
+    # Своя модель уже в памяти — её VRAM не в счёт
+    [[ "${own}" == "loaded" || "${own}" == "loading" ]] && return 0
+    gm="$(gpu_mem)"
+    IFS='|' read -r used total _ <<<"${gm}"
+    ((total > 0)) || return 0
+    free=$((total - used))
+    if ((free < LOGCHECK_MIN_FREE_VRAM_MIB)); then
+        printf 'свободно %s МиБ VRAM из %s (нужно %s)' "${free}" "${total}" "${LOGCHECK_MIN_FREE_VRAM_MIB}"
+    fi
+    return 0
+}
+
+# Ждёт свободную GPU до LOGCHECK_WAIT_SECS; ожидание и пропуск видны в трее
+logcheck_wait_gpu() {
+    local reason waited=0
+    reason="$(logcheck_gpu_busy)"
+    [[ -z "${reason}" ]] && return 0
+    info "GPU занята: ${reason}"
+    log_json "WARN" "logcheck_gpu_busy" "${reason}"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        act "logcheck_wait" "ждать освобождения GPU до ${LOGCHECK_WAIT_SECS} с (сообщение в трее)" || true
+        return 0
+    fi
+    logcheck_status "waiting_gpu" "${reason}"
+    while ((waited < LOGCHECK_WAIT_SECS)); do
+        sleep "${LOGCHECK_POLL_SECS}"
+        waited=$((waited + LOGCHECK_POLL_SECS))
+        reason="$(logcheck_gpu_busy)"
+        if [[ -z "${reason}" ]]; then
+            info "GPU освободилась через ${waited} с"
+            return 0
+        fi
+    done
+    logcheck_status "skipped" "${reason}"
+    log_json "WARN" "logcheck_skipped" "${reason}"
+    warn "проверка пропущена: GPU не освободилась за ${LOGCHECK_WAIT_SECS} с (${reason})"
+    return 1
+}
+
+logcheck_rotate() {
+    local listing old files=()
+    listing="$(find "${LOGCHECK_STATE_DIR}" -maxdepth 1 -type f -name '20*.md' -printf '%T@|%p\n' 2>/dev/null)"
+    old="$(sort -nr <<<"${listing}" | awk -F'|' -v keep="${LOGCHECK_KEEP}" 'NR > keep { print $2 }')"
+    [[ -n "${old}" ]] && mapfile -t files <<<"${old}"
+    if ((${#files[@]} > 0)); then
+        rm -f -- "${files[@]}"
+    fi
+    return 0
+}
+
+# Отчёт с сервера → GPU → модель → файл отчёта, status.json и уведомление
+logcheck_run() {
+    local dir="$1" last_file="${LOGCHECK_STATE_DIR}/last" since started remote size err
+    if [[ -s "${last_file}" ]]; then
+        since="$(head -n 1 -- "${last_file}")"
+    else
+        since="$(date -d '-1 day' '+%F %T')"
+    fi
+    started="$(date '+%F %T')"
+    # --no-save: отметку «прошлой проверки» check-logs.py оставляем ручному «проверь логи»
+    printf -v remote 'cd %q && python3 -I scripts/check-logs.py --since %q --no-save' "${LOGCHECK_REMOTE_DIR}" "${since}"
+    local SSH_OPTS=(-o BatchMode=yes -o "ConnectTimeout=${LOGCHECK_SSH_TIMEOUT_SECS}")
+    info "Отчёт check-logs.py с ${since} (${LOGCHECK_SSH_HOST})…"
+    if ! ssh "${SSH_OPTS[@]}" -- "${LOGCHECK_SSH_HOST}" "${remote}" < /dev/null > "${dir}/report.md" 2> "${dir}/ssh.err"; then
+        err="$(tail -n 3 -- "${dir}/ssh.err")"
+        logcheck_fail "сервер ${LOGCHECK_SSH_HOST} недоступен или check-logs.py завершился с ошибкой: ${err}"
+        return 4
+    fi
+    size="$(wc -c < "${dir}/report.md")"
+    if ((size > LOGCHECK_MAX_REPORT_BYTES)); then
+        head -c "${LOGCHECK_MAX_REPORT_BYTES}" -- "${dir}/report.md" > "${dir}/report.cut"
+        printf '\n\n(отчёт обрезан до %s байт из %s)\n' "${LOGCHECK_MAX_REPORT_BYTES}" "${size}" >> "${dir}/report.cut"
+        mv -f -- "${dir}/report.cut" "${dir}/report.md"
+    fi
+    info "Отчёт получен: ${size} байт"
+    if ! router_up; then
+        logcheck_fail "роутер ${ROUTER_URL} недоступен"
+        return 4
+    fi
+    require_model "${LOGCHECK_MODEL}"
+    logcheck_wait_gpu || return 3
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        act "logcheck_llm" "отправить отчёт модели ${LOGCHECK_MODEL}, сохранить разбор в ${LOGCHECK_STATE_DIR}, показать уведомление с итогом" || true
+        return 0
+    fi
+
+    local was system
+    logcheck_status "running" "модель ${LOGCHECK_MODEL}"
+    was="$(model_status "${LOGCHECK_MODEL}")"
+    system="$(cat -- "${LOGCHECK_PROMPT_FILE}")"
+    # Без reasoning: Gemma 4 иначе тратит весь max_tokens на «размышления»
+    SYS="${system}" M="${LOGCHECK_MODEL}" MT="${LOGCHECK_MAX_TOKENS}" jq -Rs '{model: env.M, temperature: 0.3,
+        max_tokens: (env.MT | tonumber), chat_template_kwargs: {enable_thinking: false},
+        messages: [{role: "system", content: env.SYS}, {role: "user", content: .}]}' \
+        < "${dir}/report.md" > "${dir}/body.json"
+    info "Разбор моделью ${LOGCHECK_MODEL} (с загрузкой модели — до пары минут)…"
+    if ! curl -fsS --max-time "${LOGCHECK_TIMEOUT_SECS}" -H 'Content-Type: application/json' \
+        --data-binary "@${dir}/body.json" "${ROUTER_URL}/v1/chat/completions" > "${dir}/resp.json" 2> "${dir}/curl.err"; then
+        err="$(tail -n 2 -- "${dir}/curl.err")"
+        logcheck_fail "модель ${LOGCHECK_MODEL} не ответила: ${err}"
+        return 4
+    fi
+    local analysis verdict speed stamp out body urgency="normal"
+    analysis="$(jq -r '.choices[0].message.content // empty' "${dir}/resp.json")"
+    if [[ -z "${analysis}" ]]; then
+        logcheck_fail "модель ${LOGCHECK_MODEL} вернула пустой ответ"
+        return 4
+    fi
+    speed="$(jq -r '.timings.predicted_per_second // 0 | floor' "${dir}/resp.json")"
+    verdict="$(grep -m1 -oiE 'ИТОГ:[[:space:]]*(в порядке|внимание|критично)' <<<"${analysis}" | sed -E 's/^[^:]*:[[:space:]]*//')"
+    # Модель нарушила формат — итог неизвестен, значит смотреть самому
+    [[ -n "${verdict}" ]] || verdict="внимание"
+    stamp="$(date '+%Y-%m-%d_%H%M')"
+    out="${LOGCHECK_STATE_DIR}/${stamp}.md"
+    {
+        printf '# Проверка логов сервера %s\n\n' "${LOGCHECK_SSH_HOST}"
+        printf 'Период: с %s по %s. Модель: %s, %s ток/с.\n\n## Разбор модели\n\n%s\n\n## Отчёт check-logs.py\n\n' \
+            "${since}" "${started}" "${LOGCHECK_MODEL}" "${speed}" "${analysis}"
+        cat -- "${dir}/report.md"
+    } > "${out}"
+    printf '%s\n' "${started}" > "${last_file}"
+    logcheck_rotate
+    # Модель грузила сама проверка — выгрузить, чтобы не держать VRAM до таймаута роутера
+    if [[ "${was}" == "unloaded" ]]; then
+        cmd_unload "${LOGCHECK_MODEL}" >/dev/null
+    fi
+    logcheck_status "done" "" "${verdict}" "${out}"
+    log_json "INFO" "logcheck_done" "${verdict}" "${out}"
+    body="$(sed -n '2,14p' <<<"${analysis}" | grep -v '^[[:space:]]*$' | cut -c1-200 | head -n 8)"
+    case "${verdict,,}" in
+        критично) urgency="critical" ;;
+        "в порядке") urgency="low" ;;
+        *) ;;
+    esac
+    logcheck_notify "${urgency}" "Логи сервера: ${verdict}" "${body}"$'\n'"Отчёт: ${out}"
+    info "ИТОГ: ${verdict}. Отчёт: ${out}"
+    [[ "${verdict,,}" == "в порядке" ]] && return 0
+    return 1
+}
+
+cmd_logcheck() {
+    local n
+    for n in "${LOGCHECK_KEEP}" "${LOGCHECK_MIN_FREE_VRAM_MIB}" "${LOGCHECK_WAIT_SECS}" "${LOGCHECK_POLL_SECS}" \
+        "${LOGCHECK_MAX_TOKENS}" "${LOGCHECK_TIMEOUT_SECS}" "${LOGCHECK_SSH_TIMEOUT_SECS}" "${LOGCHECK_MAX_REPORT_BYTES}"; do
+        [[ "${n}" =~ ^[0-9]+$ ]] || die "LOGCHECK_*: «${n}» — не число (conf/llamactl.conf)" 2
+    done
+    ((LOGCHECK_POLL_SECS > 0)) || die "LOGCHECK_POLL_SECS должен быть больше 0" 2
+    [[ -r "${LOGCHECK_PROMPT_FILE}" ]] || die "нет промпта ${LOGCHECK_PROMPT_FILE}" 2
+    need_cmd ssh flock
+    local lock_fd="" rc=0 tmpdir
+    # Таймер и ручной запуск из трея не должны работать одновременно
+    if [[ "${DRY_RUN}" -eq 0 ]]; then
+        mkdir -p -- "${LOGCHECK_STATE_DIR}"
+        exec {lock_fd}>>"${LOGCHECK_STATE_DIR}/.lock" || die "не удалось открыть ${LOGCHECK_STATE_DIR}/.lock"
+        if ! flock -n "${lock_fd}"; then
+            info "проверка логов уже выполняется"
+            return 0
+        fi
+    fi
+    tmpdir="$(mktemp -d)"
+    logcheck_run "${tmpdir}" || rc=$?
+    rm -rf -- "${tmpdir}"
+    if [[ -n "${lock_fd}" ]]; then
+        exec {lock_fd}>&-
+    fi
+    return "${rc}"
+}
+
+###############################################################################
 # КОМАНДЫ: обновление llama.cpp
 ###############################################################################
 installed_commit() {
@@ -1044,7 +1281,7 @@ llamactl — действия:
   7) проверка (doctor)       8) пресет: показать     9) пресет: изменить ключ
  10) пресеты: редактор      11) добавить модель с HF 12) удалить модель
  13) раскладка по GPU (fit) 14) замер скорости       15) обновить llama.cpp
- 16) убрать сторонние llama-server                    0) выход
+ 16) убрать сторонние llama-server 17) проверка логов сервера  0) выход
 EOF
         read -r -p "Выбор: " choice || return 0
         case "${choice}" in
@@ -1065,6 +1302,7 @@ EOF
             14) m="$(pick_model "Замер")" && cmd_bench "${m}" ;;
             15) cmd_update --bench ;;
             16) cmd_kill_foreign ;;
+            17) cmd_logcheck ;;
             0|q|exit) return 0 ;;
             *) info "нет такого пункта" ;;
         esac
@@ -1095,6 +1333,10 @@ usage() {
   add РЕПО ФАЙЛ.gguf [--name ИМЯ] [--mmproj ФАЙЛ] [--ctx N]
   remove МОДЕЛЬ [--delete-files]
   bench [МОДЕЛЬ]               замер скорости генерации
+Проверка логов сервера:
+  logcheck                     отчёт check-logs.py с сервера разбирает локальная модель (LOGCHECK_MODEL);
+                               ждёт свободную GPU до LOGCHECK_WAIT_SECS, коды: 0 в порядке, 1 есть проблемы,
+                               3 пропущено (GPU занята), 4 сбой; отчёты — state/llamactl-logcheck/
 Обновление:
   update [--ref REF] [--bench] [--force]   пересборка llama.cpp с CUDA, замена с откатом
 
@@ -1164,6 +1406,7 @@ case "${CMD}" in
     add) cmd_add "$@"; rc=$? ;;
     remove) cmd_remove "$@"; rc=$? ;;
     update) cmd_update "$@"; rc=$? ;;
+    logcheck) cmd_logcheck; rc=$? ;;
     menu) cmd_menu; rc=$? ;;
     *) usage >&2; die "неизвестная команда «${CMD}»" 2 ;;
 esac

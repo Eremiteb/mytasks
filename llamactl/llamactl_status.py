@@ -38,6 +38,8 @@ DEFAULTS = {
     "FIM_UNIT": "llama-fim",
     "SERVICE_USER": "llama",
     "MODELS_DIR": "/var/lib/llama.cpp/models",
+    # status.json команды `llamactl logcheck` (ожидание GPU, итог) — для трея
+    "LOGCHECK_STATE_DIR": str(Path(__file__).resolve().parent.parent / "state" / "llamactl-logcheck"),
 }
 
 LLAMA_SERVER_RE = re.compile(r"(^|/)llama-server(\s|$)")
@@ -263,6 +265,15 @@ def disk_avail(path: str) -> int:
     return st.f_bavail * st.f_frsize
 
 
+def logcheck(state_dir: str) -> dict | None:
+    """Последнее состояние `llamactl logcheck` (waiting_gpu/running/done/skipped/error) или None."""
+    try:
+        data = json.loads((Path(state_dir) / "status.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def collect(conf: dict[str, str], proc_root: Path = Path("/proc")) -> dict:
     """Полный статус в формате `llamactl.sh status --json`."""
     server_state, fim_state = unit_states([conf["SERVER_UNIT"], conf["FIM_UNIT"]])
@@ -276,13 +287,14 @@ def collect(conf: dict[str, str], proc_root: Path = Path("/proc")) -> dict:
         "ram": ram(proc_root),
         "disk": {"models_avail": disk_avail(conf["MODELS_DIR"])},
         "foreign": foreign(conf["SERVICE_USER"], proc_root),
+        "logcheck": logcheck(conf["LOGCHECK_STATE_DIR"]),
     }
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Статус llama.cpp в JSON (как llamactl status --json)")
-    parser.add_argument("--conf", type=Path, default=Path(__file__).resolve().parent / "conf" / "llamactl.conf",
-                        help="conf/llamactl.conf (по умолчанию рядом со скриптом)")
+    parser.add_argument("--conf", type=Path, default=Path(__file__).resolve().parent.parent / "conf" / "llamactl.conf",
+                        help="conf/llamactl.conf (по умолчанию в корне репозитория, на уровень выше llamactl/)")
     for key in DEFAULTS:
         parser.add_argument("--" + key.lower().replace("_", "-"), dest=key, help=f"переопределить {key}")
     parser.add_argument("--proc", type=Path, default=Path("/proc"), help="корень procfs (для тестов)")

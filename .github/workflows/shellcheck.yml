@@ -30,14 +30,14 @@ jobs:
           shellcheck --version
 
       - name: ShellCheck error level
-        run: shellcheck -S error ./*.sh
+        run: shellcheck -S error ./*.sh llamactl/*.sh
 
       - name: ShellCheck style level
-        run: shellcheck -S style ./*.sh
+        run: shellcheck -S style ./*.sh llamactl/*.sh
 
       - name: Bash/sh syntax
         run: |
-          for f in ./*.sh; do
+          for f in ./*.sh llamactl/*.sh; do
             if head -1 "$f" | grep -qi bash; then
               bash -n "$f" || { echo "SYNTAX FAIL: $f"; exit 1; }
             else
@@ -48,7 +48,7 @@ jobs:
       - name: Unbraced variable scan
         run: |
           fail=0
-          for f in ./*.sh; do
+          for f in ./*.sh llamactl/*.sh; do
             out=$(grep -nP '(?<!")\$(?!\{)[A-Za-z_][A-Za-z0-9_]*' "$f" \
               | grep -vP '^\d+:\s*#' \
               | grep -v "\\\\'" \
@@ -69,6 +69,6 @@ jobs:
 
       - name: Python syntax check
         run: |
-          for f in ./*.py; do
+          for f in ./*.py llamactl/*.py; do
             python3 -m py_compile "$f" || { echo "SYNTAX FAIL: $f"; exit 1; }
           done

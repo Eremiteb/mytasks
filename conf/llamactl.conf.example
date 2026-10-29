@@ -43,3 +43,29 @@ SUDO_CMD="sudo -A"
 # друг друга и не затирают чужие правки models.ini; тайм-аут ожидания, секунды
 PRESET_LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/llamactl-models-ini.lock"
 PRESET_LOCK_TIMEOUT_SECS="600"
+
+# Проверка логов сервера: `llamactl logcheck` (таймер llamactl-logcheck.timer)
+# Узел esimych-cloud и каталог проекта на нём: по ssh выполняется
+# `cd LOGCHECK_REMOTE_DIR && python3 -I scripts/check-logs.py --since ... --no-save`
+LOGCHECK_SSH_HOST="root@10.66.66.1"
+LOGCHECK_REMOTE_DIR="/opt/esimych-cloud"
+# Модель роутера для разбора отчёта (выбрана замером 2026-10-29)
+LOGCHECK_MODEL="gemma-4-26b-a4b"
+# Минимум свободной VRAM, МиБ: при меньшем значении GPU считается занятой
+LOGCHECK_MIN_FREE_VRAM_MIB="5000"
+# Сколько последних отчётов хранить в state/llamactl-logcheck/
+LOGCHECK_KEEP="30"
+# Ожидание свободной GPU: общий предел и период опроса, секунды
+LOGCHECK_WAIT_SECS="1800"
+LOGCHECK_POLL_SECS="60"
+# Лимит токенов ответа модели и тайм-аут её ответа, секунды
+LOGCHECK_MAX_TOKENS="1500"
+LOGCHECK_TIMEOUT_SECS="900"
+# Тайм-аут ssh до сервера, секунды
+LOGCHECK_SSH_TIMEOUT_SECS="20"
+# Предел размера отчёта, байт: больший отчёт обрезается перед отправкой модели
+LOGCHECK_MAX_REPORT_BYTES="100000"
+# По умолчанию промпт — llamactl/logcheck_prompt.txt в корне репозитория
+# LOGCHECK_PROMPT_FILE=...
+# По умолчанию каталог — state/llamactl-logcheck в корне репозитория (отчёты, status.json, last, .lock)
+# LOGCHECK_STATE_DIR=...

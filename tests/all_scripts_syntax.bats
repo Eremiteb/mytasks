@@ -4,8 +4,9 @@ setup() {
   REPO_ROOT="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
 }
 
+# Корневые скрипты и подкаталог llamactl/ (утилита вынесена из корня)
 @test "all root shell scripts pass syntax check" {
-  mapfile -t scripts < <(find "$REPO_ROOT" -maxdepth 1 -type f -name '*.sh' -printf '%f\n' | sort)
+  mapfile -t scripts < <(cd "$REPO_ROOT" && find . llamactl -maxdepth 1 -type f -name '*.sh' -printf '%p\n' | sed 's#^\./##' | sort)
 
   [ "${#scripts[@]}" -gt 0 ]
 

@@ -2,7 +2,7 @@
 Type=Application
 Name=llama.cpp — управление
 Comment=Иконка в трее: модели, VRAM, сервисы, пресеты, обновление llama.cpp (llamactl)
-Exec=@MYTASKS_DIR@/llamactl_tray.py
+Exec=@MYTASKS_DIR@/llamactl/llamactl_tray.py
 Icon=utilities-system-monitor
 Terminal=false
 Categories=Utility;
