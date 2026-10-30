@@ -1,0 +1,5 @@
+# Зависимости только для CI (.github/workflows/music-downloader.yml): тесты и
+# статический анализ локально не запускаются, поэтому в рабочий venv не ставятся.
+-r requirements.txt
+pytest>=9.1.0
+ruff>=0.17.0

@@ -6,23 +6,25 @@ on:
     paths:
       - "**.sh"
       - "**.py"
+      - ".github/workflows/shellcheck.yml"
   pull_request:
     branches: ["main", "master"]
     paths:
       - "**.sh"
       - "**.py"
+      - ".github/workflows/shellcheck.yml"
 
 jobs:
   shellcheck:
-    name: ShellCheck (error + style)
+    name: ShellCheck (error + style + all)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
 
       - name: Install ShellCheck
-        # Ubuntu's apt package (0.9.0 on noble) has known false positives for
-        # SC2317 on functions only invoked via `trap` (fixed upstream by 0.11.0)
-        # — install the current stable release directly instead.
+        # Пакет apt в Ubuntu (0.9.0 в noble) даёт известные ложные SC2317 на
+        # функциях, вызываемых только через `trap` (исправлено в 0.11.0), —
+        # поэтому ставим текущий стабильный релиз напрямую.
         run: |
           curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/stable/shellcheck-stable.linux.x86_64.tar.xz" \
             | tar -xJ
@@ -31,6 +33,11 @@ jobs:
 
       - name: ShellCheck error level
         run: shellcheck -S error ./*.sh llamactl/*.sh
+
+      # Все дополнительные проверки (в том числе SC2312) — обязательное
+      # требование к скриптам; локально shellcheck не запускается.
+      - name: ShellCheck all optional checks
+        run: shellcheck -o all ./*.sh llamactl/*.sh
 
       - name: ShellCheck style level
         run: shellcheck -S style ./*.sh llamactl/*.sh
@@ -62,7 +69,7 @@ jobs:
           [ "$fail" -eq 0 ] || exit 1
 
   python-check:
-    name: Python syntax
+    name: Python syntax + Ruff (llamactl)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
@@ -72,3 +79,8 @@ jobs:
           for f in ./*.py llamactl/*.py; do
             python3 -m py_compile "$f" || { echo "SYNTAX FAIL: $f"; exit 1; }
           done
+
+      # Трей и статус llamactl — Ruff с длиной строки 130 (у music_downloader
+      # свой .ruff.toml и свой workflow). pipx есть в образе ubuntu-latest.
+      - name: Ruff (llamactl)
+        run: pipx run --spec "ruff>=0.17.0" ruff check --line-length 130 llamactl/llamactl_tray.py llamactl/llamactl_status.py

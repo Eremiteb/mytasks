@@ -10,61 +10,18 @@
 
 ## Валидация
 
-До и после любых изменений проверять, что ничего не сломано.
+Тесты и проверки кода **локально не запускать** — ни на рабочей машине, ни на QNAP или сервере (глобальное правило «Тесты и проверки кода — только в CI»). Проверку выполняет GitHub Actions после пуша: правка → коммит и пуш (по правилу подтверждения) → `gh run list --branch main --limit 5`, `gh run watch <id>` (в фоне), при падении `gh run view <id> --log-failed` → исправить и запушить снова. Задача не завершена, пока CI не зелёный. Если нужной проверки нет в workflow — добавить её туда, а не запускать локально.
 
-Полный набор Bats-тестов (нужен `bats-core`; при отсутствии установить один раз):
-```sh
-git clone --depth 1 https://github.com/bats-core/bats-core.git /tmp/bats-core
-sudo /tmp/bats-core/install.sh /usr/local
-bats --print-output-on-failure tests
-```
+Что проверяет CI (`.github/workflows/`, подробности — «Тесты, CI и Git» ниже):
 
-Один тестовый файл скрипта:
-```sh
-bats --print-output-on-failure tests/getip.bats
-```
+- `bats-tests.yml` — полный набор Bats-тестов `tests/` (bats-core), на каждый push/PR; `tests/all_scripts_syntax.bats` дополнительно проверяет синтаксис каждого корневого `*.sh` и `llamactl/*.sh` по shebang.
+- `shellcheck.yml` (при изменении `*.sh`/`*.py`) — `shellcheck -S error`, `shellcheck -S style` (фигурные скобки, `[[ ]]`, ветка `case *)` и другие соглашения), `shellcheck -o all` (все дополнительные проверки, в том числе SC2312), `bash -n`/`sh -n` по shebang, поиск ссылок на переменные без фигурных скобок, `python3 -m py_compile` для корневых `.py` и `llamactl/*.py`, Ruff для `llamactl/llamactl_tray.py` и `llamactl/llamactl_status.py` (`--line-length 130`).
+- `music-downloader.yml` — ставит `music_downloader/requirements-ci.txt` (рабочие зависимости + `pytest`, `ruff`; в локальный venv из `requirements.txt` они не попадают), Ruff для `music_downloader/` (`music_downloader/.ruff.toml`: Python 3.14, длина строки 120) и pytest `music_downloader/tests` + `tests/test_music_downloader.py`. Тесты используют временные каталоги и подменённые HTTP-ответы; покрывают общие глобальные пути загрузки, отклонение неверных, отсутствующих и заполненных каталогов до создания скрапера, атомарную запись и дедупликацию БД. Реальное скачивание для проверки конфигурации не запускать.
+- `security-scan.yml` — Semgrep, Trivy, OSV-Scanner, Gitleaks, CodeQL.
 
-Проверка синтаксиса отдельного корневого shell-скрипта (также контролируется `tests/all_scripts_syntax.bats`):
-```sh
-bash -n ./some_script.sh
-```
+Инструменты проверки (`shellcheck`, `bats`, `pytest`, `ruff`) на рабочую машину не ставятся: `check_mytasks.sh` их не предлагает, `music_downloader/requirements.txt` их не содержит — их ставит только CI.
 
-ShellCheck: ошибки блокируют CI, уровень style проверяет фигурные скобки, `[[ ]]`, ветку `case *)` и другие соглашения:
-```sh
-shellcheck -S error ./*.sh
-shellcheck -S style ./*.sh
-```
-
-Проверка всех корневых shell-скриптов с учётом shebang (также выполняется CI):
-```sh
-for f in ./*.sh; do
-  if head -1 "$f" | grep -qi bash; then bash -n "$f"; else sh -n "$f"; fi
-done
-```
-
-Поиск ссылок на переменные без фигурных скобок в локальном shell-коде (контролируется CI; пропускает комментарии и строки удалённого shell):
-```sh
-grep -nP '(?<!")\$(?!\{)[A-Za-z_][A-Za-z0-9_]*' ./*.sh \
-  | grep -v '^\s*#' | grep -v "\\\\'" \
-  | grep -v 'sh -lc\|bash -c\|MARIADB_ROOT\|REDIS_WAIT\|PURGE_BINLOGS\|TRUNCATE\|in_progress'
-```
-
-Проверка синтаксиса корневых `.py` (также выполняется CI):
-```sh
-for f in ./*.py; do python3 -m py_compile "$f"; done
-```
-
-Python-тесты из корня репозитория после установки `music_downloader/requirements.txt` в venv:
-```sh
-music_downloader/venv/bin/python -m pytest tests/test_music_downloader.py music_downloader/tests -q
-```
-Тесты используют временные каталоги и подменённые HTTP-ответы; покрывают общие глобальные пути загрузки, отклонение неверных, отсутствующих и заполненных каталогов до создания скрапера, атомарную запись и дедупликацию БД. Для проверки конфигурации не запускать реальное скачивание.
-
-Ruff для `music_downloader/` (`music_downloader/.ruff.toml`: Python 3.14, длина строки 120); `llamactl/llamactl_tray.py` и `llamactl/llamactl_status.py` — тем же ruff с `--line-length 130`:
-```sh
-music_downloader/venv/bin/ruff check music_downloader/
-music_downloader/venv/bin/ruff check --line-length 130 llamactl/llamactl_tray.py llamactl/llamactl_status.py
-```
+Dry-run скриптов (`--dry-run`) — не проверка кода, а обязательный шаг перед боевым запуском; для него действуют прежние правила.
 
 ## Graphify
 
@@ -99,7 +56,7 @@ music_downloader/venv/bin/ruff check --line-length 130 llamactl/llamactl_tray.py
 ## Тесты, CI и Git
 
 - `tests/` примерно один к одному соответствует корневым скриптам (`<script>.bats`) и использует bats-core. Внешние программы (`curl`, `notify-send`, `docker`, `ssh` и другие) подменяются временными исполняемыми файлами, каталог которых добавляется в начало `PATH`; образец — `tests/getip.bats`: каталог заглушек и `env PATH="$STUB_DIR:$PATH" bash -c "..."`. `tests/all_scripts_syntax.bats` автоматически проверяет каждый корневой `*.sh` и `llamactl/*.sh` через `bash -n`/`sh -n` по shebang, поэтому новые скрипты получают проверку синтаксиса без отдельной записи.
-- CI состоит из независимых workflows. `.github/workflows/shellcheck.yml` запускает `shellcheck -S error`, `shellcheck -S style`, синтаксическую проверку `bash -n`/`sh -n`, поиск переменных без скобок и `python3 -m py_compile` для корневых `.py` и `llamactl/*.py`; срабатывает только при изменениях `*.sh`/`*.py`. `.github/workflows/bats-tests.yml` запускает все Bats-тесты при каждом push/PR. `.github/workflows/music-downloader.yml` устанавливает зависимости загрузчика, проверяет `music_downloader/` Ruff, публикует отчёты Ruff и запускает `music_downloader/tests/` вместе с `tests/test_music_downloader.py` на Python 3.14; фильтры путей включают загрузчик, общие тесты и сам workflow.
+- CI состоит из независимых workflows. `.github/workflows/shellcheck.yml` запускает `shellcheck -S error`, `shellcheck -S style`, `shellcheck -o all`, синтаксическую проверку `bash -n`/`sh -n`, поиск переменных без скобок и `python3 -m py_compile` для корневых `.py` и `llamactl/*.py`; срабатывает только при изменениях `*.sh`/`*.py`. `.github/workflows/bats-tests.yml` запускает все Bats-тесты при каждом push/PR. `.github/workflows/music-downloader.yml` устанавливает зависимости загрузчика, проверяет `music_downloader/` Ruff, публикует отчёты Ruff и запускает `music_downloader/tests/` вместе с `tests/test_music_downloader.py` на Python 3.14; фильтры путей включают загрузчик, общие тесты и сам workflow.
 - `music_downloader/` — отслеживаемый Python-подпроект этого репозитория, не вложенный Git checkout и не submodule. Его исходники, драйверы, тесты, README, `.ruff.toml`, requirements и `.json.example` коммитятся вместе с `mytasks`. Реальные `music_downloader.json`, SQLite-БД и резервные копии, логи и venv остаются локальными по `.gitignore`; не добавлять их или `graphify-out/` принудительно. Резервная копия прежних вложенных Git-метаданных хранится в игнорируемом `state/music_downloader-git-backup-6394179/`, не активна и не должна попадать в Git. `newline_to_space/` остаётся отдельным локальным Python-подпроектом, исключённым из Git.
 
 ## Резервное копирование QNAP

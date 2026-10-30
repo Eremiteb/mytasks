@@ -152,8 +152,6 @@ DEPS=(
     "sshpass|sshpass|opt|cloud_backup.sh: вход на сервер по паролю"
     "wg-quick|wireguard-tools|opt|cloud_backup.sh: туннель WireGuard"
     "py:PyQt6|python3-pyqt6;arch=python-pyqt6;suse=python3-PyQt6;alpine=py3-pyqt6;void=python3-PyQt6;gentoo=dev-python/pyqt6|path:@LLAMA_PREFIX@|llamactl_tray.py: значок в трее (PyQt6 в системном Python)"
-    "shellcheck|shellcheck;redhat=ShellCheck;suse=ShellCheck;gentoo=dev-util/shellcheck-bin|opt|Разработка: проверка shell-скриптов"
-    "bats|bats|opt|Разработка: тесты tests/*.bats"
 )
 
 # Примеры, по которым при первом запуске проходит мастер конфигов

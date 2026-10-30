@@ -225,14 +225,12 @@ sqlite3 music_downloader/music_downloader.db \
 
 ## Проверки
 
-Из корня `mytasks` (тесты загружают движок напрямую по пути к файлу, используют временные каталоги и подменённый HTTP; реальная музыка не скачивается):
-
-```bash
-music_downloader/venv/bin/python -m pytest tests/test_music_downloader.py music_downloader/tests -q
-bats --print-output-on-failure tests/music_downloader_wrapper.bats
-music_downloader/venv/bin/ruff check music_downloader/
-music_downloader/venv/bin/python -m py_compile music_downloader/music_downloader.py
-music_downloader/venv/bin/python -m json.tool music_downloader/music_downloader.json.example >/dev/null
-```
-
-CI выполняет Ruff и оба набора Python-тестов на Python 3.14 при изменениях загрузчика, общих тестов или workflow.
+Тесты и проверки кода локально не запускаются — их выполняет CI
+(`.github/workflows/music-downloader.yml`) после пуша при изменениях загрузчика,
+общих тестов или workflow: зависимости из `requirements-ci.txt` (рабочие +
+`pytest`, `ruff`), Ruff `music_downloader/`, pytest
+`tests/test_music_downloader.py` и `music_downloader/tests` (временные каталоги,
+подменённый HTTP, реальная музыка не скачивается), проверка
+`music_downloader.json.example` через `json.tool`. Bats-обёртка
+`tests/music_downloader_wrapper.bats` идёт в `bats-tests.yml`, синтаксис
+корневых `.py` — в `shellcheck.yml`. Результат: `gh run list --branch main`.

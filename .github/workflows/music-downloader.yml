@@ -33,12 +33,14 @@ jobs:
         with:
           python-version: "3.14"
           cache: "pip"
-          cache-dependency-path: music_downloader/requirements.txt
+          cache-dependency-path: |
+            music_downloader/requirements.txt
+            music_downloader/requirements-ci.txt
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r music_downloader/requirements.txt
+          pip install -r music_downloader/requirements-ci.txt
 
       - name: Run static analysis (Ruff)
         id: ruff
@@ -76,6 +78,9 @@ jobs:
         with:
           name: static-analysis-reports
           path: reports/
+
+      - name: Validate config example
+        run: python -m json.tool music_downloader/music_downloader.json.example >/dev/null
 
       - name: Run tests
         run: python -m pytest music_downloader/tests tests/test_music_downloader.py -q

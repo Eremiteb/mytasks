@@ -1062,16 +1062,18 @@ Jamendo для категории `/` использует официальны�
 
 ## Тесты и статический анализ
 
-Полные команды (установка bats-core, запуск отдельного набора, ShellCheck,
-`python3 -m py_compile` и т.д.) и правила именования — в разделе
-«Валидация» [`ai-md/AI.md`](ai-md/AI.md), не дублируются здесь.
+Тесты и проверки кода локально не запускаются — только в CI GitHub Actions
+после пуша; состав проверок и порядок чтения результата — в разделе
+«Валидация» [`ai-md/AI.md`](ai-md/AI.md), не дублируются здесь. Инструменты
+проверки на рабочую машину не ставятся: `pytest` и `ruff` для загрузчика —
+в `music_downloader/requirements-ci.txt`, который использует только CI.
 
 Кратко: `tests/` — по Bats-файлу на актуальный корневой скрипт плюс общий
 `all_scripts_syntax.bats` (синтаксис каждого корневого `*.sh` и `llamactl/*.sh` по шебангу); внешние
 команды стабируются через временный `PATH` (для `system_monitor.sh`
 настоящими остаются `sqlite3` и `jq`). CI — независимые workflow:
 `.github/workflows/bats-tests.yml` (все Bats-тесты на каждый push/PR),
-`.github/workflows/shellcheck.yml` (ShellCheck `error`+`style`, синтаксис
+`.github/workflows/shellcheck.yml` (ShellCheck `error`+`style`+`-o all`, Ruff трея и статуса `llamactl`, синтаксис
 `bash -n`/`sh -n`, сканер небракетированных `$VAR`, `py_compile` (корневые `*.sh`/`*.py` и `llamactl/*.sh`/`llamactl/*.py`) — только
 при изменении `*.sh`/`*.py`), `.github/workflows/music-downloader.yml` (Ruff и
 pytest загрузчика на Python 3.14) и `.github/workflows/security-scan.yml`
