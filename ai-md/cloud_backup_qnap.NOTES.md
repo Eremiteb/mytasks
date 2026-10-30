@@ -83,9 +83,13 @@
   `grep -c '^processor' /proc/cpuinfo`, тест — `tests/cloud_backup_qnap.bats`
   («без nproc…»). Попутно меняется вывод `probable_cause`: правило
   `avg_local_load1 >= LOCAL_NPROC` при nproc=1 всегда винило CPU QNAP.
-  На QNAP (`/mnt/store/tasks/`) правка начнёт действовать только после деплоя;
-  развёрнутая копия от 2026-10-04 старше репозитория (не задеплоены
-  `--dry-run`, `MYTASKS_LOG_DIR`, `WG_CONF_FILE`/`WG_SOCK` из конфига).
+  Задеплоено 2026-10-30 (коммит `903d670`) вместе с ранее не развёрнутыми
+  `--dry-run`, `MYTASKS_LOG_DIR`, `WG_CONF_FILE`/`WG_SOCK` из конфига; перед
+  этим `--dry-run` на QNAP с боевым конфигом — rc=0, план штатный. Прежняя
+  копия (от 2026-10-04) — `/mnt/store/tasks/cloud_backup_qnap.sh.bak-20261030`.
+  Первый боевой прогон — 2026-10-31 04:00: в `backup_env_diag` ждать
+  `local_nproc=4`. Dry-run из отдельного каталога: копия скрипта + ссылки
+  `conf -> ../conf`, `state -> ../state`, `MYTASKS_LOG_DIR=<каталог>/logs`.
   Ниже исходный (ошибочный) вывод сохранён как историческая гипотеза:
   load ~2–3 на 4 ядрах — не насыщение CPU, узкое место надо искать в
   однопоточных участках (zstd/ssh/wireguard-go) и дисках.
