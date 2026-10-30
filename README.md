@@ -452,7 +452,7 @@ journalctl --user -u check-backups.service -n 20
 | `enable-linger` | linger | `loginctl enable-linger` пользователя: user-службы (запись эфира) работают с загрузки, без входа в сеанс |
 | `beufm-recorder` | работа службы | запись эфира идёт: лог `logs/beufm_recorder-*.jsonl` обновлялся не позже 20 мин назад и без ошибок, иначе `systemctl --user restart` |
 | `cronie`/`cron`/`crond.service` | системный сервис | демон cron своего семейства ОС |
-| `music_downloader.sh`, `sources.sh`, `btrfs_monitor.sh` | cron | `0 21 * * *`, `0 23 * * *`, `0 */6 * * *` (Btrfs — только если `/` на Btrfs) |
+| `music_downloader.sh`, `sources.sh`, `btrfs_monitor.sh` | cron | `0 21 * * *`, `30 21 * * *`, `0 */6 * * *` (Btrfs — только если `/` на Btrfs) |
 | `conf/check_backups.conf`, `conf/sources.conf`, `music_downloader/music_downloader.json` | конфиг | создаются мастером |
 | `music_downloader/venv` | venv | `music_downloader/setup_venv.sh` |
 | `llamactl`, `llamactl-tray`, `llamactl-tray.desktop`, `llama-server.service`, `llama-fim.service` | ссылки, автозапуск, сервисы | только если есть каталог `LLAMA_PREFIX` (из `conf/check_mytasks.conf`, иначе из `conf/llamactl.conf`, иначе `/opt/llama.cpp`) |

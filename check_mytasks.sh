@@ -102,7 +102,7 @@ JOBS=(
     "user-unit|check-store-mount.service|||При входе в графический сеанс проверяет, смонтированы ли точки из /etc/fstab, и показывает уведомление о несмонтированных. Скрипт check-store-mount.sh."
     "system-ext|@CRON_UNIT@||cmd:crontab|Демон cron: запускает задания из crontab пользователя (скачивание музыки, синхронизация каталогов, мониторинг Btrfs)."
     "cron|music_downloader.sh|0 21 * * *||Ежедневно в 21:00: скачивание новой музыки с сайтов из music_downloader/music_downloader.json и раскладка по папкам исполнителей (split_by_dash.sh)."
-    "cron|sources.sh|0 23 * * *||Ежедневно в 23:00: синхронизация каталогов через rsync и архивы 7z по списку conf/sources.conf."
+    "cron|sources.sh|30 21 * * *||Ежедневно в 21:30: синхронизация каталогов через rsync и архивы 7z по списку conf/sources.conf."
     "cron|btrfs_monitor.sh|0 */6 * * *|fs:/=btrfs|Каждые 6 ч: проверка счётчиков ошибок Btrfs корневого раздела, уведомление при их росте."
     "conf|conf/check_backups.conf|conf/check_backups.conf.example||Настройки check_backups.sh: каталоги с архивами (BACKUP_DIRS), допустимый возраст и размер архивов."
     "conf|conf/sources.conf|conf/sources.conf.example||Список каталогов для sources.sh: строки «источник, назначение, опции rsync» либо «7z, каталог, каталог архивов, сколько хранить, опции 7z» через вертикальную черту."
