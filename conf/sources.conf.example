@@ -4,9 +4,9 @@
 # Строка, начинающаяся с «7z», — архив 7z вместо rsync:
 #   7z|КАТАЛОГ|КАТАЛОГ_АРХИВОВ|СКОЛЬКО_ХРАНИТЬ|ОПЦИИ_7Z
 # Архив «<имя каталога>-ГГГГ-ММ-ДД.7z», хранятся последние СКОЛЬКО_ХРАНИТЬ
-# (0 — не удалять старые, пусто — 10); пустые ОПЦИИ_7Z — «-t7z -mx=5 -snl».
+# (0 — не удалять старые, пусто — 3); пустые ОПЦИИ_7Z — «-t7z -mx=5 -snl».
 
 @HOME@/documents/|/mnt/backup/documents/|-arvhWP --delete
 @HOME@/music/|/mnt/backup/music/|-arvhWP --delete
 @HOME@/photos/|/mnt/backup/photos/|-arvhWP
-7z|@HOME@/|/mnt/backup/archives/|10|-t7z -mx=5 -snl -xr!.cache
+7z|@HOME@/documents/|/mnt/backup/archives/|3|-t7z -mx=5 -snl

@@ -33,7 +33,7 @@ LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
 SEVENZIP_BIN="${SEVENZIP_BIN:-7z}"
 SEVENZIP_DEFAULT_OPTS="${SEVENZIP_DEFAULT_OPTS:--t7z -mx=5 -snl}"
 # Сколько последних архивов хранить, если поле в строке конфига пустое.
-SEVENZIP_KEEP="${SEVENZIP_KEEP:-10}"
+SEVENZIP_KEEP="${SEVENZIP_KEEP:-3}"
 
 # Автоочистка старых логов (старше 10 дней)
 find "${LOG_DIR}" -maxdepth 1 -type f \
@@ -119,7 +119,8 @@ list_old_archives() {
 # Архив называется «<имя каталога>-ГГГГ-ММ-ДД.7z», пишется во временный
 # «.part» и переименовывается только после успеха. СКОЛЬКО_ХРАНИТЬ — число
 # последних архивов (0 — не удалять старые, пусто — SEVENZIP_KEEP, по
-# умолчанию 10). Пустые ОПЦИИ_7Z — SEVENZIP_DEFAULT_OPTS. Код 7z 1 (файл изменился при чтении) — не ошибка.
+# умолчанию 3). Пустые ОПЦИИ_7Z — SEVENZIP_DEFAULT_OPTS. Код 7z 1 (файл
+# изменился при чтении) — не ошибка.
 run_archive() {
   A_SRC=$(printf '%s' "$1" | cut -d'|' -f2 | trim)
   A_DST=$(printf '%s' "$1" | cut -d'|' -f3 | trim)

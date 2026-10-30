@@ -59,6 +59,7 @@ conf/*
 /newline_to_space/
 .sources.err*
 .sources.out*
+.sources.7z.err*
 *.sync-conflict
 
 # Graphify (generated code graph)

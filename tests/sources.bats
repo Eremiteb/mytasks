@@ -152,10 +152,10 @@ EOF2
   [ ! -e "$TMP_DIR/7z_args.txt" ]
 }
 
-@test "7z: пустое СКОЛЬКО_ХРАНИТЬ — хранится SEVENZIP_KEEP (по умолчанию 10)" {
+@test "7z: пустое СКОЛЬКО_ХРАНИТЬ — хранится SEVENZIP_KEEP (по умолчанию 3)" {
   make_7z_stub
   mkdir -p "$TMP_DIR/arch"
-  for d in 01 02 03 04 05 06 07 08 09 10 11 12; do
+  for d in 01 02 03 04 05; do
     touch -d "2026-01-$d" "$TMP_DIR/arch/src-2026-01-$d.7z"
   done
   printf '7z | %s/src/ | %s/arch/ | | -t7z\n' "$TMP_DIR" "$TMP_DIR" > "$TMP_DIR/conf/7z.conf"
@@ -163,11 +163,11 @@ EOF2
   run env PATH="$STUB_DIR:$PATH" sh "$TMP_DIR/sources.sh" -c "$TMP_DIR/conf/7z.conf"
 
   [ "$status" -eq 0 ]
-  # 12 старых + новый = 13, остаётся 10 последних
-  [ "$(find "$TMP_DIR/arch" -type f -name '*.7z' | wc -l)" -eq 10 ]
-  [ ! -e "$TMP_DIR/arch/src-2026-01-01.7z" ]
+  # 5 старых + новый = 6, остаётся 3 последних: новый, 05 и 04
+  [ "$(find "$TMP_DIR/arch" -type f -name '*.7z' | wc -l)" -eq 3 ]
   [ ! -e "$TMP_DIR/arch/src-2026-01-03.7z" ]
   [ -e "$TMP_DIR/arch/src-2026-01-04.7z" ]
+  [ -e "$TMP_DIR/arch/src-$(date '+%Y-%m-%d').7z" ]
 }
 
 # --- лог: удаления и экранирование -----------------------------------------
