@@ -110,7 +110,6 @@ JOBS=(
     "venv|music_downloader/venv|requests,bs4,cloudscraper||Виртуальное окружение Python загрузчика музыки: music_downloader/setup_venv.sh ставит зависимости из requirements.txt."
     "link|llamactl|llamactl/llamactl.sh|path:@LLAMA_PREFIX@|Команда llamactl в ~/.local/bin: управление локальным llama.cpp (модели, VRAM, сервисы, пресеты, обновление)."
     "link|llamactl-tray|llamactl/llamactl_tray.py|path:@LLAMA_PREFIX@|Команда llamactl-tray в ~/.local/bin: значок llama.cpp в трее."
-    "user-unit|llamactl-logcheck.timer||path:@LLAMA_PREFIX@|Через 10 мин после загрузки и далее раз в сутки: отчёт scripts/check-logs.py с сервера esimych-cloud разбирает локальная модель llama.cpp (llamactl logcheck), итог — уведомлением, отчёт — в state/llamactl-logcheck/. Если GPU занята (загружена другая модель, мало VRAM), ждёт до 30 мин с сообщением в трее, затем пропускает. Настройки LOGCHECK_* — conf/llamactl.conf."
     "autostart|llamactl-tray.desktop||path:@LLAMA_PREFIX@|Автозапуск значка llama.cpp в трее при входе в графический сеанс."
     "system-ext|llama-server.service||path:@LLAMA_PREFIX@|Роутер llama.cpp на 127.0.0.1:8080: веб-интерфейс и OpenAI-совместимый API. Юнит ставится вне mytasks."
     "system-ext|llama-fim.service||path:@LLAMA_PREFIX@|FIM-автодополнение llama.cpp на 127.0.0.1:8012 для VS Code и Zed. Юнит ставится вне mytasks."

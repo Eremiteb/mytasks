@@ -63,19 +63,11 @@ STATE_TITLES = {
     "busy": "модель загружена",
     "warn": "есть проблемы",
 }
-# Состояния `llamactl logcheck` (status.json в state/llamactl-logcheck)
-LOGCHECK_TITLES = {
-    "waiting_gpu": "ждёт освобождения GPU",
-    "running": "выполняется",
-    "done": "выполнена",
-    "skipped": "пропущена — GPU занята",
-    "error": "ошибка",
-}
 
 
 @dataclass
 class Item:
-    """Пункт меню. action — аргументы llamactl; mode: bg | term | open | file (path) | quit."""
+    """Пункт меню. action — аргументы llamactl; mode: bg | term | open | quit."""
 
     label: str
     action: list[str] | None = None
@@ -84,38 +76,6 @@ class Item:
     checked: bool | None = None
     children: list[Item] = field(default_factory=list)
     separator: bool = False
-    path: str | None = None
-
-
-def logcheck_line(status: dict | None) -> str | None:
-    """Строка о последней проверке логов сервера или None, если она не запускалась."""
-    lc = (status or {}).get("logcheck")
-    if not lc:
-        return None
-    text = "Проверка логов сервера: " + LOGCHECK_TITLES.get(lc.get("state"), str(lc.get("state")))
-    if lc.get("verdict"):
-        text += f" ({lc['verdict']})"
-    if lc.get("updated"):
-        text += f", {str(lc['updated'])[5:16]}"
-    return text
-
-
-def logcheck_message(lc: dict | None, first: bool) -> tuple[str, str] | None:
-    """Всплывающее сообщение о занятой GPU: при ожидании и при пропуске проверки.
-
-    first — состояние видно впервые после запуска трея: старый пропуск не показываем.
-    """
-    if not lc:
-        return None
-    reason = lc.get("reason") or "GPU занята"
-    if lc.get("state") == "waiting_gpu":
-        minutes = int(lc.get("wait_secs") or 0) // 60
-        return ("Проверка логов сервера ждёт GPU",
-                f"{reason}. Жду до {minutes} мин: освободите VRAM или запустите проверку позже из меню.")
-    if lc.get("state") == "skipped" and not first:
-        return ("Проверка логов сервера пропущена",
-                f"GPU не освободилась: {reason}. Запустить вручную: меню → «Проверка логов сервера».")
-    return None
 
 
 def classify(status: dict | None) -> str:
@@ -155,9 +115,6 @@ def tooltip(status: dict | None) -> str:
     fim = status.get("services", {}).get("fim")
     if fim != "active":
         lines.append(f"FIM: {fim}")
-    check = logcheck_line(status)
-    if check:
-        lines.append(check)
     return "\n".join(lines)
 
 
@@ -214,16 +171,6 @@ def build_menu(status: dict | None, dry_run: bool = False) -> list[Item]:
     logs.children.append(Item("FIM (в терминале)", action=["logs", "fim", "-f"], mode="term"))
     items.append(logs)
     items.append(Item("Проверка (doctor)", action=["doctor"]))
-
-    lc = (status or {}).get("logcheck") or {}
-    logcheck = Item("Проверка логов сервера")
-    logcheck.children.append(Item(logcheck_line(status) or "Проверка логов сервера: ещё не запускалась", enabled=False))
-    if lc.get("reason") and lc.get("state") in ("waiting_gpu", "skipped", "error"):
-        logcheck.children.append(Item(str(lc["reason"])[:100], enabled=False))
-    logcheck.children.append(Item("Запустить сейчас", action=["logcheck"]))
-    if lc.get("report"):
-        logcheck.children.append(Item("Открыть последний отчёт", mode="file", path=str(lc["report"])))
-    items.append(logcheck)
     items.append(Item("", separator=True))
 
     presets = Item("Пресеты")
@@ -324,7 +271,7 @@ def run_gui(opts: argparse.Namespace) -> int:
     tray = QSystemTrayIcon(icons["down"])
     menu = QMenu()
     tray.setContextMenu(menu)
-    st: dict = {"status": None, "running": set(), "poll": None, "logcheck_key": None}
+    st: dict = {"status": None, "running": set(), "poll": None}
     terminal = shlex.split(opts.terminal)
 
     def notify(title: str, text: str, error: bool = False) -> None:
@@ -375,8 +322,6 @@ def run_gui(opts: argparse.Namespace) -> int:
             app.quit()
         elif item.mode == "open":
             subprocess.Popen(["xdg-open", router_url()], start_new_session=True)
-        elif item.mode == "file" and item.path:
-            subprocess.Popen(["xdg-open", item.path], start_new_session=True)
         elif item.mode == "term":
             run_term(item.action or [])
         elif item.action is not None:
@@ -407,15 +352,6 @@ def run_gui(opts: argparse.Namespace) -> int:
         if st["running"]:
             tip += "\nВыполняется: " + ", ".join(sorted(st["running"]))
         tray.setToolTip(tip)
-        # Сообщение о занятой GPU — один раз на каждое новое состояние проверки логов
-        if status is not None:
-            lc = status.get("logcheck") or {}
-            key = (lc.get("state"), lc.get("updated"))
-            if key != st["logcheck_key"]:
-                msg = logcheck_message(lc, first=st["logcheck_key"] is None)
-                st["logcheck_key"] = key
-                if msg:
-                    notify(*msg, error=True)
         if not menu.isVisible():
             menu.clear()
             fill(menu, build_menu(status, opts.dry_run))
@@ -476,9 +412,6 @@ def main(argv: list[str] | None = None) -> int:
         status = read_status(opts.status_file)
         print(f"state: {classify(status)}")
         print(tooltip(status))
-        msg = logcheck_message((status or {}).get("logcheck"), first=False)
-        if msg:
-            print(f"сообщение: {msg[0]} — {msg[1]}")
         print(render_text(build_menu(status, opts.dry_run)))
         return 0
     return run_gui(opts)
