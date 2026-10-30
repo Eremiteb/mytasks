@@ -64,5 +64,7 @@ conf/*
 # Graphify (generated code graph)
 graphify-out/
 
-# Настройки IDE во вложенном каталоге mytasks/
-/mytasks/
+# Файлы настроек IDE в mytasks/
+/mytasks/.idea/
+/mytasks/.aiforopenide
+/mytasks/*.iml
