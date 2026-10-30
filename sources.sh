@@ -45,8 +45,30 @@ find "${LOG_DIR}" -maxdepth 1 -type f \
 ###############################################################################
 ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }
 
+# Разделитель полей в --out-format rsync.
+TAB="$(printf '\t')"
+
+# Экранирование строки для JSON: \ и ", табуляция как \t, перевод строки как \n,
+# прочие управляющие символы (в т.ч. CR) — \u00XX. Иначе табуляция или CR в
+# имени файла дают невалидную строку JSONL.
 json_escape() {
-  sed 's/\\/\\\\/g; s/"/\\"/g; s/\r//g'
+  # Замена циклом, а не gsub: в строке замены gsub обратная косая черта
+  # трактуется по-разному в gawk и mawk.
+  awk 'BEGIN { ORS = ""; for (i = 1; i < 32; i++) code[sprintf("%c", i)] = i }
+    {
+      out = ""; s = $0
+      while (match(s, /[\\"\001-\037]/)) {
+        c = substr(s, RSTART, 1)
+        if (c == "\\") e = "\\\\"
+        else if (c == "\"") e = "\\\""
+        else if (c == "\t") e = "\\t"
+        else e = sprintf("\\u%04x", code[c])
+        out = out substr(s, 1, RSTART - 1) e
+        s = substr(s, RSTART + 1)
+      }
+      if (NR > 1) print "\\n"
+      print out s
+    }'
 }
 
 trim() {
@@ -74,9 +96,14 @@ log_json() {
   _msg="$(printf '%s' "$5" | json_escape)"
   _detail="$(printf '%s' "$6" | json_escape)"
   _itemize_esc="$(printf '%s' "${_itemize}" | json_escape)"
+  # Пути — данные с диска и из конфига, экранируются так же, как сообщения.
+  _file="$(printf '%s' "$3" | json_escape)"
+  _dst_file="$(printf '%s' "$4" | json_escape)"
+  _src="$(printf '%s' "$7" | json_escape)"
+  _dst="$(printf '%s' "$8" | json_escape)"
 
   printf '{"@timestamp":"%s","schema.version":"%s","compat.targets":"%s","log.level":"%s","message":"%s","event.action":"%s","service.name":"%s","script":"%s","event":"%s","file":"%s","dst_file":"%s","src":"%s","dst":"%s","dry_run":%s,"rc":%s,"itemize":"%s","msg":"%s","detail":"%s"}\n' \
-    "${_ts}" "${LOG_SCHEMA_VERSION}" "${LOG_COMPAT_TARGETS}" "${_level_norm}" "${_msg}" "$2" "${SCRIPT_BASE}" "${SCRIPT_NAME}" "$2" "$3" "$4" "$7" "$8" "${_dry_run}" "${_rc}" "${_itemize_esc}" "${_msg}" "${_detail}" >> "${LOG_FILE}"
+    "${_ts}" "${LOG_SCHEMA_VERSION}" "${LOG_COMPAT_TARGETS}" "${_level_norm}" "${_msg}" "$2" "${SCRIPT_BASE}" "${SCRIPT_NAME}" "$2" "${_file}" "${_dst_file}" "${_src}" "${_dst}" "${_dry_run}" "${_rc}" "${_itemize_esc}" "${_msg}" "${_detail}" >> "${LOG_FILE}"
 }
 
 # Список архивов каталога, которые нужно удалить при хранении N последних:
@@ -290,8 +317,10 @@ while IFS= read -r LINE || [ -n "${LINE}" ]; do
   while IFS= read -r line; do
     [ -z "${line}" ] && continue
     case "${line}" in
-      \*deleting\ *)
-        name=${line#*deleting }
+      \*deleting*)
+        # rsync дополняет «*deleting» пробелами до ширины %i, затем идёт
+        # табуляция из --out-format: имя — всё после первой табуляции.
+        name=${line#*"${TAB}"}
         case "${name}" in */) continue ;; *) ;; esac
         dstf="$(join_path "${DST}" "${name}")"
         ev="deleted"; [ "${DRY_RUN}" -eq 1 ] && ev="would_delete"

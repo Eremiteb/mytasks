@@ -169,3 +169,29 @@ EOF2
   [ ! -e "$TMP_DIR/arch/src-2026-01-03.7z" ]
   [ -e "$TMP_DIR/arch/src-2026-01-04.7z" ]
 }
+
+# --- лог: удаления и экранирование -----------------------------------------
+
+@test "лог: удаления настоящего rsync — верный путь и валидный JSON в каждой строке" {
+  command -v rsync >/dev/null || skip "нет rsync"
+  mkdir -p "$TMP_DIR/dst/sub"
+  printf 'x\n' > "$TMP_DIR/dst/old file.txt"
+  printf 'y\n' > "$TMP_DIR/dst/sub/z"
+  printf 'q\n' > "$TMP_DIR/src/таб	\"кав\" \\.txt"
+  printf '%s/src/ | %s/dst/ | -a --delete\n' "$TMP_DIR" "$TMP_DIR" > "$TMP_DIR/conf/del.conf"
+
+  run sh "$TMP_DIR/sources.sh" -c "$TMP_DIR/conf/del.conf"
+
+  [ "$status" -eq 0 ]
+  log_file="$(find "$TMP_DIR/logs" -name 'sources_*-report.jsonl')"
+  run python3 - "$log_file" "$TMP_DIR" <<'PY'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")]
+tmp = sys.argv[2]
+deleted = {r["dst_file"] for r in rows if r["event"] == "deleted"}
+written = {r["dst_file"] for r in rows if r["event"] == "written"}
+assert deleted == {f"{tmp}/dst/old file.txt", f"{tmp}/dst/sub/z"}, deleted
+assert f'{tmp}/dst/таб\t"кав" \\.txt' in written, written
+PY
+  [ "$status" -eq 0 ]
+}
