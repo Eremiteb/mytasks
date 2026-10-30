@@ -28,6 +28,12 @@ if [ -r "${LOG_TEMPLATE_FILE}" ]; then
 fi
 LOG_SCHEMA_VERSION="${LOG_SCHEMA_VERSION:-1.0}"
 LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
+# Архивация в 7z (строки «7z | ...» в конфиге): программа и опции по умолчанию
+# (-snl — хранить симлинки как ссылки, а не обходить их).
+SEVENZIP_BIN="${SEVENZIP_BIN:-7z}"
+SEVENZIP_DEFAULT_OPTS="${SEVENZIP_DEFAULT_OPTS:--t7z -mx=5 -snl}"
+# Сколько последних архивов хранить, если поле в строке конфига пустое.
+SEVENZIP_KEEP="${SEVENZIP_KEEP:-10}"
 
 # Автоочистка старых логов (старше 10 дней)
 find "${LOG_DIR}" -maxdepth 1 -type f \
@@ -71,6 +77,115 @@ log_json() {
 
   printf '{"@timestamp":"%s","schema.version":"%s","compat.targets":"%s","log.level":"%s","message":"%s","event.action":"%s","service.name":"%s","script":"%s","event":"%s","file":"%s","dst_file":"%s","src":"%s","dst":"%s","dry_run":%s,"rc":%s,"itemize":"%s","msg":"%s","detail":"%s"}\n' \
     "${_ts}" "${LOG_SCHEMA_VERSION}" "${LOG_COMPAT_TARGETS}" "${_level_norm}" "${_msg}" "$2" "${SCRIPT_BASE}" "${SCRIPT_NAME}" "$2" "$3" "$4" "$7" "$8" "${_dry_run}" "${_rc}" "${_itemize_esc}" "${_msg}" "${_detail}" >> "${LOG_FILE}"
+}
+
+# Список архивов каталога, которые нужно удалить при хранении N последних:
+# $1 — каталог, $2 — шаблон имени (в кавычках), $3 — сколько оставить.
+list_old_archives() {
+  find "$1" -maxdepth 1 -type f -name "$2" -printf '%T@|%p\n' 2>/dev/null \
+    | sort -nr \
+    | awk -F'|' -v keep="$3" 'NR > keep { sub(/^[^|]*\|/, ""); print }'
+}
+
+# Архивация каталога в 7z. Строка конфига:
+#   7z | КАТАЛОГ | КАТАЛОГ_АРХИВОВ | СКОЛЬКО_ХРАНИТЬ | ОПЦИИ_7Z
+# Архив называется «<имя каталога>-ГГГГ-ММ-ДД.7z», пишется во временный
+# «.part» и переименовывается только после успеха. СКОЛЬКО_ХРАНИТЬ — число
+# последних архивов (0 — не удалять старые, пусто — SEVENZIP_KEEP, по
+# умолчанию 10). Пустые ОПЦИИ_7Z — SEVENZIP_DEFAULT_OPTS. Код 7z 1 (файл изменился при чтении) — не ошибка.
+run_archive() {
+  A_SRC=$(printf '%s' "$1" | cut -d'|' -f2 | trim)
+  A_DST=$(printf '%s' "$1" | cut -d'|' -f3 | trim)
+  A_KEEP=$(printf '%s' "$1" | cut -d'|' -f4 | trim)
+  A_OPTS=$(printf '%s' "$1" | cut -d'|' -f5- | trim)
+
+  # Пустое поле — значение по умолчанию; не число — ошибка конфига.
+  [ -z "${A_KEEP}" ] && A_KEEP="${SEVENZIP_KEEP}"
+  case "${A_KEEP}" in
+    ""|*[!0-9]*) A_KEEP="" ;;
+    *) ;;
+  esac
+  if [ -z "${A_SRC}" ] || [ -z "${A_DST}" ] || [ -z "${A_KEEP}" ]; then
+    log_json "error" "config_error" "" "" "invalid 7z config line" "$1" "" "" null ""
+    FAIL_EXIT=2
+    return 0
+  fi
+  if [ ! -d "${A_SRC}" ]; then
+    log_json "error" "archive_error" "${A_SRC}" "" "7z source is not a directory" "" "${A_SRC}" "${A_DST}" null ""
+    FAIL_EXIT=2
+    return 0
+  fi
+  if ! command -v "${SEVENZIP_BIN}" >/dev/null 2>&1; then
+    log_json "error" "archive_error" "${A_SRC}" "" "7z not found: ${SEVENZIP_BIN}" "" "${A_SRC}" "${A_DST}" null ""
+    FAIL_EXIT=2
+    return 0
+  fi
+  [ -z "${A_OPTS}" ] && A_OPTS="${SEVENZIP_DEFAULT_OPTS}"
+
+  A_NAME=$(basename -- "${A_SRC%/}")
+  [ -z "${A_NAME}" ] && A_NAME="root"
+  A_FINAL="${A_DST%/}/${A_NAME}-${TODAY}.7z"
+  A_PART="${A_FINAL}.part"
+  A_PATTERN="${A_NAME}-????-??-??.7z"
+
+  log_json "info" "task_start" "${A_SRC}" "${A_FINAL}" "7z task started" "" "${A_SRC}" "${A_DST}" null ""
+
+  # В dry-run новый архив ещё не создан: чтобы план ротации совпал с боевым
+  # запуском, из квоты вычитается он сам (если за сегодня его ещё нет).
+  A_RETAIN="${A_KEEP}"
+  if [ "${DRY_RUN}" -eq 1 ] && [ "${A_KEEP}" -gt 0 ] && [ ! -e "${A_FINAL}" ]; then
+    A_RETAIN=$((A_KEEP - 1))
+  fi
+
+  if [ "${DRY_RUN}" -eq 1 ]; then
+    echo "[dry-run] будет: ${SEVENZIP_BIN} a ${A_OPTS} ${A_FINAL} ${A_SRC}"
+    log_json "info" "would_archive" "${A_SRC}" "${A_FINAL}" "file action: would_archive" "" "${A_SRC}" "${A_DST}" null ""
+  else
+    mkdir -p "${A_DST}"
+    rm -f -- "${A_PART}"
+    A_ERR="${SCRIPT_DIR}/.${SCRIPT_BASE}.7z.err.$$"
+    ERR_TMP="${A_ERR}"
+    # Опции содержат «!» и «*» — разбиваем без раскрытия шаблонов.
+    set -f
+    # shellcheck disable=SC2086
+    set -- ${A_OPTS}
+    set +f
+    "${SEVENZIP_BIN}" a -bd -bso0 -bsp0 "$@" -- "${A_PART}" "${A_SRC}" 2>"${A_ERR}"
+    A_RC=$?
+
+    while IFS= read -r err; do
+      [ -z "${err}" ] && continue
+      lvl="error"; [ "${A_RC}" -le 1 ] && lvl="warn"
+      log_json "${lvl}" "7z_stderr" "${A_SRC}" "" "7z stderr" "${err}" "${A_SRC}" "${A_DST}" "${A_RC}" ""
+    done < "${A_ERR}"
+
+    if [ "${A_RC}" -gt 1 ]; then
+      rm -f -- "${A_PART}"
+      log_json "error" "task_end" "${A_SRC}" "${A_FINAL}" "7z task failed" "" "${A_SRC}" "${A_DST}" "${A_RC}" ""
+      FAIL_EXIT=2
+      cleanup
+      return 0
+    fi
+    mv -f -- "${A_PART}" "${A_FINAL}"
+    log_json "info" "archived" "${A_SRC}" "${A_FINAL}" "file action: archived" "" "${A_SRC}" "${A_DST}" "${A_RC}" ""
+  fi
+
+  # Ротация: оставляем A_KEEP последних архивов этого каталога.
+  if [ "${A_KEEP}" -gt 0 ]; then
+    list_old_archives "${A_DST}" "${A_PATTERN}" "${A_RETAIN}" | while IFS= read -r old; do
+      [ -z "${old}" ] && continue
+      if [ "${DRY_RUN}" -eq 1 ]; then
+        echo "[dry-run] будет: удалить старый архив ${old}"
+        log_json "info" "would_delete" "" "${old}" "file action: would_delete" "" "${A_SRC}" "${A_DST}" null ""
+      else
+        rm -f -- "${old}"
+        log_json "info" "deleted" "" "${old}" "file action: deleted" "" "${A_SRC}" "${A_DST}" null ""
+      fi
+    done
+  fi
+
+  log_json "info" "task_end" "${A_SRC}" "${A_FINAL}" "7z task completed successfully" "" "${A_SRC}" "${A_DST}" 0 ""
+  cleanup
 }
 
 ###############################################################################
@@ -119,6 +234,13 @@ while IFS= read -r LINE || [ -n "${LINE}" ]; do
   esac
 
   SRC=$(printf '%s' "${LINE}" | cut -d'|' -f1 | trim)
+
+  # Строка «7z | ...» — архивация в 7z, а не rsync.
+  if [ "${SRC}" = "7z" ]; then
+    run_archive "${LINE}"
+    continue
+  fi
+
   DST=$(printf '%s' "${LINE}" | cut -d'|' -f2 | trim)
   OPTS=$(printf '%s' "${LINE}" | cut -d'|' -f3- | trim)
 

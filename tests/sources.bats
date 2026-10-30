@@ -50,3 +50,122 @@ teardown() {
   run grep -q '"event":"would_write"' "$log_file"
   [ "$status" -eq 0 ]
 }
+
+# --- архивация в 7z ---------------------------------------------------------
+
+# Заглушка 7z: пишет аргументы и создаёт файл-архив (предпоследний аргумент).
+make_7z_stub() {
+  cat > "$STUB_DIR/7z" <<EOF2
+#!/usr/bin/env bash
+printf '%s\n' "\$*" > "$TMP_DIR/7z_args.txt"
+args=("\$@")
+printf 'archive' > "\${args[\$((\${#args[@]} - 2))]}"
+exit \${STUB_7Z_RC:-0}
+EOF2
+  chmod +x "$STUB_DIR/7z"
+}
+
+@test "7z: dry-run ничего не создаёт и не удаляет, план ротации учитывает новый архив" {
+  make_7z_stub
+  mkdir -p "$TMP_DIR/arch"
+  touch -d '2026-01-01' "$TMP_DIR/arch/src-2026-01-01.7z"
+  touch -d '2026-01-02' "$TMP_DIR/arch/src-2026-01-02.7z"
+  printf '7z | %s/src/ | %s/arch/ | 2 | -t7z\n' "$TMP_DIR" "$TMP_DIR" > "$TMP_DIR/conf/7z.conf"
+
+  run env PATH="$STUB_DIR:$PATH" sh "$TMP_DIR/sources.sh" -c "$TMP_DIR/conf/7z.conf" -n
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"[dry-run] будет: 7z a -t7z"* ]]
+  [[ "$output" == *"удалить старый архив $TMP_DIR/arch/src-2026-01-01.7z"* ]]
+  [[ "$output" != *"src-2026-01-02.7z"* ]]
+  [ ! -e "$TMP_DIR/7z_args.txt" ]
+  [ -e "$TMP_DIR/arch/src-2026-01-01.7z" ]
+  [ "$(find "$TMP_DIR/arch" -type f | wc -l)" -eq 2 ]
+  grep -q '"event":"would_archive"' "$TMP_DIR"/logs/sources_*-report.jsonl
+  grep -q '"event":"would_delete"' "$TMP_DIR"/logs/sources_*-report.jsonl
+}
+
+@test "7z: создаёт архив с датой, удаляет лишние старые, .part не остаётся" {
+  make_7z_stub
+  mkdir -p "$TMP_DIR/arch"
+  touch -d '2026-01-01' "$TMP_DIR/arch/src-2026-01-01.7z"
+  touch -d '2026-01-02' "$TMP_DIR/arch/src-2026-01-02.7z"
+  touch -d '2026-01-03' "$TMP_DIR/arch/other-2026-01-01.7z"
+  printf '7z | %s/src/ | %s/arch/ | 2 | -t7z -xr!.cache\n' "$TMP_DIR" "$TMP_DIR" > "$TMP_DIR/conf/7z.conf"
+
+  run env PATH="$STUB_DIR:$PATH" sh "$TMP_DIR/sources.sh" -c "$TMP_DIR/conf/7z.conf"
+
+  [ "$status" -eq 0 ]
+  today="$(date '+%Y-%m-%d')"
+  [ -s "$TMP_DIR/arch/src-$today.7z" ]
+  [ -e "$TMP_DIR/arch/src-2026-01-02.7z" ]
+  [ ! -e "$TMP_DIR/arch/src-2026-01-01.7z" ]
+  [ -e "$TMP_DIR/arch/other-2026-01-01.7z" ]
+  [ -z "$(find "$TMP_DIR/arch" -name '*.part')" ]
+  grep -q -- '-xr!.cache' "$TMP_DIR/7z_args.txt"
+  grep -q '"event":"archived"' "$TMP_DIR"/logs/sources_*-report.jsonl
+}
+
+@test "7z: пустые опции — значения по умолчанию, СКОЛЬКО_ХРАНИТЬ=0 не удаляет" {
+  make_7z_stub
+  mkdir -p "$TMP_DIR/arch"
+  touch -d '2026-01-01' "$TMP_DIR/arch/src-2026-01-01.7z"
+  printf '7z | %s/src/ | %s/arch/ | 0\n' "$TMP_DIR" "$TMP_DIR" > "$TMP_DIR/conf/7z.conf"
+
+  run env PATH="$STUB_DIR:$PATH" sh "$TMP_DIR/sources.sh" -c "$TMP_DIR/conf/7z.conf"
+
+  [ "$status" -eq 0 ]
+  grep -q -- '-t7z -mx=5 -snl' "$TMP_DIR/7z_args.txt"
+  [ -e "$TMP_DIR/arch/src-2026-01-01.7z" ]
+}
+
+@test "7z: код 2 — ошибка, архив не появляется, старые целы" {
+  make_7z_stub
+  mkdir -p "$TMP_DIR/arch"
+  touch -d '2026-01-01' "$TMP_DIR/arch/src-2026-01-01.7z"
+  printf '7z | %s/src/ | %s/arch/ | 1 | -t7z\n' "$TMP_DIR" "$TMP_DIR" > "$TMP_DIR/conf/7z.conf"
+
+  run env PATH="$STUB_DIR:$PATH" STUB_7Z_RC=2 sh "$TMP_DIR/sources.sh" -c "$TMP_DIR/conf/7z.conf"
+
+  [ "$status" -eq 2 ]
+  [ -e "$TMP_DIR/arch/src-2026-01-01.7z" ]
+  [ "$(find "$TMP_DIR/arch" -type f | wc -l)" -eq 1 ]
+}
+
+@test "7z: код 1 (файл изменился при чтении) — предупреждение, архив сохраняется" {
+  make_7z_stub
+  printf '7z | %s/src/ | %s/arch/ | 1 | -t7z\n' "$TMP_DIR" "$TMP_DIR" > "$TMP_DIR/conf/7z.conf"
+
+  run env PATH="$STUB_DIR:$PATH" STUB_7Z_RC=1 sh "$TMP_DIR/sources.sh" -c "$TMP_DIR/conf/7z.conf"
+
+  [ "$status" -eq 0 ]
+  [ -s "$TMP_DIR/arch/src-$(date '+%Y-%m-%d').7z" ]
+}
+
+@test "7z: неверное число хранимых архивов — config_error, код 2" {
+  make_7z_stub
+  printf '7z | %s/src/ | %s/arch/ | много | -t7z\n' "$TMP_DIR" "$TMP_DIR" > "$TMP_DIR/conf/7z.conf"
+
+  run env PATH="$STUB_DIR:$PATH" sh "$TMP_DIR/sources.sh" -c "$TMP_DIR/conf/7z.conf"
+
+  [ "$status" -eq 2 ]
+  [ ! -e "$TMP_DIR/7z_args.txt" ]
+}
+
+@test "7z: пустое СКОЛЬКО_ХРАНИТЬ — хранится SEVENZIP_KEEP (по умолчанию 10)" {
+  make_7z_stub
+  mkdir -p "$TMP_DIR/arch"
+  for d in 01 02 03 04 05 06 07 08 09 10 11 12; do
+    touch -d "2026-01-$d" "$TMP_DIR/arch/src-2026-01-$d.7z"
+  done
+  printf '7z | %s/src/ | %s/arch/ | | -t7z\n' "$TMP_DIR" "$TMP_DIR" > "$TMP_DIR/conf/7z.conf"
+
+  run env PATH="$STUB_DIR:$PATH" sh "$TMP_DIR/sources.sh" -c "$TMP_DIR/conf/7z.conf"
+
+  [ "$status" -eq 0 ]
+  # 12 старых + новый = 13, остаётся 10 последних
+  [ "$(find "$TMP_DIR/arch" -type f -name '*.7z' | wc -l)" -eq 10 ]
+  [ ! -e "$TMP_DIR/arch/src-2026-01-01.7z" ]
+  [ ! -e "$TMP_DIR/arch/src-2026-01-03.7z" ]
+  [ -e "$TMP_DIR/arch/src-2026-01-04.7z" ]
+}
