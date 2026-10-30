@@ -79,7 +79,13 @@
   `local_nproc=1` во всех прогонах (20 из 20 за октябрь) — артефакт
   `get_local_nproc()` в `cloud_backup_qnap.sh`: `nproc 2>/dev/null || echo 1`,
   а `nproc` на QNAP нет ни в BusyBox, ни в Entware, поэтому всегда срабатывает
-  запасное `1`. Нужен запасной подсчёт по `/proc/cpuinfo` (`grep -c ^processor`).
+  запасное `1`. Исправлено 2026-10-30: при отсутствии `nproc` функция считает
+  `grep -c '^processor' /proc/cpuinfo`, тест — `tests/cloud_backup_qnap.bats`
+  («без nproc…»). Попутно меняется вывод `probable_cause`: правило
+  `avg_local_load1 >= LOCAL_NPROC` при nproc=1 всегда винило CPU QNAP.
+  На QNAP (`/mnt/store/tasks/`) правка начнёт действовать только после деплоя;
+  развёрнутая копия от 2026-10-04 старше репозитория (не задеплоены
+  `--dry-run`, `MYTASKS_LOG_DIR`, `WG_CONF_FILE`/`WG_SOCK` из конфига).
   Ниже исходный (ошибочный) вывод сохранён как историческая гипотеза:
   load ~2–3 на 4 ядрах — не насыщение CPU, узкое место надо искать в
   однопоточных участках (zstd/ssh/wireguard-go) и дисках.

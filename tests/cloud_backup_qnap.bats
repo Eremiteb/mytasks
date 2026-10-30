@@ -452,3 +452,27 @@ EOF
   [ -z "$(ls -A "$BACKUP_DIR")" ]
   [ ! -e "$TMP_DIR/state" ]
 }
+
+@test "без nproc число ядер берётся из /proc/cpuinfo, а не запасная 1" {
+  cat > "$STUB_DIR/ssh" <<EOF2
+#!/usr/bin/env bash
+case "\$*" in
+  *"command -v zstd >/dev/null 2>&1"*) echo gzip; exit 0 ;;
+  *"tar --create"*) printf '$GZIP_FIXTURE'; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF2
+  chmod +x "$STUB_DIR/ssh"
+
+  # Как на QNAP: команды nproc нет (BusyBox и Entware без неё).
+  printf '#!/usr/bin/env bash\nexit 127\n' > "$STUB_DIR/nproc"
+  chmod +x "$STUB_DIR/nproc"
+
+  run_script
+
+  [ "$status" -eq 0 ]
+  expected="$(grep -c '^processor' /proc/cpuinfo)"
+  log_file=$(ls "$TMP_DIR/logs"/cloud_backup_qnap-*.jsonl 2>/dev/null | head -1)
+  run grep -q "local_nproc=${expected}," "$log_file"
+  [ "$status" -eq 0 ]
+}
