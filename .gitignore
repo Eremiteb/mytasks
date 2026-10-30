@@ -63,3 +63,6 @@ conf/*
 
 # Graphify (generated code graph)
 graphify-out/
+
+# Настройки IDE во вложенном каталоге mytasks/
+/mytasks/
