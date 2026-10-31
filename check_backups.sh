@@ -44,6 +44,9 @@ VERIFY_INTEGRITY="yes"
 VERIFY_MIN_SPEED_MBPS=20
 VERIFY_TIMEOUT_BASE_SECS=120
 VERIFY_MIN_AGE_MINUTES=30
+WRITING_RECENT_MINUTES=30
+WRITING_CHECK_SECS=15
+PARTIAL_SUFFIXES=(".part")
 KEEP_LOGS="${KEEP_LOGS:-10}"
 APP_NAME="BackupCheck"
 ICON_NAME="drive-harddisk"
@@ -59,6 +62,8 @@ if [[ ${#ARCHIVE_PATTERNS[@]} -eq 0 ]]; then
 fi
 
 NOTIFY_ENABLED="yes"
+WRITING_DETAIL=""
+PARTIAL_PATH=""
 ARCHIVES=()
 PROBLEMS=()
 SUMMARY=()
@@ -202,6 +207,76 @@ list_archives() {
     rm -f -- "${tmp_file}"
 }
 
+# «размер|mtime» файла; пустая строка, если файл недоступен
+file_stamp() {
+    timeout "${ACCESS_TIMEOUT_SECS}" stat -c '%s|%Y' -- "$1" 2>/dev/null
+}
+
+# Архив ещё пишется: изменён менее WRITING_RECENT_MINUTES назад и за
+# WRITING_CHECK_SECS меняет размер/mtime либо открыт на запись локальным
+# процессом (lsof). Удалённого писателя по NFS (QNAP) видно только по росту.
+# Возврат: 0 — пишется (причина в WRITING_DETAIL), 1 — нет.
+is_being_written() {
+    local file="$1"
+    local before after mtime now writer
+
+    WRITING_DETAIL=""
+    before="$(file_stamp "${file}")"
+    [[ -n "${before}" ]] || return 1
+    mtime="${before#*|}"
+    now="$(date +%s)"
+    if [[ $(( now - mtime )) -ge $(( WRITING_RECENT_MINUTES * 60 )) ]]; then
+        return 1
+    fi
+
+    sleep "${WRITING_CHECK_SECS}"
+    after="$(file_stamp "${file}")"
+    if [[ -n "${after}" && "${after}" != "${before}" ]]; then
+        WRITING_DETAIL="размер ${before%%|*} → ${after%%|*} Б за ${WRITING_CHECK_SECS} с"
+        return 0
+    fi
+
+    if command -v lsof >/dev/null 2>&1; then
+        writer="$(timeout "${ACCESS_TIMEOUT_SECS}" lsof -w -F pa -- "${file}" 2>/dev/null \
+            | awk '/^p/ { pid = substr($0, 2) } /^a[wu]/ { print pid; exit }')"
+        if [[ -n "${writer}" ]]; then
+            WRITING_DETAIL="открыт на запись процессом ${writer}"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Временный файл ещё не дописанного архива (маска + суффикс из
+# PARTIAL_SUFFIXES, например «*.7z.part» у sources.sh), в который идёт запись.
+# Возврат: 0 — найден (путь в PARTIAL_PATH, причина в WRITING_DETAIL), 1 — нет.
+find_partial_writing() {
+    local dir="$1"
+    local find_args=()
+    local pattern suffix newest
+
+    PARTIAL_PATH=""
+    [[ ${#PARTIAL_SUFFIXES[@]} -gt 0 ]] || return 1
+    for pattern in "${ARCHIVE_PATTERNS[@]}"; do
+        for suffix in "${PARTIAL_SUFFIXES[@]}"; do
+            if [[ ${#find_args[@]} -gt 0 ]]; then
+                find_args+=(-o)
+            fi
+            find_args+=(-name "${pattern}${suffix}")
+        done
+    done
+
+    newest="$(find "${dir}" -maxdepth "${SEARCH_DEPTH}" -type f \( "${find_args[@]}" \) \
+        -printf '%T@|%p\n' 2>/dev/null | sort -t'|' -k1,1nr | head -n 1)"
+    [[ -n "${newest}" ]] || return 1
+    newest="${newest#*|}"
+    if is_being_written "${newest}"; then
+        PARTIAL_PATH="${newest}"
+        return 0
+    fi
+    return 1
+}
+
 # Тайм-аут проверки зависит от размера: архив читается целиком, поэтому на
 # VERIFY_MIN_SPEED_MBPS МиБ/с (нижняя оценка скорости NFS/диска) плюс запас.
 verify_timeout_for() {
@@ -278,6 +353,7 @@ check_dir() {
     local max_age_days="${MAX_AGE_DAYS}"
     local mtime size path prev_size
     local count age_hours limit_hours ratio name verify_rc size_h verify_key verify_start verify_end now age_secs
+    local writing_note="" post_stamp
 
     if [[ "${spec}" == *"|"* ]]; then
         max_age_days="${spec#*|}"
@@ -300,7 +376,29 @@ check_dir() {
 
     list_archives "${dir}"
 
+    # Недописанный архив — не ошибка: его не проверяем, оцениваем предыдущие
+    # готовые (cloud_backup*.sh пишут сразу под финальным именем).
+    if [[ ${#ARCHIVES[@]} -gt 0 ]]; then
+        IFS='|' read -r _ _ path <<< "${ARCHIVES[0]}"
+        if is_being_written "${path}"; then
+            name="$(basename -- "${path}")"
+            writing_note="ещё пишется: ${name}"
+            log_json "INFO" "archive_writing" "Последний архив ещё пишется: проверяются предыдущие" "${path} | ${WRITING_DETAIL}"
+            ARCHIVES=("${ARCHIVES[@]:1}")
+        fi
+    fi
+    if [[ -z "${writing_note}" ]] && find_partial_writing "${dir}"; then
+        name="$(basename -- "${PARTIAL_PATH}")"
+        writing_note="ещё пишется: ${name}"
+        log_json "INFO" "archive_writing" "Новый архив ещё пишется во временный файл" "${PARTIAL_PATH} | ${WRITING_DETAIL}"
+    fi
+
     count=${#ARCHIVES[@]}
+    if [[ "${count}" -eq 0 && -n "${writing_note}" ]]; then
+        SUMMARY+=("${dir}: готовых архивов пока нет, ${writing_note}")
+        log_json "INFO" "dir_writing" "Готовых архивов нет, первый архив ещё пишется" "${dir} | ${writing_note}"
+        return 0
+    fi
     if [[ "${count}" -eq 0 ]]; then
         add_problem "${dir}" "no_archives" "Архивы не найдены" "маски: ${ARCHIVE_PATTERNS[*]}"
         return 0
@@ -315,7 +413,9 @@ check_dir() {
     age_hours=$(( age_secs / 3600 ))
     limit_hours=$(( max_age_days * 24 ))
 
-    if [[ "${age_hours}" -gt "${limit_hours}" ]]; then
+    if [[ "${age_hours}" -gt "${limit_hours}" && -n "${writing_note}" ]]; then
+        log_json "WARN" "archive_stale_writing" "Последний готовый архив старше лимита (${age_hours} ч при ${limit_hours} ч), но новый ещё пишется" "${path} | ${writing_note}"
+    elif [[ "${age_hours}" -gt "${limit_hours}" ]]; then
         add_problem "${dir}" "archive_stale" "Последний архив устарел (${age_hours} ч при лимите ${limit_hours} ч)" "${path}"
         return 0
     fi
@@ -347,7 +447,12 @@ check_dir() {
             verify_start="$(date +%s)"
             verify_archive "${path}" "${size}"
             verify_rc=$?
-            if [[ "${verify_rc}" -eq 1 ]]; then
+            # Архив, изменившийся за время чтения, дописывался — это не повреждение
+            post_stamp="$(file_stamp "${path}")"
+            if [[ "${verify_rc}" -eq 1 && "${post_stamp}" != "${size}|${mtime}" ]]; then
+                writing_note="изменился во время проверки"
+                log_json "INFO" "archive_writing" "Архив изменился во время проверки целостности (ещё пишется): ошибка не засчитана" "${path} | было ${size}|${mtime}, стало ${post_stamp:-нет файла}"
+            elif [[ "${verify_rc}" -eq 1 ]]; then
                 add_problem "${dir}" "archive_corrupt" "Последний архив повреждён" "${path}"
                 return 0
             elif [[ "${verify_rc}" -eq 0 ]]; then
@@ -358,8 +463,8 @@ check_dir() {
         fi
     fi
 
-    SUMMARY+=("${dir}: ${name}, ${size_h}, ${age_hours} ч назад, архивов: ${count}")
-    log_json "INFO" "dir_ok" "Каталог с бэкапами в порядке" "${dir} | ${name} | ${size_h} | ${age_hours} ч | архивов: ${count}"
+    SUMMARY+=("${dir}: ${name}, ${size_h}, ${age_hours} ч назад, архивов: ${count}${writing_note:+, ${writing_note}}")
+    log_json "INFO" "dir_ok" "Каталог с бэкапами в порядке" "${dir} | ${name} | ${size_h} | ${age_hours} ч | архивов: ${count}${writing_note:+ | ${writing_note}}"
 }
 
 usage() {

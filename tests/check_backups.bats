@@ -31,8 +31,18 @@ write_conf() {
   cat > "$TMP_DIR/conf/check_backups.conf" <<EOT
 BACKUP_DIRS=("$BACKUP_DIR${1:-}")
 VERIFY_INTEGRITY="no"
+WRITING_CHECK_SECS=0
 ${2:-}
 EOT
+}
+
+grow_on_sleep() {
+  # Стаб sleep дописывает файл — так в тесте имитируется идущая запись архива
+  cat > "$STUB_DIR/sleep" <<EOT
+#!/usr/bin/env bash
+printf 'x' >> "$1"
+EOT
+  chmod +x "$STUB_DIR/sleep"
 }
 
 make_archive() {
@@ -162,6 +172,95 @@ last_log() {
 
   [ "$status" -eq 0 ]
   [[ "$(last_log)" == *'"event":"verify_deferred"'* ]]
+}
+
+@test "пишущийся последний архив пропускается, проверяется предыдущий" {
+  write_conf
+  make_archive "b-1.tar.zst" 10000 30
+  head -c 100 /dev/zero > "$BACKUP_DIR/b-2.tar.zst"
+  grow_on_sleep "$BACKUP_DIR/b-2.tar.zst"
+  run_check
+
+  [ "$status" -eq 0 ]
+  [ ! -e "$NOTIFY_LOG" ]
+  [[ "$output" == *"b-1.tar.zst"*"ещё пишется: b-2.tar.zst"* ]]
+  [[ "$(last_log)" == *'"event":"archive_writing"'* ]]
+  [[ "$(last_log)" != *'"event":"archive_shrunk"'* ]]
+}
+
+@test "единственный архив ещё пишется: не ошибка" {
+  write_conf
+  : > "$BACKUP_DIR/b-1.tar.zst"
+  grow_on_sleep "$BACKUP_DIR/b-1.tar.zst"
+  run_check
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"готовых архивов пока нет"* ]]
+  [[ "$(last_log)" == *'"event":"dir_writing"'* ]]
+}
+
+@test "свежий, но неизменный архив проверяется как обычно" {
+  write_conf
+  make_archive "b-1.tar.zst" 10000 30
+  head -c 100 /dev/zero > "$BACKUP_DIR/b-2.tar.zst"
+  run_check
+
+  [ "$status" -eq 1 ]
+  [[ "$(last_log)" == *'"event":"archive_shrunk"'* ]]
+  [[ "$(last_log)" != *'"event":"archive_writing"'* ]]
+}
+
+@test "архив, открытый на запись локальным процессом, считается пишущимся" {
+  command -v lsof >/dev/null 2>&1 || skip "нет lsof"
+  write_conf
+  make_archive "b-1.tar.zst" 10000 30
+  head -c 100 /dev/zero > "$BACKUP_DIR/b-2.tar.zst"
+  exec 7>>"$BACKUP_DIR/b-2.tar.zst"
+  run_check
+  exec 7>&-
+
+  [ "$status" -eq 0 ]
+  [[ "$(last_log)" == *'"event":"archive_writing"'*"открыт на запись"* ]]
+}
+
+@test "растущий .part снимает ошибку устаревшего архива" {
+  write_conf
+  make_archive "b-1.7z" 1000 100
+  : > "$BACKUP_DIR/b-2.7z.part"
+  grow_on_sleep "$BACKUP_DIR/b-2.7z.part"
+  run_check
+
+  [ "$status" -eq 0 ]
+  [[ "$(last_log)" == *'"event":"archive_stale_writing"'* ]]
+  [[ "$(last_log)" != *'"event":"archive_stale"'* ]]
+}
+
+@test "заброшенный .part не скрывает устаревший архив" {
+  write_conf
+  make_archive "b-1.7z" 1000 100
+  make_archive "b-2.7z.part" 100 50
+  grow_on_sleep "$BACKUP_DIR/b-2.7z.part"
+  run_check
+
+  [ "$status" -eq 1 ]
+  [[ "$(last_log)" == *'"event":"archive_stale"'* ]]
+}
+
+@test "проверка целостности: архив, изменившийся во время проверки, не повреждён" {
+  write_conf "" 'VERIFY_INTEGRITY="yes"'
+  make_archive "b-1.tar.gz" 500 2
+  cat > "$STUB_DIR/gzip" <<'EOT'
+#!/usr/bin/env bash
+for f in "$@"; do :; done
+printf 'x' >> "$f"
+exit 1
+EOT
+  chmod +x "$STUB_DIR/gzip"
+  run_check
+
+  [ "$status" -eq 0 ]
+  [[ "$(last_log)" == *"изменился во время проверки"* ]]
+  [[ "$(last_log)" != *'"event":"archive_corrupt"'* ]]
 }
 
 @test "тайм-аут проверки пропорционален размеру архива" {
