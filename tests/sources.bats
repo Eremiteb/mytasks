@@ -195,3 +195,24 @@ assert f'{tmp}/dst/таб\t"кав" \\.txt' in written, written
 PY
   [ "$status" -eq 0 ]
 }
+
+@test "7z: недописанные .part прошлых запусков удаляются, в dry-run — только план" {
+  make_7z_stub
+  mkdir -p "$TMP_DIR/arch"
+  printf 'x' > "$TMP_DIR/arch/src-2026-01-01.7z.part"
+  printf 'x' > "$TMP_DIR/arch/other-2026-01-01.7z.part"
+  printf '7z | %s/src/ | %s/arch/ | 0 | -t7z\n' "$TMP_DIR" "$TMP_DIR" > "$TMP_DIR/conf/7z.conf"
+
+  run env PATH="$STUB_DIR:$PATH" sh "$TMP_DIR/sources.sh" -c "$TMP_DIR/conf/7z.conf" -n
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"удалить недописанный архив $TMP_DIR/arch/src-2026-01-01.7z.part"* ]]
+  [ -e "$TMP_DIR/arch/src-2026-01-01.7z.part" ]
+
+  run env PATH="$STUB_DIR:$PATH" sh "$TMP_DIR/sources.sh" -c "$TMP_DIR/conf/7z.conf"
+
+  [ "$status" -eq 0 ]
+  [ ! -e "$TMP_DIR/arch/src-2026-01-01.7z.part" ]
+  [ -e "$TMP_DIR/arch/other-2026-01-01.7z.part" ]
+  [ -s "$TMP_DIR/arch/src-$(date '+%Y-%m-%d').7z" ]
+}

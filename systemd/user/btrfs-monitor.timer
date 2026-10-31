@@ -1,0 +1,11 @@
+[Unit]
+Description=Проверка ошибок Btrfs: каждые 6 ч, пропущенный запуск — после загрузки
+
+[Timer]
+OnCalendar=*-*-* 00/6:00:00
+# Пропущенный при выключенном компьютере интервал выполняется один раз после загрузки
+Persistent=true
+Unit=btrfs-monitor.service
+
+[Install]
+WantedBy=timers.target

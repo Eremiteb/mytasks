@@ -1,0 +1,10 @@
+[Unit]
+Description=Проверка внешнего IP: через 2 минуты после загрузки и каждые 30 минут
+
+[Timer]
+OnBootSec=2min
+OnCalendar=*:00/30
+Unit=getip.service
+
+[Install]
+WantedBy=timers.target

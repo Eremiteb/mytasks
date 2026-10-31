@@ -1,0 +1,16 @@
+[Unit]
+Description=Синхронизация каталогов (rsync) и архивы 7z по списку conf/sources.conf
+Documentation=file://@MYTASKS_DIR@/README.md
+# Не начинать, пока идёт скачивание музыки: split_by_dash.sh раскладывает файлы
+# в /mnt/copy/Music, который копирует rsync. After= действует и на задания из
+# разных таймеров (оба догоняются после загрузки) — sources ждёт окончания
+# music-downloader.service (Type=oneshot).
+After=music-downloader.service
+
+[Service]
+Type=oneshot
+# Пока идёт копирование и архив 7z, выключение и сон блокируются (KDE покажет,
+# кто мешает); принудительное выключение root-ом блокировку игнорирует.
+ExecStart=/usr/bin/env systemd-inhibit --what=shutdown:sleep --who=sources.sh "--why=Резервное копирование и архив 7z" --mode=block @MYTASKS_DIR@/sources.sh
+# 7z занимает все ядра — рабочий стол не должен тормозить
+Nice=10

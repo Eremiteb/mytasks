@@ -319,6 +319,24 @@ health_log() {  # $1 — время последней записи (date -d), $
   [ "$output" = "1" ]
 }
 
+@test "no-cron: dry-run показывает план, --yes удаляет старые строки cron с комментарием" {
+  write_conf '"no-cron|crontab|demo.sh,old.sh|cmd:crontab|Старые задания cron"' ""
+  printf '%s\n' '# чужой комментарий' '0 5 * * * /usr/bin/keep.sh' \
+    '# mytasks: Демо' "0 1 * * * $WORK/demo.sh" '*/30 * * * * /old/path/old.sh >/dev/null 2>&1' > "$STATE/crontab"
+
+  run "$WORK/check_mytasks.sh" --dry-run --no-gui
+  [[ "$output" == *"[dry-run] будет: удалить из crontab строки: demo.sh old.sh"* ]]
+  run grep -c 'demo.sh\|old.sh' "$STATE/crontab"
+  [ "$output" = "2" ]
+
+  run "$WORK/check_mytasks.sh" --yes --no-gui
+  [ "$status" -eq 0 ]
+  run grep -c 'demo.sh\|old.sh\|# mytasks:' "$STATE/crontab"
+  [ "$output" = "0" ]
+  grep -q '^0 5 \* \* \* /usr/bin/keep.sh$' "$STATE/crontab"
+  grep -q '^# чужой комментарий$' "$STATE/crontab"
+}
+
 @test "юнит, отличающийся от шаблона, обновляется" {
   write_conf '"user-unit|demo.timer|||Демо-таймер"' ""
   printf 'old\n' > "$USER_UNITS/demo.service"

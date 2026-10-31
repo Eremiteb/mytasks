@@ -1,0 +1,11 @@
+[Unit]
+Description=Синхронизация каталогов и архивы 7z: ежедневно в 21:30, пропущенный запуск — после загрузки
+
+[Timer]
+OnCalendar=*-*-* 21:30:00
+# Если в 21:30 компьютер был выключен, запуск выполняется сразу после следующей загрузки
+Persistent=true
+Unit=sources.service
+
+[Install]
+WantedBy=timers.target

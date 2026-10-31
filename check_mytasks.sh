@@ -88,7 +88,10 @@ URGENCY="normal"
 #        health — служба действительно работает (имя — user-служба без
 #        .service, параметр МАСКА_ЛОГА:МИНУТЫ): последняя запись самого свежего
 #        лога в LOG_DIR не старше МИНУТ и без ERROR в последних 200 строках;
-#        исправление — systemctl --user restart.
+#        исправление — systemctl --user restart;
+#        no-cron — в crontab не должно быть строк с этими скриптами (параметр —
+#        имена через запятую): их запускают таймеры systemd, а старая строка
+#        cron дала бы второй запуск; исправление — удалить строки.
 #   условие: пусто — всегда; path:ПУТЬ, cmd:КОМАНДА, fs:ТОЧКА=ТИП,
 #        family:СЕМЕЙСТВО через запятую; при невыполненном — «не требуется».
 #   имя @CRON_UNIT@ — демон cron своего семейства ОС (cronie/cron/crond).
@@ -98,12 +101,13 @@ JOBS=(
     "user-unit|beufm-recorder.service|||Постоянная запись эфира Beu FM: каждый выход песни сохраняется дублем, из трёх дублей собирается лучшая запись (общий участок по отпечаткам fpcalc). Загрузчик берёт её, только если песни нет в источниках MP3. Скрипт music_downloader/beufm_recorder.py, настройки — блок recorder сайта beufm_kz в music_downloader/music_downloader.json."
     "health|beufm-recorder|beufm_recorder-*.jsonl:20|cmd:systemctl|Запись эфира Beu FM действительно идёт: служба пишет в лог logs/beufm_recorder-*.jsonl хотя бы раз в 20 мин (смена трека в эфире) и без ошибок. Иначе — перезапуск службы."
     "linger|enable-linger||cmd:loginctl|Пользовательские службы без входа в сеанс (loginctl enable-linger): запись эфира beufm-recorder.service работает с загрузки системы, а не только пока вы в сеансе."
+    "user-unit|sources.timer|||Ежедневно в 21:30 (пропущенный при выключенном компьютере запуск выполняется после загрузки): синхронизация каталогов через rsync и архивы 7z по списку conf/sources.conf. Ждёт окончания скачивания музыки и блокирует выключение до конца копирования. Скрипт sources.sh."
+    "user-unit|music-downloader.timer|||Ежедневно в 21:00 (пропущенный при выключенном компьютере запуск выполняется после загрузки): скачивание новой музыки с сайтов из music_downloader/music_downloader.json и раскладка по папкам исполнителей (split_by_dash.sh). Скрипт music_downloader.sh."
+    "user-unit|btrfs-monitor.timer||fs:/=btrfs|Каждые 6 ч (00, 06, 12, 18 ч; пропущенный запуск — после загрузки): проверка счётчиков ошибок Btrfs корневого раздела, уведомление при их росте. Скрипт btrfs_monitor.sh."
+    "user-unit|getip.timer|||Через 2 мин после загрузки и каждые 30 мин: проверка внешнего IP-адреса, история изменений. Скрипт getip.sh."
+    "no-cron|crontab|music_downloader.sh,sources.sh,btrfs_monitor.sh,getip.sh|cmd:crontab|Скрипты mytasks запускают таймеры systemd, а не cron: оставшаяся от прежней установки строка crontab дала бы второй, параллельный запуск."
     "user-unit|agent-skills-sync.timer|||Раз в сутки ставит навык model-routing и раздел «Выбор модели под шаг» для Claude Code, Codex и Gemini на этом устройстве и на удалённых хостах из conf/install_agent_skills.conf (недоступные пропускает до следующего запуска). Скрипт install_agent_skills.sh."
     "user-unit|check-store-mount.service|||При входе в графический сеанс проверяет, смонтированы ли точки из /etc/fstab, и показывает уведомление о несмонтированных. Скрипт check-store-mount.sh."
-    "system-ext|@CRON_UNIT@||cmd:crontab|Демон cron: запускает задания из crontab пользователя (скачивание музыки, синхронизация каталогов, мониторинг Btrfs)."
-    "cron|music_downloader.sh|0 21 * * *||Ежедневно в 21:00: скачивание новой музыки с сайтов из music_downloader/music_downloader.json и раскладка по папкам исполнителей (split_by_dash.sh)."
-    "cron|sources.sh|30 21 * * *||Ежедневно в 21:30: синхронизация каталогов через rsync и архивы 7z по списку conf/sources.conf."
-    "cron|btrfs_monitor.sh|0 */6 * * *|fs:/=btrfs|Каждые 6 ч: проверка счётчиков ошибок Btrfs корневого раздела, уведомление при их росте."
     "conf|conf/check_backups.conf|conf/check_backups.conf.example||Настройки check_backups.sh: каталоги с архивами (BACKUP_DIRS), допустимый возраст и размер архивов."
     "conf|conf/sources.conf|conf/sources.conf.example||Список каталогов для sources.sh: строки «источник, назначение, опции rsync» либо «7z, каталог, каталог архивов, сколько хранить, опции 7z» через вертикальную черту."
     "conf|music_downloader/music_downloader.json|music_downloader/music_downloader.json.example||Настройки загрузчика музыки: сайты, общий список каталогов download_paths, лимит размера."
@@ -127,7 +131,6 @@ JOBS=(
 DEPS=(
     "python3|python3;arch=python;gentoo=dev-lang/python||Python 3: music_downloader, mht_to_fb2.py, llamactl status (llamactl_status.py) и трей"
     "py:ensurepip|python3;arch=python;debian=python3-venv;gentoo=dev-lang/python||Модуль venv/ensurepip: виртуальное окружение music_downloader"
-    "crontab|cronie;debian=cron;solus=-||cron: задания music_downloader.sh, sources.sh, btrfs_monitor.sh"
     "notify-send|libnotify;debian=libnotify-bin;suse=libnotify-tools||Уведомления в трее: check_backups, check-store-mount, system_monitor, btrfs_monitor, этот скрипт"
     "gawk|gawk||split_by_dash.sh: имена файлов и папок, допустимые в Windows"
     "jq|jq||system_monitor.sh, llamactl.sh"
@@ -846,6 +849,7 @@ kind_label() {
         user-ext) printf 'сервис (польз.)' ;;
         system-ext) printf 'сервис (система)' ;;
         cron) printf 'cron' ;;
+        no-cron) printf 'старый cron' ;;
         link) printf 'ссылка' ;;
         autostart) printf 'автозапуск' ;;
         conf) printf 'конфиг' ;;
@@ -1023,6 +1027,24 @@ eval_cron() {
     esac
 }
 
+# Строк crontab с перечисленными скриптами (любой путь) быть не должно
+eval_no_cron() {
+    local i="$1" names="$2"
+    local lines match found="" n
+    local -a list=()
+    lines="$(crontab -l 2>/dev/null)" || lines=""
+    IFS=',' read -r -a list <<<"${names}"
+    for n in "${list[@]}"; do
+        match="$(cron_match "${lines}" "${n}")"
+        [[ -n "${match}" ]] && found+=" ${n}"
+    done
+    if [[ -z "${found}" ]]; then
+        set_row "${i}" "нет" "—" "чисто" "OK" "" "none" ""
+        return 0
+    fi
+    set_row "${i}" "есть" "—" "в crontab:${found}" "ВНИМАНИЕ" "в crontab остались${found} — их уже запускают таймеры systemd, будет двойной запуск" "cron-remove" "удалить из crontab строки:${found}"
+}
+
 eval_link() {
     local i="$1" name="$2" target="${MYTASKS_DIR}/$3"
     local link="${BIN_DIR}/${name}" cur
@@ -1179,6 +1201,7 @@ eval_job() {
     case "${kind}" in
         user-unit|system-unit|user-ext|system-ext) eval_unit "${i}" "${kind}" "${name}" ;;
         cron) eval_cron "${i}" "${name}" "${arg}" ;;
+        no-cron) eval_no_cron "${i}" "${arg}" ;;
         link) eval_link "${i}" "${name}" "${arg}" ;;
         autostart) eval_autostart "${i}" "${name}" ;;
         conf) eval_conf "${i}" "${name}" "${arg}" ;;
@@ -1265,7 +1288,28 @@ fix_cron() {
     fi
     lines="$(crontab -l 2>/dev/null)" || lines=""
     tmp="$(mktemp)"
-    if [[ "${R_FIX[${i}]}" == "cron-rewrite" ]]; then
+    if [[ "${R_FIX[${i}]}" == "cron-remove" ]]; then
+        # Удаляются строки с этими скриптами и комментарий «# mytasks: …» над ними
+        printf '%s\n' "${lines}" | awk -v names="${schedule//,/ }" '
+            BEGIN { n = split(names, list, " ") }
+            function hit(   f, j, b) {
+                if ($0 ~ /^[[:space:]]*(#|$)/) return 0
+                for (f = 6; f <= NF; f++)
+                    for (j = 1; j <= n; j++) {
+                        b = "/" list[j]
+                        if (length($(f)) >= length(b) && substr($(f), length($(f)) - length(b) + 1) == b) return 1
+                    }
+                return 0
+            }
+            {
+                if (hit()) { pending = ""; next }
+                if (pending != "") print pending
+                pending = ""
+                if ($0 ~ /^# mytasks: /) { pending = $0; next }
+                print
+            }
+            END { if (pending != "") print pending }' > "${tmp}"
+    elif [[ "${R_FIX[${i}]}" == "cron-rewrite" ]]; then
         printf '%s\n' "${lines}" | awk -v want="${MYTASKS_DIR}/${name}" -v base="/${name}" '
             /^[[:space:]]*(#|$)/ { print; next }
             {
@@ -1365,7 +1409,7 @@ fix_job() {
     local name arg
     case "${R_FIX[${i}]}" in
         install|enable) fix_unit "${i}" ;;
-        cron-add|cron-rewrite) fix_cron "${i}" ;;
+        cron-add|cron-rewrite|cron-remove) fix_cron "${i}" ;;
         link) fix_link "${i}" ;;
         autostart) fix_autostart "${i}" ;;
         venv) fix_venv "${i}" ;;

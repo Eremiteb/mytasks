@@ -165,6 +165,19 @@ run_archive() {
     A_RETAIN=$((A_KEEP - 1))
   fi
 
+  # Недописанные архивы прошлых запусков (компьютер выключили во время 7z):
+  # иначе «.part» за прошлые даты остаются на диске навсегда.
+  find "${A_DST}" -maxdepth 1 -type f -name "${A_PATTERN}.part" 2>/dev/null \
+    | while IFS= read -r stale; do
+        if [ "${DRY_RUN}" -eq 1 ]; then
+          echo "[dry-run] будет: удалить недописанный архив ${stale}"
+          log_json "info" "would_delete" "" "${stale}" "file action: would_delete" "stale 7z part" "${A_SRC}" "${A_DST}" null ""
+        else
+          rm -f -- "${stale}"
+          log_json "info" "deleted" "" "${stale}" "file action: deleted" "stale 7z part" "${A_SRC}" "${A_DST}" null ""
+        fi
+      done
+
   if [ "${DRY_RUN}" -eq 1 ]; then
     echo "[dry-run] будет: ${SEVENZIP_BIN} a ${A_OPTS} ${A_FINAL} ${A_SRC}"
     log_json "info" "would_archive" "${A_SRC}" "${A_FINAL}" "file action: would_archive" "" "${A_SRC}" "${A_DST}" null ""

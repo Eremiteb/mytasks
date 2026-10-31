@@ -1,0 +1,11 @@
+[Unit]
+Description=Скачивание музыки: ежедневно в 21:00, пропущенный запуск — после загрузки
+
+[Timer]
+OnCalendar=*-*-* 21:00:00
+# Если в 21:00 компьютер был выключен, запуск выполняется сразу после следующей загрузки
+Persistent=true
+Unit=music-downloader.service
+
+[Install]
+WantedBy=timers.target

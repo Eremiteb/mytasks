@@ -1,0 +1,7 @@
+[Unit]
+Description=Скачивание новой музыки и раскладка по папкам исполнителей (music_downloader.sh)
+Documentation=file://@MYTASKS_DIR@/README.md
+
+[Service]
+Type=oneshot
+ExecStart=@MYTASKS_DIR@/music_downloader.sh

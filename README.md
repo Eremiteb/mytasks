@@ -14,7 +14,8 @@ git clone git@github.com:Eremiteb/mytasks.git ~/esimych-docs/mytasks
 Red Hat и др.), обязательно обновляет систему, прописывает себя в автозагрузку,
 записывает каталог mytasks (тот,
 откуда запущен) в `conf/check_mytasks.conf`, проводит мастер конфигов, ставит
-зависимости и создаёт юниты systemd, задания cron, ссылки и автозапуск.
+зависимости и создаёт юниты и таймеры systemd, ссылки и автозапуск (cron скриптам
+mytasks не нужен; оставшиеся от прежней установки строки crontab удаляются).
 Таблица состояния — `check_mytasks.sh --status`.
 
 ## Лицензия
@@ -447,18 +448,21 @@ journalctl --user -u check-backups.service -n 20
 | `conf/check_mytasks.conf` | конфиг | каталог mytasks, семейство ОС, способ повышения прав |
 | `system-monitor.timer` | системный юнит | `system_monitor.sh` каждые 6 ч от root |
 | `check-backups.timer` | user-юнит | `check_backups.sh` раз в сутки |
+| `sources.timer` | user-юнит | `sources.sh` ежедневно в 21:30, пропущенный запуск — после загрузки; ждёт окончания скачивания музыки, блокирует выключение до конца |
 | `agent-skills-sync.timer` | user-юнит | `install_agent_skills.sh --apply` раз в сутки: навык `model-routing` на всех устройствах |
 | `check-store-mount.service` | user-юнит | `check-store-mount.sh` при входе в сеанс |
 | `beufm-recorder.service` | user-юнит | `music_downloader/beufm_recorder.py` постоянно: запись эфира Beu FM |
 | `enable-linger` | linger | `loginctl enable-linger` пользователя: user-службы (запись эфира) работают с загрузки, без входа в сеанс |
 | `beufm-recorder` | работа службы | запись эфира идёт: лог `logs/beufm_recorder-*.jsonl` обновлялся не позже 20 мин назад и без ошибок, иначе `systemctl --user restart` |
-| `cronie`/`cron`/`crond.service` | системный сервис | демон cron своего семейства ОС |
-| `music_downloader.sh`, `sources.sh`, `btrfs_monitor.sh` | cron | `0 21 * * *`, `30 21 * * *`, `0 */6 * * *` (Btrfs — только если `/` на Btrfs) |
+| `music-downloader.timer` | user-юнит | `music_downloader.sh` ежедневно в 21:00, пропущенный запуск — после загрузки |
+| `btrfs-monitor.timer` | user-юнит | `btrfs_monitor.sh` в 00/06/12/18 ч, пропущенный — после загрузки (только если `/` на Btrfs) |
+| `getip.timer` | user-юнит | `getip.sh` через 2 мин после загрузки и каждые 30 мин |
+| `crontab` | старый cron | в crontab нет строк `music_downloader.sh`, `sources.sh`, `btrfs_monitor.sh`, `getip.sh` (иначе — второй, параллельный запуск); исправление — удаление строк вместе с комментарием `# mytasks:` |
 | `conf/check_backups.conf`, `conf/sources.conf`, `music_downloader/music_downloader.json` | конфиг | создаются мастером |
 | `music_downloader/venv` | venv | `music_downloader/setup_venv.sh` |
 | `llamactl`, `llamactl-tray`, `llamactl-tray.desktop`, `llama-server.service`, `llama-fim.service` | ссылки, автозапуск, сервисы | только если есть каталог `LLAMA_PREFIX` (из `conf/check_mytasks.conf`, иначе из `conf/llamactl.conf`, иначе `/opt/llama.cpp`) |
 
-Шаблоны юнитов и автозапуска лежат в `systemd/` (`systemd/*.service|timer` — системные, `systemd/user/` — пользовательские, `systemd/autostart/` — XDG autostart) и содержат плейсхолдер `@MYTASKS_DIR@`; установленный файл, отличающийся от отрисованного шаблона (старая версия или другой каталог), отмечается «отличается» и предлагается к обновлению. Строки crontab с mytasks-скриптом из другого каталога переписываются на текущий. Таймеры включаются с `--now`, сервисы входа в сеанс — только `enable`.
+Шаблоны юнитов и автозапуска лежат в `systemd/` (`systemd/*.service|timer` — системные, `systemd/user/` — пользовательские, `systemd/autostart/` — XDG autostart) и содержат плейсхолдер `@MYTASKS_DIR@`; установленный файл, отличающийся от отрисованного шаблона (старая версия или другой каталог), отмечается «отличается» и предлагается к обновлению. Порядок между заданиями задан `After=`: `sources.service` начинается после `music-downloader.service`, `check-backups.service` — после `sources.service` (действует и когда оба таймера догоняют пропуск сразу после загрузки). Таймеры включаются с `--now`, сервисы входа в сеанс — только `enable`.
 
 **Таблица состояния** (`--status`): вид, задание, установлено (есть/нет/отличается/другой путь), автозапуск (включён, расписание cron), состояние (ожидает/работает/при событии/ошибка/не запущен), итог (`OK`, `ВНИМАНИЕ`, «не требуется») и описание; ниже — все зависимости с пакетом для текущего семейства.
 
@@ -502,7 +506,7 @@ journalctl --user -u check-backups.service -n 20
 ./btrfs_monitor.sh
 ```
 
-**Расписание:** строка crontab `0 */6 * * *` — добавляет `check_mytasks.sh`, если `/` на Btrfs.
+**Расписание:** user-таймер `btrfs-monitor.timer` (00/06/12/18 ч, `Persistent=true`) — ставит `check_mytasks.sh`, если `/` на Btrfs. Из user-службы работает и уведомление `notify-send` (есть сессионная шина D-Bus, которой у cron не было).
 
 **Режим dry-run:** `-n, --dry-run` — счётчики читаются и сравниваются как обычно, но файл состояния не создаётся и не обновляется, уведомление не отправляется (печатается).
 
@@ -929,6 +933,14 @@ Jamendo для категории `/` использует официальны�
 ./sources.sh
 ./sources.sh -n
 ./sources.sh -c /path/to/my.conf
+```
+
+**Расписание:** пользовательский таймер `systemd/user/sources.timer` (ставит `check_mytasks.sh`), а не cron: cron не догоняет запуск, пропущенный при выключенном компьютере, а компьютер часто выключают раньше, чем `sources.sh` с архивом 7z успевает закончить (~2,5 ч). Таймер срабатывает в 21:30, при `Persistent=true` пропущенный запуск выполняется сразу после загрузки. `sources.service` сначала ждёт, пока не закончится `music_downloader.sh`/`music_downloader.py` (не дольше 3 ч), затем запускает скрипт под `systemd-inhibit --what=shutdown:sleep --mode=block`: обычное выключение из KDE блокируется до конца копирования (принудительное выключение root-ом — нет). Недописанные `<имя>-ГГГГ-ММ-ДД.7z.part` прошлых запусков удаляются в начале следующего.
+
+```sh
+systemctl --user list-timers sources.timer
+systemctl --user start sources.service   # внеочередной запуск
+journalctl --user -u sources.service
 ```
 
 ---
