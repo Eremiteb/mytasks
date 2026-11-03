@@ -498,7 +498,7 @@ if [[ "${OPTIMIZE_MARIADB_BEFORE_BACKUP}" -eq 1 ]]; then
       -e PURGE_BINLOGS='${MARIADB_PURGE_BINLOGS}' \
       -e TRUNCATE_GENERAL_LOG='${MARIADB_TRUNCATE_GENERAL_LOG}' \
       '${MARIADB_SERVICE_NAME}' sh -lc 'set -e; \
-        mariadb-check -uroot -p\"\${MARIADB_ROOT_PASSWORD}\" --optimize --all-databases --skip-database=information_schema --skip-database=performance_schema --skip-database=mysql --skip-database=sys; \
+        mariadb-check -uroot -p\"\${MARIADB_ROOT_PASSWORD}\" --optimize --skip-write-binlog --all-databases --skip-database=information_schema --skip-database=performance_schema --skip-database=mysql --skip-database=sys; \
         if [ \"\${PURGE_BINLOGS}\" = \"1\" ]; then \
           mariadb -uroot -p\"\${MARIADB_ROOT_PASSWORD}\" -e \"PURGE BINARY LOGS BEFORE NOW();\"; \
         fi; \
