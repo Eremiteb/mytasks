@@ -405,7 +405,16 @@ EOF
 }
 
 @test "kill-foreign: dry-run не трогает, боевой режим завершает сторонний llama-server" {
-  cp "$(command -v sleep)" "$TMP_DIR/llama-server"
+  # Скрипт, а не копия sleep: в Rust-coreutils (Ubuntu 26.04) sleep — общий
+  # бинарник, который по имени llama-server сразу завершается «unknown program».
+  # В cmdline остаётся путь …/llama-server; trap снимает дочерний sleep вместе с ним.
+  cat > "$TMP_DIR/llama-server" <<'EOF'
+#!/usr/bin/env bash
+trap 'kill "$!" 2>/dev/null; exit 0' TERM INT
+sleep "$1" &
+wait
+EOF
+  chmod +x "$TMP_DIR/llama-server"
   "$TMP_DIR/llama-server" 300 &
   FOREIGN_PID=$!
   run ctl --dry-run kill-foreign
