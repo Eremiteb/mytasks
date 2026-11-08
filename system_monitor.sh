@@ -17,6 +17,13 @@ TIMESTAMP="$(date '+%Y-%m-%d-%H-%M-%S')"
 LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}-${TIMESTAMP}.jsonl"
 LOG_TEMPLATE_FILE="${SCRIPT_DIR}/conf/log_template.conf"
 
+# Владелец создаваемых файлов (скрипт работает от root, см. fix_owner). Значение по
+# умолчанию — владелец:группа каталога скрипта; задаётся до конфига, конфиг переопределяет.
+# SYSTEM_MONITOR_EUID — только для тестов (подмена EUID).
+RUN_EUID="${SYSTEM_MONITOR_EUID:-${EUID}}"
+FILE_OWNER="$(stat -c '%U:%G' -- "${SCRIPT_DIR}" 2>/dev/null || true)"
+FILE_OWNER_DEFAULT="${FILE_OWNER}"
+
 mkdir -p "${LOG_DIR}"
 
 if [[ -r "${LOG_TEMPLATE_FILE}" ]]; then
@@ -31,6 +38,8 @@ if [[ -r "${CONF_FILE}" ]]; then
     source "${CONF_FILE}"
 fi
 
+# Пустое значение в конфиге = владелец каталога скрипта
+FILE_OWNER="${FILE_OWNER:-${FILE_OWNER_DEFAULT}}"
 DB_FILE="${DB_FILE:-${STATE_DIR}/${SCRIPT_BASE}.db}"
 REPORT_DIR="${REPORT_DIR:-${SCRIPT_DIR}/system_reports}"
 REPORT_KEEP="${REPORT_KEEP:-5}"
@@ -100,6 +109,72 @@ log_json() {
         "${timestamp}" "${LOG_SCHEMA_VERSION}" "${LOG_COMPAT_TARGETS}" "${level_norm}" "${msg_esc}" "${event}" "${SCRIPT_BASE}" "${SCRIPT_NAME}" "${event}" "${level_norm}" "${msg_esc}" "${detail_esc}" >> "${LOG_FILE}"
 }
 
+# Различается ли владелец пути с FILE_OWNER. Без разыменования симлинков (stat без -L).
+# Если FILE_OWNER без группы — сравнивается только пользователь.
+owner_differs() {
+    local current
+    current="$(stat -c '%U:%G' -- "$1" 2>/dev/null)" || return 1
+    [[ "${FILE_OWNER}" == *:* ]] || current="${current%%:*}"
+    [[ "${current}" != "${FILE_OWNER}" ]]
+}
+
+# Передаёт перечисленные файлы во владение FILE_OWNER. Не от root — ничего не делает
+# (chown обычному пользователю не нужен и не разрешён). Каталоги не трогаются.
+# chown -h: симлинк не разыменовывается, меняется владелец самой ссылки, а не цели
+# (иначе ссылка могла бы увести chown на чужой файл). Ошибка chown — только WARN.
+fix_owner() {
+    local path
+    ((RUN_EUID == 0)) || return 0
+    [[ -n "${FILE_OWNER}" ]] || return 0
+    for path in "$@"; do
+        [[ -e "${path}" || -L "${path}" ]] || continue
+        [[ -d "${path}" && ! -L "${path}" ]] && continue
+        owner_differs "${path}" || continue
+        if ! chown -h -- "${FILE_OWNER}" "${path}"; then
+            log_json "WARN" "chown_failed" "Не удалось сменить владельца" "${FILE_OWNER} ${path}"
+        fi
+    done
+    return 0
+}
+
+# Собственные файлы скрипта (только по его маскам, чужие файлы в каталогах не трогаются):
+# БД (+ -wal/-shm), резервные копии *.bak-v*, логи, HTML-отчёты, latest.html. NUL-разделитель.
+owner_candidates() {
+    local file db_dir db_base
+    db_dir="$(dirname -- "${DB_FILE}")"
+    db_base="$(basename -- "${DB_FILE}")"
+    for file in "${DB_FILE}" "${DB_FILE}-wal" "${DB_FILE}-shm" "${REPORT_DIR}/latest.html"; do
+        if [[ -e "${file}" || -L "${file}" ]]; then
+            printf '%s\0' "${file}"
+        fi
+    done
+    find "${db_dir}" -maxdepth 1 -type f -name "${db_base}.bak-v*" -print0 2>/dev/null
+    find "${LOG_DIR}" -maxdepth 1 -type f -name "${SCRIPT_BASE}-*.jsonl" -print0 2>/dev/null
+    find "${REPORT_DIR}" -maxdepth 1 -type f -name "${SCRIPT_BASE}-*.html" -print0 2>/dev/null
+}
+
+# Приводит к FILE_OWNER уже существующие файлы скрипта (однократная починка прошлых запусков).
+fix_existing_owner() {
+    local file
+    ((RUN_EUID == 0)) || return 0
+    while IFS= read -r -d '' file; do
+        fix_owner "${file}"
+    done < <(owner_candidates)
+}
+
+# Для --dry-run: сколько файлов получит другого владельца (только чтение).
+count_owner_changes() {
+    local file count=0
+    if ((RUN_EUID == 0)) && [[ -n "${FILE_OWNER}" ]]; then
+        while IFS= read -r -d '' file; do
+            if owner_differs "${file}"; then
+                count=$((count + 1))
+            fi
+        done < <(owner_candidates)
+    fi
+    echo "${count}"
+}
+
 cleanup_logs() {
     local old_logs=()
     local old_log old_logs_file
@@ -117,6 +192,7 @@ cleanup_logs() {
     if ((${#old_logs[@]} > 0)); then
         rm -f -- "${old_logs[@]}"
     fi
+    fix_owner "${LOG_FILE}"
 }
 
 cleanup_reports() {
@@ -459,6 +535,7 @@ init_db() {
         log_json "ERROR" "db_backup_failed" "Не удалось сделать резервную копию БД" "${backup}"
         return 1
     fi
+    fix_owner "${backup}"
     echo "Резервная копия БД перед миграцией: ${backup}"
     log_json "INFO" "db_backup" "Резервная копия БД перед миграцией" "${backup}"
 
@@ -1522,6 +1599,7 @@ if ((DRY_RUN == 0)); then
         cleanup_logs
         exit 2
     fi
+    fix_existing_owner
 else
     plan_db_migration
 fi
@@ -1561,6 +1639,10 @@ fi
 REPORT_FILE="${REPORT_DIR}/${SCRIPT_BASE}-${TIMESTAMP}.html"
 if ((DRY_RUN)); then
     echo "[dry-run] будет: сформирован HTML-отчёт ${REPORT_FILE} и обновлён ${REPORT_DIR}/latest.html"
+    if ((RUN_EUID == 0)) && [[ -n "${FILE_OWNER}" ]]; then
+        OWNER_CHANGES="$(count_owner_changes)"
+        echo "[dry-run] будет: сменить владельца на ${FILE_OWNER}: ${OWNER_CHANGES} файлов"
+    fi
     echo "[dry-run] будет: уведомление, если в отчёте окажутся объекты в критическом состоянии"
     echo "[dry-run] Изменения не выполнены."
     log_json "INFO" "dry_done" "[dry-run] Опрос выполнен, БД и отчёты не изменены" "${REPORT_FILE}"
@@ -1573,6 +1655,7 @@ if ! generate_report "${REPORT_FILE}"; then
 fi
 cp -f -- "${REPORT_FILE}" "${REPORT_DIR}/latest.html"
 chmod 644 -- "${REPORT_DIR}/latest.html"
+fix_owner "${REPORT_FILE}" "${REPORT_DIR}/latest.html" "${DB_FILE}" "${DB_FILE}-wal" "${DB_FILE}-shm"
 log_json "INFO" "report_generated" "Сформирован HTML-отчёт" "${REPORT_FILE}"
 
 FINAL_EXIT=0

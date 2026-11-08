@@ -647,3 +647,93 @@ SQL
   [[ "$output" == *"[dry-run] будет: создана новая база v1"* ]]
   [ ! -e "$TMP_DIR/state/system_monitor.db" ]
 }
+
+# ---------------------------------------------------------------------------
+# FILE_OWNER / fix_owner (chown стабится, root имитируется SYSTEM_MONITOR_EUID)
+# ---------------------------------------------------------------------------
+
+make_chown_stub() {
+  CHOWN_LOG="$TMP_DIR/chown.log"
+  : > "$CHOWN_LOG"
+  cat > "$STUB_DIR/chown" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$CHOWN_LOG"
+exit 0
+EOF
+  chmod +x "$STUB_DIR/chown"
+}
+
+seed_own_files() {
+  mkdir -p "$TMP_DIR/system_reports"
+  touch "$TMP_DIR/state/system_monitor.db.bak-v0-20200101-000000" \
+    "$TMP_DIR/logs/system_monitor-2020-01-01-00-00-00.jsonl" \
+    "$TMP_DIR/logs/other-2020-01-01-00-00-00.jsonl" \
+    "$TMP_DIR/system_reports/system_monitor-2020-01-01-00-00-00.html" \
+    "$TMP_DIR/system_reports/foreign.html"
+}
+
+@test "FILE_OWNER: не от root chown не вызывается" {
+  make_chown_stub
+  seed_own_files
+  printf 'FILE_OWNER="nobodyx:nogroupx"\n' > "$TMP_DIR/conf/system_monitor.conf"
+
+  run env PATH="$STUB_DIR:$PATH" SYSTEM_MONITOR_EUID=1000 bash "$TMP_DIR/system_monitor.sh"
+
+  [ "$status" -eq 0 ]
+  [ ! -s "$CHOWN_LOG" ]
+}
+
+@test "FILE_OWNER: от root владелец меняется у БД, логов, отчётов и копий, чужие файлы не трогаются" {
+  make_chown_stub
+  seed_own_files
+  printf 'FILE_OWNER="nobodyx:nogroupx"\n' > "$TMP_DIR/conf/system_monitor.conf"
+
+  run env PATH="$STUB_DIR:$PATH" SYSTEM_MONITOR_EUID=0 bash "$TMP_DIR/system_monitor.sh"
+
+  [ "$status" -eq 0 ]
+  grep -q -- "nobodyx:nogroupx .*state/system_monitor.db$" "$CHOWN_LOG"
+  grep -q -- "state/system_monitor.db.bak-v0-" "$CHOWN_LOG"
+  grep -q -- "logs/system_monitor-2020-01-01" "$CHOWN_LOG"
+  grep -q -- "system_reports/system_monitor-2020-01-01" "$CHOWN_LOG"
+  grep -q -- "system_reports/latest.html" "$CHOWN_LOG"
+  ! grep -q -- "other-" "$CHOWN_LOG"
+  ! grep -q -- "foreign.html" "$CHOWN_LOG"
+  # chown вызывается с -h (симлинки не разыменовываются)
+  ! grep -qv -- "^-h -- " "$CHOWN_LOG"
+}
+
+@test "FILE_OWNER: файлы с нужным владельцем не трогаются" {
+  make_chown_stub
+  seed_own_files
+  local me
+  me="$(id -un):$(id -gn)"
+  printf 'FILE_OWNER="%s"\n' "$me" > "$TMP_DIR/conf/system_monitor.conf"
+
+  run env PATH="$STUB_DIR:$PATH" SYSTEM_MONITOR_EUID=0 bash "$TMP_DIR/system_monitor.sh"
+
+  [ "$status" -eq 0 ]
+  [ ! -s "$CHOWN_LOG" ]
+}
+
+@test "FILE_OWNER: ошибка chown — только WARN, скрипт не падает" {
+  make_chown_stub
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$STUB_DIR/chown"
+  printf 'FILE_OWNER="nobodyx:nogroupx"\n' > "$TMP_DIR/conf/system_monitor.conf"
+
+  run env PATH="$STUB_DIR:$PATH" SYSTEM_MONITOR_EUID=0 bash "$TMP_DIR/system_monitor.sh"
+
+  [ "$status" -eq 0 ]
+  grep -q '"event":"chown_failed"' "$TMP_DIR"/logs/system_monitor-*.jsonl
+}
+
+@test "FILE_OWNER: --dry-run печатает план и не вызывает chown" {
+  make_chown_stub
+  seed_own_files
+  printf 'FILE_OWNER="nobodyx:nogroupx"\n' > "$TMP_DIR/conf/system_monitor.conf"
+
+  run env PATH="$STUB_DIR:$PATH" SYSTEM_MONITOR_EUID=0 bash "$TMP_DIR/system_monitor.sh" --dry-run
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"[dry-run] будет: сменить владельца на nobodyx:nogroupx: "* ]]
+  [ ! -s "$CHOWN_LOG" ]
+}
