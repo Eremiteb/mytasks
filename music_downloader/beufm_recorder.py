@@ -37,6 +37,7 @@ import logging
 import os
 import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -84,6 +85,8 @@ DEFAULTS = {
     "aired_keep_days": 14,
     "maintenance_minutes": 60,
     "log_max_files": 10,
+    # DNS-серверы для резолвинга имён (пусто — системный resolver)
+    "dns_servers": [],
 }
 
 logger = logging.getLogger("BeuFMRecorder")
@@ -116,9 +119,35 @@ def load_settings(config):
                 "aired_lookback_days", "aired_keep_days", "maintenance_minutes"):
         if not isinstance(settings[key], (int, float)) or isinstance(settings[key], bool) or settings[key] <= 0:
             raise ValueError(f"recorder.{key} должно быть положительным числом")
-    if not 2 <= settings["min_takes"] <= settings["takes"]:
+if not 2 <= settings["min_takes"] <= settings["takes"]:
         raise ValueError("Нужно 2 ≤ recorder.min_takes ≤ recorder.takes: песня вырезается сравнением дублей")
+    # dns_servers — список IP-адресов DNS-серверов (пусто — системный resolver)
+    dns_servers = settings.get("dns_servers", [])
+    if not isinstance(dns_servers, list):
+        raise ValueError("recorder.dns_servers должен быть списком")
+    settings["dns_servers"] = dns_servers
     return settings
+
+
+def _create_dns_opener(dns_servers):
+    """Создаёт urllib.OpenerDirector с кастомным DNS-резолвером.
+
+    Если dns_servers пуст — возвращает None (используется стандартный opener).
+    """
+    if not dns_servers:
+        return None
+    try:
+        import dns.resolver
+        resolver = dns.resolver.Resolver()
+        resolver.nameservers = dns_servers
+        resolver.timeout = 5
+        resolver.lifetime = 5
+        dns.resolver.override_system_resolver(resolver)
+        logger.info(f"DNS-резолвер настроен на серверы: {', '.join(dns_servers)}")
+        return urllib.request.build_opener()
+    except ImportError:
+        logger.warning("dnspython не установлен, используется системный DNS")
+        return None
 
 
 # --- MP3 и буфер эфира ---------------------------------------------------
@@ -738,23 +767,23 @@ def changed_at_from_headers(headers, received_at):
     return modified + (received_at - server_now)
 
 
-def read_now_playing(url, timeout=10):
+def read_now_playing(url, timeout=10, opener=None):
     """((исполнитель, название) или None для джингла, момент изменения 1.txt или None)."""
     request = urllib.request.Request(
         f"{url}?{time.time():.0f}", headers={"User-Agent": USER_AGENT, "Cache-Control": "no-cache"}
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with urllib.request.urlopen(request, timeout=timeout, opener=opener) as response:
         text = response.read().decode("utf-8", "replace")
         changed_at = changed_at_from_headers(response.headers, time.time())
     return beufm.parse_now_playing(text), changed_at
 
 
-def stream_worker(settings, buffer, stop):
+def stream_worker(settings, buffer, stop, opener=None):
     """Читает поток с переподключением; время эфира считается по числу байтов."""
     while not stop.is_set():
         try:
             request = urllib.request.Request(settings["stream_url"], headers={"User-Agent": USER_AGENT})
-            with urllib.request.urlopen(request, timeout=20) as response:
+            with urllib.request.urlopen(request, timeout=20, opener=opener) as response:
                 connected = time.time()
                 # Icecast при подключении отдаёт «запас» из прошлого (замер: ~2.4 с):
                 # начало буфера сдвигается назад на то, что пришло быстрее реального времени.
@@ -810,7 +839,8 @@ def run_service(settings):
     stop = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop.set())
-    threading.Thread(target=stream_worker, args=(settings, buffer, stop), daemon=True).start()
+    dns_opener = _create_dns_opener(settings.get("dns_servers", []))
+    threading.Thread(target=stream_worker, args=(settings, buffer, stop, dns_opener), daemon=True).start()
     tracker = TrackTracker()
     logger.info(f"Запись эфира Beu FM запущена, записи — {settings['dir']}")
     pending = []
@@ -818,7 +848,7 @@ def run_service(settings):
     last_maintenance = 0.0
     while not stop.is_set():
         try:
-            parsed, modified_at = read_now_playing(settings["now_playing_url"])
+            parsed, modified_at = read_now_playing(settings["now_playing_url"], opener=dns_opener)
         except Exception as error:
             logger.warning(f"Не удалось прочитать название трека: {error}")
             stop.wait(settings["poll_seconds"])
@@ -853,13 +883,14 @@ def run_service(settings):
 
 def dry_run(settings):
     """Проверки без записи: настройки, поток, название, инструменты; план — `[dry-run] будет: …`."""
+    dns_opener = _create_dns_opener(settings.get("dns_servers", []))
     request = urllib.request.Request(settings["stream_url"], headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(request, timeout=20) as response:
+    with urllib.request.urlopen(request, timeout=20, opener=dns_opener) as response:
         content_type = response.headers.get("Content-Type")
         sample = response.read(16384)
     if not any(is_frame_header(sample, index) for index in range(len(sample))):
         raise RuntimeError(f"В потоке {settings['stream_url']} не найдено кадров MP3 ({content_type})")
-    parsed, _ = read_now_playing(settings["now_playing_url"])
+    parsed, _ = read_now_playing(settings["now_playing_url"], opener=dns_opener)
     now = f"{parsed[0]} - {parsed[1]}" if parsed else "джингл/реклама (без « - »)"
     tools = {name: shutil.which(name) is not None for name in ("fpcalc", "ffmpeg")}
     plan = [
