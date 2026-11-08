@@ -1,611 +1,200 @@
-# `cloud_backup_qnap.sh` — working notes / chat handoff
+# `cloud_backup_qnap.sh` — рабочие заметки
 
-Накопленный опыт по этому скрипту за несколько сессий диагностики и доработки.
-Не дублирует общие правила проекта (см. [AI.md](AI.md)) — только специфика
-именно этого скрипта и конкретной QNAP-железки.
+Специфика этого скрипта и конкретного QNAP NAS. Общие правила проекта — в
+[AI.md](AI.md), здесь не дублируются.
 
-## Окружение
+## Окружение и деплой
 
-- QNAP NAS по адресу **192.168.88.99** — это тот же хост, что отдаёт NFS-шару
-  `/mnt/store` (`192.168.88.99:/Public`, nfs4). Поэтому `/mnt/store/tasks/`
-  на десктопе == реальная директория скрипта на QNAP; деплой — обычный
-  `cp -f` на этот путь, без SSH.
-- **SSH-доступ ассистента к QNAP — только по паролю `admin@192.168.88.99`
-  через `ssh-askpass-gui`** (окно ввода пароля открывается на каждый вызов,
-  поэтому независимые проверки объединять в одну SSH-команду). Ключа для
-  `admin` нет. `admin` — это uid 0, сеанс всегда получает `HOME=/root`
-  (а не `/share/homes/admin` из `/etc/passwd`). На QNAP BusyBox 1.24:
-  нет `sort -h`, `df -B1`, `smartctl`, `nproc`; `base64 -d` отказывается
-  разбирать ввод — данные передавать через stdin ssh. `qcli_*` требуют
-  `qcli -l` с паролем — изменения хранилища делать через веб-интерфейс QTS.
-- **`docker compose exec`/`logs` требуют имя *сервиса* из docker-compose.yml,
-  не `container_name`.** На проде `container_name: esimych-cloud-redis`, но
-  ключ сервиса — `redis` (см. `SERVICE` в `docker compose ps -a`). Команда с
-  `esimych-cloud-redis` вместо `redis` падает с `service "esimych-cloud-redis"
-  is not running` / `no such service` — сам ассистент один раз наступил на
-  эту грабли 2026-08-07, диагностируя `redis_optimize_failed` (см. ниже).
-  Формулируя живые команды для пользователя — всегда сверяться со `SERVICE`
-  из `docker compose ps -a`, а не с именем контейнера.
-- **В стеке на 10.66.66.1 сервис `redis` (ключ в docker-compose.yml не
-  менялся) теперь на образе Valkey, а не Redis.** Проверено 2026-08-08:
-  `cd /opt/esimych-cloud && docker compose exec redis sh -lc 'command -v
-  redis-cli; command -v valkey-cli'` → оба бинаря есть
-  (`/usr/local/bin/redis-cli`, `/usr/local/bin/valkey-cli`) — `redis-cli`,
-  судя по всему, симлинк на `valkey-cli` для обратной совместимости.
-  Протокол командно совместим (`BGREWRITEAOF`, `INFO persistence` и т.д.).
-  Скрипт правок не потребовал — вызовы `redis-cli` в блоке оптимизации AOF
-  (~строки 1035, 1038) продолжают работать как есть.
-- Деплой-процедура после каждой правки:
+- QNAP NAS **192.168.88.99** — тот же хост, что отдаёт NFS `/mnt/store`
+  (`192.168.88.99:/Public`, nfs4). `/mnt/store/tasks/` на десктопе — рабочий
+  каталог скрипта на QNAP; деплой — `cp -f` на этот путь, без SSH.
+- **SSH ассистента к QNAP — только по паролю `admin@192.168.88.99` через
+  `ssh-askpass-gui`** (окно на каждый вызов — независимые проверки объединять
+  в одну SSH-команду). Ключа для `admin` нет. `admin` — uid 0, сеанс получает
+  `HOME=/root` (а не `/share/homes/admin` из `/etc/passwd`). QNAP не добавлять
+  как SSH-хост удалённой сессии Claude: её `/root/.claude/remote` переполняет
+  корень (см. «Корень и `/root`»).
+- BusyBox 1.24: нет `sort -h`, `df -B1`, `smartctl`, `nproc`; `base64 -d`
+  отказывается разбирать ввод — данные передавать через stdin ssh. `qcli_*`
+  требуют `qcli -l` с паролем — изменения хранилища делать через веб-интерфейс
+  QTS.
+- `docker compose exec`/`logs` на сервере принимают имя **сервиса** из
+  `docker-compose.yml` (колонка `SERVICE` в `docker compose ps -a`), а не
+  `container_name`. Команды для пользователя сверять именно с `SERVICE`.
+- Деплой после правки — только после зелёного CI (тесты и проверки локально не
+  запускаются):
   ```sh
-  bash -n cloud_backup_qnap.sh && shellcheck -S error cloud_backup_qnap.sh \
-    && bats --print-output-on-failure tests/cloud_backup_qnap.bats tests/all_scripts_syntax.bats \
-    && cp -f cloud_backup_qnap.sh /mnt/store/tasks/cloud_backup_qnap.sh \
+  cp -f cloud_backup_qnap.sh /mnt/store/tasks/cloud_backup_qnap.sh \
     && diff -q cloud_backup_qnap.sh /mnt/store/tasks/cloud_backup_qnap.sh \
-    && bash -n /mnt/store/tasks/cloud_backup_qnap.sh && echo "DEPLOY OK"
+    && echo "DEPLOY OK"
   ```
-  То же самое для `conf/cloud_backup_qnap.conf.example` при изменении конфига
-  (реальный `conf/cloud_backup_qnap.conf` на `/mnt/store/tasks/` не трогать
-  без явной просьбы — он гитигнорится и содержит боевые значения).
-- **`shellcheck -S style` даёт разные результаты в зависимости от версии.**
-  CI (`.github/workflows/shellcheck.yml`) ставил shellcheck через
-  `apt-get install shellcheck` — на `ubuntu-latest` (24.04) это версия 0.9.0,
-  у которой есть настоящие баги: ложный `SC2317` на каждой строке внутри
-  функций, вызываемых только через `trap` (сработало бы и на
-  `cleanup()`/`cleanup_logs()`/`wg_down_if_needed()` этого скрипта, все они
-  вызываются только из `trap ... EXIT INT TERM`), и ложный `SC2015` на
-  `A && B || true`. Оба фикса — уже в shellcheck 0.11.0 (стабильный релиз на
-  2026-08-07). 2026-08-07 workflow переделан: качает бинарник напрямую с
-  `github.com/koalaman/shellcheck/releases/download/stable/...` вместо apt.
-  Локально при отладке — сверяться с `shellcheck --version`, если `-S style`
-  выдаёт что-то похожее на массовый `SC2317` в функциях, вызываемых из
-  `trap`, — это, скорее всего, версия тулза, а не баг в скрипте.
-  При сопутствующей чистке проекта под `--enable=check-extra-masked-returns`
-  (`SC2312`), `--enable=add-default-case` (`SC2249`),
-  `--enable=require-variable-braces` (`SC2250`) и `--enable=require-double-brackets`
-  (`SC2292`) — все это опциональные проверки shellcheck, не входящие даже в
-  `-S style` по умолчанию — `cloud_backup_qnap.sh` оказался единственным из
-  проверенных скриптов, где не понадобилось ни одной правки: код уже был в
-  стиле, который эти проверки не флагуют (в отличие от соседнего
-  `cloud_backup.sh`, где пришлось обернуть один конвейер `printf | sed` в
-  `{ ...; } || true`).
-- Логи прода: `/mnt/store/tasks/logs/cloud_backup_qnap-YYYY-MM-DD-HH-MM-SS.jsonl`
-  (одна строка = один JSON-объект, поля `ts/level/event/msg/detail/rc`,
-  разобрать через `jq -r '[.ts,.level,.event,.msg,.detail,.rc] | @tsv' <file>`).
+  То же для `conf/cloud_backup_qnap.conf.example` при изменении конфига.
+  Боевой `conf/cloud_backup_qnap.conf` на `/mnt/store/tasks/` не трогать без
+  явной просьбы (gitignored, боевые значения). Перед боевым прогоном —
+  `--dry-run` на QNAP с боевым конфигом; dry-run из отдельного каталога: копия
+  скрипта + ссылки `conf -> ../conf`, `state -> ../state`,
+  `MYTASKS_LOG_DIR=<каталог>/logs`.
+- Логи: `/mnt/store/tasks/logs/cloud_backup_qnap-YYYY-MM-DD-HH-MM-SS.jsonl`
+  (поля `ts/level/event/msg/detail/rc`; разбор —
+  `jq -r '[.ts,.level,.event,.msg,.detail,.rc] | @tsv' <file>`). Число логов
+  ограничивает тот же `BACKUP_KEEP_COUNT`, что и число архивов.
 
-## QNAP: аппаратные/ОС факты
+## QNAP: аппаратные и ОС-факты
 
-- **Поправка 2026-10-30: у QNAP 4 ядра, а не одно.** `/sys/devices/system/cpu/online`
-  = `0-3`, `Cpus_allowed_list` у `crond`, `sshd` и SSH-сеанса — `0-3`.
-  `local_nproc=1` во всех прогонах (20 из 20 за октябрь) — артефакт
-  `get_local_nproc()` в `cloud_backup_qnap.sh`: `nproc 2>/dev/null || echo 1`,
-  а `nproc` на QNAP нет ни в BusyBox, ни в Entware, поэтому всегда срабатывает
-  запасное `1`. Исправлено 2026-10-30: при отсутствии `nproc` функция считает
-  `grep -c '^processor' /proc/cpuinfo`, тест — `tests/cloud_backup_qnap.bats`
-  («без nproc…»). Попутно меняется вывод `probable_cause`: правило
-  `avg_local_load1 >= LOCAL_NPROC` при nproc=1 всегда винило CPU QNAP.
-  Задеплоено 2026-10-30 (коммит `903d670`) вместе с ранее не развёрнутыми
-  `--dry-run`, `MYTASKS_LOG_DIR`, `WG_CONF_FILE`/`WG_SOCK` из конфига; перед
-  этим `--dry-run` на QNAP с боевым конфигом — rc=0, план штатный. Прежняя
-  копия (от 2026-10-04) — `/mnt/store/tasks/cloud_backup_qnap.sh.bak-20261030`.
-  Первый боевой прогон — 2026-10-31 04:00: в `backup_env_diag` ждать
-  `local_nproc=4`. Dry-run из отдельного каталога: копия скрипта + ссылки
-  `conf -> ../conf`, `state -> ../state`, `MYTASKS_LOG_DIR=<каталог>/logs`.
-  Ниже исходный (ошибочный) вывод сохранён как историческая гипотеза:
-  load ~2–3 на 4 ядрах — не насыщение CPU, узкое место надо искать в
-  однопоточных участках (zstd/ssh/wireguard-go) и дисках.
-- *(ошибочно, см. поправку выше)* **Одно ядро CPU** (`local_nproc=1` в каждом прогоне) — это ключевое и
-  практически неустранимое узкое место всей передачи (zstd-компрессия на
-  единственном ядре). Почти все находки по производительности так или иначе
-  об этом.
-- Entware на этом QNAP — **минимальная сборка**, аrch `aarch64-k3.10`,
-  bind-mount `/opt` ← `/share/CACHEDEV1_DATA/Public/entware`. Установленные
-  пакеты (проверено вживую): `ash bash egrep fgrep find grep nano ncat
-  netstat opkg scp sh sqlite3 ssh ssh-agent ssh-keygen ssh-keyscan
+- **4 ядра CPU** (`/sys/devices/system/cpu/online` = `0-3`). `nproc` нет ни в
+  BusyBox, ни в Entware — `get_local_nproc()` считает
+  `grep -c '^processor' /proc/cpuinfo`. Load ~2–3 на 4 ядрах — не насыщение
+  CPU: узкое место искать в однопоточных участках (ssh/wireguard-go) и сети.
+- Entware — **минимальная сборка**, arch `aarch64-k3.10`, bind-mount
+  `/opt` ← `/share/CACHEDEV1_DATA/Public/entware` (он же
+  `/share/Public/entware`). Установлено: `ash bash egrep fgrep find grep nano
+  ncat netstat opkg scp sh sqlite3 ssh ssh-agent ssh-keygen ssh-keyscan
   ssh-keysign stat unzstd wg wg-quick wireguard-go xargs xxd zstd zstdcat
   zstdgrep zstdmt`.
-  **Важно, чего тут НЕТ:** `iostat`, `vmstat`, `top`, `sysstat`, и —
-  неочевидно — **`timeout`** (ни как Entware-пакет, ни как applet системного
-  busybox; подтверждено `type timeout` → `not found`). Любой новый код,
-  который хочет что-то замерить или ограничить по времени локально на QNAP,
-  должен исходить из этого списка, а не считать coreutils доступным.
-- `/bin/sh` на QNAP — настоящий отдельный 965048-байтный бинарник (не
-  symlink на bash). Скрипт имеет шебанг `#!/opt/bin/bash`; вызов через
-  явный `sh script.sh` в crontab (как было раньше настроено у пользователя)
-  игнорирует шебанг. **Это тем не менее НЕ подтверждённая причина каких-либо
-  реальных сбоев** — см. раздел про `ncat_rc=127` ниже, где эта гипотеза была
-  выдвинута, а затем опровергнута логами. Рекомендация вызывать скрипт
-  напрямую (без `sh`) в crontab остаётся хорошей практикой сама по себе, но
-  не как объяснение конкретного бага.
-- **2026-08-12: блок SQLITE OPTIMIZATION убран из скрипта полностью**
-  (`OPTIMIZE_SQLITE_BEFORE_BACKUP`/`SQLITE_OPTIMIZE_TIMEOUT_SEC` и сам вызов
-  `PRAGMA optimize; VACUUM;` по SSH на удалённый сервер). Оптимизация
-  MariaDB и Redis (общий флаг `DB_OPTIMIZE_DUE`/`DB_OPTIMIZE_INTERVAL_DAYS`)
-  не тронута. Пакет `sqlite3-cli` убран из инструкции по установке Entware в
-  шапке скрипта — на самом QNAP он ставился только ради этой фичи (сам вызов
-  шёл через `ssh_remote` на удалённый сервер, не локально). `sqlite3` в
-  списке установленных на этом QNAP пакетов (см. ниже) — застывший факт
-  инвентаризации системы на момент проверки, не зависит от этого изменения.
+  **Нет:** `iostat`, `vmstat`, `top`, `sysstat` и **`timeout`** (ни пакетом,
+  ни applet BusyBox). Локальные ограничения по времени — `ncat
+  --idle-timeout`/`-w`, фоновый `sleep N && kill` или цикл с лимитом попыток
+  (как в raw-transfer); внешний `timeout` вокруг локальной команды даёт
+  `rc=127` (так ломался `network_speed_test`). На удалённом сервере (Ubuntu,
+  GNU coreutils) `timeout` есть.
+- `/bin/sh` — отдельный бинарник, не bash. Шебанг скрипта `#!/opt/bin/bash`;
+  в crontab вызывать скрипт через `/opt/bin/bash` или напрямую, не через `sh`.
+- Entware не зарегистрирован как QPKG (`/etc/config/qpkg.conf`), штатный
+  автозапуск его не поднимает, а bind-mount `/opt` может отвалиться (например,
+  после обновления прошивки QTS) — тогда `/opt/bin/bash` нет и cron падает
+  молча. `ensure_entware_mount()` в скрипте этого не исправит: без `/opt`
+  скрипт не стартует. Поэтому в crontab есть ежеминутная строка на чистом
+  `/bin/sh`:
+  ```sh
+  * * * * * [ -x /opt/bin/opkg ] || mount --bind /share/Public/entware /opt
+  ```
+  Данные Entware при этом не страдают; ручное восстановление —
+  `mkdir -p /opt && mount --bind /share/Public/entware /opt`.
 
-## Инцидент: `/opt` отвязался, бэкап тихо не запускался 4 дня (2026-08-09..12)
+## Cron на QNAP
 
-Cron-запись в порядке (`0 4 * * * /opt/bin/bash /share/Public/tasks/cloud_backup_qnap.sh
->/dev/null 2>&1`), `crond` жив, но с 2026-08-09 не появилось ни одного нового
-файла в `logs/` (последний успешный прогон — 2026-08-08). Причина: **bind-mount
-`/opt` ← `/share/Public/entware` отвалился** (скорее всего из-за обновления
-прошивки QTS 10-12 августа — `/opt` в этот момент стал показывать внутренние
-файлы самой QTS, `nasconfig_fs.img.tgz`/`rfs_usr.img`/`wsd/`, а не Entware).
-`/opt/bin/bash` в результате не существовал → cron падал мгновенно на попытке
-запустить несуществующий интерпретатор, вывод улетал в `>/dev/null`, тишина.
-`cat /etc/config/qpkg.conf | grep -i entware` — пусто, Entware не
-зарегистрирован как QPKG вообще, поэтому и штатный автозапуск при загрузке
-NAS его не поднимает.
+- Бэкап: `0 4 * * * /opt/bin/bash /share/Public/tasks/cloud_backup_qnap.sh >/dev/null 2>&1`.
+- `crond` (BusyBox, без `@reboot`; планировщика «При запуске» в QTS нет)
+  запущен как `/usr/sbin/crond -d 9 -c /tmp/cron/crontabs` и читает live-файл
+  `/tmp/cron/crontabs/admin` (tmpfs, обнуляется при перезагрузке), а не
+  `/etc/config/crontab`. Постоянные строки добавлять **в оба места**:
+  `/etc/config/crontab` пересоздаёт live-файл при загрузке. Применить правку —
+  `crontab /etc/config/crontab`, затем `/etc/init.d/crond.sh restart`. При
+  «cron есть, а не работает» первым делом проверять это.
 
-**Важная ловушка**: в скрипте есть `ensure_entware_mount()` (строки ~187-195),
-который должен сам чинить bind-mount при старте — но он **не может сработать**,
-потому что шебанг скрипта `#!/opt/bin/bash` требует уже рабочий `/opt`, чтобы
-вообще запуститься. Курица и яйцо: самолечение живёт внутри пациента, который
-не может подняться без него.
+## Корень и `/root`
 
-**Данные Entware физически не пострадали** — `/share/Public/entware/{bin,etc,
-lib,sbin,...}` целы. Восстановление — вручную:
-```sh
-mkdir -p /opt
-mount --bind /share/Public/entware /opt
-```
+- Корень QNAP — `tmpfs` 205 МиБ, пересобирается при загрузке. Штатно занято
+  ~184 МиБ: 130 МиБ — образ `/opt/rfs_usr.img` (backing `/dev/loop0` → `/usr`,
+  скрыт под bind-mount Entware, `du` его не видит — смотреть через
+  `mount --bind / <tmp>`), остальное — QTS. При переполнении LVM не может
+  писать `/etc/lvm/cache`.
+- Поверх `/root` — отдельный `tmpfs` 8 МиБ (`roottmp`). Переподключение после
+  загрузки — ежеминутная строка в crontab, идемпотентная по `/proc/mounts`:
+  ```sh
+  * * * * * grep -q '^roottmp /root ' /proc/mounts || { d=/tmp/.rootcopy; rm -rf "${d}"; mkdir "${d}" && cp -a /root/. "${d}/" && mount -t tmpfs -o size=8m,mode=0755 roottmp /root && cp -a "${d}/." /root/; rm -rf "${d}"; }
+  ```
+  Резервная копия crontab до этой правки — `/etc/config/crontab.bak-rootguard`.
+  Откат: удалить строку, `crontab /etc/config/crontab`, `umount /root`.
+  Защищён только `/root`; `/etc`, `/var` закрыть нельзя — туда пишет QTS.
+- DataVol1: пул `tp1` 5,33 ТиБ, тонкий том `lv1` 4,78 ТиБ, ФС 4,745 ТиБ.
+  Разницу (~558 ГиБ) занимает резерв снапшотов `snapshot_reserved = 10`
+  (`qlvm.conf`, `llreservedP` в `storage_lib.log`) — пока он включён, QTS не
+  даёт расширить том. Снапшот — еженедельный (понедельник 00:00), хранится один.
 
-**Постоянный фикс** (в интерфейсе QTS у пользователя не нашлось Планировщика
-задач по событию "При запуске"; встроенный `crond` — BusyBox, `@reboot` не
-поддерживает): добавлена запись раз-в-минуту, не зависящая от Entware/bash
-(чистый `/bin/sh`), которая сама перемонтирует `/opt`, если он отвалился:
-```sh
-* * * * * [ -x /opt/bin/opkg ] || mount --bind /share/Public/entware /opt
-```
-Добавлена **в оба места** — `/etc/config/crontab` (persistent, но crond его
-не читает напрямую) и `/tmp/cron/crontabs/admin` (реальный live-файл, tmpfs,
-обнуляется при перезагрузке — именно поэтому нужна и persistent-копия, которая
-пересоздаст live-файл при следующей загрузке). `crond` у этого QNAP запускается
-как `/usr/sbin/crond -d 9 -c /tmp/cron/crontabs`, а не читает
-`/etc/config/crontab` напрямую — это стоит проверять первым делом при любых
-будущих "cron вроде есть, а не работает" на этой NAS.
+## IO-метрики: `/proc/diskstats` без iostat
 
-## IO-метрики: `/proc/diskstats` без iostat/vmstat
+- Поле 13 `/proc/diskstats` (1-индексация) — время с незавершёнными I/O, мс;
+  на нём `iostat` считает `%util`. `get_local_io_device()`/`get_local_io_raw()`
+  читают его напрямую.
+- Устройство ФС — через `df -P`: BusyBox `df` без `-P` переносит длинное имя
+  (`/dev/mapper/cachedev1`) на отдельную строку.
+- `/dev/mapper/cachedev1` в `/proc/diskstats` называется `dm-N`;
+  сопоставлять **по major:minor**, не по имени. `stat -c '%t %T'` даёт их в
+  hex — переводить `$((16#...))` (пример: `fb 9` → `251 9 dm-9`).
 
-Поля `/proc/diskstats` (1-индексация): 1=major, 2=minor, 3=имя устройства,
-4=reads completed, 5=reads merged, 6=sectors read, 7=time reading(ms),
-8=writes completed, 9=writes merged, 10=sectors written, 11=time writing(ms),
-12=I/Os in progress, **13=time spent doing I/Os(ms)** — это та же величина,
-на которой `iostat` считает `%util` (доля времени с ≥1 незавершённой
-операцией).
+## Метрики прогона и деградация
 
-`get_local_io_device()`/`get_local_io_raw()` в скрипте читают это напрямую,
-без установки пакетов. Два прошлых бага и их фиксы:
+- `_progress_monitor()`: тик 60 с; каждый 5-й тик — удалённые loadavg/mem и
+  RTT (отдельное SSH + ping); каждый 10-й — локальные CPU+RAM+IO одним замером
+  (`backup_resource_diag`), чтобы значения относились к одному моменту.
+- Средние по прогону (`avg_local_load1`, `avg_remote_load1`, `avg_rtt_ms`,
+  `avg_io_util_pct`) и `network_test_mib_s` (результат `network_speed_test`)
+  пишутся в `backup_metrics`; по ним выбирается `probable_cause` в
+  `backup_degradation` (в т.ч. `network_throughput_limit`). Порог —
+  `BACKUP_DEGRADATION_MIBS_THRESHOLD` (по умолчанию 4 МиБ/с).
+- Ориентир (сентябрь 2026): ~9 МиБ/с, 23–35 ГБ за 2600–3900 с; `io_util_pct`
+  QNAP ~11–15 % — диск не узкое место.
+- Сжатие — `zstd -5 --threads=0` на удалённом сервере (`10.66.66.1`); QNAP
+  принимает уже сжатый поток, CPU сжатия тратит сервер.
 
-1. **BusyBox `df` без `-P`** переносит длинное имя устройства
-   (`/dev/mapper/cachedev1`, 21 символ) на отдельную строку — наивный
-   `awk 'NR==2{print $1}'` подхватывал не то поле. Фикс: `df -P` (POSIX,
-   всегда одна строка).
-2. **Несовпадение имён**: `/dev/mapper/cachedev1` — настоящий device-mapper
-   узел (`readlink -f` возвращает его же самого, это не symlink), но в
-   `/proc/diskstats` та же физическая сущность зарегистрирована под другим
-   именем, `dm-N`. Единственный надёжный способ сопоставить — **по
-   major:minor**, не по имени. `stat -c '%t %T' <path>` даёт major:minor в
-   **hex**, нужно `$((16#...))` перед сравнением с диск-статс (там decimal).
-   Проверено вживую: `cachedev1` → `stat` → `fb 9` (hex) → major=251,
-   minor=9 → совпадает с `/proc/diskstats` строкой `251 9 dm-9 ...`.
+## Raw TCP transfer
 
-Текущая (рабочая, задеплоенная) реализация — `get_local_io_device()` в
-`cloud_backup_qnap.sh` использует именно `df -P` + major:minor. В логе от
-2026-08-05 `io_device=dm9` резолвится верно на всех прогонах, `io_util_pct`
-стабильно в районе 11–15% — IO не является узким местом.
+Поток `tar|zstd` идёт сырым TCP (`nc`/`ncat`) внутри WireGuard-туннеля вместо
+SSH поверх WG — без двойного шифрования, конфиденциальность и целостность
+обеспечивает WG. Включён в боевом конфиге (`RAW_TRANSFER_ENABLED=1`), порт
+8873.
 
-## Совмещённый замер CPU/RAM/IO — `backup_resource_diag`
+- Удалённый пайплайн запускается через `ssh_remote`:
+  `nohup bash -c 'set -o pipefail; tar ... | zstd ... | timeout <N> nc -l -s <host> <port>; echo $? > <status_file>' </dev/null >/dev/null 2>err_file &`
+  — **именно `bash -c`**: `/bin/sh` на Ubuntu — dash, без `pipefail`.
+- Клиент на QNAP — цикл подключений (`RAW_TRANSFER_CONNECT_RETRIES`, по
+  умолчанию 10, пауза 2 с). Обрыв посреди потока не повторяется — листенера
+  уже нет.
+- После приёма — обязательный опрос статус-файла на сервере
+  (`RAW_TRANSFER_STATUS_POLL_RETRIES`): EOF у `nc` не доказывает, что
+  `tar`/`zstd` не упали.
+- Фолбэк на SSH-канал при `raw_transfer_nc_missing` или
+  `raw_transfer_connect_exhausted` (WARN) безопасен: в `BACKUP_PATH` ещё ничего
+  не записано. `detail` у `raw_transfer_connect_exhausted` содержит
+  `remote_status=<rc|none>, remote_err=<stderr|none>` из `REMOTE_STATUS_FILE`/
+  `REMOTE_ERR_FILE`.
+- Правило фаервола — `ufw allow from 10.66.66.0/24 to any port 8873 proto tcp`
+  в docker-томе `ufw_data:/etc/ufw` контейнера `esimych-cloud-fail2ban`
+  (`network_mode: host`, `NET_ADMIN`); управлять им можно только через
+  `docker exec esimych-cloud-fail2ban ufw ...`. При пересборке сервера теряется
+  вместе с томом.
+- Диагностика по тексту stderr `ncat` (`ncat_rc=1` в обоих случаях):
+  - `Ncat: TIMEOUT.` (`remote_status=none, remote_err=none`) — пакеты
+    дропаются фаерволом: `docker exec esimych-cloud-fail2ban ufw show added | grep 8873`;
+  - `Ncat: Connection refused.` — порт открыт, листенер не поднялся: смотреть
+    реальный rc и stderr упавшего `nc`/`tar` в `detail`.
+- Стаб ssh в `tests/cloud_backup_qnap.bats`: `RAW_LAUNCH_CMD` сам начинается с
+  `rm -f '...'`, поэтому ветка `*"rm -f '"*` срабатывает и на запуск
+  листенера, не только на зачистку.
 
-По явному запросу пользователя все три метрики снимаются **одновременно**,
-раз в ~10 минут (не раздельно с разной частотой) — чтобы значения относились
-к одному и тому же моменту. Реализовано в `_progress_monitor()`:
-тик каждые 60 сек, каждый 5-й тик — дополнительно remote diag (loadavg/mem
-удалённого сервера) + RTT (отдельное SSH-соединение + ping, поэтому не на
-каждом тике), каждый 10-й тик (подмножество 5-минутных) — локальный
-CPU+RAM+IO одним замером, событие `backup_resource_diag`. Средние по всему
-прогону (`avg_local_load1`, `avg_remote_load1`, `avg_rtt_ms`,
-`avg_io_util_pct`) попадают в `backup_metrics` в конце и используются для
-`probable_cause` в `backup_degradation`.
+## WireGuard и SSH к серверу
 
-## Raw TCP transfer (обход двойного шифрования) — уже реализовано и живёт в проде
-
-Полный план см. в `/home/esimych/.claude/plans/zippy-sleeping-wolf.md` (если
-ещё существует) — здесь только суть и текущий статус.
-
-**Мотивация:** узкое место — CPU QNAP насыщается двойным шифрованием
-(WireGuard AEAD + SSH поверх него для потока `tar|zstd`). Замена SSH-канала
-на сырой TCP-сокет (`nc`/`ncat`) **внутри уже зашифрованного** WG-туннеля не
-теряет конфиденциальность/целостность.
-
-**Статус: реализовано, задеплоено, включено (`RAW_TRANSFER_ENABLED=1` в
-боевом конфиге), подтверждено рабочим в проде** (лог 2026-08-05: чистый
-`raw_transfer_listener_launch` → `raw_transfer_status_fetch rc=0` без единого
-`raw_transfer_connect_retry`).
-
-Ключевые элементы дизайна (код — `cloud_backup_qnap.sh`, блок
-~строка 1182+):
-- Удалённый пайплайн запускается через `ssh_remote` командой вида
-  `nohup bash -c 'set -o pipefail; tar ... | zstd ... | timeout <N> nc -l -s
-  <host> <port>; echo $? > <status_file>' </dev/null >/dev/null 2>err_file &`
-  — **явно `bash -c`, не `sh -c`**, т.к. `/bin/sh` на Ubuntu (удалённый
-  сервер) — dash и не умеет `set -o pipefail`. На удалённой (Ubuntu) стороне
-  `timeout` есть (GNU coreutils) — там его использовать безопасно, в отличие
-  от локальной QNAP-стороны.
-- Локальный клиент — цикл подключений с ретраями
-  (`RAW_TRANSFER_CONNECT_RETRIES`, по умолчанию 10, sleep 2 между попытками).
-  Обрыв **в середине** потока (байты уже росли) не ретраится — листенера
-  больше нет, шанса нет.
-- После успешного локального приёма — обязательный опрос статус-файла на
-  удалённой стороне (`RAW_TRANSFER_STATUS_POLL_RETRIES`), т.к. чистый EOF у
-  `nc` не доказывает, что `tar`/`zstd` выше по пайпу не упали.
-- Фолбэк на сегодняшний SSH-путь: если на удалённой стороне нет `nc`
-  (`raw_transfer_nc_missing`, WARN) или не удалось подключиться после всех
-  попыток (`raw_transfer_connect_exhausted`, WARN) — безопасно, т.к. в
-  `BACKUP_PATH` в этом случае ничего не записано.
-- Firewall: правило добавлено через контейнер `esimych-cloud-fail2ban`
-  (`docker exec esimych-cloud-fail2ban ufw allow ...`) — `ufw` на самом
-  удалённом хосте управляется только оттуда (`network_mode: host`,
-  `cap_add: NET_ADMIN`, том `ufw_data:/etc/ufw`).
-- Эффект в проде: скромный, но положительный прирост скорости (5.05 → 5.12
-  МиБ/с между 08-04 и 08-05), `avg_local_load1` тоже чуть ниже (2.51 → 2.23).
-  **CPU всё равно остаётся насыщен** (`nproc=1`) — `backup_degradation` с
-  `probable_cause=local_cpu_or_io_contention` продолжает срабатывать почти
-  каждый прогон, и это ожидаемо: raw-transfer убрал только слой
-  SSH-шифрования, а не саму нехватку ядра под zstd. Дальнейшее ускорение
-  потребует либо более быстрого/слабого сжатия, либо другого железа.
-
-## `network_speed_test_failed ncat_rc=127` — история диагностики (важно не наступить повторно)
-
-Дважды подряд (логи 2026-08-04 и 2026-08-05) один и тот же симптом:
-`network_speed_test_failed`, `bytes=0, duration_s=1, ncat_rc=127`.
-
-**Первая гипотеза (2026-08-04, ОШИБОЧНАЯ):** crontab вызывал скрипт через
-`sh /share/Public/tasks/cloud_backup_qnap.sh`, что игнорирует шебанг
-`#!/opt/bin/bash` и должно было исполнять его под системным `/bin/sh`
-(busybox-подобный бинарник, не bash). Была задокументирована в README как
-вероятная причина.
-
-**Опровержение (2026-08-05):** тот же лог, где `ncat_rc=127` снова
-воспроизвёлся, **также содержит** полностью успешный прогон raw-transfer,
-который использует bash-специфичный синтаксис (`[[ ]]`) в той же ветке
-исполнения. Под настоящим `sh`/dash такой синтаксис вызвал бы немедленную
-синтаксическую ошибку и обвалил бы весь скрипт целиком — а он доехал до
-`backup_done`/`wg_down_ok`. Значит, скрипт совершенно точно исполняется под
-bash, и гипотеза про `sh` в crontab не объясняет этот баг (хотя как общая
-практика — не вызывать через `sh` — осталась разумной рекомендацией).
-
-**Настоящая причина (найдена и подтверждена вживую 2026-08-05):**
-`measure_network_speed()` — **единственное место во всём скрипте**, где
-локальный `ncat` на QNAP оборачивался во внешний `timeout 60 ...`. На этой
-QNAP бинаря `timeout` просто нет (см. раздел про Entware выше — подтверждено
-`command -v timeout` / `which timeout` / `type timeout`, все пустые/`not
-found`). `rc=127` от `timeout X` в GNU-семантике означает «не найден X,
-переданный timeout» — то есть падал сам `timeout`, а не `ncat`. Раз-transfer
-клиентский `ncat`-вызов **не** оборачивался в `timeout` и поэтому всегда
-работал нормально — это и было ключевой уликой, которая привела к разгадке.
-
-**Фикс (задеплоен 2026-08-05):** заменена внешняя обёртка на встроенный
-idle-таймаут самого `ncat`:
-```sh
-# было:
-timeout 60 ncat --recv-only "${REMOTE_HOST}" "${RAW_TRANSFER_PORT}" > "${test_out}" ...
-# стало:
-ncat --recv-only --idle-timeout 60s "${REMOTE_HOST}" "${RAW_TRANSFER_PORT}" > "${test_out}" ...
-```
-Не требует отдельного бинаря, даёт ту же защиту от зависания (закрывает
-соединение, если нет данных дольше 60с). Удалённая сторона (Ubuntu, есть
-`timeout`) не менялась — там всё было в порядке.
-
-**Подтверждено, вопрос закрыт:** `ncat_rc=127` не воспроизводился ни
-2026-08-05, ни 2026-08-06, ни 2026-08-07 — фикс на `--idle-timeout`
-устойчив. Если он всё же появится снова, гипотеза про `timeout` неверна и
-нужна новая итерация той же живой диагностики (просить пользователя
-выполнить команды на QNAP и прислать вывод).
-
-## `redis_optimize_failed` — BGREWRITEAOF не укладывается даже в увеличенный таймаут (2026-08-07)
-
-Комментарий у `DB_OPTIMIZE_INTERVAL_DAYS` в скрипте фиксирует провал
-BGREWRITEAOF ещё 2026-07-29 при `REDIS_REWRITE_WAIT_SEC=600`. К 2026-08-07
-боевой конфиг (`/mnt/store/tasks/conf/cloud_backup_qnap.conf`) уже поднял
-таймаут до **1800** сек — и в логе того дня всё равно:
-
-```
-04:03:29  redis_optimize_start
-04:33:44  redis_optimize_failed  "AOF rewrite did not finish within 1800 seconds"  rc=1
-```
-
-Стартовал сразу после `mariadb_optimize_ok` (04:03:29 секунда в секунду) —
-подозрение, что тяжёлый `mariadb-check --optimize --all-databases`
-(recreate+analyze ~200+ таблиц) насытил CPU/диск удалённого хоста и помешал
-fork'у AOF rewrite, но это **не подтверждено**, только гипотеза по совпадению
-времени. WARN не блокирует бэкап — скрипт корректно едет дальше на
-`services_stop`.
-
-**Ключевая проблема расследования**: `services_stop` (`docker compose down`)
-выполняется через ~1 минуту после этого WARN и **пересоздаёт контейнер
-Redis** — логи зависшего процесса пропадают безвозвратно вместе со старым
-контейнером. Живая проверка через несколько часов после инцидента
-(`docker compose exec redis redis-cli INFO persistence`, `docker compose logs
-redis`) увидела уже новый контейнер: AOF крошечный (~3.1 МБ), rewrite
-укладывается в <1с — то есть это **не хроническая проблема медленного AOF**,
-а что-то ситуативное, разово совпавшее с тем ночным прогоном. Непроверенная
-гипотеза: `mem_limit: 128m` у сервиса `redis` в `docker-compose.yml` мог
-привести к OOM-килу child-процесса rewrite при fork под нагрузкой (не
-проверено — нужен `dmesg`/`journalctl -k` на хосте за окно 04:03–04:33,
-но эта возможность исчезает по мере ротации логов ядра).
-
-**Фикс/митигация (задеплоено 2026-08-07)**: перед `docker compose down` в
-`services_stop` добавлено событие `redis_logs_capture` — снимает
-`docker compose logs --tail=${REDIS_LOG_TAIL_LINES} redis` (новая переменная,
-по умолчанию 300) и пишет в JSONL-лог бэкапа **до** того, как контейнер
-пересоздастся. Код — `cloud_backup_qnap.sh`, сразу перед `services_stop`
-(~строка 1056). Это не устраняет причину, но при следующем повторении
-`redis_optimize_failed` логи зависшего контейнера уже не потеряются.
-
-**Повтор 2026-08-15 и решение**: AOF rewrite снова не завершился за 1800с,
-при этом сохранённые логи не дали подтверждения OOM/fork-ошибки. Две
-30-минутные задержки (2026-08-07 и 2026-08-15) при отсутствии пользы для
-архива перевесили потенциальный эффект оптимизации. В production-конфиге
-`OPTIMIZE_REDIS_BEFORE_BACKUP` выключен; код оставлен как опциональный режим.
-
-## Анализ логов 2026-08-06..18 и доработка надёжности (2026-08-18)
-
-- Все 9 архивов завершились событием `backup_done`, но 2026-08-13 Valkey
-  остался `unhealthy` после единственной попытки `docker compose up -d`.
-  Теперь запуск повторяется до `SERVICES_START_RETRIES` раз, проверяется
-  `docker compose ps -a`, а окончательная ошибка меняет код завершения всего
-  скрипта на ненулевой и сохраняет состояние контейнеров и логи Valkey.
-- 2026-08-18 очистка Nextcloud не выполнилась: в стеке исчез жёстко заданный
-  контейнер `esimych-cloud-app`. Все команды `occ` переведены на
-  `docker compose exec -T` и настраиваемое имя сервиса
-  `NEXTCLOUD_SERVICE_NAME` (по умолчанию `nextcloud`); перед очисткой пишется
-  событие `nextcloud_preflight`.
-- QNAP-реализация `tr` в `json_escape` ошибочно удаляла дефисы из строк
-  (`esimych-cloud-app` превращался в `esimychcloudapp`). Диапазоны управляющих
-  байтов заменены явным списком octal-кодов; дефисы в JSONL теперь сохраняются.
-- Медленные прогоны 13, 14 и 17 августа совпадали прежде всего с низким
-  `network_speed_test`, а не с высокой локальной нагрузкой. Значение теста
-  теперь сохраняется в `backup_metrics` как `network_test_mib_s`, причина
-  может быть `network_throughput_limit`, а порог ложных ежедневных
-  предупреждений снижен с 6 до 4 МиБ/с.
-- Ротация подтверждена: число JSONL-логов управляется тем же
-  `BACKUP_KEEP_COUNT`, что и число архивов.
-
-## Уровень сжатия zstd изменён на 3 (2026-08-21)
-
-- Удалённое сжатие изменено с `zstd --fast=1 --threads=0 -c` на
-  `zstd -3 --threads=0 -c`. Цель — уменьшить объём потока через канал,
-  который по последним логам чаще ограничивает длительность передачи.
-- `tar` и `zstd` по-прежнему выполняются на `10.66.66.1`; QNAP принимает
-  уже сжатый поток. Поэтому дополнительная CPU-нагрузка приходится на
-  удалённый сервер, а не на одноядерный QNAP.
-- После следующего ночного запуска сравнить `duration_s`, `bytes`,
-  `avg_mib_s`, `network_test_mib_s` и `avg_remote_load1` с предыдущими
-  прогонами. Главный критерий — полное время передачи, а не только MiB/s.
-
-## Уровень сжатия zstd увеличен до 5 (2026-09-03)
-
-Удалённое сжатие изменено с `zstd -3 --threads=0 -c` на
-`zstd -5 --threads=0 -c`. Формат архива и процедура восстановления не
-меняются. Цель — получить немного меньший архив, используя запас CPU
-удалённого сервера: в успешном прогоне 2026-09-03 `remote_nproc=2`,
-`avg_remote_load1=0.36`, тогда как QNAP остаётся основным ограничением
-(`local_nproc=1`, `avg_local_load1=3.28`). После первого прогона сравнить
-`bytes`, `duration_s`, `avg_mib_s` и `avg_remote_load1` с 2026-09-03, учитывая,
-что объём исходных данных между ночами меняется.
-
-## Compose-сервис Redis переименован в Valkey (2026-08-22)
-
-- В актуальном стеке `10.66.66.1` Compose-ключ сервиса — `valkey`.
-  Production-конфиг всё ещё содержал `REDIS_SERVICE_NAME="redis"`, поэтому
-  событие `redis_logs_capture` завершалось с `rc=1` и сообщением
-  `no such service: redis`, хотя сам бэкап продолжался успешно.
-- Значение по умолчанию и production-конфиг изменены на
-  `REDIS_SERVICE_NAME="valkey"`. Команды оптимизации и сохранения логов
-  используют эту переменную, поэтому дополнительная логика в скрипте не
-  требуется.
-
-## Смена публичного endpoint WireGuard (2026-08-27)
-
-- На локальном клиенте `wg0-client` подтверждены настройки: внутренний адрес
-  `10.66.66.2`, `AllowedIPs=10.66.66.0/24`, новый публичный endpoint сервера
-  `109.235.117.160:59347`. Приватный и preshared-ключи при проверке не
-  выводились.
-- `REMOTE_HOST="10.66.66.1"` в QNAP-бэкапе остаётся без изменений: это
-  внутренний адрес сервера в туннеле, а не публичный адрес подключения.
-- Добавлен необязательный `WG_ENDPOINT`: если он задан в
-  `conf/cloud_backup_qnap.conf`, скрипт использует его вместо `Endpoint` из
-  `/opt/etc/wireguard/<WG_INTERFACE>.conf`; пустое значение сохраняет прежнее
-  поведение. Выбранное значение и источник записываются событием
+- `REMOTE_HOST="10.66.66.1"` — адрес сервера внутри туннеля. Необязательный
+  `WG_ENDPOINT` в `conf/cloud_backup_qnap.conf` заменяет `Endpoint` из
+  `/opt/etc/wireguard/<WG_INTERFACE>.conf`; выбор пишется событием
   `wg_endpoint_selected`.
+- На сервере в `/etc/wireguard/wg0.conf` должны быть оба пира: десктоп
+  `10.66.66.2` и QNAP `10.66.66.3`.
+- Если туннель не поднимается без единой строки в логах сервера, а на QNAP
+  `tx_bytes>0`, `rx_bytes=0` — проверить `[Peer].PublicKey` в конфиге QNAP:
+  сервер молча отбрасывает handshake с неверным ключом (штатно для WG).
+  Диагностика — `tcpdump` на сервере при ручном подъёме туннеля с QNAP.
+- Ключ QNAP (`admin@EsimychStore-1`) должен быть в `authorized_keys` root на
+  сервере. После смены host key сервера `ssh_remote()` падает на каждом шаге —
+  в т.ч. ложно выглядит как `network_speed_test_skip_no_nc`/
+  `raw_transfer_nc_missing`. Новый отпечаток сверять с десктопом и
+  `ssh-keyscan`, старые записи — `ssh-keygen -R`.
 
-## Инцидент 26-27.08: сервер пересобран, посыпалось сразу всё (2026-08-28..30)
+## Шаги на сервере
 
-Судя по всему, вокруг 26-27.08 на `10.66.66.1` произошла существенная
-пересборка/переустановка (не подтверждено напрямую, только по совпадению
-дат нескольких независимых находок) — за три дня диагностики нашлись и
-исправлены пять никак не связанных в коде проблем (шестая всплыла неделей
-позже):
-
-1. **WireGuard: пропал пир QNAP на сервере** (`/etc/wireguard/wg0.conf`
-   содержал только пира десктопа) — добавлен обратно (`wg set` вживую +
-   дописано в конфиг), см. также «Смена публичного endpoint» выше.
-2. **WireGuard: `[Peer].PublicKey` в конфиге QNAP устарел** — QNAP шифровал
-   handshake для несуществующего уже ключа сервера, сервер тихо отбрасывал
-   пакет без единой строчки в логах (штатное поведение WG при неверном MAC,
-   не баг). Диагностировано `tcpdump` на сервере одновременно с ручным
-   подъёмом туннеля с QNAP: `tx_bytes>0` на QNAP, пакет виден на `eth0 In`
-   сервера, но `rx_bytes=0` и нет ответа. Ключ в `[Peer].PublicKey`
-   заменён на актуальный.
-3. **SSH host key сервера сменился** — у QNAP в `known_hosts` остались 3
-   старые записи (ed25519/rsa/ecdsa), из-за чего `ssh_remote()` падал с
-   "REMOTE HOST IDENTIFICATION HAS CHANGED" на КАЖДОМ шаге бэкапа (occ,
-   docker compose и т.д.) — именно это, а не отсутствие `nc`, стояло за
-   `network_speed_test_skip_no_nc`/`raw_transfer_nc_missing` 29-30.08:
-   проверка `command -v nc` сама не могла подключиться по SSH. Новый
-   отпечаток сверен с независимо уже доверенным ключом на десктопе и с
-   live `ssh-keyscan` — совпадает, легитимная смена, не MITM. Старые записи
-   вычищены (`ssh-keygen -R`), добавлена верная.
-4. **`authorized_keys` root на сервере не содержал ключ QNAP вообще** —
-   только ключ десктопа. Добавлен `admin@EsimychStore-1` в
-   `~/.ssh/authorized_keys`.
-5. **Nextcloud: приложения `files_trashbin` и `files_versions` оказались
-   выключены** (`occ app:list` → `Disabled:`) — поэтому `occ
-   trashbin:cleanup`/`versions:cleanup` падали с "no commands defined in
-   the ... namespace" (namespace регистрирует само приложение, у
-   выключенного его просто нет — не баг синтаксиса occ). Скрипт восстановил
-   `files_trashbin`-папки собственной логикой независимо от `occ` — бэкап
-   не пострадал. По решению пользователя (2026-09-01) оба приложения сначала
-   включены обратно (`occ app:enable files_trashbin files_versions`), код
-   скрипта не менялся — он и был правильным, просто приложения были
-   выключены. В тот же день пользователь решил `files_versions` держать
-   выключенным осознанно (не оставлять версии файлов) — см. ниже.
-6. **ufw: пропало правило `allow 8873/tcp` для raw-transfer** (живёт в
-   docker-томе `ufw_data` контейнера fail2ban) — обнаружено позже
-   остальных (01-02.09), т.к. маскировалось штатным фолбэком на SSH.
-   Восстановлено 2026-09-02, см. отдельный раздел ниже.
-
-Ни один из шести пунктов не потребовал изменений в `cloud_backup_qnap.sh`
-(кроме уже упомянутого `WG_ENDPOINT` для п.1) — все актуальные значения и
-состояния восстановлены на самой инфраструктуре. Диагностика велась через
-`ssh-askpass-gui` (см. [[feedback_ssh_askpass_gui]] в памяти Claude) — доступ
-к QNAP по паролю через `admin@192.168.88.99` появился в этой сессии.
-
-## files_versions и files_trashbin отключены осознанно (2026-09-01)
-
-В отличие от исходной причины из п.5 инцидента выше (приложения были
-выключены случайно, при пересборке сервера), оба приложения —
-`files_versions`, затем в тот же день и `files_trashbin` — отключены на
-`10.66.66.1` по явному решению пользователя (`occ app:disable ...`):
-версии файлов и корзина сознательно не используются. Соответственно в
-`cloud_backup_qnap.sh` убраны полностью (а не просто игнорируют ошибку)
-оба шага между очисткой корзин/версий и оптимизацией БД:
-
-- `occ versions:cleanup` — при выключенном `files_versions` у occ нет
-  самого namespace `versions`, это не «мягкая» ошибка, а ожидаемое
-  отсутствие команды;
-- `occ trashbin:cleanup --all-users` вместе со всем repair-блоком, который
-  пересоздавал `data/<user>/files_trashbin` после очистки (см. п.5) — сам
-  repair был нужен только как компенсация побочного эффекта
-  `trashbin:cleanup`; без вызова самой команды он бессмыслен и тоже убран.
-
-Лог теперь пишет `occ_trashbin_skipped`/`occ_versions_skipped` вместо
-`occ_cleanup_trash_ok/failed`, `occ_trashbin_repair_ok/failed`,
-`occ_cleanup_versions_ok/failed`. Тест `tests/cloud_backup_qnap.bats`
-("OCC использует настраиваемое имя сервиса docker compose") переключён на
-проверку `docker compose ps -a` — единственный оставшийся occ-связанный
-вызов, использующий `NEXTCLOUD_SERVICE_NAME`.
-
-Если `files_versions`/`files_trashbin` когда-нибудь снова понадобятся —
-`occ app:enable files_versions files_trashbin`; соответствующие шаги
-очистки/repair в скрипте придётся вернуть отдельно (сам он не отслеживает
-состояние приложений).
-
-## Raw-TCP 8873 не подключался после пересборки сервера — пропало правило ufw (2026-09-01..03)
-
-Фактически шестая потеря состояния того же инцидента 26-27.08 (см. выше),
-всплывшая позже остальных, потому что raw-transfer безопасно фолбэчится на
-SSH и бэкап при этом не страдает.
-
-**Симптом (логи 2026-09-01 и 2026-09-02, одинаково):**
-- `network_speed_test_failed` — `bytes=0, duration_s=10, ncat_rc=1`;
-- `raw_transfer_listener_launch` → 10× `raw_transfer_connect_retry`
-  (`ncat_rc=1`) → `raw_transfer_connect_exhausted` с `detail="Ncat:
-  TIMEOUT."` → штатный переход на SSH-канал, `backup_done rc=0`.
-
-**Причина:** правило `ufw allow from 10.66.66.0/24 to any port 8873 proto
-tcp` живёт не на хосте, а в docker-томе `ufw_data:/etc/ufw` контейнера
-`esimych-cloud-fail2ban` (см. комментарий в шапке `cloud_backup_qnap.sh`).
-При пересборке сервера оно потерялось вместе с остальными «живыми»
-настройками. Подтверждено: пользователь добавил правило обратно 2026-09-02,
-и лог 2026-09-03 чистый — `network_speed_test` ok (8.33 MiB/s),
-`raw_transfer_status_fetch rc=0` без единого retry, 0 WARN.
-
-**Диагностический признак на будущее** — текст stderr `ncat` в
-`raw_transfer_connect_exhausted`/`network_speed_test_failed`:
-- `Ncat: TIMEOUT.` — пакеты молча дропаются → фаервол (ufw) на сервере;
-  проверять `docker exec esimych-cloud-fail2ban ufw show added | grep 8873`;
-- `Ncat: Connection refused.` — порт открыт, но никто не слушает → удалённый
-  листенер не поднялся (смотреть `nc`-вариант на сервере / `REMOTE_ERR_FILE`).
-
-Оба случая дают одинаковый `ncat_rc=1`, различаются только текстом.
-
-Доработка диагностики (2026-09-03): раньше `raw_transfer_connect_exhausted`
-писал в `detail` только локальный stderr `ncat`, а удалённые
-`REMOTE_ERR_FILE`/`REMOTE_STATUS_FILE` удалялись (`rm -f`) не читаясь. Теперь
-оба вычитываются перед удалением и попадают в `detail` как
-`remote_status=<rc|none>, remote_err=<stderr|none>`. При фаерволе (`TIMEOUT`)
-ожидаемо будет `none/none` (листенер жив и ждёт, статус ещё не записан);
-при `Connection refused` — реальный rc и сообщение упавшего `nc`/`tar`.
-Тест: «raw transfer: листенер недоступен все попытки — фолбэк на SSH, в лог
-попадает удалённый err-файл» в `tests/cloud_backup_qnap.bats`. При написании
-стаба ssh учитывать, что `RAW_LAUNCH_CMD` сам начинается с `rm -f '...'` —
-ветка `*"rm -f '"*` срабатывает и на запуск листенера, не только на зачистку.
-
-Сам фикс порта — инфраструктурный, логика передачи не менялась.
-
-## Корень QNAP переполнен, защита `/root` (2026-10-30)
-
-Корень QNAP — `tmpfs` на 205 МиБ, пересобирается при каждой загрузке.
-Штатно занято ~184 МиБ: 130 МиБ — образ `/opt/rfs_usr.img` (backing для
-`/dev/loop0` → `/usr`, скрыт под bind-монтированием Entware в `/opt`,
-обычный `du` его не видит; смотреть через `mount --bind / <tmp>`), остальное —
-QTS. 30.10 в 22:17 корень заполнили до 100 % 25 МиБ попытки приложения Claude
-развернуть свой remote-сервер (`/root/.claude/remote`, недокачанный
-`ccd-cli`), после чего LVM не мог писать `/etc/lvm/cache`. Каталог удалён.
-QNAP не добавлять как SSH-хост удалённой сессии Claude.
-
-Защита: поверх `/root` подключён отдельный `tmpfs` на 8 МиБ (`roottmp`),
-содержимое `/root` копируется в него. Переподключение после загрузки —
-ежеминутная строка в `/etc/config/crontab` (по образцу строки с bind-mount
-Entware), идемпотентна по `grep -q '^roottmp /root ' /proc/mounts`:
-
-```sh
-* * * * * grep -q '^roottmp /root ' /proc/mounts || { d=/tmp/.rootcopy; rm -rf "${d}"; mkdir "${d}" && cp -a /root/. "${d}/" && mount -t tmpfs -o size=8m,mode=0755 roottmp /root && cp -a "${d}/." /root/; rm -rf "${d}"; }
-```
-
-Тест: `dd` 12 МиБ в `$HOME` обрывается на 8 МиБ, свободное место корня не
-меняется. Резервная копия crontab до правки —
-`/etc/config/crontab.bak-rootguard`. Откат: удалить строку, `crontab
-/etc/config/crontab`, `umount /root`. Защищён только `/root`; `/etc`, `/var`
-закрыть нельзя — туда пишет QTS.
-
-Попутно о месте на DataVol1 (не меняли): пул `tp1` 5,33 ТиБ, тонкий том
-`lv1` 4,78 ТиБ, ФС 4,745 ТиБ. Разницу (~558 ГиБ) занимает гарантированный
-резерв снапшотов пула `snapshot_reserved = 10` (`qlvm.conf`,
-`llreservedP` в `storage_lib.log`) — пока он включён, QTS не даёт расширить
-том. Снапшот — еженедельный (понедельник 00:00), хранится один.
-
-## Открытые вопросы / что смотреть дальше
-
-- Тренд `avg_mib_s`/`avg_local_load1` по прогонам с raw-transfer (нужно
-  накопить больше ночей, чем один прогон, для уверенного вывода):
-  - 2026-07-29 (SSH, до смены шифра): avg_local_load1=1.77, avg_mib_s=4.65
-  - 2026-07-30 (SSH, после смены приоритета SSH_CIPHERS): 1.82 / 5.01
-  - 2026-08-04 (raw-transfer включён, но `io_device=n/a` баг): load ~2.51,
-    avg_mib_s=5.05
-  - 2026-08-05 (raw-transfer + io_device фикс): load=2.23, avg_mib_s=5.12
-  - 2026-08-07 (тот же прогон, где `redis_optimize_failed`): load=2.15,
-    avg_mib_s=4.83 — сама скорость архивирования не пострадала, 30 минут
-    зависшего Redis были **до** старта `backup_start`/передачи, не внутри неё.
-  - 2026-09-01 (SSH-фолбэк, ufw-правило потеряно, `remote_nproc=2` после
-    пересборки сервера): load=3.25, avg_mib_s=9.04, 35G / 3906с
-  - 2026-09-02 (SSH-фолбэк): load=2.89, avg_mib_s=8.74, 23G / 2582с
-  - 2026-09-03 (raw-transfer снова работает): load=3.28, avg_mib_s=9.49,
-    28G / 2977с, inst 8.42–9.66 ровно, 0 WARN
-  - Общий вывод: после пересборки сервера (26-27.08) скорость выросла почти
-    вдвое (~5 → ~9 MiB/s) даже через SSH — вклад самой смены серверного
-    железа/ОС явно больше, чем raw-transfer (+~0.5-0.7 MiB/s поверх SSH,
-    09-03 vs 09-01/02). CPU QNAP (load ~3; «1 ядро» ошибочно — ядер 4, см. «QNAP: аппаратные/ОС факты») остаётся доминирующим
-    ограничением.
-- `redis_optimize_failed` (AOF rewrite >1800с) — см. отдельный раздел выше.
-  Митигация (`redis_logs_capture`) задеплоена 2026-08-07, ждём следующего
-  повторения, чтобы иметь логи для разбора причины.
-- Если в будущем понадобится ещё один локальный таймаут/лимит на QNAP —
-  **не использовать внешний `timeout`**, он отсутствует. Варианты: `ncat
-  --idle-timeout`/`-w`, фоновый `sleep N && kill` вручную, или явный
-  retry-loop с ограничением попыток (как в raw-transfer).
+- Запуск сервисов после бэкапа повторяется до `SERVICES_START_RETRIES` раз с
+  проверкой `docker compose ps -a`; окончательная ошибка даёт ненулевой код
+  скрипта.
+- `occ` — через `docker compose exec -T` и сервис `NEXTCLOUD_SERVICE_NAME`
+  (по умолчанию `nextcloud`), перед этим событие `nextcloud_preflight`.
+- `files_versions` и `files_trashbin` на сервере отключены осознанно
+  (решение пользователя): версии и корзина не используются, поэтому очистки
+  `occ versions:cleanup`/`trashbin:cleanup` в скрипте нет — в лог пишутся
+  `occ_versions_skipped`/`occ_trashbin_skipped`. Если приложения снова
+  включат (`occ app:enable files_versions files_trashbin`), шаги очистки
+  придётся вернуть в скрипт отдельно.
+- Оптимизация MariaDB — раз в `DB_OPTIMIZE_INTERVAL_DAYS` (флаг
+  `DB_OPTIMIZE_DUE`).
+- `json_escape`: управляющие байты задаются явным списком octal-кодов — с
+  диапазонами QNAP-реализация `tr` удаляла дефисы.
