@@ -62,7 +62,7 @@ Pipeline:
            иначе antiword/catdoc/catdoc -b/wvText -> txt -> pandoc (что доступно)
 
 Автоудаление логов:
-  Удаляет doc2fb2_*.jsonl старше 10 дней рядом с логом.
+  Удаляет doc2fb2_*.jsonl старше LOG_KEEP_DAYS дней (conf/doc2fb2.conf, по умолчанию 10) рядом с логом.
 EOF
 }
 

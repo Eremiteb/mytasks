@@ -824,9 +824,9 @@ ssh_remote() {
 ###############################################################################
 get_local_load1() { awk '{print $1}' /proc/loadavg 2>/dev/null; }
 get_local_mem_avail_mb() { awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo 2>/dev/null; }
-# nproc есть не везде: на QNAP его нет ни в BusyBox, ни в Entware, и прежний
-# запасной вариант «echo 1» давал в логах local_nproc=1 при 4 ядрах. Поэтому
-# дальше считаем ядра по /proc/cpuinfo, и только если не вышло — 1.
+# nproc есть не везде (на QNAP его нет ни в BusyBox, ни в Entware), поэтому
+# число ядер берётся из nproc, а если его нет — из /proc/cpuinfo; если и там
+# пусто, используется 1.
 get_local_nproc() {
   local n=""
   n="$(nproc 2>/dev/null)" || n=""

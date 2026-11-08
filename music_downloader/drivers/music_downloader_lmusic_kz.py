@@ -71,7 +71,7 @@ def get_tracks(session, base_url, category_path):
     tracks = parse_tracks(resp.text, base_url, target_url)
 
     # 3. Рандомизированная финальная пауза
-    # Базовые 8 секунд + случайные от 5 до 15 секунд
+    # Базовая пауза final_pause_seconds + случайная добавка из final_pause_extra_range_seconds (SETTINGS)
     total_wait = SETTINGS["final_pause_seconds"] + random.randint(*map(int, SETTINGS["final_pause_extra_range_seconds"]))
     logger.info(f"LMusic: категория {category_path} обработана. Пауза {total_wait} сек.")
     time.sleep(total_wait)

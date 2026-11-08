@@ -16,7 +16,7 @@ COVER_NAMES="cover.jpg folder.jpg front.jpg"
 JOBS=0
 
 # Каталог, куда пишутся MP3, лог ошибок и отчёт (структура подпапок источника сохраняется).
-OUTPUT_DIR="/copy/Music"
+OUTPUT_DIR="/mnt/copy/Music"
 
 # Имя файла журнала ошибок (создаётся внутри OUTPUT_DIR).
 ERROR_LOG="audio_to_mp3_errors.log"

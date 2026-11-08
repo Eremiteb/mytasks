@@ -111,7 +111,7 @@ Shell-скрипты с JSONL-логированием читают его, ес
 | `QUALITY`    | `0`                  | Качество MP3 (0 — наилучшее)          |
 | `COVER_NAMES`| `cover.jpg folder.jpg front.jpg` | Имена файлов обложек   |
 | `JOBS`       | `nproc`              | Количество параллельных потоков       |
-| `OUTPUT_DIR` | `/copy/Music`        | Папка для результата (структура подпапок источника сохраняется) |
+| `OUTPUT_DIR` | `/mnt/copy/Music`    | Папка для результата (структура подпапок источника сохраняется) |
 | `ERROR_LOG`  | `audio_to_mp3_errors.log` | Имя журнала ошибок (создаётся внутри `OUTPUT_DIR`) |
 | `REPORT_FILE`| `audio_to_mp3_report.txt` | Имя отчёта о конвертации (создаётся внутри `OUTPUT_DIR`) |
 

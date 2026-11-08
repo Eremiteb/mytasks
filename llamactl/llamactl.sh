@@ -999,7 +999,7 @@ root_swap_install() {
     mv -- "${prefix}" "${prev}" && mv -- "${new}" "${prefix}" || exit 1
     systemctl restart "${su}" "${fu}"
     local t=0 ok=0
-    while ((t < 90)); do
+    while ((t < HEALTH_TIMEOUT_SECS)); do
         if curl -fsS --max-time 3 "${rurl}/health" >/dev/null 2>&1 && curl -fsS --max-time 3 "${furl}/health" >/dev/null 2>&1; then
             ok=1; break
         fi

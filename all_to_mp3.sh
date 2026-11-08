@@ -32,7 +32,7 @@ fi
 : "${QUALITY:=0}"
 : "${COVER_NAMES:=cover.jpg folder.jpg front.jpg}"
 : "${JOBS:=0}"
-: "${OUTPUT_DIR:=/copy/Music}"
+: "${OUTPUT_DIR:=/mnt/copy/Music}"
 : "${ERROR_LOG:=audio_to_mp3_errors.log}"
 : "${REPORT_FILE:=audio_to_mp3_report.txt}"
 
@@ -125,9 +125,8 @@ fi
 [ -n "${TMP_COVER:-}" ] && [ -f "${TMP_COVER}" ] && rm -f "${TMP_COVER}"
 '
 
-# Выражение для find собирается в позиционных параметрах: прежняя строка с
-# литеральными кавычками (-iname '*.ext') никогда не совпадала с файлами, и
-# обработчик запускался на пустом имени.
+# Выражение для find собирается в позиционных параметрах: каждое расширение
+# даёт отдельный -iname, кавычки не проходят через разбор строки.
 set -- -type f
 if [ -n "${FORMATS}" ]; then
   set -- -type f '('

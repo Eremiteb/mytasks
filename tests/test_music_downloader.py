@@ -481,15 +481,14 @@ class TestMusicDownloader(unittest.TestCase):
                     self.assertEqual(error.exception.code, 2)
                     create_scraper.assert_not_called()
 
-    def test_database_removes_legacy_table_and_case_insensitive_duplicates(self):
+    def test_database_removes_case_insensitive_duplicates(self):
         with tempfile.TemporaryDirectory() as root:
             db_path = os.path.join(root, "music.db")
             with sqlite3.connect(db_path) as conn:
-                schema = "(id TEXT PRIMARY KEY, artist TEXT, title TEXT, site TEXT, timestamp DATETIME, src TEXT, filename TEXT, filesize INTEGER)"
-                conn.execute(f"CREATE TABLE downloads {schema}")
-                conn.execute(f"CREATE TABLE allsongs {schema}")
+                schema = "(id TEXT PRIMARY KEY, artist TEXT, title TEXT, site TEXT, timestamp DATETIME, src TEXT, X
                 conn.executemany(
-                    "INSERT INTO downloads VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO downloads (id, artist, title, site, timestamp, src, filename, filesize) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     [
                         ("old", "ӘСЕМ", "  Ән  ", "one", "2026-01-01", None, "old.mp3", 1),
                         ("new", "Әсем", "ӘН!", "two", "2026-01-02", None, "new.mp3", 2),
@@ -500,11 +499,6 @@ class TestMusicDownloader(unittest.TestCase):
 
             with sqlite3.connect(db_path) as conn:
                 self.assertEqual(conn.execute("SELECT id FROM downloads").fetchall(), [("new",)])
-                self.assertIsNone(
-                    conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='allsongs'").fetchone()
-                )
-                columns = {row[1] for row in conn.execute("PRAGMA table_info(downloads)")}
-                self.assertTrue({"original_artist", "original_title", "filehash"} <= columns)
                 self.assertEqual(
                     conn.execute(
                         "SELECT artist, title, original_artist, original_title FROM downloads"
@@ -523,8 +517,9 @@ class TestMusicDownloader(unittest.TestCase):
             db_path = os.path.join(root, "music.db")
             with sqlite3.connect(db_path) as conn:
                 conn.execute(
-                    "CREATE TABLE downloads (id TEXT PRIMARY KEY, artist TEXT, title TEXT, site TEXT, "
-                    "timestamp DATETIME, src TEXT, filename TEXT, filesize INTEGER)"
+                    "CREATE TABLE downloads (id TEXT PRIMARY KEY, artist TEXT, title TEXT, original_artist TEXT, "
+                    "original_title TEXT, site TEXT, timestamp DATETIME, src TEXT, filename TEXT, filesize INTEGER, "
+                    "filehash TEXT)"
                 )
                 conn.execute("CREATE UNIQUE INDEX idx_downloads_artist_title ON downloads(artist, title)")
                 conn.executemany(
@@ -547,8 +542,9 @@ class TestMusicDownloader(unittest.TestCase):
             db_path = os.path.join(root, "music.db")
             with sqlite3.connect(db_path) as conn:
                 conn.execute(
-                    "CREATE TABLE downloads (id TEXT PRIMARY KEY, artist TEXT, title TEXT, site TEXT, "
-                    "timestamp DATETIME, src TEXT, filename TEXT, filesize INTEGER, filehash TEXT)"
+                    "CREATE TABLE downloads (id TEXT PRIMARY KEY, artist TEXT, title TEXT, original_artist TEXT, "
+                    "original_title TEXT, site TEXT, timestamp DATETIME, src TEXT, filename TEXT, filesize INTEGER, "
+                    "filehash TEXT)"
                 )
                 conn.executemany(
                     "INSERT INTO downloads (id, artist, title, site, timestamp, filename, filehash) "

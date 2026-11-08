@@ -252,10 +252,6 @@ CREATE TABLE IF NOT EXISTS gpu_stats (
 );
 CREATE INDEX IF NOT EXISTS idx_gpu_stats_device_ts ON gpu_stats(device, ts);
 SQL
-    # Миграции для баз, созданных до появления этих колонок (ошибку "duplicate column" игнорируем)
-    sqlite3 "${DB_FILE}" "ALTER TABLE disk_stats ADD COLUMN device_alias TEXT;" 2>/dev/null || true
-    sqlite3 "${DB_FILE}" "ALTER TABLE disk_stats ADD COLUMN mountpoints TEXT;" 2>/dev/null || true
-    sqlite3 "${DB_FILE}" "ALTER TABLE disk_stats ADD COLUMN size_bytes INTEGER;" 2>/dev/null || true
 }
 
 insert_row() {

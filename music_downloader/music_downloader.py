@@ -91,12 +91,6 @@ class DatabaseManager:
                 "original_artist TEXT, original_title TEXT, site TEXT, "
                 "timestamp DATETIME, src TEXT, filename TEXT, filesize INTEGER, filehash TEXT)"
             )
-            conn.execute("DROP TABLE IF EXISTS allsongs")
-
-            columns = {row[1] for row in conn.execute("PRAGMA table_info(downloads)")}
-            for column in ("original_artist", "original_title", "filehash"):
-                if column not in columns:
-                    conn.execute(f"ALTER TABLE downloads ADD COLUMN {column} TEXT")
 
             # В старых строках точное исходное написание уже могло быть потеряно,
             # поэтому сохраняем лучшее доступное значение до очередной нормализации.
