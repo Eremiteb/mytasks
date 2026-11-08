@@ -32,6 +32,11 @@ NVIDIA_SMI_BIN="nvidia-smi"
 TEMP_WARN_C=50
 TEMP_CRIT_C=60
 
+# Отдельные пороги NVMe (/dev/nvme*): контроллеры NVMe штатно теплее SATA
+# (Kingston NV2 под нагрузкой ~60 °C). Пусто — общие TEMP_WARN_C/TEMP_CRIT_C
+NVME_TEMP_WARN_C=70
+NVME_TEMP_CRIT_C=80
+
 # Пороги температуры CPU (°C)
 CPU_TEMP_WARN_C=80
 CPU_TEMP_CRIT_C=90

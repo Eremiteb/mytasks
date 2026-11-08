@@ -42,6 +42,9 @@ NVIDIA_SMI_BIN="${NVIDIA_SMI_BIN:-nvidia-smi}"
 DISKS="${DISKS:-}"
 TEMP_WARN_C="${TEMP_WARN_C:-50}"
 TEMP_CRIT_C="${TEMP_CRIT_C:-60}"
+# Отдельные пороги для NVMe (/dev/nvme*): им штатно теплее, чем SATA; пусто — общие TEMP_*
+NVME_TEMP_WARN_C="${NVME_TEMP_WARN_C:-}"
+NVME_TEMP_CRIT_C="${NVME_TEMP_CRIT_C:-}"
 CPU_TEMP_WARN_C="${CPU_TEMP_WARN_C:-80}"
 CPU_TEMP_CRIT_C="${CPU_TEMP_CRIT_C:-90}"
 GPU_TEMP_WARN_C="${GPU_TEMP_WARN_C:-75}"
@@ -539,9 +542,20 @@ poll_gpu() {
 ###############################################################################
 # REPORT ANALYSIS
 ###############################################################################
+# Пороги температуры диска -> DISK_TEMP_WARN_C / DISK_TEMP_CRIT_C (NVMe — свои, если заданы)
+set_disk_temp_limits() {
+    DISK_TEMP_WARN_C="${TEMP_WARN_C}"
+    DISK_TEMP_CRIT_C="${TEMP_CRIT_C}"
+    if [[ "$1" == /dev/nvme* ]]; then
+        DISK_TEMP_WARN_C="${NVME_TEMP_WARN_C:-${TEMP_WARN_C}}"
+        DISK_TEMP_CRIT_C="${NVME_TEMP_CRIT_C:-${TEMP_CRIT_C}}"
+    fi
+}
+
 classify_status() {
-    # $1=health $2=temp $3=realloc $4=pending $5=uncorrect -> echoes "ok|warn|crit"
+    # $1=health $2=temp $3=realloc $4=pending $5=uncorrect $6=device -> echoes "ok|warn|crit"
     local health="$1" temp="$2" realloc="$3" pending="$4" uncorrect="$5"
+    set_disk_temp_limits "${6:-}"
 
     if [[ "${health}" == "FAILED" ]]; then
         echo "crit"
@@ -551,7 +565,7 @@ classify_status() {
         echo "crit"
         return
     fi
-    if [[ "${temp}" =~ ^-?[0-9]+$ ]] && ((temp >= TEMP_CRIT_C)); then
+    if [[ "${temp}" =~ ^-?[0-9]+$ ]] && ((temp >= DISK_TEMP_CRIT_C)); then
         echo "crit"
         return
     fi
@@ -563,7 +577,7 @@ classify_status() {
         echo "warn"
         return
     fi
-    if [[ "${temp}" =~ ^-?[0-9]+$ ]] && ((temp >= TEMP_WARN_C)); then
+    if [[ "${temp}" =~ ^-?[0-9]+$ ]] && ((temp >= DISK_TEMP_WARN_C)); then
         echo "warn"
         return
     fi
@@ -594,6 +608,7 @@ classify_temp_status() {
 analyze_disk() {
     local device="$1" health="$2" temp="$3" poh="$4" realloc="$5" pending="$6" uncorrect="$7" mountpoints="$8"
     local -a notes=()
+    set_disk_temp_limits "${device}"
 
     case "${health}" in
         FAILED)
@@ -615,10 +630,10 @@ analyze_disk() {
         notes+=("Есть секторы, ожидающие переназначения (Current_Pending_Sector=${pending}). Рекомендуется внеплановая полная проверка диска (long self-test).")
     fi
     if [[ "${temp}" =~ ^-?[0-9]+$ ]]; then
-        if ((temp >= TEMP_CRIT_C)); then
-            notes+=("Температура ${temp}°C выше критического порога (${TEMP_CRIT_C}°C) — проверьте охлаждение и обдув корпуса.")
-        elif ((temp >= TEMP_WARN_C)); then
-            notes+=("Температура ${temp}°C приближается к порогу предупреждения (${TEMP_WARN_C}°C), стоит проверить охлаждение.")
+        if ((temp >= DISK_TEMP_CRIT_C)); then
+            notes+=("Температура ${temp}°C выше критического порога (${DISK_TEMP_CRIT_C}°C) — проверьте охлаждение и обдув корпуса.")
+        elif ((temp >= DISK_TEMP_WARN_C)); then
+            notes+=("Температура ${temp}°C приближается к порогу предупреждения (${DISK_TEMP_WARN_C}°C), стоит проверить охлаждение.")
         fi
     fi
 
@@ -949,7 +964,7 @@ generate_report() {
         [[ -z "${device}" ]] && continue
         local status color label analysis
         local e_device e_mountpoints e_model e_serial e_size e_label e_row_ts e_alias e_analysis
-        status="$(classify_status "${health}" "${temp}" "${realloc}" "${pending}" "${uncorrect}")"
+        status="$(classify_status "${health}" "${temp}" "${realloc}" "${pending}" "${uncorrect}" "${device}")"
         color="$(status_color "${status}")"
         label="$(status_label "${status}")"
         analysis="$(analyze_disk "${device}" "${health}" "${temp}" "${poh}" "${realloc}" "${pending}" "${uncorrect}" "${mountpoints}")"
@@ -1115,9 +1130,13 @@ generate_report() {
 
     rm -f -- "${ts_axis_file}"
 
-    local e_db_file e_report_dir
+    local e_db_file e_report_dir e_nvme_limits=""
     e_db_file="$(html_escape "${DB_FILE}")"
     e_report_dir="$(html_escape "${REPORT_DIR}")"
+    if [[ -n "${NVME_TEMP_WARN_C}${NVME_TEMP_CRIT_C}" ]]; then
+        set_disk_temp_limits /dev/nvme
+        e_nvme_limits=" (NVMe: warn=${DISK_TEMP_WARN_C}°C, crit=${DISK_TEMP_CRIT_C}°C)"
+    fi
 
     tmp_report="$(mktemp)"
     cat > "${tmp_report}" <<HTML
@@ -1221,7 +1240,7 @@ ${temp_chart}
 ${sector_chart}
 </section>
 
-<footer>${SCRIPT_NAME} · пороги дисков: warn=${TEMP_WARN_C}°C, crit=${TEMP_CRIT_C}°C · CPU: warn=${CPU_TEMP_WARN_C}°C, crit=${CPU_TEMP_CRIT_C}°C · GPU: warn=${GPU_TEMP_WARN_C}°C, crit=${GPU_TEMP_CRIT_C}°C · отчёт хранится ${REPORT_KEEP} последних версий в ${e_report_dir}</footer>
+<footer>${SCRIPT_NAME} · пороги дисков: warn=${TEMP_WARN_C}°C, crit=${TEMP_CRIT_C}°C${e_nvme_limits} · CPU: warn=${CPU_TEMP_WARN_C}°C, crit=${CPU_TEMP_CRIT_C}°C · GPU: warn=${GPU_TEMP_WARN_C}°C, crit=${GPU_TEMP_CRIT_C}°C · отчёт хранится ${REPORT_KEEP} последних версий в ${e_report_dir}</footer>
 </body>
 </html>
 HTML

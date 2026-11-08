@@ -362,6 +362,34 @@ EOF
   [ "$status" -eq 1 ]
 }
 
+@test "NVMe: свои пороги NVME_TEMP_* вместо общих TEMP_*, SATA остаётся на общих" {
+  write_smart_json nvme0n1 '{"smart_status":{"passed":true},"model_name":"TestNVMe","serial_number":"SNNVME","temperature":{"current":65},"power_on_time":{"hours":500}}'
+
+  # без NVMe-порогов 65 °C выше общего критического (60) → выход 1
+  DISKS="nvme0n1" run_monitor
+  [ "$status" -eq 1 ]
+
+  # с порогами 70/80 те же 65 °C — норма, без предупреждения
+  rm -f "$TMP_DIR/logs"/system_monitor-*.jsonl
+  DISKS="nvme0n1" NVME_TEMP_WARN_C=70 NVME_TEMP_CRIT_C=80 run_monitor
+  [ "$status" -eq 0 ]
+  run grep -q '"event":"system_warning"' "$(last_log)"
+  [ "$status" -ne 0 ]
+
+  # 72 °C — «внимание» по NVMe-порогу, но не критично
+  write_smart_json nvme0n1 '{"smart_status":{"passed":true},"model_name":"TestNVMe","serial_number":"SNNVME","temperature":{"current":72},"power_on_time":{"hours":500}}'
+  rm -f "$TMP_DIR/logs"/system_monitor-*.jsonl
+  DISKS="nvme0n1" NVME_TEMP_WARN_C=70 NVME_TEMP_CRIT_C=80 run_monitor
+  [ "$status" -eq 0 ]
+  run grep -q '"event":"system_warning"' "$(last_log)"
+  [ "$status" -eq 0 ]
+
+  # SATA-диск при тех же NVMe-порогах судится по общим TEMP_*: 65 °C → критично
+  write_smart_json sdb '{"smart_status":{"passed":true},"model_name":"TestDisk-B","serial_number":"SNBBB","temperature":{"current":65},"power_on_time":{"hours":2000},"ata_smart_attributes":{"table":[{"name":"Reallocated_Sector_Ct","raw":{"value":0}},{"name":"Current_Pending_Sector","raw":{"value":0}},{"name":"Offline_Uncorrectable","raw":{"value":0}}]}}'
+  DISKS="sdb" NVME_TEMP_WARN_C=70 NVME_TEMP_CRIT_C=80 run_monitor
+  [ "$status" -eq 1 ]
+}
+
 @test "переназначенные секторы (warning) не вызывают notify-send" {
   write_smart_json sdb '{"smart_status":{"passed":true},"model_name":"TestDisk-B","serial_number":"SNBBB","temperature":{"current":36},"power_on_time":{"hours":2000},"ata_smart_attributes":{"table":[{"name":"Reallocated_Sector_Ct","raw":{"value":5}},{"name":"Current_Pending_Sector","raw":{"value":0}},{"name":"Offline_Uncorrectable","raw":{"value":0}}]}}'
 
