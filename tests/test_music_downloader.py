@@ -5,6 +5,8 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -574,6 +576,170 @@ class TestMusicDownloader(unittest.TestCase):
                     "INSERT INTO downloads (id, artist, title, site, timestamp, filehash) "
                     "VALUES ('f', 'q', 'six', 's', '2026-01-06', NULL)"
                 )
+
+    # --- Версионированные миграции схемы (PRAGMA user_version) ---
+
+    CANONICAL_DOWNLOADS = [
+        "id", "artist", "title", "original_artist", "original_title", "site",
+        "timestamp", "src", "filename", "filesize", "filehash",
+    ]
+
+    @staticmethod
+    def _columns(db_path, table):
+        with sqlite3.connect(db_path) as conn:
+            return [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
+
+    @staticmethod
+    def _backups(db_path):
+        return sorted(Path(db_path).parent.glob(Path(db_path).name + ".bak-v*"))
+
+    def _make_old_db(self, db_path, schema, rows_sql, rows):
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(f"CREATE TABLE downloads {schema}")
+            conn.executemany(rows_sql, rows)
+
+    def test_migration_reorders_columns_and_keeps_data(self):
+        with tempfile.TemporaryDirectory() as root:
+            db_path = os.path.join(root, "music.db")
+            # Старый порядок: original_* и filehash в конце
+            self._make_old_db(
+                db_path,
+                "(id TEXT PRIMARY KEY, artist TEXT, title TEXT, site TEXT, timestamp DATETIME, src TEXT, "
+                "filename TEXT, filesize INTEGER, original_artist TEXT, original_title TEXT, filehash TEXT)",
+                "INSERT INTO downloads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    ("a", "x", "one", "s1", "2026-01-01", "u1", "a.mp3", 11, "X", "One", "H1"),
+                    ("b", "y", "two", "s2", "2026-01-02", None, "b.mp3", 22, None, None, None),
+                ],
+            )
+
+            DatabaseManager(db_path)
+
+            self.assertEqual(self._columns(db_path, "downloads"), self.CANONICAL_DOWNLOADS)
+            with sqlite3.connect(db_path) as conn:
+                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
+                row = conn.execute(
+                    "SELECT id, artist, title, original_artist, original_title, site, timestamp, src, "
+                    "filename, filesize, filehash FROM downloads WHERE id = 'a'"
+                ).fetchone()
+                self.assertEqual(row, ("a", "x", "one", "X", "One", "s1", "2026-01-01", "u1", "a.mp3", 11, "H1"))
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM downloads").fetchone()[0], 2)
+            backups = self._backups(db_path)
+            self.assertEqual(len(backups), 1)
+            self.assertRegex(backups[0].name, r"\.bak-v0-\d{8}-\d{6}$")
+            with sqlite3.connect(backups[0]) as conn:  # копия — до миграции, в старом порядке
+                self.assertEqual(conn.execute("PRAGMA table_info(downloads)").fetchall()[-1][1], "filehash")
+                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 0)
+
+    def test_migration_adds_missing_columns_as_null(self):
+        with tempfile.TemporaryDirectory() as root:
+            db_path = os.path.join(root, "music.db")
+            self._make_old_db(
+                db_path,
+                "(id TEXT PRIMARY KEY, artist TEXT, title TEXT, site TEXT, timestamp DATETIME)",
+                "INSERT INTO downloads VALUES (?, ?, ?, ?, ?)",
+                [("a", "x", "one", "s", "2026-01-01")],
+            )
+
+            DatabaseManager(db_path)
+
+            self.assertEqual(self._columns(db_path, "downloads"), self.CANONICAL_DOWNLOADS)
+            with sqlite3.connect(db_path) as conn:
+                row = conn.execute("SELECT id, filename, filesize, filehash FROM downloads").fetchone()
+                self.assertEqual(row, ("a", None, None, None))
+
+    def test_migration_drops_extra_column(self):
+        with tempfile.TemporaryDirectory() as root:
+            db_path = os.path.join(root, "music.db")
+            self._make_old_db(
+                db_path,
+                "(id TEXT PRIMARY KEY, junk TEXT, artist TEXT, title TEXT, site TEXT, timestamp DATETIME)",
+                "INSERT INTO downloads VALUES (?, ?, ?, ?, ?, ?)",
+                [("a", "zzz", "x", "one", "s", "2026-01-01")],
+            )
+
+            DatabaseManager(db_path)
+
+            self.assertNotIn("junk", self._columns(db_path, "downloads"))
+            with sqlite3.connect(db_path) as conn:
+                self.assertEqual(conn.execute("SELECT id, artist FROM downloads").fetchall(), [("a", "x")])
+
+    def test_migration_new_database_gets_latest_version_without_backup(self):
+        with tempfile.TemporaryDirectory() as root:
+            db_path = os.path.join(root, "music.db")
+
+            DatabaseManager(db_path)
+
+            self.assertEqual(self._columns(db_path, "downloads"), self.CANONICAL_DOWNLOADS)
+            with sqlite3.connect(db_path) as conn:
+                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], music_downloader.DB_LATEST)
+            self.assertEqual(self._backups(db_path), [])
+
+    def test_migration_reopen_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as root:
+            db_path = os.path.join(root, "music.db")
+            self._make_old_db(
+                db_path,
+                "(id TEXT PRIMARY KEY, artist TEXT, title TEXT, site TEXT, timestamp DATETIME)",
+                "INSERT INTO downloads VALUES (?, ?, ?, ?, ?)",
+                [("a", "x", "one", "s", "2026-01-01")],
+            )
+            DatabaseManager(db_path)
+            backups = self._backups(db_path)
+
+            DatabaseManager(db_path)
+
+            self.assertEqual(self._backups(db_path), backups)
+            with sqlite3.connect(db_path) as conn:
+                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM downloads").fetchone()[0], 1)
+
+    def test_migrate_db_dry_run_does_not_change_file_and_prints_plan(self):
+        with tempfile.TemporaryDirectory() as root:
+            db_path = os.path.join(root, "music.db")
+            self._make_old_db(
+                db_path,
+                "(id TEXT PRIMARY KEY, junk TEXT, artist TEXT, title TEXT, site TEXT, timestamp DATETIME)",
+                "INSERT INTO downloads VALUES (?, ?, ?, ?, ?, ?)",
+                [("a", "zzz", "x", "one", "s", "2026-01-01")],
+            )
+            before = Path(db_path).read_bytes()
+            buffer = StringIO()
+
+            with patch.object(music_downloader, "DB_PATH", db_path), redirect_stdout(buffer):
+                code = music_downloader.main(["--migrate-db", "--dry-run"])
+
+            self.assertEqual(code, 0)
+            self.assertEqual(Path(db_path).read_bytes(), before)
+            self.assertEqual(self._backups(db_path), [])
+            output = buffer.getvalue()
+            self.assertIn("[dry-run] будет: миграция БД v0 → v1", output)
+            self.assertIn("[dry-run] будет: резервная копия", output)
+            self.assertIn("таблица downloads: 1 строк", output)
+            self.assertIn("отбрасываются: junk", output)
+
+    def test_migrate_db_without_dry_run_migrates_without_dedup(self):
+        with tempfile.TemporaryDirectory() as root:
+            db_path = os.path.join(root, "music.db")
+            self._make_old_db(
+                db_path,
+                "(id TEXT PRIMARY KEY, artist TEXT, title TEXT, site TEXT, timestamp DATETIME)",
+                "INSERT INTO downloads VALUES (?, ?, ?, ?, ?)",
+                [("a", "ARTIST", "One", "s", "2026-01-01")],
+            )
+
+            with (
+                patch.object(music_downloader, "DB_PATH", db_path),
+                patch.object(music_downloader, "setup_logging"),
+                redirect_stdout(StringIO()),
+            ):
+                code = music_downloader.main(["--migrate-db"])
+
+            self.assertEqual(code, 0)
+            with sqlite3.connect(db_path) as conn:
+                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
+                # перенормализации нет: регистр сохранён
+                self.assertEqual(conn.execute("SELECT artist FROM downloads").fetchone()[0], "ARTIST")
 
     def test_run_deduplicates_identical_audio_by_content_hash(self):
         with tempfile.TemporaryDirectory() as root:

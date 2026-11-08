@@ -553,3 +553,97 @@ EOF
   [ "$status" -eq 0 ]
   grep -qF -- '-a -j -d sat /dev/sda' "$args_log"
 }
+
+# ---------------------------------------------------------------------------
+# Версионированные миграции схемы БД (PRAGMA user_version)
+# ---------------------------------------------------------------------------
+
+make_old_db() {
+  # Старая схема: device_alias/mountpoints/size_bytes в конце; счётчик AUTOINCREMENT = 4
+  # при MAX(id) = 3 (четвёртая строка была удалена)
+  sqlite3 "$TMP_DIR/state/system_monitor.db" <<'SQL'
+CREATE TABLE disk_stats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, device TEXT NOT NULL, model TEXT, serial TEXT,
+    health TEXT NOT NULL, temperature_c INTEGER, power_on_hours INTEGER, reallocated_sectors INTEGER,
+    pending_sectors INTEGER, uncorrectable_errors INTEGER, device_alias TEXT, mountpoints TEXT, size_bytes INTEGER
+);
+INSERT INTO disk_stats (ts, device, model, serial, health, temperature_c, power_on_hours, reallocated_sectors, pending_sectors, uncorrectable_errors, device_alias, mountpoints, size_bytes)
+VALUES ('2026-01-01T00:00:00+0000', '/dev/sda', 'M1', 'S1', 'PASSED', 30, 100, 0, 0, 0, 'a1', '/', 111),
+       ('2026-01-01T00:00:00+0000', '/dev/sdb', 'M2', 'S2', 'PASSED', 31, 200, 0, 0, 0, 'a2', '/home', 222),
+       ('2026-01-02T00:00:00+0000', '/dev/sda', 'M1', 'S1', 'PASSED', 32, 101, 0, 0, 0, 'a1', '/', 111),
+       ('2026-01-03T00:00:00+0000', '/dev/sda', 'M1', 'S1', 'PASSED', 33, 102, 0, 0, 0, 'a1', '/', 111);
+DELETE FROM disk_stats WHERE id = 4;
+SQL
+}
+
+@test "миграция: старая БД пересобирается в канонический порядок, данные и id на месте, есть копия" {
+  make_old_db
+
+  run_monitor --report
+  [ "$status" -eq 0 ]
+
+  run db_query "SELECT group_concat(name, ',') FROM pragma_table_info('disk_stats');"
+  [ "$output" = "id,ts,device,device_alias,mountpoints,model,serial,size_bytes,health,temperature_c,power_on_hours,reallocated_sectors,pending_sectors,uncorrectable_errors" ]
+  run db_query "PRAGMA user_version;"
+  [ "$output" = "1" ]
+  run db_query "SELECT id, device, device_alias, mountpoints, size_bytes, temperature_c FROM disk_stats ORDER BY id;"
+  [ "$output" = $'1|/dev/sda|a1|/|111|30\n2|/dev/sdb|a2|/home|222|31\n3|/dev/sda|a1|/|111|32' ]
+  # счётчик AUTOINCREMENT сохранён (не меньше прежнего 4), индекс пересоздан
+  run db_query "SELECT seq FROM sqlite_sequence WHERE name='disk_stats';"
+  [ "$output" = "4" ]
+  run db_query "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_disk_stats_device_ts';"
+  [ "$output" = "1" ]
+  # недостающие таблицы созданы
+  run db_query "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('cpu_stats','gpu_stats');"
+  [ "$output" = "2" ]
+  compgen -G "$TMP_DIR/state/system_monitor.db.bak-v0-*" > /dev/null
+  run sqlite3 -noheader "$(compgen -G "$TMP_DIR/state/system_monitor.db.bak-v0-*" | head -1)" "SELECT COUNT(*) FROM disk_stats; PRAGMA user_version;"
+  [ "$output" = $'3\n0' ]
+}
+
+@test "миграция: повторный запуск ничего не меняет и не делает копий" {
+  make_old_db
+  run_monitor --report
+  [ "$status" -eq 0 ]
+  before="$(ls "$TMP_DIR/state" | wc -l)"
+
+  run_monitor --report
+  [ "$status" -eq 0 ]
+  [ "$(ls "$TMP_DIR/state" | wc -l)" = "$before" ]
+  run db_query "PRAGMA user_version;"
+  [ "$output" = "1" ]
+}
+
+@test "новая БД получает user_version = 1 без резервной копии" {
+  run_monitor
+  [ "$status" -eq 0 ]
+
+  run db_query "PRAGMA user_version;"
+  [ "$output" = "1" ]
+  run compgen -G "$TMP_DIR/state/system_monitor.db.bak-*"
+  [ "$status" -ne 0 ]
+}
+
+@test "миграция: --dry-run не меняет старую БД и печатает план" {
+  make_old_db
+  before="$(sha256sum "$TMP_DIR/state/system_monitor.db")"
+
+  run_monitor --dry-run
+  [ "$status" -eq 0 ]
+  plan="$output"
+
+  [ "$(sha256sum "$TMP_DIR/state/system_monitor.db")" = "$before" ]
+  run compgen -G "$TMP_DIR/state/system_monitor.db.bak-*"
+  [ "$status" -ne 0 ]
+  [[ "$plan" == *"[dry-run] будет: миграция БД v0 → v1"* ]]
+  [[ "$plan" == *"будет: резервная копия"*".bak-v0-"* ]]
+  [[ "$plan" == *"таблица disk_stats: 3 строк"* ]]
+  [[ "$plan" == *"таблица cpu_stats: нет, будет создана"* ]]
+}
+
+@test "миграция: --dry-run без базы сообщает о создании новой базы" {
+  run_monitor --dry-run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"[dry-run] будет: создана новая база v1"* ]]
+  [ ! -e "$TMP_DIR/state/system_monitor.db" ]
+}

@@ -172,7 +172,8 @@ usage() {
   -r, --report   Только пересобрать HTML-отчёт из уже накопленных в
                  SQLite данных, без повторного опроса.
   -n, --dry-run  Опросить систему и показать, что было бы записано в SQLite и
-                 отчёт, не меняя БД, отчёты и не показывая уведомлений.
+                 отчёт, не меняя БД, отчёты и не показывая уведомлений; печатает
+                 план миграции схемы БД (только чтение).
   -h, --help     Показать эту справку и выйти.
 EOF
 }
@@ -207,9 +208,18 @@ done
 ###############################################################################
 # DB
 ###############################################################################
-init_db() {
-    sqlite3 "${DB_FILE}" <<'SQL'
-CREATE TABLE IF NOT EXISTS disk_stats (
+# Версия схемы — PRAGMA user_version. Схема меняется ТОЛЬКО миграцией: новая миграция —
+# следующий номер (DB_LATEST) и ветка в db_migration_sql; DDL каждой таблицы — в одной
+# функции ddl_*, ею пользуются и создание, и пересборка; таблицы вручную ALTER не правим.
+DB_LATEST=1
+DB_TABLES=(disk_stats cpu_stats gpu_stats)
+DB_BUSY_TIMEOUT_MS="${DB_BUSY_TIMEOUT_MS:-30000}"
+
+# DDL таблиц: ddl_<таблица> [имя] — CREATE TABLE (имя нужно для пересборки T__new).
+ddl_disk_stats() {
+    local name="${1:-disk_stats}"
+    cat <<SQL
+CREATE TABLE IF NOT EXISTS ${name} (
     id                    INTEGER PRIMARY KEY AUTOINCREMENT,
     ts                    TEXT NOT NULL,
     device                TEXT NOT NULL,
@@ -225,9 +235,13 @@ CREATE TABLE IF NOT EXISTS disk_stats (
     pending_sectors       INTEGER,
     uncorrectable_errors  INTEGER
 );
-CREATE INDEX IF NOT EXISTS idx_disk_stats_device_ts ON disk_stats(device, ts);
+SQL
+}
 
-CREATE TABLE IF NOT EXISTS cpu_stats (
+ddl_cpu_stats() {
+    local name="${1:-cpu_stats}"
+    cat <<SQL
+CREATE TABLE IF NOT EXISTS ${name} (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     ts             TEXT NOT NULL,
     model          TEXT,
@@ -237,9 +251,13 @@ CREATE TABLE IF NOT EXISTS cpu_stats (
     load5          REAL,
     load15         REAL
 );
-CREATE INDEX IF NOT EXISTS idx_cpu_stats_ts ON cpu_stats(ts);
+SQL
+}
 
-CREATE TABLE IF NOT EXISTS gpu_stats (
+ddl_gpu_stats() {
+    local name="${1:-gpu_stats}"
+    cat <<SQL
+CREATE TABLE IF NOT EXISTS ${name} (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     ts             TEXT NOT NULL,
     device         TEXT NOT NULL,
@@ -250,8 +268,253 @@ CREATE TABLE IF NOT EXISTS gpu_stats (
     mem_total_mb   INTEGER,
     power_draw_w   REAL
 );
-CREATE INDEX IF NOT EXISTS idx_gpu_stats_device_ts ON gpu_stats(device, ts);
 SQL
+}
+
+# DDL индексов таблицы (только имя таблицы).
+ddl_disk_stats_indexes() {
+    echo "CREATE INDEX IF NOT EXISTS idx_disk_stats_device_ts ON disk_stats(device, ts);"
+}
+
+ddl_cpu_stats_indexes() {
+    echo "CREATE INDEX IF NOT EXISTS idx_cpu_stats_ts ON cpu_stats(ts);"
+}
+
+ddl_gpu_stats_indexes() {
+    echo "CREATE INDEX IF NOT EXISTS idx_gpu_stats_device_ts ON gpu_stats(device, ts);"
+}
+
+table_ddl() {
+    case "$1" in
+        disk_stats) ddl_disk_stats "${2:-$1}" ;;
+        cpu_stats) ddl_cpu_stats "${2:-$1}" ;;
+        gpu_stats) ddl_gpu_stats "${2:-$1}" ;;
+        *) return 1 ;;
+    esac
+}
+
+table_index_ddl() {
+    case "$1" in
+        disk_stats) ddl_disk_stats_indexes ;;
+        cpu_stats) ddl_cpu_stats_indexes ;;
+        gpu_stats) ddl_gpu_stats_indexes ;;
+        *) return 1 ;;
+    esac
+}
+
+# Колонки таблицы в каноническом порядке (по одной в строке) — из DDL в памяти.
+schema_columns() {
+    local table="$1" ddl
+    ddl="$(table_ddl "${table}")"
+    sqlite3 -noheader :memory: "${ddl}
+SELECT name FROM pragma_table_info('${table}') ORDER BY cid;"
+}
+
+# Чтение существующей БД — только sqlite3 -readonly.
+db_read() {
+    sqlite3 -readonly -noheader "${DB_FILE}" "$1"
+}
+
+db_user_version() {
+    db_read "PRAGMA user_version;"
+}
+
+db_has_table() {
+    local found
+    found="$(db_read "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '$1';")"
+    [[ "${found}" == "1" ]]
+}
+
+# Новая база: файла нет или в нём нет ни одной таблицы статистики.
+db_is_new() {
+    local table
+    [[ -s "${DB_FILE}" ]] || return 0
+    for table in "${DB_TABLES[@]}"; do
+        if db_has_table "${table}"; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+# has_line ТЕКСТ СТРОКА — есть ли СТРОКА среди строк ТЕКСТА.
+has_line() {
+    [[ $'\n'"$1"$'\n' == *$'\n'"$2"$'\n'* ]]
+}
+
+# Заполняет COLS_OLD/COLS_NEW (через запятую), COLS_COMMON (пересечение, порядок новой
+# схемы) и COLS_DROPPED (есть в старой таблице, нет в новой схеме).
+column_sets() {
+    local table="$1" old new col
+    old="$(db_read "SELECT name FROM pragma_table_info('${table}') ORDER BY cid;")"
+    new="$(schema_columns "${table}")"
+    COLS_OLD="${old//$'\n'/, }"
+    COLS_NEW="${new//$'\n'/, }"
+    COLS_COMMON=""
+    COLS_DROPPED=""
+    while IFS= read -r col; do
+        if [[ -n "${col}" ]] && has_line "${old}" "${col}"; then
+            COLS_COMMON+="${COLS_COMMON:+, }${col}"
+        fi
+    done <<<"${new}"
+    while IFS= read -r col; do
+        if [[ -n "${col}" ]] && ! has_line "${new}" "${col}"; then
+            COLS_DROPPED+="${COLS_DROPPED:+, }${col}"
+        fi
+    done <<<"${old}"
+}
+
+db_backup_path() {
+    local stamp
+    stamp="$(date '+%Y%m%d-%H%M%S')"
+    printf '%s.bak-v%s-%s' "${DB_FILE}" "$1" "${stamp}"
+}
+
+# SQL новой базы: текущая схема и user_version = DB_LATEST одной транзакцией.
+db_create_sql() {
+    local table ddl idx
+    echo "BEGIN IMMEDIATE;"
+    for table in "${DB_TABLES[@]}"; do
+        ddl="$(table_ddl "${table}")"
+        idx="$(table_index_ddl "${table}")"
+        printf '%s\n%s\n' "${ddl}" "${idx}"
+    done
+    echo "PRAGMA user_version = ${DB_LATEST};"
+    echo "COMMIT;"
+}
+
+# SQL миграции 1: пересборка каждой таблицы в схему из кода (порядок колонок; колонки,
+# которых не было в старой таблице, — NULL; лишние отбрасываются), одной транзакцией.
+# Сверка COUNT(*) — через CHECK во временной таблице: нарушение прерывает sqlite3 -bail,
+# незавершённая транзакция откатывается при закрытии соединения.
+db_migration_sql() {
+    local number="$1" table ddl_new idx new_name
+    case "${number}" in
+        1) ;;
+        *) return 1 ;;
+    esac
+    echo "BEGIN IMMEDIATE;"
+    echo "CREATE TEMP TABLE _mig_check (ok INTEGER CHECK (ok = 1));"
+    for table in "${DB_TABLES[@]}"; do
+        idx="$(table_index_ddl "${table}")"
+        if ! db_has_table "${table}"; then
+            ddl_new="$(table_ddl "${table}")"
+            printf '%s\n%s\n' "${ddl_new}" "${idx}"
+            continue
+        fi
+        column_sets "${table}"
+        new_name="${table}__new"
+        ddl_new="$(table_ddl "${table}" "${new_name}")"
+        echo "DROP TABLE IF EXISTS ${new_name};"
+        echo "${ddl_new}"
+        echo "INSERT INTO ${new_name} (${COLS_COMMON}) SELECT ${COLS_COMMON} FROM ${table};"
+        echo "INSERT INTO _mig_check SELECT (SELECT COUNT(*) FROM ${table}) = (SELECT COUNT(*) FROM ${new_name});"
+        # Прежний счётчик AUTOINCREMENT (мог быть больше MAX(id) из-за удалённых строк).
+        echo "CREATE TEMP TABLE _mig_seq_${table} AS SELECT seq FROM sqlite_sequence WHERE name = '${table}';"
+        echo "DROP TABLE ${table};"
+        echo "ALTER TABLE ${new_name} RENAME TO ${table};"
+        echo "DELETE FROM sqlite_sequence WHERE name = '${table}';"
+        echo "INSERT INTO sqlite_sequence (name, seq) SELECT '${table}', v FROM (SELECT MAX(COALESCE((SELECT MAX(seq) FROM _mig_seq_${table}), 0), COALESCE((SELECT MAX(id) FROM ${table}), 0)) AS v) WHERE v > 0;"
+        echo "${idx}"
+    done
+    echo "PRAGMA user_version = ${number};"
+    echo "COMMIT;"
+}
+
+db_run_sql() {
+    local sql="$1"
+    sqlite3 -bail -cmd ".timeout ${DB_BUSY_TIMEOUT_MS}" "${DB_FILE}" <<<"${sql}"
+}
+
+init_db() {
+    local version sql backup number table
+    if db_is_new; then
+        sql="$(db_create_sql)"
+        if ! db_run_sql "${sql}"; then
+            echo "Ошибка: не удалось создать базу ${DB_FILE}" >&2
+            log_json "ERROR" "db_create_failed" "Не удалось создать базу" "${DB_FILE}"
+            return 1
+        fi
+        log_json "INFO" "db_created" "Создана новая база" "v${DB_LATEST} ${DB_FILE}"
+        return 0
+    fi
+
+    version="$(db_user_version)"
+    if [[ ! "${version}" =~ ^[0-9]+$ ]]; then
+        echo "Ошибка: не удалось прочитать версию схемы базы ${DB_FILE}" >&2
+        log_json "ERROR" "db_version_unreadable" "Не удалось прочитать версию схемы" "${DB_FILE}"
+        return 1
+    fi
+    if ((version >= DB_LATEST)); then
+        return 0
+    fi
+
+    if [[ "${DB_FILE}" == *"'"* ]]; then
+        echo "Ошибка: в пути к базе нельзя использовать апостроф: ${DB_FILE}" >&2
+        return 1
+    fi
+    backup="$(db_backup_path "${version}")"
+    if ! sqlite3 "${DB_FILE}" ".backup '${backup}'"; then
+        echo "Ошибка: не удалось сделать резервную копию ${backup}" >&2
+        log_json "ERROR" "db_backup_failed" "Не удалось сделать резервную копию БД" "${backup}"
+        return 1
+    fi
+    echo "Резервная копия БД перед миграцией: ${backup}"
+    log_json "INFO" "db_backup" "Резервная копия БД перед миграцией" "${backup}"
+
+    for ((number = version + 1; number <= DB_LATEST; number++)); do
+        for table in "${DB_TABLES[@]}"; do
+            if db_has_table "${table}"; then
+                column_sets "${table}"
+                if [[ -n "${COLS_DROPPED}" ]]; then
+                    echo "Миграция ${number}: таблица ${table}: отбрасываются колонки ${COLS_DROPPED}"
+                    log_json "WARN" "db_migrate_drop_columns" "Миграция отбрасывает колонки" "${table}: ${COLS_DROPPED}"
+                fi
+            fi
+        done
+        sql="$(db_migration_sql "${number}")"
+        if ! db_run_sql "${sql}"; then
+            echo "Ошибка: миграция ${number} не выполнена, откат (база осталась v$((number - 1))): ${DB_FILE}" >&2
+            log_json "ERROR" "db_migrate_failed" "Миграция не выполнена, откат" "v${number} ${DB_FILE}"
+            return 1
+        fi
+        echo "Схема БД обновлена до v${number}"
+        log_json "INFO" "db_migrated" "Схема БД обновлена" "v${number} ${DB_FILE}"
+    done
+    return 0
+}
+
+# План миграций для --dry-run: только чтение (sqlite3 -readonly), ничего не создаёт и не меняет.
+plan_db_migration() {
+    local version table count backup
+    if db_is_new; then
+        echo "[dry-run] будет: создана новая база v${DB_LATEST}: ${DB_FILE}"
+        log_json "INFO" "dry_db_plan" "[dry-run] будет создана новая база" "v${DB_LATEST} ${DB_FILE}"
+        return 0
+    fi
+    version="$(db_user_version)"
+    if [[ ! "${version}" =~ ^[0-9]+$ ]]; then
+        echo "[dry-run] не удалось прочитать версию схемы базы ${DB_FILE} (нет прав?)"
+        return 0
+    fi
+    if ((version >= DB_LATEST)); then
+        echo "[dry-run] будет: миграций БД нет, схема уже v${version} (последняя v${DB_LATEST})"
+        return 0
+    fi
+    echo "[dry-run] будет: миграция БД v${version} → v${DB_LATEST}: ${DB_FILE}"
+    backup="$(db_backup_path "${version}")"
+    echo "[dry-run] будет: резервная копия ${backup}"
+    for table in "${DB_TABLES[@]}"; do
+        if ! db_has_table "${table}"; then
+            echo "[dry-run] будет: таблица ${table}: нет, будет создана"
+            continue
+        fi
+        column_sets "${table}"
+        count="$(db_read "SELECT COUNT(*) FROM ${table};")"
+        echo "[dry-run] будет: таблица ${table}: ${count} строк; колонки сейчас: ${COLS_OLD}; после: ${COLS_NEW}; отбрасываются: ${COLS_DROPPED:-нет}"
+    done
+    log_json "INFO" "dry_db_plan" "[dry-run] план миграции БД" "v${version} → v${DB_LATEST} ${DB_FILE}"
+    return 0
 }
 
 insert_row() {
@@ -1255,7 +1518,12 @@ HTML
 require_cmd sqlite3
 if ((DRY_RUN == 0)); then
     mkdir -p "${REPORT_DIR}" "$(dirname -- "${DB_FILE}")"
-    init_db
+    if ! init_db; then
+        cleanup_logs
+        exit 2
+    fi
+else
+    plan_db_migration
 fi
 
 if ((REPORT_ONLY == 0)); then

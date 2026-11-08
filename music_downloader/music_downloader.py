@@ -1,3 +1,4 @@
+import argparse
 import hashlib
 import importlib.util
 import json
@@ -8,8 +9,9 @@ import shutil
 import sqlite3
 import time
 import unicodedata
-from contextlib import ExitStack, suppress
+from contextlib import ExitStack, closing, suppress
 from datetime import datetime
+from pathlib import Path
 
 import cloudscraper
 from mutagen.id3 import COMM, ID3, ID3NoHeaderError, TextFrame, UrlFrame
@@ -77,6 +79,216 @@ def normalize_db_text(value):
     text = unicodedata.normalize("NFKC", str(value)).casefold()
     return "".join(char for char in text if char.isalnum())
 
+# --- Схема БД и версионированные миграции -------------------------------------------
+# Версия схемы — PRAGMA user_version. Схема меняется ТОЛЬКО миграцией: новая миграция —
+# следующий номер в DB_MIGRATIONS (DB_LATEST считается по нему); DDL таблиц и индексов
+# хранится здесь, в одном месте, и им пользуются и создание, и пересборка.
+DB_TIMEOUT_SECONDS = 30
+
+DB_SCHEMA = {
+    "downloads": {
+        "columns": (
+            "(id TEXT PRIMARY KEY, artist TEXT, title TEXT, "
+            "original_artist TEXT, original_title TEXT, site TEXT, "
+            "timestamp DATETIME, src TEXT, filename TEXT, filesize INTEGER, filehash TEXT)"
+        ),
+        "indexes": {
+            "idx_downloads_artist_title": (
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_downloads_artist_title "
+                "ON downloads(artist, title)"
+            ),
+            # Частичный UNIQUE: одна строка на содержимое; строки без хеша (NULL) —
+            # в том числе намеренно записанные дубликаты — не ограничиваются.
+            "idx_downloads_filehash": (
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_downloads_filehash "
+                "ON downloads(filehash) WHERE filehash IS NOT NULL"
+            ),
+        },
+    },
+    # Итоги запусков: метрики по мостам, источникам поиска и папкам назначения (JSON).
+    "runs": {
+        "columns": (
+            "(started TEXT PRIMARY KEY, finished TEXT, seconds REAL, exit_code INTEGER, "
+            "downloaded INTEGER, bytes INTEGER, sites TEXT, sources TEXT, destinations TEXT)"
+        ),
+        "indexes": {},
+    },
+}
+
+
+class MigrationError(RuntimeError):
+    """Миграция схемы БД не выполнена; база осталась в прежней версии."""
+
+
+def table_ddl(table, name=None):
+    """DDL таблицы из схемы кода; `name` — временное имя для пересборки (`T__new`)."""
+    return f"CREATE TABLE IF NOT EXISTS {name or table} {DB_SCHEMA[table]['columns']}"
+
+
+def schema_columns(table):
+    """Колонки таблицы в каноническом порядке (из DDL кода, в памяти)."""
+    with closing(sqlite3.connect(":memory:")) as conn:
+        conn.execute(table_ddl(table))
+        return [row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')]
+
+
+def _table_exists(conn, table):
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+    ).fetchone() is not None
+
+
+def _table_columns(conn, table):
+    return [row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')]
+
+
+def _user_tables(conn):
+    return [
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        )
+    ]
+
+
+def _rebuild_table(conn, table, out):
+    """Миграция 1 для одной таблицы: пересборка в схему кода (порядок колонок, недостающие — NULL)."""
+    if not _table_exists(conn, table):
+        conn.execute(table_ddl(table))
+        for ddl in DB_SCHEMA[table]["indexes"].values():
+            conn.execute(ddl)
+        return
+    old_columns = _table_columns(conn, table)
+    new_columns = schema_columns(table)
+    common = [column for column in new_columns if column in old_columns]
+    dropped = [column for column in old_columns if column not in new_columns]
+    existing_indexes = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?", (table,)
+        )
+    }
+    new_name = f"{table}__new"
+    conn.execute(f"DROP TABLE IF EXISTS {new_name}")
+    conn.execute(table_ddl(table, new_name))
+    column_list = ", ".join(f'"{column}"' for column in common)
+    conn.execute(f'INSERT INTO {new_name} ({column_list}) SELECT {column_list} FROM "{table}"')
+    old_count = conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+    new_count = conn.execute(f"SELECT COUNT(*) FROM {new_name}").fetchone()[0]
+    if old_count != new_count:
+        raise MigrationError(
+            f"таблица {table}: число строк после копирования ({new_count}) не равно исходному ({old_count})"
+        )
+    if dropped:
+        out(f"Миграция 1: таблица {table}: отбрасываются колонки {', '.join(dropped)}")
+    conn.execute(f'DROP TABLE "{table}"')
+    conn.execute(f'ALTER TABLE {new_name} RENAME TO "{table}"')
+    # Уникальные индексы, которых в старой таблице не было, не создаём: данные могли быть
+    # ещё не дедуплицированы. Недостающие индексы создаёт обычная последовательность
+    # `_create_table` после перенормализации и дедупа. (AUTOINCREMENT в этих таблицах нет,
+    # поэтому sqlite_sequence не затрагивается.)
+    for index_name, ddl in DB_SCHEMA[table]["indexes"].items():
+        if index_name in existing_indexes:
+            conn.execute(ddl)
+    out(f"Миграция 1: таблица {table}: {new_count} строк, колонки {', '.join(new_columns)}")
+
+
+def _migration_1(conn, out):
+    for table in DB_SCHEMA:
+        _rebuild_table(conn, table, out)
+
+
+DB_MIGRATIONS = {1: _migration_1}
+DB_LATEST = max(DB_MIGRATIONS)
+
+
+def _backup_path(path, version):
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return f"{path}.bak-v{version}-{stamp}"
+
+
+def _plan_lines(conn, path, version):
+    """Строки плана миграции (только чтение)."""
+    lines = [f"миграция БД v{version} → v{DB_LATEST}: {path}"]
+    lines.append(f"резервная копия: {_backup_path(path, version)}")
+    for table in DB_SCHEMA:
+        if not _table_exists(conn, table):
+            lines.append(f"таблица {table}: нет, будет создана")
+            continue
+        count = conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+        old_columns = _table_columns(conn, table)
+        new_columns = schema_columns(table)
+        dropped = [column for column in old_columns if column not in new_columns]
+        lines.append(
+            f"таблица {table}: {count} строк; колонки сейчас: {', '.join(old_columns)}; "
+            f"после: {', '.join(new_columns)}; отбрасываются: {', '.join(dropped) or 'нет'}"
+        )
+    return lines
+
+
+def migrate_database(path, dry_run=False, out=None):
+    """Приводит БД к DB_LATEST. dry_run только печатает план (через `out`, строки `[dry-run] будет: …`)."""
+    out = out or logger.info
+    path = os.fspath(path)
+    if dry_run:
+        if not os.path.exists(path):
+            out(f"[dry-run] будет: создана новая база v{DB_LATEST}: {path}")
+            return
+        uri = Path(path).resolve().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=DB_TIMEOUT_SECONDS)) as conn:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if not _user_tables(conn):
+                out(f"[dry-run] будет: создана новая база v{DB_LATEST}: {path}")
+            elif version >= DB_LATEST:
+                out(f"[dry-run] будет: ничего, схема БД уже v{version} (последняя v{DB_LATEST})")
+            else:
+                for line in _plan_lines(conn, path, version):
+                    out(f"[dry-run] будет: {line}")
+        return
+
+    conn = sqlite3.connect(path, timeout=DB_TIMEOUT_SECONDS, isolation_level=None)
+    try:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if not _user_tables(conn):
+            # Новая база: сразу текущая схема, миграции не нужны.
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for table, spec in DB_SCHEMA.items():
+                    conn.execute(table_ddl(table))
+                    for ddl in spec["indexes"].values():
+                        conn.execute(ddl)
+                conn.execute(f"PRAGMA user_version = {DB_LATEST}")
+                conn.execute("COMMIT")
+            except sqlite3.Error as error:
+                conn.execute("ROLLBACK")
+                raise MigrationError(f"не удалось создать новую базу: {error}") from error
+            out(f"Создана новая база v{DB_LATEST}: {path}")
+            return
+        if version >= DB_LATEST:
+            return
+        backup = _backup_path(path, version)
+        try:
+            with closing(sqlite3.connect(backup)) as target:
+                conn.backup(target)
+        except sqlite3.Error as error:
+            raise MigrationError(f"не удалось сделать резервную копию {backup}: {error}") from error
+        out(f"Резервная копия БД перед миграцией: {backup}")
+        for number in range(version + 1, DB_LATEST + 1):
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                DB_MIGRATIONS[number](conn, out)
+                conn.execute(f"PRAGMA user_version = {number}")
+                conn.execute("COMMIT")
+            except (sqlite3.Error, MigrationError) as error:
+                conn.execute("ROLLBACK")
+                raise MigrationError(
+                    f"миграция {number} не выполнена, откат (база осталась v{number - 1}): {error}"
+                ) from error
+            out(f"Схема БД обновлена до v{number}")
+    except sqlite3.Error as error:
+        raise MigrationError(f"ошибка SQLite: {error}") from error
+    finally:
+        conn.close()
+
 
 class DatabaseManager:
     def __init__(self, path):
@@ -84,13 +296,10 @@ class DatabaseManager:
         self._create_table()
 
     def _create_table(self):
-        with sqlite3.connect(self.path) as conn:
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS downloads ("
-                "id TEXT PRIMARY KEY, artist TEXT, title TEXT, "
-                "original_artist TEXT, original_title TEXT, site TEXT, "
-                "timestamp DATETIME, src TEXT, filename TEXT, filesize INTEGER, filehash TEXT)"
-            )
+        # Версионированные миграции схемы — до перенормализации и дедупа ниже.
+        migrate_database(self.path)
+        with sqlite3.connect(self.path, timeout=DB_TIMEOUT_SECONDS) as conn:
+            conn.execute(table_ddl("downloads"))
 
             # В старых строках точное исходное написание уже могло быть потеряно,
             # поэтому сохраняем лучшее доступное значение до очередной нормализации.
@@ -132,24 +341,12 @@ class DatabaseManager:
                 ") AS duplicate_number FROM downloads WHERE filehash IS NOT NULL"
                 ") WHERE duplicate_number > 1)"
             )
-            conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_downloads_artist_title "
-                "ON downloads(artist, title)"
-            )
-            # Частичный UNIQUE: одна строка на содержимое; строки без хеша (NULL) —
-            # в том числе намеренно записанные дубликаты — не ограничиваются.
-            conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_downloads_filehash "
-                "ON downloads(filehash) WHERE filehash IS NOT NULL"
-            )
+            for ddl in DB_SCHEMA["downloads"]["indexes"].values():
+                conn.execute(ddl)
 
         # Итоги запусков: метрики по мостам, источникам поиска и папкам назначения (JSON).
-        with sqlite3.connect(self.path) as conn:
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS runs ("
-                "started TEXT PRIMARY KEY, finished TEXT, seconds REAL, exit_code INTEGER, "
-                "downloaded INTEGER, bytes INTEGER, sites TEXT, sources TEXT, destinations TEXT)"
-            )
+        with sqlite3.connect(self.path, timeout=DB_TIMEOUT_SECONDS) as conn:
+            conn.execute(table_ddl("runs"))
 
     def add_run(self, started, finished, seconds, exit_code, downloaded, total_bytes, sites, sources, destinations):
         with sqlite3.connect(self.path) as conn:
@@ -901,7 +1098,11 @@ def run():
         raise SystemExit(2)
 
     logger.info("Инициализирую scraper...")
-    db = DatabaseManager(DB_PATH)
+    try:
+        db = DatabaseManager(DB_PATH)
+    except MigrationError as error:
+        logger.error(f"Миграция БД не выполнена: {error}")
+        raise SystemExit(1) from error
     scraper = cloudscraper.create_scraper(
         browser={"browser": "chrome", "platform": "windows", "desktop": True}
     )
@@ -1126,5 +1327,35 @@ def run():
         report_run(db, run_started, run_clock, exit_code, sites_data, search_stats, download_paths)
 
 
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Загрузчик музыки с мостов (music_downloader)")
+    parser.add_argument("--migrate-db", action="store_true", help="только миграции схемы БД и выход")
+    parser.add_argument(
+        "--dry-run", "-n", action="store_true", help="с --migrate-db: показать план, ничего не меняя"
+    )
+    args = parser.parse_args(argv)
+    if args.dry_run and not args.migrate_db:
+        parser.error("--dry-run поддерживается только вместе с --migrate-db")
+    if not args.migrate_db:
+        run()
+        return 0
+    if not args.dry_run:
+        setup_logging()
+
+    def out(message):
+        print(message)
+        if not args.dry_run:
+            logger.info(message)
+
+    try:
+        migrate_database(DB_PATH, dry_run=args.dry_run, out=out)
+    except MigrationError as error:
+        message = f"Миграция БД не выполнена: {error}"
+        print(message)
+        logger.error(message)
+        return 1
+    return 0
+
+
 if __name__ == "__main__":
-    run()
+    raise SystemExit(main())
