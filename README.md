@@ -405,19 +405,19 @@ journalctl --user -u check-backups.service -n 20
 **Порядок работы:**
 1. Определяет семейство ОС по `/etc/os-release` (сначала `ID`, затем `ID_LIKE`):
 
-   | Семейство | Дистрибутивы (примеры) | Пакеты | Обновление системы | cron |
-   |---|---|---|---|---|
-   | `arch` | Arch, Garuda, Manjaro, EndeavourOS, CachyOS, Artix, ArcoLinux, SteamOS | `pacman` | Garuda — `garuda-update --noconfirm`, иначе `pacman -Syu` | `cronie.service` |
-   | `debian` | Debian, Ubuntu (и *buntu), Mint/LMDE, Pop!_OS, elementary, Zorin, KDE neon, MX, Kali, Deepin, Devuan, Raspberry Pi OS | `apt-get` | `apt-get update && apt-get -y full-upgrade` | `cron.service` |
-   | `redhat` | Fedora, RHEL, CentOS Stream, Rocky, Alma, Oracle, Amazon, Nobara, Mageia; Fedora Atomic (Silverblue, Kinoite, Bazzite) | `dnf`/`yum`; Atomic — `rpm-ostree` | `dnf -y upgrade --refresh` / `yum -y update` / `rpm-ostree upgrade` | `crond.service` |
-   | `suse` | openSUSE Leap/Tumbleweed/Slowroll, SLES; MicroOS — `transactional-update` | `zypper` | Tumbleweed/Slowroll — `zypper dup`, Leap/SLES — `zypper update` | `cron.service` |
-   | `alpine` | Alpine, postmarketOS (без systemd) | `apk` | `apk update && apk upgrade` | по процессу |
-   | `void` | Void (runit) | `xbps-install` | `xbps-install -Syu xbps && xbps-install -Syu` | по процессу |
-   | `gentoo` | Gentoo, Funtoo, Calculate | `emerge` | `emaint sync -a && emerge -uDN @world` (может идти часы) | `cronie.service` |
-   | `solus` | Solus | `eopkg` | `eopkg upgrade -y` | — |
-   | `nixos` | NixOS — пакеты и службы объявляются в `configuration.nix`, автоустановка пакетов отключена | — | `nixos-rebuild switch --upgrade` | `cron.service` |
+   | Семейство | Дистрибутивы (примеры) | Пакеты | Обновление системы |
+   |---|---|---|---|
+   | `arch` | Arch, Garuda, Manjaro, EndeavourOS, CachyOS, Artix, ArcoLinux, SteamOS | `pacman` | Garuda — `garuda-update --noconfirm`, иначе `pacman -Syu` |
+   | `debian` | Debian, Ubuntu (и *buntu), Mint/LMDE, Pop!_OS, elementary, Zorin, KDE neon, MX, Kali, Deepin, Devuan, Raspberry Pi OS | `apt-get` | `apt-get update && apt-get -y full-upgrade` |
+   | `redhat` | Fedora, RHEL, CentOS Stream, Rocky, Alma, Oracle, Amazon, Nobara, Mageia; Fedora Atomic (Silverblue, Kinoite, Bazzite) | `dnf`/`yum`; Atomic — `rpm-ostree` | `dnf -y upgrade --refresh` / `yum -y update` / `rpm-ostree upgrade` |
+   | `suse` | openSUSE Leap/Tumbleweed/Slowroll, SLES; MicroOS — `transactional-update` | `zypper` | Tumbleweed/Slowroll — `zypper dup`, Leap/SLES — `zypper update` |
+   | `alpine` | Alpine, postmarketOS (без systemd) | `apk` | `apk update && apk upgrade` |
+   | `void` | Void (runit) | `xbps-install` | `xbps-install -Syu xbps && xbps-install -Syu` |
+   | `gentoo` | Gentoo, Funtoo, Calculate | `emerge` | `emaint sync -a && emerge -uDN @world` (может идти часы) |
+   | `solus` | Solus | `eopkg` | `eopkg upgrade -y` |
+   | `nixos` | NixOS — пакеты и службы объявляются в `configuration.nix`, автоустановка пакетов отключена | — | `nixos-rebuild switch --upgrade` |
 
-   Нераспознанная ОС — явное предупреждение с её `ID`/`ID_LIKE`: пакеты ставятся вручную либо семейство задаётся в `OS_FAMILY`. Без systemd юниты не создаются (службы включаются средствами своего init), демон cron проверяется по процессу.
+   Нераспознанная ОС — явное предупреждение с её `ID`/`ID_LIKE`: пакеты ставятся вручную либо семейство задаётся в `OS_FAMILY`. Без systemd юниты не создаются (службы включаются средствами своего init).
 
    **Alpine / postmarketOS:** скрипты mytasks на Bash, а в Alpine по умолчанию только busybox — перед первым запуском выполните `apk add bash`; GNU `find`/`coreutils` (нужны `find -printf`, `stat -c` и т.п.) скрипт проверит как зависимости `gnu:find`/`gnu:stat` и предложит `findutils`/`coreutils`. **NixOS:** нет `/bin/bash`, `/usr/bin/python3`, `/usr/bin/sleep` — шебанги и юниты mytasks используют `/usr/bin/env`; пакеты объявляйте в `configuration.nix`.
 2. **Обязательно обновляет систему** штатной командой своего семейства (столбец «Обновление системы»; одно повышение прав) — до любых изменений. Если обновление не удалось или для ОС не поддерживается, пакеты в этом запуске не ставятся (в rolling-дистрибутивах установка без обновления — неподдерживаемое частичное обновление), остальные проверки идут. После обновления ядра или при флаге `/run/reboot-required` скрипт напоминает о перезагрузке. В режимах `--status`, `--no-create` и без терминала/окон без `--yes` обновление не выполняется; `GARUDA_UPDATE="no"` — на Garuda чистый `pacman -Syu` вместо `garuda-update`.
@@ -454,7 +454,7 @@ journalctl --user -u check-backups.service -n 20
 
 Шаблоны юнитов и автозапуска лежат в `systemd/` (`systemd/*.service|timer` — системные, `systemd/user/` — пользовательские, `systemd/autostart/` — XDG autostart) и содержат плейсхолдер `@MYTASKS_DIR@`; установленный файл, отличающийся от отрисованного шаблона (старая версия или другой каталог), отмечается «отличается» и предлагается к обновлению. Порядок между заданиями задан `After=`: `sources.service` начинается после `music-downloader.service`, `check-backups.service` — после `sources.service` (действует и когда оба таймера догоняют пропуск сразу после загрузки). Таймеры включаются с `--now`, сервисы входа в сеанс — только `enable`.
 
-**Таблица состояния** (`--status`): вид, задание, установлено (есть/нет/отличается/другой путь), автозапуск (включён, расписание cron), состояние (ожидает/работает/при событии/ошибка/не запущен), итог (`OK`, `ВНИМАНИЕ`, «не требуется») и описание; ниже — все зависимости с пакетом для текущего семейства.
+**Таблица состояния** (`--status`): вид, задание, установлено (есть/нет/отличается/другой путь), автозапуск (включён), состояние (ожидает/работает/при событии/ошибка/не запущен), итог (`OK`, `ВНИМАНИЕ`, «не требуется») и описание; ниже — все зависимости с пакетом для текущего семейства.
 
 **Повышение прав** (обновление системы, системные юниты, пакеты): `SUDO_CMD="auto"` — `sudo -A` при заданном `SUDO_ASKPASS`, иначе `pkexec` в графическом сеансе, иначе `sudo` в терминале. Скрипт перезапускает сам себя с внутренней командой `__root-update`/`__root-install-units`/`__root-enable`/`__root-pkg` — один запрос пароля на действие; эти вызовы логов не пишут.
 

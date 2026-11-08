@@ -11,7 +11,7 @@
 #      kdialog/zenity (или терминал) с описанием и значениями по умолчанию;
 #   3) проверяет зависимости и ставит пакеты менеджером своего семейства ОС:
 #      arch — pacman, debian — apt-get, redhat — dnf;
-#   4) создаёт юниты systemd, задания cron, ссылки и автозапуск из шаблонов
+#   4) создаёт юниты systemd, ссылки и автозапуск из шаблонов
 #      каталога systemd/ с подстановкой @MYTASKS_DIR@.
 # Для каждого отсутствующего или неработающего задания выводится
 # предупреждение с описанием и вопрос «создать?»: «да» — создаётся, «нет» —
@@ -79,8 +79,7 @@ URGENCY="normal"
 #   вид: user-unit / system-unit — юнит из шаблонов systemd/user/ или systemd/
 #        (ставятся все файлы с тем же базовым именем: .service и .timer);
 #        user-ext / system-ext — юнит, который ставится вне mytasks (только
-#        проверка и включение); cron — строка crontab пользователя (параметр —
-#        расписание); link — ссылка в BIN_DIR (параметр — цель в mytasks);
+#        проверка и включение); link — ссылка в BIN_DIR (параметр — цель в mytasks);
 #        autostart — файл из systemd/autostart/ в AUTOSTART_DIR; conf — конфиг
 #        (параметр — пример); venv — окружение Python (параметр — модули);
 #        linger — loginctl enable-linger для пользователя: его user-службы
@@ -94,7 +93,6 @@ URGENCY="normal"
 #        cron дала бы второй запуск; исправление — удалить строки.
 #   условие: пусто — всегда; path:ПУТЬ, cmd:КОМАНДА, fs:ТОЧКА=ТИП,
 #        family:СЕМЕЙСТВО через запятую; при невыполненном — «не требуется».
-#   имя @CRON_UNIT@ — демон cron своего семейства ОС (cronie/cron/crond).
 JOBS=(
     "system-unit|system-monitor.timer|||Опрос SMART дисков, CPU и GPU каждые 6 ч (00, 06, 12, 18 ч; пропущенный запуск догоняется после загрузки), запись в SQLite и HTML-отчёт system_reports/latest.html. Скрипт system_monitor.sh, запуск от root."
     "user-unit|check-backups.timer|||Ежедневная проверка каталогов с архивами резервных копий (наличие, возраст, размер, целостность) с уведомлением в трее. Скрипт check_backups.sh, настройки — conf/check_backups.conf."
@@ -193,7 +191,6 @@ UPDATE_MODE=""
 UPDATE_DESC=""
 UPDATE_OK=1
 REBOOT_NEEDED=0
-CRON_UNIT=""
 FIRST_RUN=0
 CHANGED=0
 SKIPPED_CONFS=""
@@ -578,8 +575,8 @@ select_sudo() {
     return 0
 }
 
-# Семейство ОС по /etc/os-release (ID, затем ID_LIKE): менеджер пакетов,
-# юнит cron и наличие systemd. Нераспознанная ОС — unknown с предупреждением.
+# Семейство ОС по /etc/os-release (ID, затем ID_LIKE): менеджер пакетов
+# и наличие systemd. Нераспознанная ОС — unknown с предупреждением.
 detect_family() {
     local key val id="" like="" variant="" word words=()
 
@@ -631,20 +628,18 @@ detect_family() {
             ;;
     esac
 
-    CRON_UNIT=""
     PKG_MGR=""
     case "${OS_FAMILY}" in
         arch)
-            PKG_MGR="pacman"; CRON_UNIT="cronie.service"
+            PKG_MGR="pacman"
             if [[ "${GARUDA_UPDATE}" != "no" ]] && command -v garuda-update >/dev/null 2>&1; then
                 UPDATE_MODE="garuda"; UPDATE_DESC="garuda-update --noconfirm (зеркала, keyring, hotfix Garuda, pacman -Syu)"
             else
                 UPDATE_DESC="pacman -Syu --noconfirm"
             fi
             ;;
-        debian) PKG_MGR="apt-get"; CRON_UNIT="cron.service"; UPDATE_DESC="apt-get update && apt-get -y full-upgrade" ;;
+        debian) PKG_MGR="apt-get"; UPDATE_DESC="apt-get update && apt-get -y full-upgrade" ;;
         redhat)
-            CRON_UNIT="crond.service"
             if [[ -e "${OSTREE_FLAG}" ]]; then
                 # Fedora Atomic (Silverblue, Kinoite, Bazzite…): пакеты — слоями rpm-ostree
                 PKG_MGR="rpm-ostree"; UPDATE_DESC="rpm-ostree upgrade (новая версия — после перезагрузки)"
@@ -656,7 +651,7 @@ detect_family() {
             fi
             ;;
         suse)
-            PKG_MGR="zypper"; CRON_UNIT="cron.service"
+            PKG_MGR="zypper"
             if [[ "${id}" == *microos* || "${id}" == sle-micro* ]]; then
                 PKG_MGR="transactional-update"; UPDATE_DESC="transactional-update --non-interactive dup (после перезагрузки)"
                 OS_NOTE="транзакционная система: обновление и пакеты применяются после перезагрузки"
@@ -669,12 +664,11 @@ detect_family() {
         alpine) PKG_MGR="apk"; UPDATE_DESC="apk update && apk upgrade" ;;
         void) PKG_MGR="xbps-install"; UPDATE_DESC="xbps-install -Syu xbps && xbps-install -Syu" ;;
         gentoo)
-            PKG_MGR="emerge"; CRON_UNIT="cronie.service"
+            PKG_MGR="emerge"
             UPDATE_DESC="emaint sync -a && emerge -uDN @world (сборка из исходников может занять часы)"
             ;;
         solus) PKG_MGR="eopkg"; UPDATE_DESC="eopkg upgrade -y" ;;
         nixos)
-            CRON_UNIT="cron.service"
             UPDATE_MGR="nixos-rebuild"; UPDATE_DESC="nixos-rebuild switch --upgrade"
             OS_NOTE="NixOS: пакеты и службы объявляются в configuration.nix — автоустановка пакетов отключена"
             ;;
@@ -848,7 +842,6 @@ kind_label() {
         system-unit) printf 'юнит (система)' ;;
         user-ext) printf 'сервис (польз.)' ;;
         system-ext) printf 'сервис (система)' ;;
-        cron) printf 'cron' ;;
         no-cron) printf 'старый cron' ;;
         link) printf 'ссылка' ;;
         autostart) printf 'автозапуск' ;;
@@ -995,36 +988,17 @@ eval_unit() {
     fi
 }
 
-# Поиск строки crontab с mytasks-скриптом: печатает exact / other / пусто
+# Есть ли в crontab строка, вызывающая скрипт (любой путь): печатает found или пусто
 cron_match() {
     local lines="$1"
     local name="$2"
-    printf '%s\n' "${lines}" | awk -v want="${MYTASKS_DIR}/${name}" -v base="/${name}" '
+    printf '%s\n' "${lines}" | awk -v base="/${name}" '
         /^[[:space:]]*(#|$)/ { next }
         {
-            for (i = 6; i <= NF; i++) {
-                if ($(i) == want) { found = "exact"; exit }
-                if (length($(i)) >= length(base) && substr($(i), length($(i)) - length(base) + 1) == base) found = "other"
-            }
+            for (i = 6; i <= NF; i++)
+                if (length($(i)) >= length(base) && substr($(i), length($(i)) - length(base) + 1) == base) { found = "found"; exit }
         }
         END { print found }'
-}
-
-eval_cron() {
-    local i="$1" name="$2" schedule="$3"
-    local lines match
-
-    if ! command -v crontab >/dev/null 2>&1; then
-        set_row "${i}" "—" "—" "нет crontab" "ВНИМАНИЕ" "команда crontab не найдена (установите cron в зависимостях)" "none" ""
-        return 0
-    fi
-    lines="$(crontab -l 2>/dev/null)" || lines=""
-    match="$(cron_match "${lines}" "${name}")"
-    case "${match}" in
-        exact) set_row "${i}" "есть" "${schedule}" "в crontab" "OK" "" "none" "" ;;
-        other) set_row "${i}" "другой путь" "—" "в crontab" "ВНИМАНИЕ" "в crontab ${name} вызывается не из ${MYTASKS_DIR}" "cron-rewrite" "заменить путь к ${name} в crontab на ${MYTASKS_DIR}/${name}" ;;
-        *) set_row "${i}" "нет" "—" "—" "ВНИМАНИЕ" "задания нет в crontab" "cron-add" "добавить в crontab: ${schedule} ${MYTASKS_DIR}/${name}" ;;
-    esac
 }
 
 # Строк crontab с перечисленными скриптами (любой путь) быть не должно
@@ -1173,24 +1147,10 @@ eval_job() {
     local i="$1"
     local kind name arg when desc label
     IFS='|' read -r kind name arg when desc <<<"${ALL_JOBS[${i}]}"
-    [[ "${name}" == "@CRON_UNIT@" ]] && name="${CRON_UNIT:-cron}"
     R_KIND[i]="${kind}"
     R_NAME[i]="${name}"
     R_DESC[i]="${desc}"
 
-    if [[ "${ALL_JOBS[${i}]}" == *"|@CRON_UNIT@|"* ]] && { [[ -z "${CRON_UNIT}" ]] || ! has_systemd; }; then
-        # Без systemd (Alpine, Void и т.п.) или с неизвестным юнитом — по процессу
-        R_NAME[i]="демон cron"
-        if ! command -v crontab >/dev/null 2>&1; then
-            set_row "${i}" "—" "—" "—" "не требуется" "" "none" ""
-            R_STATE[i]="нет crontab"
-        elif pgrep -x 'crond|cron|cronie|busybox' >/dev/null 2>&1; then
-            set_row "${i}" "—" "—" "работает" "OK" "" "none" ""
-        else
-            set_row "${i}" "—" "—" "не запущен" "ВНИМАНИЕ" "демон cron не запущен; включите его средствами init (OpenRC: rc-update add crond, runit: ln -s /etc/sv/cronie /var/service)" "none" ""
-        fi
-        return 0
-    fi
     if ! check_when "${when}"; then
         label="$(when_label "${when}")"
         set_row "${i}" "—" "—" "—" "не требуется" "" "none" ""
@@ -1200,7 +1160,6 @@ eval_job() {
 
     case "${kind}" in
         user-unit|system-unit|user-ext|system-ext) eval_unit "${i}" "${kind}" "${name}" ;;
-        cron) eval_cron "${i}" "${name}" "${arg}" ;;
         no-cron) eval_no_cron "${i}" "${arg}" ;;
         link) eval_link "${i}" "${name}" "${arg}" ;;
         autostart) eval_autostart "${i}" "${name}" ;;
@@ -1279,8 +1238,8 @@ fix_unit() {
 
 fix_cron() {
     local i="$1"
-    local name="${R_NAME[${i}]}" schedule desc lines tmp rc
-    IFS='|' read -r _ _ schedule _ desc <<<"${ALL_JOBS[${i}]}"
+    local names lines tmp rc
+    IFS='|' read -r _ _ names _ _ <<<"${ALL_JOBS[${i}]}"
 
     if [[ "${DRY_RUN}" -eq 1 ]]; then
         say "[dry-run] будет: ${R_ACTION[${i}]}"
@@ -1288,39 +1247,26 @@ fix_cron() {
     fi
     lines="$(crontab -l 2>/dev/null)" || lines=""
     tmp="$(mktemp)"
-    if [[ "${R_FIX[${i}]}" == "cron-remove" ]]; then
-        # Удаляются строки с этими скриптами и комментарий «# mytasks: …» над ними
-        printf '%s\n' "${lines}" | awk -v names="${schedule//,/ }" '
-            BEGIN { n = split(names, list, " ") }
-            function hit(   f, j, b) {
-                if ($0 ~ /^[[:space:]]*(#|$)/) return 0
-                for (f = 6; f <= NF; f++)
-                    for (j = 1; j <= n; j++) {
-                        b = "/" list[j]
-                        if (length($(f)) >= length(b) && substr($(f), length($(f)) - length(b) + 1) == b) return 1
-                    }
-                return 0
-            }
-            {
-                if (hit()) { pending = ""; next }
-                if (pending != "") print pending
-                pending = ""
-                if ($0 ~ /^# mytasks: /) { pending = $0; next }
-                print
-            }
-            END { if (pending != "") print pending }' > "${tmp}"
-    elif [[ "${R_FIX[${i}]}" == "cron-rewrite" ]]; then
-        printf '%s\n' "${lines}" | awk -v want="${MYTASKS_DIR}/${name}" -v base="/${name}" '
-            /^[[:space:]]*(#|$)/ { print; next }
-            {
-                for (i = 6; i <= NF; i++)
-                    if (length($(i)) >= length(base) && substr($(i), length($(i)) - length(base) + 1) == base) $(i) = want
-                print
-            }' > "${tmp}"
-    else
-        [[ -n "${lines}" ]] && printf '%s\n' "${lines}" > "${tmp}"
-        printf '# mytasks: %s\n%s %s/%s\n' "${desc}" "${schedule}" "${MYTASKS_DIR}" "${name}" >> "${tmp}"
-    fi
+    # Удаляются строки с этими скриптами и комментарий «# mytasks: …» над ними
+    printf '%s\n' "${lines}" | awk -v names="${names//,/ }" '
+        BEGIN { n = split(names, list, " ") }
+        function hit(   f, j, b) {
+            if ($0 ~ /^[[:space:]]*(#|$)/) return 0
+            for (f = 6; f <= NF; f++)
+                for (j = 1; j <= n; j++) {
+                    b = "/" list[j]
+                    if (length($(f)) >= length(b) && substr($(f), length($(f)) - length(b) + 1) == b) return 1
+                }
+            return 0
+        }
+        {
+            if (hit()) { pending = ""; next }
+            if (pending != "") print pending
+            pending = ""
+            if ($0 ~ /^# mytasks: /) { pending = $0; next }
+            print
+        }
+        END { if (pending != "") print pending }' > "${tmp}"
     crontab "${tmp}"
     rc=$?
     rm -f -- "${tmp}"
@@ -1409,7 +1355,7 @@ fix_job() {
     local name arg
     case "${R_FIX[${i}]}" in
         install|enable) fix_unit "${i}" ;;
-        cron-add|cron-rewrite|cron-remove) fix_cron "${i}" ;;
+        cron-remove) fix_cron "${i}" ;;
         link) fix_link "${i}" ;;
         autostart) fix_autostart "${i}" ;;
         venv) fix_venv "${i}" ;;
@@ -1973,7 +1919,7 @@ apply_defaults() {
     BIN_DIR="${BIN_DIR:-${HOME}/.local/bin}"
     ALL_JOBS=(
         "user-unit|${SELF_UNIT}|||Сам ${SCRIPT_NAME} при входе в сеанс: таблица состояния в журнале и уведомление, если сервисы не запущены или задания не прописаны."
-        "conf|${CONF_REL}|${CONF_REL}.example||Каталог mytasks (берётся из каталога запуска) для юнитов, cron, ссылок и автозапуска; семейство ОС; способ повышения прав."
+        "conf|${CONF_REL}|${CONF_REL}.example||Каталог mytasks (берётся из каталога запуска) для юнитов, ссылок и автозапуска; семейство ОС; способ повышения прав."
         "${JOBS[@]}"
     )
 }

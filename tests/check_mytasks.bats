@@ -161,8 +161,6 @@ EOT
 
 ALL_DEMO_JOBS='"user-unit|demo.timer|||Демо-таймер пользователя"
 "system-unit|sysdemo.timer|||Системный демо-таймер"
-"system-ext|@CRON_UNIT@||cmd:crontab|Демон cron"
-"cron|demo.sh|0 1 * * *||Демо-задание cron"
 "link|demo-link|demo.sh||Демо-ссылка"
 "autostart|demo.desktop|||Демо-автозапуск"'
 
@@ -172,7 +170,6 @@ ALL_DEMO_JOBS='"user-unit|demo.timer|||Демо-таймер пользоват�
   [ "$status" -eq 1 ]
   [[ "$output" == *"Состояние сервисов и заданий"* ]]
   [[ "$output" == *"demo.timer"*"ВНИМАНИЕ"* ]]
-  [[ "$output" == *"cronie.service"* ]]
   [[ "$output" == *"check-mytasks.service"*"OK"* ]]
   [ ! -e "$USER_UNITS/demo.timer" ]
   [ ! -e "$STATE/crontab" ]
@@ -184,7 +181,6 @@ ALL_DEMO_JOBS='"user-unit|demo.timer|||Демо-таймер пользоват�
   run "$WORK/check_mytasks.sh" --dry-run --no-gui
   [ "$status" -eq 1 ]
   [[ "$output" == *"[dry-run] будет: установить demo.service demo.timer"* ]]
-  [[ "$output" == *"[dry-run] будет: добавить в crontab: 0 1 * * * $WORK/demo.sh"* ]]
   [[ "$output" == *"[dry-run] будет: установить пакеты (arch, pacman): demo-arch"* ]]
   [[ "$output" == *"[dry-run] будет: обновить систему: "* ]]
   [ ! -e "$USER_UNITS/demo.timer" ]
@@ -295,14 +291,12 @@ health_log() {  # $1 — время последней записи (date -d), $
   [[ "$output" == *"ошибки: 1"*"ВНИМАНИЕ"* ]]
 }
 
-@test "--yes создаёт юниты, cron, ссылку и автозапуск; итог OK" {
+@test "--yes создаёт юниты, ссылку и автозапуск; итог OK" {
   write_conf "$ALL_DEMO_JOBS" ""
-  touch "$STATE/ext/cronie.service" "$STATE/enabled/cronie.service"
   run "$WORK/check_mytasks.sh" --yes --no-gui
   [ "$status" -eq 0 ]
   [ -f "$SYS_UNITS/sysdemo.timer" ]
   grep -q "ExecStart=$WORK/demo.sh" "$SYS_UNITS/sysdemo.service"
-  grep -q "^0 1 \* \* \* $WORK/demo.sh$" "$STATE/crontab"
   [ "$(readlink "$HOME/.local/bin/demo-link")" = "$WORK/demo.sh" ]
   grep -q "Exec=$WORK/demo.sh" "$HOME/.config/autostart/demo.desktop"
   [[ "$output" == *"Итоговое состояние"* ]]
@@ -311,12 +305,9 @@ health_log() {  # $1 — время последней записи (date -d), $
 
 @test "повторный запуск после --yes ничего не дублирует" {
   write_conf "$ALL_DEMO_JOBS" ""
-  touch "$STATE/ext/cronie.service" "$STATE/enabled/cronie.service"
   "$WORK/check_mytasks.sh" --yes --no-gui
   run "$WORK/check_mytasks.sh" --yes --no-gui
   [ "$status" -eq 0 ]
-  run grep -c "demo.sh" "$STATE/crontab"
-  [ "$output" = "1" ]
 }
 
 @test "no-cron: dry-run показывает план, --yes удаляет старые строки cron с комментарием" {
@@ -349,19 +340,6 @@ health_log() {  # $1 — время последней записи (date -d), $
   grep -q "ExecStart=$WORK/demo.sh" "$USER_UNITS/demo.service"
 }
 
-@test "cron со старым путём переписывается на каталог mytasks" {
-  write_conf '"cron|demo.sh|0 1 * * *||Демо-задание cron"' ""
-  printf '# свой комментарий\n0 1 * * * /old/place/demo.sh\n' > "$STATE/crontab"
-  run "$WORK/check_mytasks.sh" --status
-  [[ "$output" == *"другой путь"* ]]
-  run "$WORK/check_mytasks.sh" --yes --no-gui
-  [ "$status" -eq 0 ]
-  grep -q "^0 1 \* \* \* $WORK/demo.sh$" "$STATE/crontab"
-  grep -q '^# свой комментарий$' "$STATE/crontab"
-  run grep -c 'old/place' "$STATE/crontab"
-  [ "$output" = "0" ]
-}
-
 @test "другой каталог в конфиге: предупреждение и запись каталога запуска" {
   write_conf "" "" "/old/place"
   run "$WORK/check_mytasks.sh" --status
@@ -372,25 +350,23 @@ health_log() {  # $1 — время последней записи (date -d), $
   grep -q "^MYTASKS_DIR=\"$WORK\"$" "$WORK/conf/check_mytasks.conf"
 }
 
-@test "семейство debian: cron.service и пакеты через apt-get" {
-  write_conf '"system-ext|@CRON_UNIT@||cmd:crontab|Демон cron"' '"democmd|demo-arch;debian=demo-deb;redhat=demo-rh;suse=demo-suse||Демо"
+@test "семейство debian: пакеты через apt-get" {
+  write_conf "" '"democmd|demo-arch;debian=demo-deb;redhat=demo-rh;suse=demo-suse||Демо"
 "optcmd|opt-arch;debian=opt-deb|opt|Необязательная"'
   printf 'ID=ubuntu\nID_LIKE=debian\nPRETTY_NAME="Ubuntu"\n' > "$STATE/os-release"
   run "$WORK/check_mytasks.sh" --yes --no-gui
   [[ "$output" == *"семейство debian, пакеты — apt-get"* ]]
-  [[ "$output" == *"cron.service"* ]]
   grep -q 'apt-get install -y -- demo-deb' "$CALLS"
   grep -q 'apt-get -y full-upgrade' "$CALLS"
   run grep -q 'opt-deb' "$CALLS"
   [ "$status" -ne 0 ]
 }
 
-@test "семейство redhat: crond.service и dnf" {
-  write_conf '"system-ext|@CRON_UNIT@||cmd:crontab|Демон cron"' '"democmd|demo-arch;debian=demo-deb;redhat=demo-rh;suse=demo-suse||Демо"'
+@test "семейство redhat: dnf" {
+  write_conf "" '"democmd|demo-arch;debian=demo-deb;redhat=demo-rh;suse=demo-suse||Демо"'
   printf 'ID=fedora\nPRETTY_NAME="Fedora"\n' > "$STATE/os-release"
   run "$WORK/check_mytasks.sh" --yes --no-gui
   [[ "$output" == *"семейство redhat"* ]]
-  [[ "$output" == *"crond.service"* ]]
   grep -q 'dnf install -y -- demo-rh' "$CALLS"
   grep -q 'dnf -y upgrade --refresh' "$CALLS"
 }
@@ -405,11 +381,10 @@ health_log() {  # $1 — время последней записи (date -d), $
   done
 }
 
-@test "семейство suse: zypper и cron.service" {
-  write_conf '"system-ext|@CRON_UNIT@||cmd:crontab|Демон cron"' '"democmd|demo-arch;debian=demo-deb;redhat=demo-rh;suse=demo-suse||Демо"'
+@test "семейство suse: zypper" {
+  write_conf "" '"democmd|demo-arch;debian=demo-deb;redhat=demo-rh;suse=demo-suse||Демо"'
   printf 'ID="opensuse-leap"\nID_LIKE="suse opensuse"\nPRETTY_NAME="openSUSE Leap"\n' > "$STATE/os-release"
   run "$WORK/check_mytasks.sh" --yes --no-gui
-  [[ "$output" == *"cron.service"* ]]
   grep -q 'zypper --non-interactive install -- demo-suse' "$CALLS"
   grep -q 'zypper --non-interactive update' "$CALLS"
 }
@@ -424,14 +399,12 @@ health_log() {  # $1 — время последней записи (date -d), $
   grep -q 'rpm-ostree upgrade' "$CALLS"
 }
 
-@test "Alpine без systemd: юниты не создаются, cron проверяется по процессу" {
+@test "Alpine без systemd: юниты не создаются" {
   export SYSTEMD_DIR="$TMP_DIR/no-systemd"
-  write_conf '"user-unit|demo.timer|||Демо-таймер"
-"system-ext|@CRON_UNIT@||cmd:crontab|Демон cron"' '"democmd|demo-arch;alpine=demo-apk||Демо"'
+  write_conf '"user-unit|demo.timer|||Демо-таймер"' '"democmd|demo-arch;alpine=demo-apk||Демо"'
   printf 'ID=alpine\nPRETTY_NAME="Alpine Linux"\n' > "$STATE/os-release"
   run "$WORK/check_mytasks.sh" --yes --no-gui
   [[ "$output" == *"systemd не запущен"* ]]
-  [[ "$output" == *"демон cron"* ]]
   [ ! -e "$USER_UNITS/demo.timer" ]
   grep -q 'apk add -- demo-apk' "$CALLS"
   grep -q 'apk upgrade' "$CALLS"
