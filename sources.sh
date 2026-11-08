@@ -34,11 +34,12 @@ SEVENZIP_BIN="${SEVENZIP_BIN:-7z}"
 SEVENZIP_DEFAULT_OPTS="${SEVENZIP_DEFAULT_OPTS:--t7z -mx=5 -snl}"
 # Сколько последних архивов хранить, если поле в строке конфига пустое.
 SEVENZIP_KEEP="${SEVENZIP_KEEP:-3}"
+# Настройки SEVENZIP_BIN, SEVENZIP_DEFAULT_OPTS, SEVENZIP_KEEP и LOG_KEEP_DAYS
+# можно задать в самом файле заданий строками «ИМЯ=значение» (читаются sed, файл
+# не выполняется как shell); они главнее окружения.
 
-# Автоочистка старых логов (старше 10 дней)
-find "${LOG_DIR}" -maxdepth 1 -type f \
-  -name "${SCRIPT_BASE}_????-??-??-report.jsonl" -mtime +10 \
-  -exec rm -f -- {} \; 2>/dev/null
+# Сколько дней хранить логи (очистка выполняется после чтения конфига).
+LOG_KEEP_DAYS="${LOG_KEEP_DAYS:-10}"
 
 ###############################################################################
 # HELPERS
@@ -253,6 +254,27 @@ if [ ! -r "${CONFIG_FILE}" ]; then
   exit 1
 fi
 
+# Значение настройки «ИМЯ=значение» из файла заданий (последнее вхождение,
+# внешние кавычки снимаются); пусто, если ключа нет.
+conf_value() {
+  sed -n "s/^$1=//p" "${CONFIG_FILE}" | tail -n 1 | sed 's/^"\(.*\)"$/\1/; s/^'"'"'\(.*\)'"'"'$/\1/'
+}
+
+for _key in SEVENZIP_BIN SEVENZIP_DEFAULT_OPTS SEVENZIP_KEEP LOG_KEEP_DAYS; do
+  _val="$(conf_value "${_key}")"
+  [ -n "${_val}" ] && export "${_key}=${_val}"
+done
+
+case "${LOG_KEEP_DAYS}" in
+  ''|*[!0-9]*) LOG_KEEP_DAYS=10 ;;
+  *) ;;
+esac
+
+# Автоочистка старых логов (старше LOG_KEEP_DAYS дней)
+find "${LOG_DIR}" -maxdepth 1 -type f \
+  -name "${SCRIPT_BASE}_????-??-??-report.jsonl" -mtime "+${LOG_KEEP_DAYS}" \
+  -exec rm -f -- {} \; 2>/dev/null
+
 ###############################################################################
 # MAIN
 ###############################################################################
@@ -271,6 +293,7 @@ FAIL_EXIT=0
 while IFS= read -r LINE || [ -n "${LINE}" ]; do
   case "${LINE}" in
     ""|\#*) continue ;;
+    SEVENZIP_BIN=*|SEVENZIP_DEFAULT_OPTS=*|SEVENZIP_KEEP=*|LOG_KEEP_DAYS=*) continue ;;
     *) ;;
   esac
 

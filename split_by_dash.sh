@@ -176,8 +176,12 @@ done
 # скрипт работал без сети.
 OFFICIAL_NAMES="${OFFICIAL_NAMES:-no}"
 OFFICIAL_API="${OFFICIAL_API:-https://musicbrainz.org/ws/2/artist}"
-OFFICIAL_UA="mytasks-split_by_dash/1.0 (https://github.com/Eremiteb/mytasks)"
-OFFICIAL_CACHE="${SCRIPT_DIR}/state/${SCRIPT_BASE}_official.tsv"
+OFFICIAL_UA="${OFFICIAL_UA:-mytasks-split_by_dash/1.0 (https://github.com/Eremiteb/mytasks)}"
+OFFICIAL_CACHE="${OFFICIAL_CACHE:-${SCRIPT_DIR}/state/${SCRIPT_BASE}_official.tsv}"
+OFFICIAL_TIMEOUT="${OFFICIAL_TIMEOUT:-20}"
+OFFICIAL_DELAY="${OFFICIAL_DELAY:-1}"
+OFFICIAL_MIN_SCORE="${OFFICIAL_MIN_SCORE:-90}"
+OFFICIAL_MAX_TRIES="${OFFICIAL_MAX_TRIES:-3}"
 
 ###############################################################################
 # HELPERS
@@ -383,14 +387,14 @@ mb_ids() {
     return 0
   fi
   _mi_query=$(printf '%s' "$1" | tr '_' ' ')
-  sleep 1
-  if ! _mi_resp=$(curl -sf -m 20 -A "${OFFICIAL_UA}" -G "${OFFICIAL_API}" \
+  sleep "${OFFICIAL_DELAY}"
+  if ! _mi_resp=$(curl -sf -m "${OFFICIAL_TIMEOUT}" -A "${OFFICIAL_UA}" -G "${OFFICIAL_API}" \
       --data-urlencode "query=artist:\"${_mi_query}\"" --data-urlencode "fmt=json" --data-urlencode "limit=5"); then
     log_json "WARN" "official_lookup_failed" "Не удалось запросить MusicBrainz" "${_mi_query}"
     return 0
   fi
   _mi_found=$(printf '%s' "${_mi_resp}" \
-    | jq -r '.artists[]? | select(.score >= 90) | [.id, .name, ([.aliases[]?.name] | join("\u0001"))] | @tsv' 2>/dev/null \
+    | jq -r --argjson ms "${OFFICIAL_MIN_SCORE}" '.artists[]? | select(.score >= $ms) | [.id, .name, ([.aliases[]?.name] | join("\u0001"))] | @tsv' 2>/dev/null \
     | LC_ALL=C.UTF-8 awk -F'\t' -v n="$1" 'BEGIN { w = tolower(n) } { ok = (tolower($2) == w); m = split($3, a, "\001"); for (i = 1; i <= m; i++) if (tolower(a[i]) == w) ok = 1; if (ok) print $1 "\t" $2 }' || true)
   mkdir -p "$(dirname -- "${_mi_cache}")"
   if [ -n "${_mi_found}" ]; then
@@ -676,15 +680,15 @@ official_name() {
     _on_query=$(printf '%s' "${_on_variant}" | tr '_' ' ')
     case "${_on_seen}" in *"|${_on_query}|"*) continue ;; *) ;; esac
     _on_seen="${_on_seen}|${_on_query}|"
-    [ "${_on_tried}" -lt 3 ] || break
+    [ "${_on_tried}" -lt "${OFFICIAL_MAX_TRIES}" ] || break
     _on_tried=$((_on_tried+1))
-    sleep 1
-    if ! _on_resp=$(curl -sf -m 20 -A "${OFFICIAL_UA}" -G "${OFFICIAL_API}" \
+    sleep "${OFFICIAL_DELAY}"
+    if ! _on_resp=$(curl -sf -m "${OFFICIAL_TIMEOUT}" -A "${OFFICIAL_UA}" -G "${OFFICIAL_API}" \
         --data-urlencode "query=artist:\"${_on_query}\"" --data-urlencode "fmt=json" --data-urlencode "limit=5"); then
       log_json "WARN" "official_lookup_failed" "Не удалось запросить официальное имя" "${_on_query}"
       return 0
     fi
-    _on_names=$(printf '%s' "${_on_resp}" | jq -r '.artists[]? | select(.score >= 90) | .name' 2>/dev/null || true)
+    _on_names=$(printf '%s' "${_on_resp}" | jq -r --argjson ms "${OFFICIAL_MIN_SCORE}" '.artists[]? | select(.score >= $ms) | .name' 2>/dev/null || true)
     while IFS= read -r _on_name; do
       [ -n "${_on_name}" ] || continue
       _on_name_key=$(name_key "${_on_name}")
@@ -927,6 +931,14 @@ move_created_dirs() {
 ###############################################################################
 # MAIN
 ###############################################################################
+# conf_get КЛЮЧ ПЕРЕМЕННАЯ: непустое значение КЛЮЧ=... из конфига переопределяет ПЕРЕМЕННУЮ
+conf_get() {
+  local _cg_val
+  _cg_val=$(sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "${CONFIG_FILE}" | sed 's/#.*//' | tail -n1)
+  _cg_val=$(trim "${_cg_val}")
+  [ -z "${_cg_val}" ] || printf -v "$2" '%s' "${_cg_val}"
+}
+
 DEST_DIR=""
 if [ -r "${CONFIG_FILE}" ]; then
   DEST_DIR=$(sed -n 's/^[[:space:]]*DEST_DIR[[:space:]]*=[[:space:]]*//p' "${CONFIG_FILE}" | sed 's/#.*//' | tail -n1)
@@ -934,6 +946,13 @@ if [ -r "${CONFIG_FILE}" ]; then
   conf_official=$(sed -n 's/^[[:space:]]*OFFICIAL_NAMES[[:space:]]*=[[:space:]]*//p' "${CONFIG_FILE}" | sed 's/#.*//' | tail -n1)
   conf_official=$(trim "${conf_official}")
   [ -z "${conf_official}" ] || OFFICIAL_NAMES="${conf_official}"
+  conf_get OFFICIAL_API OFFICIAL_API
+  conf_get OFFICIAL_UA OFFICIAL_UA
+  conf_get OFFICIAL_CACHE OFFICIAL_CACHE
+  conf_get OFFICIAL_TIMEOUT OFFICIAL_TIMEOUT
+  conf_get OFFICIAL_DELAY OFFICIAL_DELAY
+  conf_get OFFICIAL_MIN_SCORE OFFICIAL_MIN_SCORE
+  conf_get OFFICIAL_MAX_TRIES OFFICIAL_MAX_TRIES
 fi
 
 # При явно указанном каталоге DEST_DIR из конфига не применяется (иначе проход слияния и
@@ -955,7 +974,7 @@ elif [ -r "${CONFIG_FILE}" ]; then
   log_json "INFO" "config_used" "Использование конфига" "${CONFIG_FILE}"
   while IFS= read -r line || [ -n "${line}" ]; do
     case "${line}" in ""|\#*) continue ;; *) ;; esac
-    case "${line}" in *DEST_DIR=*|*OFFICIAL_NAMES=*) continue ;; *) ;; esac
+    case "${line}" in *DEST_DIR=*|*OFFICIAL_*=*) continue ;; *) ;; esac
     target=$(trim "$({ printf '%s' "${line}" | sed 's/#.*//'; } || true)")
     [ -n "${target}" ] && process_directory "${target}"
   done < "${CONFIG_FILE}"

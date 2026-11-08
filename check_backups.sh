@@ -51,6 +51,9 @@ KEEP_LOGS="${KEEP_LOGS:-10}"
 APP_NAME="BackupCheck"
 ICON_NAME="drive-harddisk"
 URGENCY="critical"
+NOTIFY_ENABLED="yes"
+VERIFY_NICE_LEVEL=19
+VERIFIED_KEEP=50
 
 if [[ -r "${CONF_FILE}" ]]; then
     # shellcheck source=/dev/null
@@ -61,7 +64,6 @@ if [[ ${#ARCHIVE_PATTERNS[@]} -eq 0 ]]; then
     ARCHIVE_PATTERNS=("*.tar.zst" "*.tar.gz" "*.tgz" "*.tar" "*.zip" "*.7z")
 fi
 
-NOTIFY_ENABLED="yes"
 WRITING_DETAIL=""
 PARTIAL_PATH=""
 ARCHIVES=()
@@ -112,7 +114,7 @@ cleanup_logs() {
     fi
 }
 
-# Уведомление в трее. Из systemd user-сервиса и cron переменные сессии могут
+# Уведомление в трее. Из systemd user-сервиса переменные сессии могут
 # отсутствовать, поэтому при необходимости указываем шину D-Bus пользователя.
 notify_alert() {
     local title="$1"
@@ -310,7 +312,7 @@ verify_archive() {
 
     # Чтение десятков ГБ не должно мешать работе пользователя после загрузки
     if command -v nice >/dev/null 2>&1; then
-        prefix+=(nice -n 19)
+        prefix+=(nice -n "${VERIFY_NICE_LEVEL}")
     fi
     if command -v ionice >/dev/null 2>&1; then
         prefix+=(ionice -c3)
@@ -342,7 +344,7 @@ mark_verified() {
     fi
     mkdir -p "${STATE_DIR}"
     tmp_file="$(mktemp)"
-    { [[ -r "${VERIFIED_FILE}" ]] && cat -- "${VERIFIED_FILE}"; echo "$1"; } | tail -n 50 > "${tmp_file}"
+    { [[ -r "${VERIFIED_FILE}" ]] && cat -- "${VERIFIED_FILE}"; echo "$1"; } | tail -n "${VERIFIED_KEEP}" > "${tmp_file}"
     mv -- "${tmp_file}" "${VERIFIED_FILE}"
 }
 

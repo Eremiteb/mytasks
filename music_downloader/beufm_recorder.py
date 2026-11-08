@@ -84,6 +84,13 @@ DEFAULTS = {
     "aired_keep_days": 14,
     "maintenance_minutes": 60,
     "log_max_files": 10,
+    # Сеть и внешние программы: тайм-ауты в секундах, User-Agent запросов к эфиру.
+    "user_agent": USER_AGENT,
+    "stream_timeout_seconds": 20,
+    "now_playing_timeout_seconds": 10,
+    "reconnect_seconds": 10,
+    "fpcalc_timeout_seconds": 120,
+    "ffmpeg_timeout_seconds": 300,
 }
 
 logger = logging.getLogger("BeuFMRecorder")
@@ -113,7 +120,9 @@ def load_settings(config):
         settings["dir"] = os.path.normpath(os.path.join(BASE_DIR, settings["dir"]))
     for key in ("bitrate_kbps", "poll_seconds", "window_seconds", "tail_seconds", "takes", "min_takes",
                 "max_wait_days", "match_ber", "min_seconds", "max_seconds", "keep_days", "max_mb",
-                "aired_lookback_days", "aired_keep_days", "maintenance_minutes"):
+                "aired_lookback_days", "aired_keep_days", "maintenance_minutes",
+                "stream_timeout_seconds", "now_playing_timeout_seconds", "reconnect_seconds",
+                "fpcalc_timeout_seconds", "ffmpeg_timeout_seconds"):
         if not isinstance(settings[key], (int, float)) or isinstance(settings[key], bool) or settings[key] <= 0:
             raise ValueError(f"recorder.{key} должно быть положительным числом")
     if not 2 <= settings["min_takes"] <= settings["takes"]:
@@ -307,12 +316,12 @@ def remove_take(mp3_path):
             os.remove(path)
 
 
-def fingerprint(path):
+def fingerprint(path, timeout=120):
     """Сырой отпечаток Chromaprint всего файла (список 32-битных чисел); нет `fpcalc` — None."""
     if shutil.which("fpcalc") is None:
         return None
     result = subprocess.run(
-        ["fpcalc", "-raw", "-length", "0", "-json", path], capture_output=True, text=True, timeout=120, check=False
+        ["fpcalc", "-raw", "-length", "0", "-json", path], capture_output=True, text=True, timeout=timeout, check=False
     )
     # При битом кадре fpcalc завершается с кодом 3, но отпечаток выдаёт: битые дубли
     # отсеивает decode_errors, здесь достаточно, чтобы отпечаток был.
@@ -322,12 +331,12 @@ def fingerprint(path):
         return None
 
 
-def decode_errors(path):
+def decode_errors(path, timeout=300):
     """Число сообщений об ошибках при полном декодировании (битые кадры, обрывы); нет ffmpeg — 0."""
     if shutil.which("ffmpeg") is None:
         return 0
     result = subprocess.run(
-        ["ffmpeg", "-v", "error", "-i", path, "-f", "null", "-"], capture_output=True, text=True, timeout=300,
+        ["ffmpeg", "-v", "error", "-i", path, "-f", "null", "-"], capture_output=True, text=True, timeout=timeout,
         check=False,
     )
     return len([line for line in result.stderr.splitlines() if line.strip()]) + (result.returncode != 0)
@@ -456,10 +465,10 @@ def finalize(directory, track_id, settings, force=False):
     takes = list_takes(track_dir)
     if len(takes) < settings["min_takes"] or (len(takes) < settings["takes"] and not force):
         return "waiting"
-    fingerprints = [fingerprint(path) for path, _ in takes]
+    fingerprints = [fingerprint(path, settings["fpcalc_timeout_seconds"]) for path, _ in takes]
     if any(fp is None for fp in fingerprints):
         return "no-tools"
-    errors = [decode_errors(path) for path, _ in takes]
+    errors = [decode_errors(path, settings["ffmpeg_timeout_seconds"]) for path, _ in takes]
     usable = [index for index, count in enumerate(errors) if count == 0]
     for index in [i for i in range(len(takes)) if i not in usable]:
         logger.info(f"Дубль {takes[index][0]} с ошибками декодирования ({errors[index]}) — удалён")
@@ -738,10 +747,10 @@ def changed_at_from_headers(headers, received_at):
     return modified + (received_at - server_now)
 
 
-def read_now_playing(url, timeout=10):
+def read_now_playing(url, timeout=10, user_agent=USER_AGENT):
     """((исполнитель, название) или None для джингла, момент изменения 1.txt или None)."""
     request = urllib.request.Request(
-        f"{url}?{time.time():.0f}", headers={"User-Agent": USER_AGENT, "Cache-Control": "no-cache"}
+        f"{url}?{time.time():.0f}", headers={"User-Agent": user_agent, "Cache-Control": "no-cache"}
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
         text = response.read().decode("utf-8", "replace")
@@ -753,8 +762,8 @@ def stream_worker(settings, buffer, stop):
     """Читает поток с переподключением; время эфира считается по числу байтов."""
     while not stop.is_set():
         try:
-            request = urllib.request.Request(settings["stream_url"], headers={"User-Agent": USER_AGENT})
-            with urllib.request.urlopen(request, timeout=20) as response:
+            request = urllib.request.Request(settings["stream_url"], headers={"User-Agent": settings["user_agent"]})
+            with urllib.request.urlopen(request, timeout=settings["stream_timeout_seconds"]) as response:
                 connected = time.time()
                 # Icecast при подключении отдаёт «запас» из прошлого (замер: ~2.4 с):
                 # начало буфера сдвигается назад на то, что пришло быстрее реального времени.
@@ -773,8 +782,8 @@ def stream_worker(settings, buffer, stop):
         except Exception as error:
             if stop.is_set():
                 break
-            logger.warning(f"Разрыв эфира, переподключение через 10 с: {error}")
-            stop.wait(10)
+            logger.warning(f"Разрыв эфира, переподключение через {settings['reconnect_seconds']} с: {error}")
+            stop.wait(settings["reconnect_seconds"])
 
 
 def handle_finished(settings, buffer, artist, title, started, ended):
@@ -818,7 +827,9 @@ def run_service(settings):
     last_maintenance = 0.0
     while not stop.is_set():
         try:
-            parsed, modified_at = read_now_playing(settings["now_playing_url"])
+            parsed, modified_at = read_now_playing(
+                settings["now_playing_url"], settings["now_playing_timeout_seconds"], settings["user_agent"]
+            )
         except Exception as error:
             logger.warning(f"Не удалось прочитать название трека: {error}")
             stop.wait(settings["poll_seconds"])
@@ -853,13 +864,15 @@ def run_service(settings):
 
 def dry_run(settings):
     """Проверки без записи: настройки, поток, название, инструменты; план — `[dry-run] будет: …`."""
-    request = urllib.request.Request(settings["stream_url"], headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(request, timeout=20) as response:
+    request = urllib.request.Request(settings["stream_url"], headers={"User-Agent": settings["user_agent"]})
+    with urllib.request.urlopen(request, timeout=settings["stream_timeout_seconds"]) as response:
         content_type = response.headers.get("Content-Type")
         sample = response.read(16384)
     if not any(is_frame_header(sample, index) for index in range(len(sample))):
         raise RuntimeError(f"В потоке {settings['stream_url']} не найдено кадров MP3 ({content_type})")
-    parsed, _ = read_now_playing(settings["now_playing_url"])
+    parsed, _ = read_now_playing(
+        settings["now_playing_url"], settings["now_playing_timeout_seconds"], settings["user_agent"]
+    )
     now = f"{parsed[0]} - {parsed[1]}" if parsed else "джингл/реклама (без « - »)"
     tools = {name: shutil.which(name) is not None for name in ("fpcalc", "ffmpeg")}
     plan = [

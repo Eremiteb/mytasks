@@ -533,3 +533,23 @@ EOF
   [[ "$output" == *"[dry-run] будет: запись в"*"disk_stats"* ]]
   [[ "$output" == *"[dry-run] Изменения не выполнены."* ]]
 }
+
+@test "SMARTCTL_OPTS из конфигурации передаются в smartctl" {
+  local args_log="$TMP_DIR/smartctl_args.log"
+  cat > "$STUB_DIR/smartctl" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$args_log"
+dev="\${!#}"
+name="\$(basename -- "\$dev")"
+file="$SMART_DIR/\${name}.json"
+[[ -f "\$file" ]] && cat "\$file"
+exit 0
+EOF
+  chmod +x "$STUB_DIR/smartctl"
+  printf 'SMARTCTL_OPTS="-a -j -d sat"\n' > "$TMP_DIR/conf/system_monitor.conf"
+
+  DISKS="sda" run_monitor
+
+  [ "$status" -eq 0 ]
+  grep -qF -- '-a -j -d sat /dev/sda' "$args_log"
+}

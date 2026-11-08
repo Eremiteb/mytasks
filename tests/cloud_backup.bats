@@ -555,3 +555,39 @@ EOF
   [ ! -e "$TMP_DIR/wgquick.log" ]
   [[ "$output" == *"[dry-run] будет: поднят WireGuard"* ]]
 }
+
+@test "WG_PING_ATTEMPTS из конфига задаёт число попыток проверки связи" {
+  printf 'WG_PING_ATTEMPTS="5"\n' >> "$TMP_DIR/conf/cloud_backup.conf"
+  cat > "$STUB_DIR/ping" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+  cat > "$STUB_DIR/sleep" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "$STUB_DIR/ping" "$STUB_DIR/sleep"
+
+  run env PATH="$STUB_DIR:$PATH" bash "$TMP_DIR/cloud_backup.sh"
+
+  [ "$status" -ne 0 ]
+  log_file=$(ls "$TMP_DIR/logs"/cloud_backup-*.jsonl 2>/dev/null | head -1)
+  [ "$(grep -c '"event":"wg_ping_retry"' "$log_file")" -eq 5 ]
+}
+
+@test "COMP_GZIP_CMD из конфига попадает в команду сжатия на сервере" {
+  printf 'COMP_GZIP_CMD="gzip -3"\n' >> "$TMP_DIR/conf/cloud_backup.conf"
+  ssh_cmd_file="$TMP_DIR/ssh_cmd.txt"
+  cat > "$STUB_DIR/ssh" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$ssh_cmd_file"
+printf '\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+exit 0
+EOF
+  chmod +x "$STUB_DIR/ssh"
+
+  run env PATH="$STUB_DIR:$PATH" bash "$TMP_DIR/cloud_backup.sh"
+
+  [ "$status" -eq 0 ]
+  grep -qF "| gzip -3" "$ssh_cmd_file"
+}

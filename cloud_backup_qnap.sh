@@ -371,6 +371,15 @@ MARIADB_PURGE_BINLOGS="${MARIADB_PURGE_BINLOGS:-0}"
 MARIADB_TRUNCATE_GENERAL_LOG="${MARIADB_TRUNCATE_GENERAL_LOG:-1}"
 SERVICES_START_RETRIES="${SERVICES_START_RETRIES:-3}"
 SERVICES_START_RETRY_DELAY_SEC="${SERVICES_START_RETRY_DELAY_SEC:-15}"
+SERVICES_SETTLE_SECS="${SERVICES_SETTLE_SECS:-5}"
+WG_UP_WAIT_SECS="${WG_UP_WAIT_SECS:-2}"
+WG_PING_ATTEMPTS="${WG_PING_ATTEMPTS:-3}"
+WG_PING_TIMEOUT_SECS="${WG_PING_TIMEOUT_SECS:-5}"
+WG_PING_RETRY_SECS="${WG_PING_RETRY_SECS:-5}"
+SSH_CONNECT_TIMEOUT_SECS="${SSH_CONNECT_TIMEOUT_SECS:-30}"
+COMP_ZSTD_CMD="${COMP_ZSTD_CMD:-zstd -5 --threads=0 -c}"
+COMP_PIGZ_CMD="${COMP_PIGZ_CMD:-pigz -1}"
+COMP_GZIP_CMD="${COMP_GZIP_CMD:-gzip -1}"
 
 # Передача потока бэкапа через сырой TCP-сокет (nc/ncat) внутри уже
 # зашифрованного WireGuard-туннеля, минуя дополнительный слой SSH-шифрования —
@@ -685,27 +694,27 @@ else
     exit 1
   fi
   WG_BROUGHT_UP=1
-  sleep 2
+  sleep "${WG_UP_WAIT_SECS}"
   log_json "INFO" "wg_up_ok" "WireGuard ${WG_INTERFACE} успешно поднят" "" 0
 fi
 
 # Проверяем реальную связь с удалённым хостом через VPN
 log_json "INFO" "wg_check" "Проверяем доступность ${REMOTE_HOST} через VPN..."
 _wg_ok=0
-for _attempt in 1 2 3; do
+for ((_attempt = 1; _attempt <= WG_PING_ATTEMPTS; _attempt++)); do
   if [[ "${DRY_OFFLINE}" -eq 1 ]]; then
     _wg_ok=1
     break
   fi
-  if ping -c 1 -W 5 "${REMOTE_HOST}" >/dev/null 2>&1; then
+  if ping -c 1 -W "${WG_PING_TIMEOUT_SECS}" "${REMOTE_HOST}" >/dev/null 2>&1; then
     _wg_ok=1
     break
   fi
-  log_json "WARN" "wg_ping_retry" "Попытка ${_attempt}/3: хост ${REMOTE_HOST} не отвечает"
-  [[ "${_attempt}" -lt 3 ]] && sleep 5
+  log_json "WARN" "wg_ping_retry" "Попытка ${_attempt}/${WG_PING_ATTEMPTS}: хост ${REMOTE_HOST} не отвечает"
+  [[ "${_attempt}" -lt "${WG_PING_ATTEMPTS}" ]] && sleep "${WG_PING_RETRY_SECS}"
 done
 if [[ "${_wg_ok}" -eq 0 ]]; then
-  log_json "ERROR" "wg_no_connection" "Хост ${REMOTE_HOST} недоступен через VPN после 3 попыток" "" 1
+  log_json "ERROR" "wg_no_connection" "Хост ${REMOTE_HOST} недоступен через VPN после ${WG_PING_ATTEMPTS} попыток" "" 1
   echo "Ошибка: ${REMOTE_HOST} недоступен через VPN" >&2
   exit 1
 fi
@@ -781,7 +790,7 @@ SSH_CIPHERS="${SSH_CIPHERS:-chacha20-poly1305@openssh.com,aes128-gcm@openssh.com
 SSH_OPTS=(
   -p "${REMOTE_SSH_PORT}"
   -o StrictHostKeyChecking=accept-new
-  -o ConnectTimeout=30
+  -o "ConnectTimeout=${SSH_CONNECT_TIMEOUT_SECS}"
   -o BatchMode=no
   -o Compression=no
   -c "${SSH_CIPHERS}"
@@ -954,9 +963,9 @@ if [[ "${DRY_OFFLINE}" -eq 0 ]]; then
     "if command -v zstd >/dev/null 2>&1; then echo zstd; elif command -v pigz >/dev/null 2>&1; then echo pigz; else echo gzip; fi" 2>/dev/null)
 fi
 case "${REMOTE_COMP}" in
-  zstd) COMP_CMD="zstd -5 --threads=0 -c";         BACKUP_EXT="tar.zst" ;;
-  pigz) COMP_CMD="pigz -1";                       BACKUP_EXT="tar.gz"  ;;
-  *)    COMP_CMD="gzip -1";                        BACKUP_EXT="tar.gz"  ;;
+  zstd) COMP_CMD="${COMP_ZSTD_CMD}"; BACKUP_EXT="tar.zst" ;;
+  pigz) COMP_CMD="${COMP_PIGZ_CMD}"; BACKUP_EXT="tar.gz"  ;;
+  *)    COMP_CMD="${COMP_GZIP_CMD}"; BACKUP_EXT="tar.gz"  ;;
 esac
 
 if [[ "${DRY_RUN}" -eq 0 ]]; then
@@ -1118,8 +1127,8 @@ else
   # на удалённой стороне после того, как сама команда уже вернула управление
   # (наблюдалось: raw-transfer падал с SIGPIPE через ~2с после запуска
   # листенера сразу после docker compose down). Даём хосту стабилизироваться.
-  sleep 5
-  log_json "INFO" "post_services_stop_settle" "Пауза после остановки сервисов для стабилизации сети хоста" "sleep_sec=5"
+  sleep "${SERVICES_SETTLE_SECS}"
+  log_json "INFO" "post_services_stop_settle" "Пауза после остановки сервисов для стабилизации сети хоста" "sleep_sec=${SERVICES_SETTLE_SECS}"
 fi
 
 if [[ "${DB_OPTIMIZE_DUE}" -eq 1 ]]; then

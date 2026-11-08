@@ -13,3 +13,24 @@
 # Используются при объединении папок, различающихся регистром/знаками/«&»/апострофами.
 # По умолчанию выключено (работа без сети).
 # OFFICIAL_NAMES=yes
+
+# Адрес API MusicBrainz для поиска официальных имён (используется при OFFICIAL_NAMES=yes).
+OFFICIAL_API=https://musicbrainz.org/ws/2/artist
+
+# User-Agent запросов к MusicBrainz (сервис просит указывать контакт).
+OFFICIAL_UA=mytasks-split_by_dash/1.0 (https://github.com/Eremiteb/mytasks)
+
+# Файл кэша официальных имён (TSV). По умолчанию — state/split_by_dash_official.tsv рядом со скриптом.
+OFFICIAL_CACHE=@MYTASKS_DIR@/state/split_by_dash_official.tsv
+
+# Тайм-аут одного запроса к MusicBrainz, секунды.
+OFFICIAL_TIMEOUT=20
+
+# Пауза перед каждым запросом, секунды (MusicBrainz допускает не чаще 1 запроса в секунду).
+OFFICIAL_DELAY=1
+
+# Минимальная оценка совпадения (score, 0-100), при которой имя из ответа принимается.
+OFFICIAL_MIN_SCORE=90
+
+# Сколько вариантов написания имени пробовать запрашивать для одной папки.
+OFFICIAL_MAX_TRIES=3

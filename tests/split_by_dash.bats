@@ -534,6 +534,23 @@ STUB
   [ -z "$(ls -A "$TMP_DIR/dest")" ]
 }
 
+@test "OFFICIAL_CACHE and OFFICIAL_MIN_SCORE from the config are applied" {
+  mkdir -p "$TMP_DIR/music/Банд'Эрос" "$TMP_DIR/music/Банд\`Эрос" "$TMP_DIR/stubs" "$TMP_DIR/conf"
+  touch "$TMP_DIR/music/Банд'Эрос/a.mp3" "$TMP_DIR/music/Банд\`Эрос/b.mp3"
+  cat > "$TMP_DIR/stubs/curl" <<'STUB'
+#!/usr/bin/env bash
+printf '{"artists":[{"score":95,"name":"Банд’Эрос"}]}'
+STUB
+  chmod +x "$TMP_DIR/stubs/curl"
+  printf 'OFFICIAL_CACHE=%s\nOFFICIAL_MIN_SCORE=99\nOFFICIAL_DELAY=0\n' "$TMP_DIR/my_cache.tsv" > "$TMP_DIR/conf/split_by_dash.conf"
+
+  run env PATH="$TMP_DIR/stubs:$PATH" OFFICIAL_NAMES=yes bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/my_cache.tsv" ]
+  [ ! -e "$TMP_DIR/music/Банд’Эрос" ]
+}
+
 @test "config mode processes listed directories and applies DEST_DIR" {
   mkdir -p "$TMP_DIR/music" "$TMP_DIR/dest" "$TMP_DIR/conf"
   touch "$TMP_DIR/music/Artist - Song.mp3"

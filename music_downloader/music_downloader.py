@@ -837,6 +837,19 @@ def report_run(db, started, clock, exit_code, sites_data, search_stats, download
         logger.error(f"Не удалось записать итог запуска в БД: {error}", extra={"site": "system"})
 
 
+DOWNLOAD_TIMEOUT_SECONDS = 60
+DOWNLOAD_PAUSE_SECONDS = 1.2
+
+
+def number_setting(config, key, default, minimum=0):
+    """Число из корня music_downloader.json; нет ключа или значение не число ≥ minimum — default."""
+    value = config.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < minimum:
+        logger.warning(f"Настройка {key} должна быть числом не меньше {minimum}, беру {default}")
+        return default
+    return value
+
+
 def run():
     if not os.path.exists(CONFIG_PATH):
         return
@@ -847,6 +860,8 @@ def run():
         config = json.load(f)
     logger.info("Конфигурация загружена")
 
+    download_timeout = number_setting(config, "download_timeout_seconds", DOWNLOAD_TIMEOUT_SECONDS, minimum=1)
+    download_pause = number_setting(config, "download_pause_seconds", DOWNLOAD_PAUSE_SECONDS)
     run_started = datetime.now().isoformat(timespec="seconds")
     run_clock = time.monotonic()
     # Метрики источников поиска (find_audio дополняет по имени источника).
@@ -1013,7 +1028,7 @@ def run():
                     fetch = t.get("fetch")
                     with (
                         fetch() if callable(fetch)
-                        else scraper.get(t["download_url"], timeout=60, headers=headers, stream=True)
+                        else scraper.get(t["download_url"], timeout=download_timeout, headers=headers, stream=True)
                     ) as r:
                         if r.status_code == 200:
                             # Получаем размер файла из заголовка Content-Length
@@ -1068,7 +1083,7 @@ def run():
                                 stats["downloaded"] += 1
                                 stats["bytes"] += downloaded_bytes
                                 logger.info(f"Успешно скачан: {clean_fn} ({downloaded_bytes} байт)", extra={"site": s_name})
-                                time.sleep(1.2)
+                                time.sleep(download_pause)
                         else:
                             stats["errors"] += 1
                             logger.error(f"Ошибка соединения (код: {r.status_code})", extra={"site": s_name})

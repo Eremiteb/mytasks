@@ -87,3 +87,11 @@ EOF
   [ "$status" -eq 0 ]
   [ "$(grep -c 'Выбор модели под шаг' "$HOME/.claude/CLAUDE.md")" -eq 1 ]
 }
+
+@test "SKILLS_SRC_DIR из conf/install_agent_skills.conf применяется" {
+  mv "$TMP_DIR/agent-skills" "$TMP_DIR/other-skills"
+  printf 'SKILLS_SRC_DIR="%s/other-skills"\n' "$TMP_DIR" > "$TMP_DIR/conf/install_agent_skills.conf"
+  run "$TMP_DIR/install_agent_skills.sh" --apply local
+  [ "$status" -eq 0 ]
+  [ -f "$HOME/.claude/skills/model-routing/SKILL.md" ]
+}

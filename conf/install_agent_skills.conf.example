@@ -3,3 +3,6 @@
 HOSTS=(local hoster)
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10)
 KEEP_LOGS=10
+# Каталог с источниками навыка и разделов (SKILL.md, section.*.md, хук).
+# @MYTASKS_DIR@ — каталог проекта mytasks
+SKILLS_SRC_DIR="@MYTASKS_DIR@/agent-skills"

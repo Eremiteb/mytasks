@@ -32,6 +32,17 @@ def test_load_settings_defaults_and_validation(tmp_path):
         recorder.load_settings({"sites": []})
 
 
+def test_network_and_tool_settings_defaults_and_overrides(tmp_path):
+    loaded = settings(tmp_path)
+    assert loaded["stream_timeout_seconds"] == 20 and loaded["fpcalc_timeout_seconds"] == 120
+    assert loaded["ffmpeg_timeout_seconds"] == 300 and loaded["reconnect_seconds"] == 10
+    assert loaded["user_agent"] == recorder.USER_AGENT
+    custom = settings(tmp_path, stream_timeout_seconds=7, user_agent="TestAgent/1")
+    assert custom["stream_timeout_seconds"] == 7 and custom["user_agent"] == "TestAgent/1"
+    with pytest.raises(ValueError):
+        settings(tmp_path, ffmpeg_timeout_seconds=0)
+
+
 def test_whole_frames_drops_garbage_and_partial_last_frame():
     assert recorder.frame_length(FRAME, 0) == 576
     data = b"\x00\xff\xfb" + FRAME * 3 + FRAME[:100]

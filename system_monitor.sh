@@ -39,6 +39,8 @@ HISTORY_POINTS="${HISTORY_POINTS:-30}"
 SMARTCTL_BIN="${SMARTCTL_BIN:-smartctl}"
 SENSORS_BIN="${SENSORS_BIN:-sensors}"
 NVIDIA_SMI_BIN="${NVIDIA_SMI_BIN:-nvidia-smi}"
+SMARTCTL_OPTS="${SMARTCTL_OPTS:--a -j -d auto}"
+CPU_SAMPLE_SECS="${CPU_SAMPLE_SECS:-1}"
 DISKS="${DISKS:-}"
 TEMP_WARN_C="${TEMP_WARN_C:-50}"
 TEMP_CRIT_C="${TEMP_CRIT_C:-60}"
@@ -164,7 +166,7 @@ usage() {
   Опрашивает диски (smartctl), CPU (lm_sensors, /proc) и GPU (nvidia-smi,
   если есть), сохраняет состояние в SQLite (${DB_FILE}) и формирует
   HTML-отчёт в ${REPORT_DIR}. Предназначен для запуска по расписанию
-  (cron) и/или при загрузке системы.
+  (таймер systemd) и/или при загрузке системы.
 
 Опции:
   -r, --report   Только пересобрать HTML-отчёт из уже накопленных в
@@ -418,11 +420,13 @@ device_alias() {
 poll_disk() {
     local dev="$1" row_ts="$2" json parsed alias mountpoints size
     local health model serial temp poh realloc pending uncorrect
+    local -a smartctl_opts=()
+    read -r -a smartctl_opts <<< "${SMARTCTL_OPTS}"
 
     alias="$(device_alias "${dev}")"
     mountpoints="$(disk_mountpoints "${dev}")"
     size="$(disk_size_bytes "${dev}")"
-    json="$("${SMARTCTL_BIN}" -a -j -d auto "${dev}" 2>/dev/null || true)"
+    json="$("${SMARTCTL_BIN}" "${smartctl_opts[@]}" "${dev}" 2>/dev/null || true)"
 
     if [[ -z "${json}" ]] || ! jq -e . >/dev/null 2>&1 <<< "${json}"; then
         log_json "WARN" "smartctl_read_failed" "Не удалось получить данные SMART" "${dev}"
@@ -472,13 +476,13 @@ cpu_temperature() {
     ' 2>/dev/null | awk '{ if ($1 != "") printf "%.0f", $1 }'
 }
 
-# Загрузка CPU (%) — две выборки /proc/stat с интервалом 1с (тот же
+# Загрузка CPU (%) — две выборки /proc/stat с интервалом CPU_SAMPLE_SECS (по умолчанию 1 с) (тот же
 # принцип, что использует top/mpstat), без дополнительных зависимостей.
 cpu_usage_percent() {
     local read1 read2 total1 idle1 total2 idle2 dtotal didle
     read1="$(awk '/^cpu /{total=$2+$3+$4+$5+$6+$7+$8+$9+$10+$11; print total, $5}' /proc/stat 2>/dev/null)"
     [[ -z "${read1}" ]] && return 0
-    sleep 1
+    sleep "${CPU_SAMPLE_SECS}"
     read2="$(awk '/^cpu /{total=$2+$3+$4+$5+$6+$7+$8+$9+$10+$11; print total, $5}' /proc/stat 2>/dev/null)"
     [[ -z "${read2}" ]] && return 0
     read -r total1 idle1 <<< "${read1}"

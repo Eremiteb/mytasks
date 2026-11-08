@@ -1,6 +1,8 @@
 {
     "log_cleanup_days": 10,
     "log_max_files": 10,
+    "download_timeout_seconds": 60,
+    "download_pause_seconds": 1.2,
 
     "file_permissions": {
         "enabled": true,
@@ -154,7 +156,15 @@
                 "aired_file": "aired.jsonl",
                 "aired_lookback_days": 2,
                 "aired_keep_days": 14,
-                "maintenance_minutes": 60
+                "maintenance_minutes": 60,
+                "bitrate_kbps": 192,
+                "log_max_files": 10,
+                "user_agent": "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0",
+                "stream_timeout_seconds": 20,
+                "now_playing_timeout_seconds": 10,
+                "reconnect_seconds": 10,
+                "fpcalc_timeout_seconds": 120,
+                "ffmpeg_timeout_seconds": 300
             },
             "categories": [
                 "/"

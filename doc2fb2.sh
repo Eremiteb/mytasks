@@ -124,15 +124,23 @@ SKIP_NEWER=0
 
 AUTHOR_SET=0
 AUTHOR="${USER:-}"
-TITLE_MODE="auto"
 
+# Значения по умолчанию; conf/doc2fb2.conf их переопределяет, ключи командной
+# строки главнее конфига. Из окружения не берутся (LOG_LEVEL, TOC — общие имена).
+TITLE_MODE="auto"
 TOC=1
 TOC_DEPTH=3
+LOG_KEEP_DAYS=10
+LOG_LEVEL="info"   # info|error
+CONFIG_FILE="${SCRIPT_DIR}/conf/${SCRIPT_BASE}.conf"
+if [[ -r "${CONFIG_FILE}" ]]; then
+  # shellcheck source=/dev/null
+  source "${CONFIG_FILE}"
+fi
 
 ONLY="all"
 EXCLUDES=()
 
-LOG_LEVEL="info"   # info|error
 DEBUG=0
 
 ORIG_ARGS=("$@")
@@ -219,13 +227,13 @@ mkdir -p "$(dirname "${LOGFILE}")" 2>/dev/null || { echo "Ошибка: не м�
 # Auto-delete old logs (keep 10 days)
 ###############################################################################
 cleanup_old_logs() {
-  local keep_days=10
+  local keep_days="${LOG_KEEP_DAYS}"
   local logdir cur pattern
   logdir="$(cd "$(dirname "${LOGFILE}")" 2>/dev/null && pwd)" || return 0
   cur="${logdir}/$(basename "${LOGFILE}")"
   pattern="doc2fb2_*.jsonl"
 
-  log_info "log_cleanup_start" "" "" "Очистка логов старше 10 дней" "dir=${logdir} pattern=${pattern} keep_days=${keep_days}"
+  log_info "log_cleanup_start" "" "" "Очистка логов старше ${keep_days} дн." "dir=${logdir} pattern=${pattern} keep_days=${keep_days}"
 
   local _log_list_file
   _log_list_file="$(mktemp)"

@@ -15,12 +15,19 @@ LOG_DIR="${MYTASKS_LOG_DIR:-${SCRIPT_DIR}/logs}"
 TIMESTAMP="$(date '+%Y-%m-%d-%H-%M-%S')"
 LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}-${TIMESTAMP}.jsonl"
 LOG_TEMPLATE_FILE="${SCRIPT_DIR}/conf/log_template.conf"
+# Значения по умолчанию; conf/music_downloader.conf их переопределяет
 CRON_LOG="${LOG_DIR}/cron_execution.log"
+PYTHON_BIN="python3"
+CONFIG_FILE="${SCRIPT_DIR}/conf/${SCRIPT_BASE}.conf"
 mkdir -p "${LOG_DIR}"
 
 if [[ -r "${LOG_TEMPLATE_FILE}" ]]; then
     # shellcheck source=/dev/null
     source "${LOG_TEMPLATE_FILE}"
+fi
+if [[ -r "${CONFIG_FILE}" ]]; then
+    # shellcheck source=/dev/null
+    source "${CONFIG_FILE}"
 fi
 LOG_SCHEMA_VERSION="${LOG_SCHEMA_VERSION:-1.0}"
 LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
@@ -92,7 +99,7 @@ fi
 
 cd "${PROJECT_PATH}"
 if [[ "${DRY_RUN}" -eq 1 ]]; then
-    echo "[dry-run] будет: запуск загрузчика python3 music_downloader.py в ${PROJECT_PATH}"
+    echo "[dry-run] будет: запуск загрузчика ${PYTHON_BIN} music_downloader.py в ${PROJECT_PATH}"
     log_json "INFO" "dry_downloader" "[dry-run] Был бы запущен загрузчик" "${PROJECT_PATH}"
     PYTHON_EXIT_CODE=0
 else
@@ -105,7 +112,7 @@ else
     fi
 
     set +e
-    python3 music_downloader.py >> "${CRON_LOG}" 2>&1
+    "${PYTHON_BIN}" music_downloader.py >> "${CRON_LOG}" 2>&1
     PYTHON_EXIT_CODE=$?
     set -e
 

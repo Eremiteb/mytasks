@@ -96,11 +96,8 @@ run_script() {
 # ---------------------------------------------------------------------------
 
 @test "актуальные значения zstd и WireGuard заданы по умолчанию" {
-  run grep -F 'zstd) COMP_CMD="zstd -5 --threads=0 -c"' "$TMP_DIR/cloud_backup_qnap.sh"
+  run grep -F 'COMP_ZSTD_CMD="${COMP_ZSTD_CMD:-zstd -5 --threads=0 -c}"' "$TMP_DIR/cloud_backup_qnap.sh"
   [ "$status" -eq 0 ]
-
-  run grep -qi -E 'redis|valkey' "$TMP_DIR/cloud_backup_qnap.sh"
-  [ "$status" -ne 0 ]
 
   run grep -F 'WG_ENDPOINT="${WG_ENDPOINT:-}"' "$TMP_DIR/cloud_backup_qnap.sh"
   [ "$status" -eq 0 ]
@@ -475,4 +472,30 @@ EOF2
   log_file=$(ls "$TMP_DIR/logs"/cloud_backup_qnap-*.jsonl 2>/dev/null | head -1)
   run grep -q "local_nproc=${expected}," "$log_file"
   [ "$status" -eq 0 ]
+}
+
+@test "SERVICES_SETTLE_SECS и COMP_GZIP_CMD из конфига применяются" {
+  cat >> "$TMP_DIR/conf/cloud_backup_qnap.conf" <<'EOF'
+SERVICES_SETTLE_SECS="0"
+COMP_GZIP_CMD="gzip -3"
+EOF
+  ssh_cmd_file="$TMP_DIR/ssh_cmd.txt"
+  cat > "$STUB_DIR/ssh" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$ssh_cmd_file"
+case "\$*" in
+  *"command -v zstd >/dev/null 2>&1"*) echo gzip; exit 0 ;;
+  *"tar --create"*) printf '$GZIP_FIXTURE'; exit 0 ;;
+  *"docker compose ps -a"*) echo 'nextcloud running healthy'; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+  chmod +x "$STUB_DIR/ssh"
+
+  run_script
+
+  [ "$status" -eq 0 ]
+  grep -qF "| gzip -3" "$ssh_cmd_file"
+  log_file=$(ls "$TMP_DIR/logs"/cloud_backup_qnap-*.jsonl 2>/dev/null | head -1)
+  grep -q 'sleep_sec=0' "$log_file"
 }

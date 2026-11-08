@@ -170,6 +170,24 @@ EOF2
   [ -e "$TMP_DIR/arch/src-$(date '+%Y-%m-%d').7z" ]
 }
 
+@test "7z: SEVENZIP_KEEP из файла заданий применяется" {
+  make_7z_stub
+  mkdir -p "$TMP_DIR/arch"
+  for d in 01 02 03 04 05; do
+    touch -d "2026-01-$d" "$TMP_DIR/arch/src-2026-01-$d.7z"
+  done
+  {
+    printf 'SEVENZIP_KEEP=1\n'
+    printf '7z | %s/src/ | %s/arch/ | | -t7z\n' "$TMP_DIR" "$TMP_DIR"
+  } > "$TMP_DIR/conf/7z.conf"
+
+  run env PATH="$STUB_DIR:$PATH" sh "$TMP_DIR/sources.sh" -c "$TMP_DIR/conf/7z.conf"
+
+  [ "$status" -eq 0 ]
+  [ "$(find "$TMP_DIR/arch" -type f -name '*.7z' | wc -l)" -eq 1 ]
+  [ -e "$TMP_DIR/arch/src-$(date '+%Y-%m-%d').7z" ]
+}
+
 # --- лог: удаления и экранирование -----------------------------------------
 
 @test "лог: удаления настоящего rsync — верный путь и валидный JSON в каждой строке" {

@@ -122,3 +122,26 @@ BACKUP_DEGRADATION_MIBS_THRESHOLD="4"
 # одном ядре).
 # Переопределите, если замеры на вашем железе покажут другой шифр быстрее.
 #SSH_CIPHERS="chacha20-poly1305@openssh.com,aes128-gcm@openssh.com,aes256-gcm@openssh.com,aes128-ctr"
+
+# Пауза после остановки сервисов на сервере перед передачей (даёт хосту
+# дособрать сеть/DNS после docker compose down), с
+SERVICES_SETTLE_SECS="5"
+
+# Пауза после подъёма WireGuard перед проверкой связи, с
+WG_UP_WAIT_SECS="2"
+
+# Проверка связи с сервером через VPN (ping): число попыток, тайм-аут одного
+# ping и пауза между попытками, с
+WG_PING_ATTEMPTS="3"
+WG_PING_TIMEOUT_SECS="5"
+WG_PING_RETRY_SECS="5"
+
+# Тайм-аут установки SSH-соединения (ConnectTimeout), с
+SSH_CONNECT_TIMEOUT_SECS="30"
+
+# Команды сжатия на сервере: берётся первая из доступных zstd, pigz, gzip.
+# Для zstd обязателен ключ -c (запись в stdout); уровень zstd -1..-19,
+# pigz/gzip -1..-9. Узкое место — CPU QNAP при приёме, а не сервер.
+COMP_ZSTD_CMD="zstd -5 --threads=0 -c"
+COMP_PIGZ_CMD="pigz -1"
+COMP_GZIP_CMD="gzip -1"

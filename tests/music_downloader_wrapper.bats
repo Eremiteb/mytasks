@@ -62,3 +62,19 @@ EOF2
   [ "$(cat "$TMP_DIR/split_args")" = "--dry-run" ]
   [[ "$output" == *"[dry-run] будет: запуск загрузчика"* ]]
 }
+
+@test "CRON_LOG and PYTHON_BIN from the config are applied" {
+  mkdir -p "$TMP_DIR/conf" "$TMP_DIR/bin"
+  cat > "$TMP_DIR/bin/mypython" <<'EOF2'
+#!/usr/bin/env bash
+echo "mypython called"
+EOF2
+  chmod +x "$TMP_DIR/bin/mypython"
+  touch "$TMP_DIR/music_downloader/music_downloader.py"
+  printf 'PYTHON_BIN=%s\nCRON_LOG=%s\n' "$TMP_DIR/bin/mypython" "$TMP_DIR/my_cron.log" > "$TMP_DIR/conf/music_downloader.conf"
+
+  run env MYTASKS_LOG_DIR="$TMP_DIR/logs" bash "$TMP_DIR/music_downloader.sh"
+
+  [ "$status" -eq 0 ]
+  grep -q "mypython called" "$TMP_DIR/my_cron.log"
+}

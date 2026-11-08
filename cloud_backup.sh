@@ -173,6 +173,16 @@ OPTIMIZE_MARIADB_BEFORE_BACKUP="${OPTIMIZE_MARIADB_BEFORE_BACKUP:-0}"
 MARIADB_SERVICE_NAME="${MARIADB_SERVICE_NAME:-mariadb}"
 MARIADB_PURGE_BINLOGS="${MARIADB_PURGE_BINLOGS:-0}"
 MARIADB_TRUNCATE_GENERAL_LOG="${MARIADB_TRUNCATE_GENERAL_LOG:-1}"
+WG_UP_WAIT_SECS="${WG_UP_WAIT_SECS:-2}"
+WG_PING_ATTEMPTS="${WG_PING_ATTEMPTS:-3}"
+WG_PING_TIMEOUT_SECS="${WG_PING_TIMEOUT_SECS:-5}"
+WG_PING_RETRY_SECS="${WG_PING_RETRY_SECS:-5}"
+SSH_CONNECT_TIMEOUT_SECS="${SSH_CONNECT_TIMEOUT_SECS:-30}"
+SSH_CIPHERS="${SSH_CIPHERS:-aes128-gcm@openssh.com,chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-ctr}"
+COMP_ZSTD_CMD="${COMP_ZSTD_CMD:-zstd --fast=1 --threads=0 -c}"
+COMP_PIGZ_CMD="${COMP_PIGZ_CMD:-pigz -1}"
+COMP_GZIP_CMD="${COMP_GZIP_CMD:-gzip -1}"
+PROGRESS_INTERVAL_SECS="${PROGRESS_INTERVAL_SECS:-60}"
 
 ###############################################################################
 # WireGuard
@@ -249,27 +259,27 @@ else
     exit 1
   fi
   WG_BROUGHT_UP=1
-  sleep 2
+  sleep "${WG_UP_WAIT_SECS}"
   log_json "INFO" "wg_up_ok" "WireGuard ${WG_INTERFACE} успешно поднят" "" 0
 fi
 
 # Проверяем реальную связь с удалённым хостом через VPN
 log_json "INFO" "wg_check" "Проверяем доступность ${REMOTE_HOST} через VPN..."
 _wg_ok=0
-for _attempt in 1 2 3; do
+for ((_attempt = 1; _attempt <= WG_PING_ATTEMPTS; _attempt++)); do
   if [[ "${DRY_OFFLINE}" -eq 1 ]]; then
     _wg_ok=1
     break
   fi
-  if ping -c 1 -W 5 "${REMOTE_HOST}" >/dev/null 2>&1; then
+  if ping -c 1 -W "${WG_PING_TIMEOUT_SECS}" "${REMOTE_HOST}" >/dev/null 2>&1; then
     _wg_ok=1
     break
   fi
-  log_json "WARN" "wg_ping_retry" "Попытка ${_attempt}/3: хост ${REMOTE_HOST} не отвечает"
-  [[ "${_attempt}" -lt 3 ]] && sleep 5
+  log_json "WARN" "wg_ping_retry" "Попытка ${_attempt}/${WG_PING_ATTEMPTS}: хост ${REMOTE_HOST} не отвечает"
+  [[ "${_attempt}" -lt "${WG_PING_ATTEMPTS}" ]] && sleep "${WG_PING_RETRY_SECS}"
 done
 if [[ "${_wg_ok}" -eq 0 ]]; then
-  log_json "ERROR" "wg_no_connection" "Хост ${REMOTE_HOST} недоступен через VPN после 3 попыток" "" 1
+  log_json "ERROR" "wg_no_connection" "Хост ${REMOTE_HOST} недоступен через VPN после ${WG_PING_ATTEMPTS} попыток" "" 1
   echo "Ошибка: ${REMOTE_HOST} недоступен через VPN" >&2
   exit 1
 fi
@@ -324,10 +334,10 @@ done
 SSH_OPTS=(
   -p "${REMOTE_SSH_PORT}"
   -o StrictHostKeyChecking=accept-new
-  -o ConnectTimeout=30
+  -o "ConnectTimeout=${SSH_CONNECT_TIMEOUT_SECS}"
   -o BatchMode=no
   -o Compression=no
-  -c "aes128-gcm@openssh.com,chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-ctr"
+  -c "${SSH_CIPHERS}"
 )
 
 # Выбираем быстрейший доступный компрессор на удалённом сервере:
@@ -340,9 +350,9 @@ if [[ "${DRY_OFFLINE}" -eq 0 ]]; then
   unset SSHPASS
 fi
 case "${REMOTE_COMP}" in
-  zstd) COMP_CMD="zstd --fast=1 --threads=0 -c"; BACKUP_EXT="tar.zst" ;;
-  pigz) COMP_CMD="pigz -1";                       BACKUP_EXT="tar.gz"  ;;
-  *)    COMP_CMD="gzip -1";                        BACKUP_EXT="tar.gz"  ;;
+  zstd) COMP_CMD="${COMP_ZSTD_CMD}"; BACKUP_EXT="tar.zst" ;;
+  pigz) COMP_CMD="${COMP_PIGZ_CMD}"; BACKUP_EXT="tar.gz"  ;;
+  *)    COMP_CMD="${COMP_GZIP_CMD}"; BACKUP_EXT="tar.gz"  ;;
 esac
 
 BACKUP_FILENAME="${SCRIPT_BASE}-${BACKUP_DATE}.${BACKUP_EXT}"
@@ -533,9 +543,9 @@ fi
 export SSHPASS="${REMOTE_PASSWORD}"
 PROGRESS_METRICS_FILE="$(mktemp)"
 
-# Фоновый монитор: пишет размер файла в лог каждые 60 сек
+# Фоновый монитор: пишет размер файла в лог каждые PROGRESS_INTERVAL_SECS сек
 _progress_monitor() {
-  while sleep 60; do
+  while sleep "${PROGRESS_INTERVAL_SECS}"; do
     [[ -f "${BACKUP_PATH}" ]] || break
     local sz size_bytes now_epoch
     sz=$(du -sh "${BACKUP_PATH}" 2>/dev/null | cut -f1)

@@ -66,3 +66,13 @@ KEEP_LOGS=10
 APP_NAME="BackupCheck"
 ICON_NAME="drive-harddisk"
 URGENCY="critical"
+
+# Показывать desktop-уведомление в трее при проблемах: yes или no
+# (флаг --no-notify отключает уведомление независимо от этого значения)
+NOTIFY_ENABLED="yes"
+
+# Приоритет nice для проверки целостности архива (0..19, 19 — самый низкий)
+VERIFY_NICE_LEVEL=19
+
+# Сколько последних проверенных архивов помнить в state/check_backups.verified
+VERIFIED_KEEP=50

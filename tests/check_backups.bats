@@ -316,3 +316,12 @@ EOT
   [ ! -e "$TMP_DIR/state" ]
   [[ "$output" == *"[dry-run] будет: уведомление"* ]]
 }
+
+@test "NOTIFY_ENABLED=no из конфига отключает уведомление" {
+  write_conf "" 'NOTIFY_ENABLED="no"'
+  make_archive "b-1.tar.zst" 1000 100
+  run_check
+
+  [ "$status" -eq 1 ]
+  [ ! -e "$NOTIFY_LOG" ]
+}

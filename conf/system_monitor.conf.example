@@ -20,6 +20,10 @@ HISTORY_POINTS=30
 # Путь к бинарю smartctl (если не в PATH)
 SMARTCTL_BIN="smartctl"
 
+# Опции smartctl для опроса диска (обязательно -j: разбор идёт как JSON;
+# -d auto — автоопределение типа устройства)
+SMARTCTL_OPTS="-a -j -d auto"
+
 # Путь к бинарю sensors из lm_sensors (если не в PATH); опционально —
 # при отсутствии CPU опрашивается без температуры
 SENSORS_BIN="sensors"
@@ -27,6 +31,9 @@ SENSORS_BIN="sensors"
 # Путь к бинарю nvidia-smi (если не в PATH); опционально — при отсутствии
 # (нет NVIDIA GPU/драйвера) опрос GPU просто пропускается
 NVIDIA_SMI_BIN="nvidia-smi"
+
+# Интервал между двумя выборками /proc/stat для расчёта загрузки CPU, с
+CPU_SAMPLE_SECS=1
 
 # Пороги температуры дисков (°C) для статусов "внимание" и "критично"
 TEMP_WARN_C=50

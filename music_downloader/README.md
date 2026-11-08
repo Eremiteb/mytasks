@@ -50,6 +50,8 @@ bash ../music_downloader.sh
 - Контроль рассчитан на один процесс. Параллельные записи других программ не блокируются; для общей строгой квоты используйте квоты файловой системы.
 - `file_permissions.enabled` и восьмеричная строка `file_permissions.mode` включают `chmod` после сохранения. Владелец и группа не меняются; ошибка `chmod` только логируется.
 - `log_cleanup_days` и `log_max_files` задают очистку логов движка; оба значения по умолчанию равны `10`.
+- `download_timeout_seconds` (60) — тайм-аут HTTP при скачивании файла, с.
+- `download_pause_seconds` (1.2) — пауза после успешной загрузки, с (0 допустим).
 
 ## Очистка тегов ID3
 
@@ -178,7 +180,7 @@ def get_tracks(session, base_url, category):
 - **очистка дублей найденных песен**: раз в `maintenance_minutes` (60) рекордер удаляет дубли песен, которые уже есть в `music_downloader.db`, — дубли остаются только у песен, которых нет ни в одном источнике (замер 2026-10-27: без этого за три дня накопилось 384 дубля на 2 ГБ, ни одна песня не дождалась трёх выходов, а лимит `max_mb` начал удалять первые дубли);
 - кэш чистится по `keep_days` (14) и `max_mb` (2048 МиБ).
 
-Настройки — блок `recorder` сайта `beufm_kz` в `music_downloader.json` (`enabled`, `stream_url`, `now_playing_url`, `dir`, `takes`, `min_takes`, `max_wait_days`, `keep_days`, `max_mb`, `aired_file`, `aired_lookback_days`, `aired_keep_days`, `maintenance_minutes`; дополнительно `poll_seconds`, `window_seconds`, `tail_seconds`, `pad_start_seconds`, `pad_end_seconds`, `match_ber`, `min_seconds`, `max_seconds`). Нужны `ffmpeg` и `fpcalc` (пакет `chromaprint`); без них дубли копятся, но запись не собирается. Проверка без записи:
+Настройки — блок `recorder` сайта `beufm_kz` в `music_downloader.json` (`enabled`, `stream_url`, `now_playing_url`, `dir`, `takes`, `min_takes`, `max_wait_days`, `keep_days`, `max_mb`, `aired_file`, `aired_lookback_days`, `aired_keep_days`, `maintenance_minutes`, `bitrate_kbps`, `log_max_files`, `user_agent` (User-Agent запросов к потоку и `1.txt`), `stream_timeout_seconds` (20), `now_playing_timeout_seconds` (10), `reconnect_seconds` (10, пауза перед переподключением), `fpcalc_timeout_seconds` (120), `ffmpeg_timeout_seconds` (300); дополнительно `poll_seconds`, `window_seconds`, `tail_seconds`, `pad_start_seconds`, `pad_end_seconds`, `match_ber`, `min_seconds`, `max_seconds`). Нужны `ffmpeg` и `fpcalc` (пакет `chromaprint`); без них дубли копятся, но запись не собирается. Проверка без записи:
 
 ```sh
 music_downloader/venv/bin/python music_downloader/beufm_recorder.py --dry-run

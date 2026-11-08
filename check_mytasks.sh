@@ -109,7 +109,7 @@ JOBS=(
     "conf|conf/check_backups.conf|conf/check_backups.conf.example||Настройки check_backups.sh: каталоги с архивами (BACKUP_DIRS), допустимый возраст и размер архивов."
     "conf|conf/sources.conf|conf/sources.conf.example||Список каталогов для sources.sh: строки «источник, назначение, опции rsync» либо «7z, каталог, каталог архивов, сколько хранить, опции 7z» через вертикальную черту."
     "conf|music_downloader/music_downloader.json|music_downloader/music_downloader.json.example||Настройки загрузчика музыки: сайты, общий список каталогов download_paths, лимит размера."
-    "venv|music_downloader/venv|requests,bs4,cloudscraper||Виртуальное окружение Python загрузчика музыки: music_downloader/setup_venv.sh ставит зависимости из requirements.txt."
+    "venv|music_downloader/venv|requests,bs4,cloudscraper,mutagen||Виртуальное окружение Python загрузчика музыки: music_downloader/setup_venv.sh ставит зависимости из requirements.txt."
     "link|llamactl|llamactl/llamactl.sh|path:@LLAMA_PREFIX@|Команда llamactl в ~/.local/bin: управление локальным llama.cpp (модели, VRAM, сервисы, пресеты, обновление)."
     "link|llamactl-tray|llamactl/llamactl_tray.py|path:@LLAMA_PREFIX@|Команда llamactl-tray в ~/.local/bin: значок llama.cpp в трее."
     "autostart|llamactl-tray.desktop||path:@LLAMA_PREFIX@|Автозапуск значка llama.cpp в трее при входе в графический сеанс."

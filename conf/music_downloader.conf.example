@@ -1,0 +1,13 @@
+# Конфигурация обёртки music_downloader.sh
+# Скопируйте этот файл в music_downloader.conf и при необходимости измените значения.
+# Настройки самого загрузчика (источники, качество, каталоги) — в music_downloader/music_downloader.json.
+# Срок хранения логов обёртки (KEEP_LOGS) задаётся в conf/log_template.conf.
+
+# Интерпретатор Python для запуска music_downloader/music_downloader.py (имя команды или полный путь).
+PYTHON_BIN="python3"
+
+# Каталог виртуального окружения загрузчика (активируется, если в нём есть bin/activate).
+VENV_PATH="@MYTASKS_DIR@/music_downloader/venv"
+
+# Файл, куда пишется вывод загрузчика и сортировщика (stdout/stderr) при запуске обёрткой.
+CRON_LOG="@MYTASKS_DIR@/logs/cron_execution.log"

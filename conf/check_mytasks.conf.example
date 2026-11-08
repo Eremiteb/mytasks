@@ -48,6 +48,14 @@ AUTOSTART_DIR="@HOME@/.config/autostart"
 # Каталог для команд-ссылок (llamactl и т.п.)
 BIN_DIR="@HOME@/.local/bin"
 
+# Системный Python для проверки модулей зависимостей (py:...). Пусто —
+# /usr/bin/python3, а где его нет (NixOS) — python3 из PATH
+SYSTEM_PYTHON=""
+
+# Каталог модулей ядер: по нему определяется, что работающее ядро удалено
+# после обновления и нужна перезагрузка
+KERNEL_MODULES_DIR="/usr/lib/modules"
+
 # Сколько последних JSONL-логов хранить
 KEEP_LOGS=10
 
