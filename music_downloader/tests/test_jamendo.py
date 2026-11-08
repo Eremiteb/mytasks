@@ -48,15 +48,47 @@ def test_api_tracks_and_playlist_compatibility(session, category):
     if category == "/":
         session.get.assert_called_once_with(
             "https://api.jamendo.com/v3.0/tracks/",
-            params={"client_id": "test-client", "format": "json", "limit": 200, "order": "releasedate_desc"},
+            params={
+                "client_id": "test-client", "format": "json", "limit": 200, "order": "releasedate_desc",
+                "include": "musicinfo", "vocalinstrumental": "vocal",
+            },
             timeout=30,
         )
     else:
         session.get.assert_called_once_with(
             "https://api.jamendo.com/v3.0/playlists/tracks/",
-            params={"client_id": "test-client", "id": "123", "limit": 200, "offset": 0},
+            params={"client_id": "test-client", "id": "123", "limit": 200, "offset": 0, "include": "musicinfo"},
             timeout=30,
         )
+
+
+@pytest.mark.parametrize("category", ["/", "/playlist/123/example"])
+def test_instrumental_tracks_skipped(session, caplog, category):
+    """Треки без вокала (instrumental и без пометки) отбрасываются, без musicinfo — остаются."""
+    entries = [
+        TRACK | {"id": "100001", "musicinfo": {"vocalinstrumental": "vocal"}},
+        TRACK | {"id": "100002", "musicinfo": {"vocalinstrumental": "instrumental"}},
+        TRACK | {"id": "100003", "musicinfo": {"vocalinstrumental": ""}},
+        TRACK | {"id": "100004", "musicinfo": {}},
+        TRACK | {"id": "100005"},
+    ]
+    session.get.return_value.json.return_value["results"] = (
+        entries if category == "/" else [{"tracks": entries}]
+    )
+    with caplog.at_level(logging.INFO):
+        tracks = jamendo.get_tracks(session, BASE_URL, category)
+    assert [track["id"] for track in tracks] == ["100001", "100005"]
+    assert "пропущено треков без вокала: 3" in caplog.text
+
+
+def test_vocal_only_disabled_keeps_instrumental(session, monkeypatch):
+    monkeypatch.setitem(jamendo.SETTINGS, "vocal_only", False)
+    session.get.return_value.json.return_value["results"] = [
+        TRACK | {"musicinfo": {"vocalinstrumental": "instrumental"}},
+    ]
+    assert [track["id"] for track in jamendo.get_tracks(session, BASE_URL, "/")] == ["123456"]
+    params = session.get.call_args.kwargs["params"]
+    assert "vocalinstrumental" not in params and "include" not in params
 
 
 @pytest.mark.parametrize("category", ["/", "/playlist/123/example"])

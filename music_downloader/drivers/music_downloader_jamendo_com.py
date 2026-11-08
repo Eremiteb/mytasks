@@ -23,6 +23,10 @@ SETTINGS = {
     "page_timeout_seconds": 30,
     "user_agent": "Mozilla/5.0",
     "final_pause_seconds": 1.0,
+    # Только песни с вокалом: инструментальные треки и треки без пометки
+    # musicinfo.vocalinstrumental отбрасываются (замер 2026-11-08: из 200 последних
+    # релизов 126 инструментальных, 48 без пометки, 26 с вокалом).
+    "vocal_only": True,
 }
 _CONFIG_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "music_downloader.json"
@@ -207,6 +211,33 @@ def _build_download_url(track_id):
     return _MP3_URL_TEMPLATE.format(track_id=track_id)
 
 
+def _is_rejected_instrumental(entry):
+    """Трек без вокала, который нужно пропустить при включённом vocal_only.
+
+    Решение принимается только по полю musicinfo.vocalinstrumental (его даёт
+    include=musicinfo): всё, кроме «vocal», — инструментальная или неразмеченная
+    запись, как и при серверном фильтре vocalinstrumental=vocal. Если musicinfo в
+    ответе нет (эндпоинт его не вернул), трек не отбрасывается.
+    """
+    if not SETTINGS["vocal_only"] or not isinstance(entry, dict):
+        return False
+    musicinfo = entry.get("musicinfo")
+    if not isinstance(musicinfo, dict):
+        return False
+    return musicinfo.get("vocalinstrumental") != "vocal"
+
+
+def _vocal_params():
+    if not SETTINGS["vocal_only"]:
+        return {}
+    return {"include": "musicinfo", "vocalinstrumental": "vocal"}
+
+
+def _log_skipped_instrumental(label, count):
+    if count:
+        logger.info(f"JAMENDO: {label} — пропущено треков без вокала: {count}")
+
+
 def _extract_playlist_id(category_path):
     m = re.search(r"/playlist/(\d+)", category_path)
     return m.group(1) if m else None
@@ -218,6 +249,7 @@ def _fetch_tracks(session, client_id):
         "format": "json",
         "limit": SETTINGS["api_page_limit"],
         "order": "releasedate_desc",
+        **_vocal_params(),
     }
     last_error = None
     last_error_level = logging.ERROR
@@ -259,7 +291,11 @@ def _fetch_tracks(session, client_id):
             continue
 
         tracks = []
+        skipped_instrumental = 0
         for entry in results:
+            if _is_rejected_instrumental(entry):
+                skipped_instrumental += 1
+                continue
             # audiodownload_allowed — поле ответа, а не параметр фильтрации API.
             if not isinstance(entry, dict) or entry.get("audiodownload_allowed") is not True:
                 continue
@@ -271,6 +307,7 @@ def _fetch_tracks(session, client_id):
                 track["download_url"] = download_url
                 tracks.append(track)
 
+        _log_skipped_instrumental("/", skipped_instrumental)
         deduped = _dedupe_tracks(tracks)
         if not deduped:
             last_error = "в ответе API нет треков с разрешённым audiodownload"
@@ -299,6 +336,9 @@ def _fetch_playlist_tracks(session, playlist_id, client_id):
             "id": playlist_id,
             "limit": limit,
             "offset": offset,
+            # Серверный фильтр vocalinstrumental для плейлистов не используется:
+            # просим musicinfo и, если он пришёл, отсеиваем треки без вокала на месте.
+            **({"include": "musicinfo"} if SETTINGS["vocal_only"] else {}),
         }
         results = None
         headers = {}
@@ -340,8 +380,12 @@ def _fetch_playlist_tracks(session, playlist_id, client_id):
         if not results:
             break
 
+        skipped_instrumental = 0
         for item in results:
             for t in item.get("tracks", []) or []:
+                if _is_rejected_instrumental(t):
+                    skipped_instrumental += 1
+                    continue
                 if t.get("audiodownload_allowed") is not True:
                     continue
                 download_url = t.get("audiodownload")
@@ -362,6 +406,7 @@ def _fetch_playlist_tracks(session, playlist_id, client_id):
                     "download_url": download_url,
                 })
 
+        _log_skipped_instrumental(f"плейлист {playlist_id}", skipped_instrumental)
         total = headers.get("results_count")
         if total and isinstance(total, int) and offset + limit >= total:
             break

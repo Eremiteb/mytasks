@@ -138,6 +138,7 @@ Dry-run скриптов (`--dry-run`) — не проверка кода, а о
 
 - Категория `/` получает из официального `tracks` API одну страницу до 200 последних треков (`releasedate_desc`), `/playlist/<ID>` использует API плейлистов. Периодические пустые ответы CDN и сбои API повторяются по `api_retry_delays_seconds` (по умолчанию `1, 3, 5` с, блок `drivers` → `music_downloader_jamendo_com`).
 - Принимать только записи с `audiodownload_allowed: true` и непустым `audiodownload`; не подменять его потоковым `audio`. Нужен `client_id` сайта либо `JAMENDO_CLIENT_ID`.
+- Только песни с вокалом (`vocal_only`, по умолчанию `true`): `tracks` запрашивается с `include=musicinfo` и `vocalinstrumental=vocal`, плейлисты — с `include=musicinfo`; `musicinfo.vocalinstrumental` не `vocal` (`instrumental`/пусто) — пропуск, нет `musicinfo` — трек остаётся. Тест — `test_instrumental_tracks_skipped`. Без фильтра около 2/3 новинок Jamendo — инструментал (замер 2026-11-08).
 - Ошибки API и пустые результаты логировать по-русски с `site=jamendo_com`. Проверки метаданных не должны скачивать аудио.
 
 ### Контракт драйверов, Shazam и MyChords

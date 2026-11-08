@@ -101,7 +101,8 @@
             "api_page_limit": 200,
             "page_timeout_seconds": 30,
             "user_agent": "Mozilla/5.0",
-            "final_pause_seconds": 1.0
+            "final_pause_seconds": 1.0,
+            "vocal_only": true
         },
         "music_downloader_lmu_kz": {
             "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
