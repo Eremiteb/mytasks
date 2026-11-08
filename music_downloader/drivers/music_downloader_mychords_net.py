@@ -12,6 +12,17 @@ logger = logging.LoggerAdapter(logging.getLogger("Engine"), {"site": "mychords_n
 
 _TRACK_ID_RE = re.compile(r"/(\d+)-[^/]+\.html?$")
 
+# Значения по умолчанию; переопределяются блоком drivers.music_downloader_mychords_net в music_downloader.json.
+SETTINGS = {
+    "connect_timeout_seconds": 5,
+    "read_timeout_seconds": 20,
+    "player_pause_seconds": 1,
+}
+
+
+def _timeout():
+    return (SETTINGS["connect_timeout_seconds"], SETTINGS["read_timeout_seconds"])
+
 
 def _load_driver(name):
     """Загружает соседний драйвер по пути: движок не добавляет каталог загрузчика в sys.path."""
@@ -78,7 +89,7 @@ def get_tracks(session, base_url, category_path):
     """Возвращает список новинок; адрес аудио запрашивается позже, только для новых треков."""
     target_url = urljoin(base_url, category_path)
     try:
-        response = session.get(target_url, timeout=(5, 20))
+        response = session.get(target_url, timeout=_timeout())
         response.raise_for_status()
         tracks = parse_listing(response.text, base_url)
     except Exception as error:
@@ -94,13 +105,13 @@ def get_tracks(session, base_url, category_path):
 def _resolve_player(session, page_url):
     """Открывает страницу трека и плеер Xpleer; возвращает ответ для движка или None."""
     try:
-        page = session.get(page_url, timeout=(5, 20))
+        page = session.get(page_url, timeout=_timeout())
         page.raise_for_status()
         player_url = parse_player_url(page.text, page_url)
         if not player_url:
             logger.warning(f"MyChords: на странице {page_url} нет плеера")
             return None
-        player = session.get(player_url, headers={"Referer": page_url}, timeout=(5, 20))
+        player = session.get(player_url, headers={"Referer": page_url}, timeout=_timeout())
         player.raise_for_status()
         download_url = parse_player_file(player.text)
         if download_url is None:
@@ -110,7 +121,7 @@ def _resolve_player(session, page_url):
         logger.warning(f"MyChords: не удалось получить аудио для {page_url}: {error}")
         return None
     finally:
-        time.sleep(1)
+        time.sleep(SETTINGS["player_pause_seconds"])
     return {"download_url": download_url, "referer": player_url, "src": page_url}
 
 

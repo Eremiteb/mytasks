@@ -25,14 +25,22 @@ def _load_driver(name):
 
 audio_search = _load_driver("music_downloader_audio_search")
 
-CHART_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux i686; rv:60.9) "
-        "Gecko/20100101 Goanna/4.1 Firefox/60.9 PaleMoon/28.3.0"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate",
+# Значения по умолчанию; переопределяются блоком drivers.music_downloader_shazam в music_downloader.json.
+# `chart_headers` — проверенные Firefox-заголовки запроса чарта; `retry_delays_seconds` — расписание
+# повторов чарта (см. комментарий ниже).
+SETTINGS = {
+    "chart_headers": {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux i686; rv:60.9) "
+            "Gecko/20100101 Goanna/4.1 Firefox/60.9 PaleMoon/28.3.0"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate",
+    },
+    "retry_delays_seconds": (15, 45, 90),
+    "connect_timeout_seconds": 5,
+    "read_timeout_seconds": 20,
 }
 
 # Shazam (Next.js App Router за Fastly) периодически отдаёт по адресу чарта
@@ -44,7 +52,6 @@ CHART_HEADERS = {
 # полезной нагрузке `self.__next_f`); попытки распределены по минутам и идут с
 # новым соединением. Query-параметр-«антикэш» не добавлять: отдельный ключ
 # Fastly чаще указывает как раз на «отравленную» копию.
-CHART_RETRY_DELAYS = (15, 45, 90)
 
 # Куски RSC-потока Next.js: `self.__next_f.push([1, "<json-строка>"])`.
 _FLIGHT_PUSH_RE = re.compile(r'self\.__next_f\.push\(\[1,\s*("(?:[^"\\]|\\.)*")\]\)', re.S)
@@ -156,7 +163,7 @@ def get_tracks(session, base_url, category_path):
     """Возвращает метаданные чарта; поиск MP3 выполняется после дедупликации движком.
 
     Каждая попытка читает HTML-страницу, а при неудаче — RSC-поток того же
-    адреса; попытки повторяются по расписанию ``CHART_RETRY_DELAYS`` с новым
+    адреса; попытки повторяются по расписанию ``SETTINGS["retry_delays_seconds"]`` с новым
     соединением. ``ERROR`` пишется только после того, как оба источника не
     ответили ни разу, — сама по себе такая запись означает временный сбой
     Shazam/CDN. На поломку разбора указывают ``В карточке чарта...`` /
@@ -165,17 +172,17 @@ def get_tracks(session, base_url, category_path):
     target_url = urljoin(base_url, category_path)
     last_error = None
     attempt = 0
-    for delay in (0, *CHART_RETRY_DELAYS):
+    for delay in (0, *SETTINGS["retry_delays_seconds"]):
         if delay:
             time.sleep(delay)
         attempt += 1
         for kind, extra_headers, parser in CHART_SOURCES:
-            headers = {**CHART_HEADERS, **extra_headers}
+            headers = {**SETTINGS["chart_headers"], **extra_headers}
             if attempt > 1:
                 # Новое соединение — шанс выйти на другой пограничный узел CDN.
                 headers["Connection"] = "close"
             try:
-                response = session.get(target_url, headers=headers, timeout=(5, 20))
+                response = session.get(target_url, headers=headers, timeout=(SETTINGS["connect_timeout_seconds"], SETTINGS["read_timeout_seconds"]))
                 response.raise_for_status()
                 # RSC-поток приходит как `text/x-component` без charset, и requests
                 # по умолчанию читает его как ISO-8859-1 («Ã©» вместо «é»): искажённые

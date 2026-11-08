@@ -9,6 +9,14 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger("Engine")
 
+# Значения по умолчанию; переопределяются блоком drivers.music_downloader_tunes_kz в music_downloader.json.
+SETTINGS = {
+    "user_agent": "Mozilla/5.0",
+    "track_timeout_seconds": 25,
+    "category_timeout_seconds": 30,
+    "track_pause_range_seconds": [1.0, 2.0],
+}
+
 _TRACK_RE = re.compile(r"^/(\d+)-[^/]+\.html?$", re.IGNORECASE)
 _MP3_RE = re.compile(r"\.mp3($|\?)", re.IGNORECASE)
 
@@ -153,12 +161,12 @@ def _extract_page_artist_title(soup: BeautifulSoup):
 
 def _extract_download_link(session, base_url, track_url):
     headers = {
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": SETTINGS["user_agent"],
         "Referer": track_url,
     }
 
     try:
-        r = session.get(track_url, timeout=25, headers=headers)
+        r = session.get(track_url, timeout=SETTINGS["track_timeout_seconds"], headers=headers)
         r.raise_for_status()
     except Exception as e:
         logger.warning(f"TUNES.KZ: failed to open track page {track_url}: {e}")
@@ -190,12 +198,12 @@ def get_tracks(session, base_url, category_path):
     target_url = urljoin(base_url, category_path)
 
     headers = {
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": SETTINGS["user_agent"],
         "Referer": base_url,
     }
 
     try:
-        resp = session.get(target_url, timeout=30, headers=headers)
+        resp = session.get(target_url, timeout=SETTINGS["category_timeout_seconds"], headers=headers)
         resp.raise_for_status()
     except Exception as e:
         logger.error(f"TUNES.KZ: failed to fetch category {category_path}: {e}")
@@ -257,7 +265,7 @@ def get_tracks(session, base_url, category_path):
             "src": track_url,
         })
 
-        time.sleep(random.uniform(1.0, 2.0))
+        time.sleep(random.uniform(*SETTINGS["track_pause_range_seconds"]))
 
     logger.info(f"TUNES.KZ: {category_path} -> {len(tracks)} tracks")
     return tracks

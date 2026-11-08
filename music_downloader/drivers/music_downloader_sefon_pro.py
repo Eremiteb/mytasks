@@ -6,6 +6,11 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger("Engine")
 
+# Значения по умолчанию; переопределяются блоком drivers.music_downloader_sefon_pro в music_downloader.json.
+SETTINGS = {
+    "timeout_seconds": 15,
+}
+
 def sefon_decrypt(url_str, key_str):
     if not url_str or not key_str:
         return None
@@ -25,7 +30,7 @@ def sefon_decrypt(url_str, key_str):
 
 def get_tracks(session, base_url, category_path):
     target_url = urljoin(base_url, category_path)
-    resp = session.get(target_url, timeout=15)
+    resp = session.get(target_url, timeout=SETTINGS["timeout_seconds"])
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, 'html.parser')
     blocks = soup.find_all('div', class_='mp3')

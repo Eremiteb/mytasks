@@ -19,7 +19,7 @@ def _patch_sources(monkeypatch, module, sefon, lmusic):
     by_name = {"sefon.pro": sefon, "lmusic_kz": lmusic}
     monkeypatch.setattr(module.audio_search.time, "sleep", lambda _: None)
     monkeypatch.setattr(
-        module.audio_search, "_query_source", lambda session, source, query: by_name[source["name"]](session, query)
+        module.audio_search, "_query_source", lambda session, source, query, driver_settings=None: by_name[source["name"]](session, query)
     )
 
 CANONICAL = '<link rel="canonical" href="https://www.shazam.com/charts/top-200/world">'
@@ -113,7 +113,7 @@ def test_get_tracks_retries_both_sources_then_logs_error(monkeypatch, caplog):
     session.get.return_value.text = "<html></html>"
     assert shazam.get_tracks(session, "https://www.shazam.com", "/ru-ru/charts/top-200/world") == []
     # каждая попытка (первая плюс каждая пауза) пробует HTML и RSC
-    assert session.get.call_count == len(shazam.CHART_SOURCES) * (1 + len(shazam.CHART_RETRY_DELAYS))
+    assert session.get.call_count == len(shazam.CHART_SOURCES) * (1 + len(shazam.SETTINGS["retry_delays_seconds"]))
     assert any(record.levelno == logging.ERROR and record.site == "shazam_com" for record in caplog.records)
 
 

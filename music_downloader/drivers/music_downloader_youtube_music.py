@@ -2,7 +2,7 @@
 
 Нужен для релизов, которых нет на MP3-сайтах (нишевые южноафриканские, турецкие,
 бразильские, казахские треки). Поиск — `https://music.youtube.com/search?q=…#songs`
-(только песни, не клипы); у первых `MAX_CANDIDATES` результатов читаются полные
+(только песни, не клипы); у первых `max_candidates` (`SETTINGS`) результатов читаются полные
 метаданные, где YouTube Music отдаёт точные `artists` и `track` (каналы «… - Topic»),
 поэтому сверка в `find_audio` такая же строгая, как у остальных источников.
 
@@ -36,11 +36,14 @@ def _load_driver(name):
 
 audio_search = _load_driver("music_downloader_audio_search")
 
-MAX_CANDIDATES = 3
-SEARCH_TIMEOUT = 60
-DOWNLOAD_TIMEOUT = 600
-# VBR ~190 кбит/с: исходник opus ~130–160 кбит/с, больший битрейт MP3 качества не добавит.
-MP3_QUALITY = "2"
+# Значения по умолчанию; переопределяются блоком drivers.music_downloader_youtube_music в music_downloader.json.
+SETTINGS = {
+    "max_candidates": 3,
+    "search_timeout_seconds": 60,
+    "download_timeout_seconds": 600,
+    # VBR ~190 кбит/с: исходник opus ~130–160 кбит/с, больший битрейт MP3 качества не добавит.
+    "mp3_quality": "2",
+}
 
 
 def available():
@@ -64,10 +67,10 @@ def download_mp3(url):
         result = subprocess.run(
             [
                 "yt-dlp", "--no-warnings", "--ignore-config", "--no-playlist", "--quiet",
-                "-f", "bestaudio", "-x", "--audio-format", "mp3", "--audio-quality", MP3_QUALITY,
+                "-f", "bestaudio", "-x", "--audio-format", "mp3", "--audio-quality", SETTINGS["mp3_quality"],
                 "-o", os.path.join(workdir, "track.%(ext)s"), url,
             ],
-            capture_output=True, text=True, timeout=DOWNLOAD_TIMEOUT, check=False,
+            capture_output=True, text=True, timeout=SETTINGS["download_timeout_seconds"], check=False,
         )
         path = os.path.join(workdir, "track.mp3")
         if result.returncode != 0 or not os.path.isfile(path):
@@ -100,14 +103,15 @@ def search_tracks(session, base_url, search_path):
     if not available():
         return []
     search_url = urljoin(base_url, search_path)
-    found = _run_json(["--flat-playlist", "--playlist-end", str(MAX_CANDIDATES), "-J", search_url], SEARCH_TIMEOUT)
+    found = _run_json(["--flat-playlist", "--playlist-end", str(SETTINGS["max_candidates"]), "-J", search_url],
+                      SETTINGS["search_timeout_seconds"])
     tracks = []
     for entry in found.get("entries") or []:
         url = entry.get("url")
         if not url:
             continue
         try:
-            candidate = parse_info(_run_json(["--skip-download", "-J", url], SEARCH_TIMEOUT))
+            candidate = parse_info(_run_json(["--skip-download", "-J", url], SETTINGS["search_timeout_seconds"]))
         except Exception as error:
             logger.warning(f"YouTube Music: не удалось прочитать {url}: {error}")
             continue

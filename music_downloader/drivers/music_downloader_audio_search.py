@@ -4,12 +4,17 @@
 и передаётся движком в `track["_search_sources"]`. Один список обслуживает Shazam,
 MyChords и Beu FM; новый источник добавляется записью в конфиг, если его драйвер
 предоставляет `search_tracks(session, base_url, search_path)`.
+
+Настройки драйверов (блок `drivers` конфига) движок кладёт в `track["_driver_settings"]`:
+`find_audio` применяет их к собственному `SETTINGS` и к каждому драйверу источника
+один раз при его загрузке (`_load_driver`).
 """
 import importlib.util
 import logging
 import os
 import re
 import time
+import types
 import unicodedata
 from html import unescape
 from urllib.parse import quote, quote_plus, urljoin, urlsplit
@@ -34,6 +39,15 @@ DEFAULT_SOURCES = (
 
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _DRIVERS = {}
+_SETTINGS_MODULE = None
+_OWN_SETTINGS_APPLIED = False
+
+# Значения по умолчанию; переопределяются блоком drivers.music_downloader_audio_search в music_downloader.json.
+SETTINGS = {
+    "link_check_connect_timeout_seconds": 5,
+    "link_check_read_timeout_seconds": 15,
+    "query_pause_seconds": 1,
+}
 
 
 class FileResponse:
@@ -242,8 +256,31 @@ def search_queries(artist, title, alias_groups=(), translit=False):
     return queries
 
 
-def _load_driver(path):
-    """Загружает драйвер источника по пути (каталог загрузчика не входит в sys.path) и кеширует его."""
+def _driver_settings_module():
+    """Модуль применения настроек драйверов; загружается по пути, как и сами драйверы."""
+    global _SETTINGS_MODULE
+    if _SETTINGS_MODULE is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "music_downloader_driver_settings.py")
+        spec = importlib.util.spec_from_file_location("music_downloader_driver_settings", path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Не удалось загрузить {path}")
+        _SETTINGS_MODULE = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_SETTINGS_MODULE)
+    return _SETTINGS_MODULE
+
+
+def _apply_settings(module, driver_settings, path):
+    """Применяет к модулю настройки его записи (имя файла без `.py`) из блока `drivers` конфига."""
+    if not driver_settings:
+        return
+    name = os.path.splitext(os.path.basename(path))[0]
+    _driver_settings_module().apply_driver_settings(module, driver_settings.get(name, {}), logger)
+
+
+def _load_driver(path, driver_settings=None):
+    """Загружает драйвер источника по пути (каталог загрузчика не входит в sys.path) и кеширует его.
+
+    Настройки из `driver_settings` применяются один раз — при первой загрузке модуля."""
     full_path = path if os.path.isabs(path) else os.path.join(_BASE_DIR, path)
     if full_path not in _DRIVERS:
         spec = importlib.util.spec_from_file_location(
@@ -253,6 +290,7 @@ def _load_driver(path):
             raise ImportError(f"Не удалось загрузить драйвер поиска {full_path}")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        _apply_settings(module, driver_settings, full_path)
         _DRIVERS[full_path] = module
     return _DRIVERS[full_path]
 
@@ -264,9 +302,9 @@ def enabled_sources(sources):
     return [source for source in sources if source.get("enabled", True)]
 
 
-def _query_source(session, source, query):
+def _query_source(session, source, query, driver_settings=None):
     """Возвращает кандидатов источника и адрес поисковой страницы."""
-    driver = _load_driver(source["driver"])
+    driver = _load_driver(source["driver"], driver_settings)
     # {query} — для параметра (`q=Кино+Цой`), {query_path} — для сегмента пути (`/search/Кино%20Цой`).
     search_path = source["search_path"].format(query=quote_plus(query), query_path=quote(query, safe=""))
     return (
@@ -280,7 +318,8 @@ def _reachable(session, candidate, label, name, log):
     if candidate.get("fetch"):
         return True
     with session.get(
-        candidate["download_url"], headers={"Referer": candidate["referer"]}, stream=True, timeout=(5, 15)
+        candidate["download_url"], headers={"Referer": candidate["referer"]}, stream=True,
+        timeout=(SETTINGS["link_check_connect_timeout_seconds"], SETTINGS["link_check_read_timeout_seconds"]),
     ) as response:
         if response.status_code == 200:
             return True
@@ -323,6 +362,12 @@ def find_audio(session, track, label, log=logger, sources=None):
     (`relaxed_match`: без `(feat. …)` и пометок remaster, общий исполнитель).
     Превью не используются; ссылка проверяется запросом без чтения тела.
     """
+    global _OWN_SETTINGS_APPLIED
+    driver_settings = track.get("_driver_settings") or {}
+    if driver_settings and not _OWN_SETTINGS_APPLIED:
+        _OWN_SETTINGS_APPLIED = True
+        # Модуль загружен по пути и не лежит в sys.modules: словарь SETTINGS меняется на месте.
+        _apply_settings(types.SimpleNamespace(SETTINGS=SETTINGS, __file__=__file__), driver_settings, __file__)
     artist, title = track.get("artist"), track.get("title")
     expected = (match_key(artist), match_key(title))
     if not all(expected):
@@ -341,10 +386,10 @@ def find_audio(session, track, label, log=logger, sources=None):
         chosen = False
         try:
             for query in queries:
-                candidates, search_url = _query_source(session, source, query)
+                candidates, search_url = _query_source(session, source, query, driver_settings)
                 stats["queries"] += 1
                 stats["candidates"] += len(candidates)
-                time.sleep(1)
+                time.sleep(SETTINGS["query_pause_seconds"])
                 for candidate in candidates:
                     download_url = candidate.get("download_url") or ""
                     if urlsplit(download_url).scheme not in ("http", "https"):

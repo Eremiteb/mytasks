@@ -14,7 +14,16 @@ _MP3_URL_TEMPLATE = "https://mp3d.jamendo.com/?trackid={track_id}&format=mp32"
 _API_FILE_TEMPLATE = "https://api.jamendo.com/v3.0/tracks/file?client_id={client_id}&id={track_id}"
 _API_PLAYLIST_TRACKS = "https://api.jamendo.com/v3.0/playlists/tracks/"
 _API_TRACKS = "https://api.jamendo.com/v3.0/tracks/"
-_API_RETRY_DELAYS = (1, 3, 5)
+
+# Значения по умолчанию; переопределяются блоком drivers.music_downloader_jamendo_com в music_downloader.json.
+SETTINGS = {
+    "api_retry_delays_seconds": (1, 3, 5),
+    "api_timeout_seconds": 30,
+    "api_page_limit": 200,
+    "page_timeout_seconds": 30,
+    "user_agent": "Mozilla/5.0",
+    "final_pause_seconds": 1.0,
+}
 _CONFIG_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "music_downloader.json"
 )
@@ -207,18 +216,18 @@ def _fetch_tracks(session, client_id):
     params = {
         "client_id": client_id,
         "format": "json",
-        "limit": 200,
+        "limit": SETTINGS["api_page_limit"],
         "order": "releasedate_desc",
     }
     last_error = None
     last_error_level = logging.ERROR
     attempt = 0
-    for delay in (0, *_API_RETRY_DELAYS):
+    for delay in (0, *SETTINGS["api_retry_delays_seconds"]):
         if delay:
             time.sleep(delay)
         attempt += 1
         try:
-            resp = session.get(_API_TRACKS, params=params, timeout=30)
+            resp = session.get(_API_TRACKS, params=params, timeout=SETTINGS["api_timeout_seconds"])
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
@@ -282,7 +291,7 @@ def _fetch_tracks(session, client_id):
 def _fetch_playlist_tracks(session, playlist_id, client_id):
     tracks = []
     offset = 0
-    limit = 200
+    limit = SETTINGS["api_page_limit"]
 
     while True:
         params = {
@@ -295,12 +304,12 @@ def _fetch_playlist_tracks(session, playlist_id, client_id):
         headers = {}
         last_error = None
         attempt = 0
-        for delay in (0, *_API_RETRY_DELAYS):
+        for delay in (0, *SETTINGS["api_retry_delays_seconds"]):
             if delay:
                 time.sleep(delay)
             attempt += 1
             try:
-                resp = session.get(_API_PLAYLIST_TRACKS, params=params, timeout=30)
+                resp = session.get(_API_PLAYLIST_TRACKS, params=params, timeout=SETTINGS["api_timeout_seconds"])
                 resp.raise_for_status()
                 data = resp.json()
             except Exception as e:
@@ -366,7 +375,7 @@ def _fetch_playlist_tracks(session, playlist_id, client_id):
 def get_tracks(session, base_url, category_path):
     playlist_url = urljoin(base_url, category_path)
     headers = {
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": SETTINGS["user_agent"],
         "Referer": base_url,
     }
 
@@ -391,11 +400,11 @@ def get_tracks(session, base_url, category_path):
             logger.info(f"JAMENDO: {category_path} — получено треков через API: {len(tracks)}")
         else:
             logger.warning(f"JAMENDO: {category_path} — API не вернул доступных для скачивания треков")
-        time.sleep(1.0)
+        time.sleep(SETTINGS["final_pause_seconds"])
         return tracks
 
     try:
-        resp = session.get(playlist_url, timeout=30, headers=headers)
+        resp = session.get(playlist_url, timeout=SETTINGS["page_timeout_seconds"], headers=headers)
         resp.raise_for_status()
     except Exception as e:
         logger.error(f"JAMENDO: не удалось получить страницу {category_path}: {e}")
@@ -416,5 +425,5 @@ def get_tracks(session, base_url, category_path):
         logger.info(f"JAMENDO: {category_path} — найдено треков в HTML: {len(tracks)}")
     else:
         logger.warning(f"JAMENDO: {category_path} — в HTML не найдено треков")
-    time.sleep(1.0)
+    time.sleep(SETTINGS["final_pause_seconds"])
     return tracks

@@ -107,9 +107,9 @@ def test_api_errors_and_empty_not_silent(session, caplog, category, failure):
     assert all(record.site == "jamendo_com" for record in caplog.records)
     assert "JAMENDO:" in caplog.text
     if category == "/":
-        expected_calls = 1 + len(jamendo._API_RETRY_DELAYS)
+        expected_calls = 1 + len(jamendo.SETTINGS["api_retry_delays_seconds"])
     else:
-        expected_calls = 1 if failure in ("empty", "disabled") else 1 + len(jamendo._API_RETRY_DELAYS)
+        expected_calls = 1 if failure in ("empty", "disabled") else 1 + len(jamendo.SETTINGS["api_retry_delays_seconds"])
     assert session.get.call_count == expected_calls
 
 

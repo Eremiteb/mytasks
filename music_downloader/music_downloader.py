@@ -26,6 +26,22 @@ class SSLAdapter(HTTPAdapter):
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DRIVER_SETTINGS_PATH = os.path.join(BASE_DIR, "drivers", "music_downloader_driver_settings.py")
+
+
+def load_driver_settings_module():
+    """Загружает `apply_driver_settings` по пути: каталог загрузчика не входит в `sys.path`."""
+    spec = importlib.util.spec_from_file_location("music_downloader_driver_settings", DRIVER_SETTINGS_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Не удалось загрузить {DRIVER_SETTINGS_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def driver_settings_key(script_path):
+    """Ключ блока `drivers` для драйвера: имя файла без `.py`."""
+    return os.path.splitext(os.path.basename(script_path))[0]
 SCRIPT_NAME = os.path.splitext(os.path.basename(__file__))[0]
 LOG_NAME = f"{SCRIPT_NAME}_engine"
 CONFIG_PATH = os.path.join(BASE_DIR, f"{SCRIPT_NAME}.json")
@@ -871,6 +887,11 @@ def run():
     if search_sources is not None and not isinstance(search_sources, list):
         logger.error("Настройка search_sources должна быть списком источников")
         raise SystemExit(2)
+    driver_settings = config.get("drivers", {})
+    if not isinstance(driver_settings, dict):
+        logger.error("Настройка drivers должна быть объектом: имя файла драйвера -> настройки")
+        raise SystemExit(2)
+    apply_driver_settings = load_driver_settings_module().apply_driver_settings
     artist_aliases = config.get("artist_aliases") or []
     if not isinstance(artist_aliases, list) or not all(
         isinstance(group, list) and all(isinstance(name, str) for name in group) for group in artist_aliases
@@ -918,6 +939,9 @@ def run():
             logger.exception(f"Не удалось загрузить драйвер {s_name}", extra={"site": s_name})
             continue
         logger.info(f"Драйвер {s_name} загружен", extra={"site": s_name})
+        apply_driver_settings(
+            provider, driver_settings.get(driver_settings_key(site_cfg["site_script"]), {}), logger
+        )
 
         # Сохраняем данные сайта для последующей обработки
         sites_data.append({
@@ -1014,6 +1038,7 @@ def run():
                         # Общий список источников MP3 для драйверов без собственного аудио.
                         t["_search_sources"] = search_sources
                         t["_artist_aliases"] = artist_aliases
+                        t["_driver_settings"] = driver_settings
                         t["_search_stats"] = search_stats
                         resolved = resolver(scraper, t)
                         if resolved is None:

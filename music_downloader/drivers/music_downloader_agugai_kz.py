@@ -8,6 +8,16 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger("Engine")
 
+# Значения по умолчанию; переопределяются блоком drivers.music_downloader_agugai_kz в music_downloader.json.
+SETTINGS = {
+    "timeout_seconds": 25,
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0",
+    "accept_language": "ru-RU,ru;q=0.9,en-US;q=0.7,en;q=0.6",
+    "track_pause_range_seconds": [0.5, 1.3],
+    "final_pause_seconds": 4,
+    "final_pause_range_seconds": [1.0, 3.0],
+}
+
 
 _MP3_RE = re.compile(r'(https?://[^\s"\']+\.mp3|/uploads/[^\s"\']+\.mp3)', re.IGNORECASE)
 
@@ -155,13 +165,13 @@ def get_tracks(session, base_url, category_path):
     target_url = urljoin(base_url, category_path)
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0",
+        "User-Agent": SETTINGS["user_agent"],
         "Referer": base_url,
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.7,en;q=0.6",
+        "Accept-Language": SETTINGS["accept_language"],
     }
 
     try:
-        resp = session.get(target_url, timeout=25, headers=headers)
+        resp = session.get(target_url, timeout=SETTINGS["timeout_seconds"], headers=headers)
         resp.raise_for_status()
     except Exception as e:
         logger.error(f"AGUGAI: не удалось открыть категорию {category_path}: {e}")
@@ -188,10 +198,10 @@ def get_tracks(session, base_url, category_path):
     tracks = []
     for _i, track_url in enumerate(uniq_links, start=1):
         # маленькая рандом-пауза между карточками
-        time.sleep(random.uniform(0.5, 1.3))
+        time.sleep(random.uniform(*SETTINGS["track_pause_range_seconds"]))
 
         try:
-            r = session.get(track_url, timeout=25, headers={**headers, "Referer": target_url})
+            r = session.get(track_url, timeout=SETTINGS["timeout_seconds"], headers={**headers, "Referer": target_url})
             r.raise_for_status()
         except Exception as e:
             logger.warning(f"AGUGAI: пропуск трека {track_url}: {e}")
@@ -215,7 +225,7 @@ def get_tracks(session, base_url, category_path):
         })
 
     # финальная пауза (как в других драйверах)
-    wait_s = 4 + random.uniform(1.0, 3.0)
+    wait_s = SETTINGS["final_pause_seconds"] + random.uniform(*SETTINGS["final_pause_range_seconds"])
     logger.info(f"AGUGAI: категория {category_path} обработана. Пауза {wait_s:.1f} сек.")
     time.sleep(wait_s)
 

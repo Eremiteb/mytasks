@@ -24,7 +24,7 @@ def _patch_sources(monkeypatch, module, sefon, lmusic):
     by_name = {"sefon.pro": sefon, "lmusic_kz": lmusic}
     monkeypatch.setattr(module.audio_search.time, "sleep", lambda _: None)
     monkeypatch.setattr(
-        module.audio_search, "_query_source", lambda session, source, query: by_name[source["name"]](session, query)
+        module.audio_search, "_query_source", lambda session, source, query, driver_settings=None: by_name[source["name"]](session, query)
     )
 
 # Страница в исходном виде: спан пуст, его наполняет Player.js из 1.txt.

@@ -28,7 +28,7 @@ def test_sources_come_from_config_in_order_and_skip_disabled(monkeypatch):
     ]
     asked = []
 
-    def query(session, source, text):
+    def query(session, source, text, driver_settings=None):
         asked.append(source["name"])
         if source["name"] == "first":
             return [], "https://first.test/s?q=x"
@@ -124,7 +124,7 @@ def test_strict_match_in_later_source_beats_relaxed_in_earlier(monkeypatch):
                "download_url": "https://b.test/2.mp3"}],
     }
     monkeypatch.setattr(
-        audio_search, "_query_source", lambda session, source, query: (found[source["name"]], f"{source['base_url']}/s")
+        audio_search, "_query_source", lambda session, source, query, driver_settings=None: (found[source["name"]], f"{source['base_url']}/s")
     )
     track = {"artist": "Keane", "title": "Somewhere Only We Know (Remastered 2024)", "_search_sources": sources}
     assert audio_search.find_audio(_reachable_session(), track, "Тест")["download_url"] == "https://b.test/2.mp3"
@@ -136,7 +136,7 @@ def test_fetch_candidate_skips_http_check_and_reaches_engine(monkeypatch):
     monkeypatch.setattr(audio_search.time, "sleep", lambda _: None)
     fetch = Mock()
     source = {"name": "ytm", "driver": "x", "base_url": "https://music.youtube.com", "search_path": "/search?q={query}"}
-    monkeypatch.setattr(audio_search, "_query_source", lambda session, src, query: (
+    monkeypatch.setattr(audio_search, "_query_source", lambda session, src, query, driver_settings=None: (
         [{"artist": "A", "title": "B", "download_url": "https://music.youtube.com/watch?v=1", "fetch": fetch}],
         "https://music.youtube.com/search?q=x",
     ))
@@ -206,7 +206,7 @@ def test_every_source_query_is_logged_even_when_empty(monkeypatch, caplog):
         {"name": "never", "driver": "x", "base_url": "https://n.test", "search_path": "/?q={query}"},
     ]
 
-    def query(session, source, text):
+    def query(session, source, text, driver_settings=None):
         if source["name"] == "broken":
             raise RuntimeError("503")
         if source["name"] == "empty":
@@ -230,7 +230,7 @@ def test_run_stats_accumulate_per_source_across_tracks(monkeypatch):
         {"name": "hit", "driver": "x", "base_url": "https://h.test", "search_path": "/?q={query}"},
     ]
 
-    def query(session, source, text):
+    def query(session, source, text, driver_settings=None):
         if source["name"] == "empty":
             return [], "https://e.test/s"
         return [{"artist": "A", "title": "B", "download_url": "https://h.test/b.mp3"}], "https://h.test/s"

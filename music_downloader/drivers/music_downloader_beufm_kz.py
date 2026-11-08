@@ -33,6 +33,13 @@ audio_search = _load_driver("music_downloader_audio_search")
 NOW_PLAYING_PATH = "1.txt"
 NO_CACHE_HEADERS = {"Cache-Control": "no-cache", "Pragma": "no-cache"}
 
+# Значения по умолчанию; переопределяются блоком drivers.music_downloader_beufm_kz в music_downloader.json.
+# Настройки рекордера эфира лежат отдельно, в sites[].recorder.
+SETTINGS = {
+    "connect_timeout_seconds": 5,
+    "read_timeout_seconds": 15,
+}
+
 
 def _site_root(base_url):
     """HTTPS-сертификат выдан только на `beufm.kz`: `https://www.beufm.kz` не проходит проверку."""
@@ -71,19 +78,23 @@ def _track_id(artist, title):
     return f"fm_{digest[:16]}"
 
 
+def _timeout():
+    return (SETTINGS["connect_timeout_seconds"], SETTINGS["read_timeout_seconds"])
+
+
 def get_tracks(session, base_url, category_path):
     """Возвращает текущий эфирный трек радио (0 или 1 запись); MP3 ищется позже в `resolve_track`."""
     root = _site_root(base_url)
     page_url = urljoin(root, category_path)
     try:
-        page = session.get(page_url, headers=NO_CACHE_HEADERS, timeout=(5, 15))
+        page = session.get(page_url, headers=NO_CACHE_HEADERS, timeout=_timeout())
         page.raise_for_status()
         parsed = parse_now_playing(page.text)
         source = page.url if isinstance(getattr(page, "url", None), str) else page_url
         if parsed is None:
             # Спан пуст — читаем источник, из которого его наполняет Player.js.
             now_url = urljoin(source, NOW_PLAYING_PATH)
-            now = session.get(now_url, headers=NO_CACHE_HEADERS, timeout=(5, 15))
+            now = session.get(now_url, headers=NO_CACHE_HEADERS, timeout=_timeout())
             now.raise_for_status()
             parsed = parse_now_playing(now.text)
             source = now_url

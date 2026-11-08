@@ -9,6 +9,14 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger("Engine")
 
+# Значения по умолчанию; переопределяются блоком drivers.music_downloader_lmu_kz в music_downloader.json.
+SETTINGS = {
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "track_timeout_seconds": 15,
+    "category_timeout_seconds": 30,
+    "final_pause_range_seconds": [2.0, 5.0],
+}
+
 # допускаем варианты:
 # /song/slug/232692
 # song/slug/232692
@@ -66,10 +74,10 @@ def _pick_artist_from_row(a_title, session=None, base_url=None, href=None):
             from urllib.parse import urljoin
             track_url = urljoin(base_url, href)
             headers = {
-                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                "User-Agent": SETTINGS["user_agent"],
                 "Referer": base_url,
             }
-            resp = session.get(track_url, timeout=15, headers=headers)
+            resp = session.get(track_url, timeout=SETTINGS["track_timeout_seconds"], headers=headers)
             if resp.status_code == 200:
                 track_soup = BeautifulSoup(resp.text, "html.parser")
                 # Ищем в og:title информацию
@@ -99,10 +107,10 @@ def _extract_title_artist_from_track_page(session, base_url, href, list_title=No
     try:
         track_url = urljoin(base_url, href)
         headers = {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "User-Agent": SETTINGS["user_agent"],
             "Referer": base_url,
         }
-        resp = session.get(track_url, timeout=15, headers=headers)
+        resp = session.get(track_url, timeout=SETTINGS["track_timeout_seconds"], headers=headers)
         if resp.status_code != 200:
             return None, None
     except Exception:
@@ -269,12 +277,12 @@ def get_tracks(session, base_url, category_path):
     """
     target_url = urljoin(base_url, category_path)
     headers = {
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "User-Agent": SETTINGS["user_agent"],
         "Referer": base_url,
     }
 
     try:
-        resp = session.get(target_url, timeout=30, headers=headers)
+        resp = session.get(target_url, timeout=SETTINGS["category_timeout_seconds"], headers=headers)
         resp.raise_for_status()
     except Exception as e:
         logger.error(f"LMU.KZ: failed to fetch category {category_path}: {e}")
@@ -331,7 +339,7 @@ def get_tracks(session, base_url, category_path):
             f"Anchors={len(anchors)}. Sample hrefs: {sample[:15]}"
         )
 
-    wait = random.uniform(2.0, 5.0)
+    wait = random.uniform(*SETTINGS["final_pause_range_seconds"])
     logger.info(f"LMU.KZ: {category_path} -> {len(tracks)} tracks. Pause {wait:.1f}s")
     time.sleep(wait)
     return tracks

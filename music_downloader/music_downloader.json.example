@@ -69,6 +69,94 @@
         ["Madi Syzdykov", "Мәди Сыздықов", "Мади Сыздыков", "Madi Syzdyq", "Madistation"]
     ],
 
+    "drivers": {
+        "music_downloader_agugai_kz": {
+            "timeout_seconds": 25,
+            "user_agent": "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0",
+            "accept_language": "ru-RU,ru;q=0.9,en-US;q=0.7,en;q=0.6",
+            "track_pause_range_seconds": [0.5, 1.3],
+            "final_pause_seconds": 4,
+            "final_pause_range_seconds": [1.0, 3.0]
+        },
+        "music_downloader_audio_search": {
+            "link_check_connect_timeout_seconds": 5,
+            "link_check_read_timeout_seconds": 15,
+            "query_pause_seconds": 1
+        },
+        "music_downloader_beufm_kz": {
+            "connect_timeout_seconds": 5,
+            "read_timeout_seconds": 15
+        },
+        "music_downloader_drivemusic": {
+            "connect_timeout_seconds": 5,
+            "read_timeout_seconds": 20
+        },
+        "music_downloader_hitmotop": {
+            "connect_timeout_seconds": 5,
+            "read_timeout_seconds": 20
+        },
+        "music_downloader_jamendo_com": {
+            "api_retry_delays_seconds": [1, 3, 5],
+            "api_timeout_seconds": 30,
+            "api_page_limit": 200,
+            "page_timeout_seconds": 30,
+            "user_agent": "Mozilla/5.0",
+            "final_pause_seconds": 1.0
+        },
+        "music_downloader_lmu_kz": {
+            "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "track_timeout_seconds": 15,
+            "category_timeout_seconds": 30,
+            "final_pause_range_seconds": [2.0, 5.0]
+        },
+        "music_downloader_lmusic_kz": {
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "warmup_timeout_seconds": 15,
+            "warmup_pause_range_seconds": [2, 5],
+            "category_timeout_seconds": 20,
+            "server_error_pause_range_seconds": [30, 60],
+            "final_pause_seconds": 8,
+            "final_pause_extra_range_seconds": [5, 15],
+            "search_connect_timeout_seconds": 5,
+            "search_read_timeout_seconds": 15
+        },
+        "music_downloader_muzofond": {
+            "connect_timeout_seconds": 5,
+            "read_timeout_seconds": 20
+        },
+        "music_downloader_mychords_net": {
+            "connect_timeout_seconds": 5,
+            "read_timeout_seconds": 20,
+            "player_pause_seconds": 1
+        },
+        "music_downloader_sefon_pro": {
+            "timeout_seconds": 15
+        },
+        "music_downloader_shazam": {
+            "chart_headers": {
+                "User-Agent": "Mozilla/5.0 (X11; Linux i686; rv:60.9) Gecko/20100101 Goanna/4.1 Firefox/60.9 PaleMoon/28.3.0",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+                "Accept-Encoding": "gzip, deflate"
+            },
+            "retry_delays_seconds": [15, 45, 90],
+            "connect_timeout_seconds": 5,
+            "read_timeout_seconds": 20
+        },
+        "music_downloader_tunes_kz": {
+            "user_agent": "Mozilla/5.0",
+            "track_timeout_seconds": 25,
+            "category_timeout_seconds": 30,
+            "track_pause_range_seconds": [1.0, 2.0]
+        },
+        "music_downloader_youtube_music": {
+            "max_candidates": 3,
+            "search_timeout_seconds": 60,
+            "download_timeout_seconds": 600,
+            "mp3_quality": "2"
+        }
+    },
+
     "sites": [
         {
             "site_name": "sefon.pro",

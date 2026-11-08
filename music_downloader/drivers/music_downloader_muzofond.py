@@ -29,9 +29,16 @@ def parse_search(html, page_url):
     return tracks
 
 
+# Значения по умолчанию; переопределяются блоком drivers.music_downloader_muzofond в music_downloader.json.
+SETTINGS = {
+    "connect_timeout_seconds": 5,
+    "read_timeout_seconds": 20,
+}
+
+
 def search_tracks(session, base_url, search_path):
     url = urljoin(base_url, search_path)
-    response = session.get(url, timeout=(5, 20))
+    response = session.get(url, timeout=(SETTINGS["connect_timeout_seconds"], SETTINGS["read_timeout_seconds"]))
     if response.status_code == 404:
         # Пустую выдачу Muzofond отдаёт как 404 — это «не найдено», а не сбой.
         return []
