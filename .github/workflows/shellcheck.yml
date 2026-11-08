@@ -25,10 +25,21 @@ jobs:
         # Пакет apt в Ubuntu (0.9.0 в noble) даёт известные ложные SC2317 на
         # функциях, вызываемых только через `trap` (исправлено в 0.11.0), —
         # поэтому ставим текущий стабильный релиз напрямую.
+        # Загрузка релиза с GitHub временами отвечает раннеру 504 (2026-11-08 —
+        # три попытки подряд): повторы curl, а при неудаче — та же версия из
+        # PyPI (shellcheck-py), у которого другой CDN.
         run: |
-          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/stable/shellcheck-stable.linux.x86_64.tar.xz" \
-            | tar -xJ
-          sudo install -m 755 shellcheck-stable/shellcheck /usr/local/bin/shellcheck
+          if curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 -o shellcheck.tar.xz \
+              "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz"; then
+            tar -xJf shellcheck.tar.xz
+            sudo install -m 755 shellcheck-v0.11.0/shellcheck /usr/local/bin/shellcheck
+          else
+            echo "::warning::релиз shellcheck на GitHub недоступен — ставлю shellcheck-py из PyPI"
+            # pipx предустановлен на раннерах; pip --user на них упирается в PEP 668
+            pipx install "shellcheck-py==0.11.0.1"
+            echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+            export PATH="${HOME}/.local/bin:${PATH}"
+          fi
           shellcheck --version
 
       - name: ShellCheck error level
