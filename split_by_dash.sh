@@ -1102,12 +1102,10 @@ move_created_dirs() {
 ###############################################################################
 # MAIN
 ###############################################################################
-# conf_get КЛЮЧ ПЕРЕМЕННАЯ: непустое значение КЛЮЧ=... из конфига переопределяет ПЕРЕМЕННУЮ
+# Печатает значение КЛЮЧ=... из конфига без пробелов по краям.
 conf_get() {
-  local _cg_val
   _cg_val=$(sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "${CONFIG_FILE}" | sed 's/#.*//' | tail -n1)
-  _cg_val=$(trim "${_cg_val}")
-  [ -z "${_cg_val}" ] || printf -v "$2" '%s' "${_cg_val}"
+  trim "${_cg_val}"
 }
 
 DEST_DIR=""
@@ -1117,13 +1115,13 @@ if [ -r "${CONFIG_FILE}" ]; then
   conf_official=$(sed -n 's/^[[:space:]]*OFFICIAL_NAMES[[:space:]]*=[[:space:]]*//p' "${CONFIG_FILE}" | sed 's/#.*//' | tail -n1)
   conf_official=$(trim "${conf_official}")
   [ -z "${conf_official}" ] || OFFICIAL_NAMES="${conf_official}"
-  conf_get OFFICIAL_API OFFICIAL_API
-  conf_get OFFICIAL_UA OFFICIAL_UA
-  conf_get OFFICIAL_CACHE OFFICIAL_CACHE
-  conf_get OFFICIAL_TIMEOUT OFFICIAL_TIMEOUT
-  conf_get OFFICIAL_DELAY OFFICIAL_DELAY
-  conf_get OFFICIAL_MIN_SCORE OFFICIAL_MIN_SCORE
-  conf_get OFFICIAL_MAX_TRIES OFFICIAL_MAX_TRIES
+  conf_value=$(conf_get OFFICIAL_API); [ -z "${conf_value}" ] || OFFICIAL_API="${conf_value}"
+  conf_value=$(conf_get OFFICIAL_UA); [ -z "${conf_value}" ] || OFFICIAL_UA="${conf_value}"
+  conf_value=$(conf_get OFFICIAL_CACHE); [ -z "${conf_value}" ] || OFFICIAL_CACHE="${conf_value}"
+  conf_value=$(conf_get OFFICIAL_TIMEOUT); [ -z "${conf_value}" ] || OFFICIAL_TIMEOUT="${conf_value}"
+  conf_value=$(conf_get OFFICIAL_DELAY); [ -z "${conf_value}" ] || OFFICIAL_DELAY="${conf_value}"
+  conf_value=$(conf_get OFFICIAL_MIN_SCORE); [ -z "${conf_value}" ] || OFFICIAL_MIN_SCORE="${conf_value}"
+  conf_value=$(conf_get OFFICIAL_MAX_TRIES); [ -z "${conf_value}" ] || OFFICIAL_MAX_TRIES="${conf_value}"
 fi
 
 # При явно указанном каталоге DEST_DIR из конфига не применяется (иначе проход слияния и

@@ -149,29 +149,47 @@ owner_candidates() {
             printf '%s\0' "${file}"
         fi
     done
-    find "${db_dir}" -maxdepth 1 -type f -name "${db_base}.bak-v*" -print0 2>/dev/null
-    find "${LOG_DIR}" -maxdepth 1 -type f -name "${SCRIPT_BASE}-*.jsonl" -print0 2>/dev/null
-    find "${REPORT_DIR}" -maxdepth 1 -type f -name "${SCRIPT_BASE}-*.html" -print0 2>/dev/null
+    if [[ -e "${db_dir}" || -L "${db_dir}" ]]; then
+        find "${db_dir}" -maxdepth 1 -type f -name "${db_base}.bak-v*" -print0 || return 1
+    fi
+    if [[ -e "${LOG_DIR}" || -L "${LOG_DIR}" ]]; then
+        find "${LOG_DIR}" -maxdepth 1 -type f -name "${SCRIPT_BASE}-*.jsonl" -print0 || return 1
+    fi
+    if [[ -e "${REPORT_DIR}" || -L "${REPORT_DIR}" ]]; then
+        find "${REPORT_DIR}" -maxdepth 1 -type f -name "${SCRIPT_BASE}-*.html" -print0 || return 1
+    fi
 }
 
 # Приводит к FILE_OWNER уже существующие файлы скрипта (однократная починка прошлых запусков).
 fix_existing_owner() {
-    local file
+    local file candidates_file
     ((RUN_EUID == 0)) || return 0
+    candidates_file="$(mktemp)" || return 1
+    if ! owner_candidates > "${candidates_file}"; then
+        rm -f -- "${candidates_file}"
+        return 1
+    fi
     while IFS= read -r -d '' file; do
         fix_owner "${file}"
-    done < <(owner_candidates)
+    done < "${candidates_file}"
+    rm -f -- "${candidates_file}"
 }
 
 # Для --dry-run: сколько файлов получит другого владельца (только чтение).
 count_owner_changes() {
-    local file count=0
+    local file count=0 candidates_file
     if ((RUN_EUID == 0)) && [[ -n "${FILE_OWNER}" ]]; then
+        candidates_file="$(mktemp)" || return 1
+        if ! owner_candidates > "${candidates_file}"; then
+            rm -f -- "${candidates_file}"
+            return 1
+        fi
         while IFS= read -r -d '' file; do
             if owner_differs "${file}"; then
                 count=$((count + 1))
             fi
-        done < <(owner_candidates)
+        done < "${candidates_file}"
+        rm -f -- "${candidates_file}"
     fi
     echo "${count}"
 }
@@ -1600,7 +1618,11 @@ if ((DRY_RUN == 0)); then
         cleanup_logs
         exit 2
     fi
-    fix_existing_owner
+    if ! fix_existing_owner; then
+        echo "Ошибка: не удалось перечислить файлы для исправления владельца" >&2
+        cleanup_logs
+        exit 2
+    fi
 else
     plan_db_migration
 fi
@@ -1641,7 +1663,11 @@ REPORT_FILE="${REPORT_DIR}/${SCRIPT_BASE}-${TIMESTAMP}.html"
 if ((DRY_RUN)); then
     echo "[dry-run] будет: сформирован HTML-отчёт ${REPORT_FILE} и обновлён ${REPORT_DIR}/latest.html"
     if ((RUN_EUID == 0)) && [[ -n "${FILE_OWNER}" ]]; then
-        OWNER_CHANGES="$(count_owner_changes)"
+        if ! OWNER_CHANGES="$(count_owner_changes)"; then
+            echo "Ошибка: не удалось перечислить файлы для плана смены владельца" >&2
+            cleanup_logs
+            exit 2
+        fi
         echo "[dry-run] будет: сменить владельца на ${FILE_OWNER}: ${OWNER_CHANGES} файлов"
     fi
     echo "[dry-run] будет: уведомление, если в отчёте окажутся объекты в критическом состоянии"

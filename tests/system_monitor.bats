@@ -729,6 +729,7 @@ seed_own_files() {
 @test "FILE_OWNER: --dry-run печатает план и не вызывает chown" {
   make_chown_stub
   seed_own_files
+  rm -rf "$TMP_DIR/system_reports"
   printf 'FILE_OWNER="nobodyx:nogroupx"\n' > "$TMP_DIR/conf/system_monitor.conf"
 
   run env PATH="$STUB_DIR:$PATH" SYSTEM_MONITOR_EUID=0 bash "$TMP_DIR/system_monitor.sh" --dry-run
