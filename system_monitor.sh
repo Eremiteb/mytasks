@@ -124,6 +124,7 @@ owner_differs() {
 # (иначе ссылка могла бы увести chown на чужой файл). Ошибка chown — только WARN.
 fix_owner() {
     local path
+    ((DRY_RUN == 0)) || return 0
     ((RUN_EUID == 0)) || return 0
     [[ -n "${FILE_OWNER}" ]] || return 0
     for path in "$@"; do
