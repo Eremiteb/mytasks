@@ -850,6 +850,138 @@ sanitize_names() {
   rm -f -- "${fix_list}" "${group_file}"
 }
 
+# Значение тега key (artist, album_artist, title) из вывода ffprobe «TAG:ключ=значение»
+# (ключ без учёта регистра); печатает первое найденное значение без пробелов по краям.
+tag_field() {
+  awk -v tags="$1" -v k="tag:$2" 'BEGIN {
+    n = split(tags, L, "\n")
+    for (i = 1; i <= n; i++) {
+      p = index(L[i], "=")
+      if (p > 0 && tolower(substr(L[i], 1, p - 1)) == k) {
+        v = substr(L[i], p + 1)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+        print v
+        exit
+      }
+    }
+  }'
+}
+
+# Ключ сравнения: кириллица (в т.ч. казахская) транслитерируется в латиницу (оба
+# регистра заданы явно), затем нижний регистр, остаются только [a-z0-9], y -> i.
+translit_key() {
+  printf '%s' "$1" | LC_ALL=C.UTF-8 awk 'BEGIN {
+    n = split("а б в г д е ё ж з и й к л м н о п р с т у ф х ц ч ш щ ъ ы ь э ю я ә ғ қ ң ө ұ ү һ і", lo, " ")
+    split("А Б В Г Д Е Ё Ж З И Й К Л М Н О П Р С Т У Ф Х Ц Ч Ш Щ Ъ Ы Ь Э Ю Я Ә Ғ Қ Ң Ө Ұ Ү Һ І", up, " ")
+    split("a b v g d e e zh z i i k l m n o p r s t u f h ts ch sh sch - y - e yu ya a g q n o u u h i", la, " ")
+    for (i = 1; i <= n; i++) { v = (la[i] == "-") ? "" : la[i]; M[lo[i]] = v; M[up[i]] = v }
+  }
+  { out = ""
+    for (i = 1; i <= length($0); i++) { c = substr($0, i, 1); out = out ((c in M) ? M[c] : c) }
+    out = tolower(out); gsub(/[^a-z0-9]/, "", out); gsub(/y/, "i", out); printf "%s", out }'
+}
+
+# Печатает «1», если первое слово текста text (ключ, первые до 3 символов) является
+# началом ключа fk (основа старого имени файла); иначе ничего. Пустой ключ — не совпадает.
+tag_matches_name() {
+  _tm_word="${2%% *}"
+  _tm_k=$(translit_key "${_tm_word}")
+  [ -z "${_tm_k}" ] && return 0
+  case "${_tm_k}" in
+    ???*) _tm_p="${_tm_k%"${_tm_k#???}"}" ;;
+    *) _tm_p="${_tm_k}" ;;
+  esac
+  case "$1" in
+    "${_tm_p}"*) printf '1' ;;
+    *) ;;
+  esac
+}
+
+# Для файла без « - » в имени печатает новое имя «Исполнитель - Название.расширение»
+# по тегам ffprobe: исполнитель — artist (если пуст — album_artist), название — title
+# (если пусто — основа исходного имени). Теги сверяются со старым именем (ключи через
+# translit_key): artist совпал — как есть; совпал только title — они меняются местами
+# (событие tags_swapped); не совпало ничего — пропуск. Печатает имя либо строку
+# «SKIP:причина:подробности» (no_artist, tag_mismatch, artist_dash); без ffprobe — ничего.
+name_from_tags() {
+  command -v ffprobe >/dev/null 2>&1 || return 0
+  if ! _nt_tags=$(ffprobe -v error -show_entries format_tags=artist,album_artist,title -of default=nw=1 "$1" 2>/dev/null); then
+    return 0
+  fi
+  _nt_artist=$(tag_field "${_nt_tags}" "artist")
+  [ -z "${_nt_artist}" ] && _nt_artist=$(tag_field "${_nt_tags}" "album_artist")
+  if [ -z "${_nt_artist}" ]; then
+    printf 'SKIP:no_artist:%s\n' "$1"
+    return 0
+  fi
+  _nt_title=$(tag_field "${_nt_tags}" "title")
+  _nt_old=$(basename -- "$1")
+  case "${_nt_old}" in
+    *.*)
+      _nt_ext=".${_nt_old##*.}"
+      _nt_base="${_nt_old%.*}"
+      ;;
+    *)
+      _nt_ext=""
+      _nt_base="${_nt_old}"
+      ;;
+  esac
+  _nt_fk=$(translit_key "${_nt_base}")
+  _nt_swapped=""
+  # Совпадение — непустой вывод tag_matches_name (не код возврата: функция в
+  # условии if отключает set -e, SC2310)
+  _nt_am=$(tag_matches_name "${_nt_fk}" "${_nt_artist}")
+  _nt_tm=""
+  [ -n "${_nt_title}" ] && _nt_tm=$(tag_matches_name "${_nt_fk}" "${_nt_title}")
+  if [ -z "${_nt_am}" ]; then
+    if [ -n "${_nt_tm}" ]; then
+      _nt_swapped="старое имя ${_nt_old}: artist=${_nt_artist} title=${_nt_title}"
+      _nt_swap="${_nt_artist}"
+      _nt_artist="${_nt_title}"
+      _nt_title="${_nt_swap}"
+    else
+      printf 'SKIP:tag_mismatch:%s: artist=%s title=%s\n' "$1" "${_nt_artist}" "${_nt_title}"
+      return 0
+    fi
+  fi
+  case "${_nt_artist}" in
+    *" - "*|*" – "*|*" — "*)
+      printf 'SKIP:artist_dash:%s: artist=%s title=%s\n' "$1" "${_nt_artist}" "${_nt_title}"
+      return 0
+      ;;
+    *) ;;
+  esac
+  # Перестановку пишем в лог только для файла, который действительно переименуется
+  [ -n "${_nt_swapped}" ] && log_json "INFO" "tags_swapped" "Теги исполнителя и названия переставлены по старому имени файла" "${_nt_swapped}"
+  [ -z "${_nt_title}" ] && _nt_title="${_nt_base}"
+  # «/» в тегах недопустим в имени файла
+  _nt_artist=$(printf '%s' "${_nt_artist}" | tr '/' '_')
+  _nt_title=$(printf '%s' "${_nt_title}" | tr '/' '_')
+  _nt_artist=$(win_safe_name "${_nt_artist}")
+  if [ -z "${_nt_artist}" ]; then
+    printf 'SKIP:no_artist:%s\n' "$1"
+    return 0
+  fi
+  win_safe_name "${_nt_artist} - ${_nt_title}${_nt_ext}"
+}
+
+# Свободное имя для переименования по тегам: проверяются каталог dir и папка
+# исполнителя dir/folder; при занятом имени суффикс « (2)», « (3)» … ставится перед
+# расширением.
+tag_free_name() {
+  _tf_cand="$3"
+  case "$3" in
+    *.*) _tf_stem="${3%.*}"; _tf_ext=".${3##*.}" ;;
+    *) _tf_stem="$3"; _tf_ext="" ;;
+  esac
+  _tf_i=2
+  while [ -e "$1/${_tf_cand}" ] || [ -e "$1/$2/${_tf_cand}" ]; do
+    _tf_cand="${_tf_stem} (${_tf_i})${_tf_ext}"
+    _tf_i=$((_tf_i+1))
+  done
+  printf '%s\n' "${_tf_cand}"
+}
+
 process_directory() {
   current_dir="$1"
   if [ ! -d "${current_dir}" ]; then
@@ -861,7 +993,46 @@ process_directory() {
   find "${current_dir}" -maxdepth 1 -type f | while IFS= read -r file; do
     name=$(basename -- "${file}")
     folder_raw=$(printf '%s\n' "${name}" | sed -n 's/^\(.*\)[[:space:]][-–—][[:space:]].*/\1/p' | sed 's/[[:space:]]*$//' | sed -n '1p')
-    [ -z "${folder_raw}" ] && continue
+    if [ -z "${folder_raw}" ]; then
+      # Нет « - » в имени: исполнитель и название берём из тегов (ffprobe)
+      tag_name=$(name_from_tags "${file}")
+      case "${tag_name}" in
+        SKIP:*)
+          tag_reason="${tag_name#SKIP:}"
+          tag_detail="${tag_reason#*:}"
+          tag_reason="${tag_reason%%:*}"
+          case "${tag_reason}" in
+            tag_mismatch) log_json "WARN" "skip_tag_mismatch" "Теги не совпадают со старым именем файла, файл пропущен" "${tag_detail}" ;;
+            artist_dash) log_json "WARN" "skip_artist_dash" "Исполнитель в тегах содержит « - », файл пропущен" "${tag_detail}" ;;
+            *) log_json "WARN" "skip_no_artist" "Нет « - » в имени и нет тега исполнителя, файл пропущен" "${tag_detail}" ;;
+          esac
+          continue
+          ;;
+        "")
+          log_json "WARN" "skip_no_artist" "Нет « - » в имени и нет тега исполнителя, файл пропущен" "${file}"
+          continue
+          ;;
+        *) ;;
+      esac
+      tag_folder_raw=$(printf '%s\n' "${tag_name}" | sed -n 's/^\(.*\)[[:space:]][-–—][[:space:]].*/\1/p' | sed 's/[[:space:]]*$//' | sed -n '1p')
+      tag_folder_safe=$(win_safe_name "${tag_folder_raw}")
+      tag_folder=$(folder_name "${tag_folder_safe}")
+      if [ -n "${tag_folder}" ] && [ -f "${current_dir}/${tag_folder}/${tag_name}" ] && cmp -s -- "${file}" "${current_dir}/${tag_folder}/${tag_name}"; then
+        log_json "WARN" "skip_duplicate" "Файл с таким именем по тегам уже есть и совпадает по содержимому, исходник оставлен" "${file} == ${current_dir}/${tag_folder}/${tag_name}"
+        continue
+      fi
+      tag_free=$(tag_free_name "${current_dir}" "${tag_folder}" "${tag_name}")
+      # В dry-run файл не трогаем: дальше план строится для нового имени
+      if [ "${DRY_RUN}" -eq 1 ] || mv -f -- "${file}" "${current_dir}/${tag_free}"; then
+        log_action "INFO" "renamed_by_tag" "Файл переименован по тегам" "${name} -> ${tag_free}"
+        file="${current_dir}/${tag_free}"
+        name="${tag_free}"
+      else
+        continue
+      fi
+      folder_raw=$(printf '%s\n' "${name}" | sed -n 's/^\(.*\)[[:space:]][-–—][[:space:]].*/\1/p' | sed 's/[[:space:]]*$//' | sed -n '1p')
+      [ -z "${folder_raw}" ] && continue
+    fi
     # Имена приводятся к допустимым в Windows: в имени папки («Автор.»), в части
     # «Автор» внутри имени файла и во всём имени файла («песня.mp3.»)
     folder_full=$(win_safe_name "${folder_raw}")

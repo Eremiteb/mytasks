@@ -818,3 +818,141 @@ STUB
   [ -f "$TMP_DIR/music/Группировка/c.mp3" ]
   [ -f "$TMP_DIR/music/Official/d.mp3" ]
 }
+
+# Файлы без « - » в имени: исполнитель и название берутся из тегов ffprobe.
+# Заглушка печатает содержимое файла (строки «TAG:ключ=значение») и пишет вызовы в calls.log
+make_ffprobe_tag_stub() {
+  mkdir -p "$TMP_DIR/stubs"
+  printf '#!/usr/bin/env bash\necho "$*" >> "%s/calls.log"\ncat "${!#}"\n' "$TMP_DIR" > "$TMP_DIR/stubs/ffprobe"
+  chmod +x "$TMP_DIR/stubs/ffprobe"
+}
+
+@test "file without dash is renamed by tags and moved into artist directory" {
+  make_ffprobe_tag_stub
+  mkdir -p "$TMP_DIR/music"
+  printf 'TAG:artist=Aerosmith\nTAG:title=Dream On (Original)\n' > "$TMP_DIR/music/aerosmith-dream-on-original.mp3"
+
+  run env PATH="$TMP_DIR/stubs:$PATH" bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ ! -e "$TMP_DIR/music/aerosmith-dream-on-original.mp3" ]
+  [ -f "$TMP_DIR/music/Aerosmith/Aerosmith - Dream On (Original).mp3" ]
+  grep -q '"event":"renamed_by_tag"' "$MYTASKS_LOG_DIR"/split_by_dash-*.jsonl
+}
+
+@test "tag rename dry-run changes nothing and prints the plan" {
+  make_ffprobe_tag_stub
+  mkdir -p "$TMP_DIR/music"
+  printf 'TAG:artist=Aerosmith\nTAG:title=Dream On\n' > "$TMP_DIR/music/aerosmith-dream-on.mp3"
+
+  run env PATH="$TMP_DIR/stubs:$PATH" bash "$TMP_DIR/split_by_dash.sh" --dry-run "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"[dry-run] будет: Файл переименован по тегам: aerosmith-dream-on.mp3 -> Aerosmith - Dream On.mp3"* ]]
+  [[ "$output" == *"Aerosmith/Aerosmith - Dream On.mp3"* ]]
+  [ -f "$TMP_DIR/music/aerosmith-dream-on.mp3" ]
+  [ ! -e "$TMP_DIR/music/Aerosmith" ]
+  grep -q '"event":"dry_renamed_by_tag"' "$MYTASKS_LOG_DIR"/split_by_dash-*.jsonl
+}
+
+@test "file without dash and without artist tag stays and logs skip_no_artist" {
+  make_ffprobe_tag_stub
+  mkdir -p "$TMP_DIR/music"
+  printf 'TAG:title=Only Title\n' > "$TMP_DIR/music/nodash.mp3"
+
+  run env PATH="$TMP_DIR/stubs:$PATH" bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/nodash.mp3" ]
+  grep -q '"event":"skip_no_artist"' "$MYTASKS_LOG_DIR"/split_by_dash-*.jsonl
+}
+
+@test "file with dash is split by name and ffprobe is not called" {
+  make_ffprobe_tag_stub
+  mkdir -p "$TMP_DIR/music"
+  printf 'TAG:artist=Other\n' > "$TMP_DIR/music/Artist - Song.mp3"
+
+  run env PATH="$TMP_DIR/stubs:$PATH" bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/Artist/Artist - Song.mp3" ]
+  [ ! -e "$TMP_DIR/calls.log" ]
+}
+
+# Сверка тегов со старым именем файла: перестановка, пропуски, конфликты имён.
+@test "tags swapped when only title matches old file name" {
+  make_ffprobe_tag_stub
+  mkdir -p "$TMP_DIR/music"
+  printf 'TAG:artist=Все Пацаны Изменяют\nTAG:title=Остап Парфенов\n' > "$TMP_DIR/music/ostap-parfenov-vse-pacany-izmenjajut.mp3"
+
+  run env PATH="$TMP_DIR/stubs:$PATH" bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/Остап Парфенов/Остап Парфенов - Все Пацаны Изменяют.mp3" ]
+  grep -q '"event":"tags_swapped"' "$MYTASKS_LOG_DIR"/split_by_dash-*.jsonl
+}
+
+@test "tags matching neither artist nor title log skip_tag_mismatch" {
+  make_ffprobe_tag_stub
+  mkdir -p "$TMP_DIR/music"
+  printf 'TAG:artist=Touch It (TikTok Remix)\nTAG:title=Dj Viral TikToker\n' > "$TMP_DIR/music/busta-rhymes-touch-it-dj-viral-tiktok-remix.mp3"
+
+  run env PATH="$TMP_DIR/stubs:$PATH" bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/busta-rhymes-touch-it-dj-viral-tiktok-remix.mp3" ]
+  grep -q '"event":"skip_tag_mismatch"' "$MYTASKS_LOG_DIR"/split_by_dash-*.jsonl
+}
+
+@test "artist with dash after swap logs skip_artist_dash" {
+  make_ffprobe_tag_stub
+  mkdir -p "$TMP_DIR/music"
+  printf 'TAG:artist=ГОСТ ENTERTAINMENT\nTAG:title=ИРИНА КАЙРАТОВНА x FREEFIRE - МАЙК, КРОССОВКИ [MV]\n' > "$TMP_DIR/music/Irina-kairatovna-x-freefire-maik-krossovki.mp3"
+
+  run env PATH="$TMP_DIR/stubs:$PATH" bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/Irina-kairatovna-x-freefire-maik-krossovki.mp3" ]
+  grep -q '"event":"skip_artist_dash"' "$MYTASKS_LOG_DIR"/split_by_dash-*.jsonl
+}
+
+@test "cyrillic tag matches latin file name" {
+  make_ffprobe_tag_stub
+  mkdir -p "$TMP_DIR/music"
+  printf 'TAG:artist=Скриптонит, Райда\nTAG:title=Song\n' > "$TMP_DIR/music/Skriptonit_Rajda_Song.mp3"
+
+  run env PATH="$TMP_DIR/stubs:$PATH" bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/Скриптонит, Райда/Скриптонит, Райда - Song.mp3" ]
+  ! grep -q '"event":"tags_swapped"' "$MYTASKS_LOG_DIR"/split_by_dash-*.jsonl
+}
+
+@test "tag rename name conflict gets suffix before extension" {
+  make_ffprobe_tag_stub
+  mkdir -p "$TMP_DIR/music"
+  printf 'TAG:artist=Captown, Landau\nTAG:title=Gangsta Party\n' > "$TMP_DIR/music/captown-landau-gangsta-party.mp3"
+  printf 'TAG:artist=Captown, Landau\nTAG:title=Gangsta Party\nextra\n' > "$TMP_DIR/music/captown-landau-gangsta-party-mp3.mp3"
+
+  run env PATH="$TMP_DIR/stubs:$PATH" bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  d="$TMP_DIR/music/Captown, Landau"
+  [ -f "$d/Captown, Landau - Gangsta Party.mp3" ]
+  [ -f "$d/Captown, Landau - Gangsta Party (2).mp3" ]
+  ! ls "$d" | grep -q '\.mp3\.[0-9]'
+}
+
+@test "identical file with same tag name is kept as skip_duplicate" {
+  make_ffprobe_tag_stub
+  mkdir -p "$TMP_DIR/music"
+  printf 'TAG:artist=Captown, Landau\nTAG:title=Gangsta Party\n' > "$TMP_DIR/music/captown-landau-gangsta-party.mp3"
+  printf 'TAG:artist=Captown, Landau\nTAG:title=Gangsta Party\n' > "$TMP_DIR/music/captown-landau-gangsta-party-mp3.mp3"
+
+  run env PATH="$TMP_DIR/stubs:$PATH" bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/Captown, Landau/Captown, Landau - Gangsta Party.mp3" ]
+  [ "$(find "$TMP_DIR/music" -maxdepth 1 -type f | wc -l)" -eq 1 ]
+  grep -q '"event":"skip_duplicate"' "$MYTASKS_LOG_DIR"/split_by_dash-*.jsonl
+}
