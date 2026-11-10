@@ -394,7 +394,7 @@ mb_ids() {
     return 0
   fi
   _mi_found=$(printf '%s' "${_mi_resp}" \
-    | jq -r --argjson ms "${OFFICIAL_MIN_SCORE}" '.artists[]? | select(.score >= $ms) | [.id, .name, ([.aliases[]?.name] | join("\u0001"))] | @tsv' 2>/dev/null \
+    | OFFICIAL_MIN_SCORE="${OFFICIAL_MIN_SCORE}" jq -r '.artists[]? | select(.score >= (env.OFFICIAL_MIN_SCORE | tonumber)) | [.id, .name, ([.aliases[]?.name] | join("\u0001"))] | @tsv' 2>/dev/null \
     | LC_ALL=C.UTF-8 awk -F'\t' -v n="$1" 'BEGIN { w = tolower(n) } { ok = (tolower($2) == w); m = split($3, a, "\001"); for (i = 1; i <= m; i++) if (tolower(a[i]) == w) ok = 1; if (ok) print $1 "\t" $2 }' || true)
   mkdir -p "$(dirname -- "${_mi_cache}")"
   if [ -n "${_mi_found}" ]; then
@@ -688,7 +688,7 @@ official_name() {
       log_json "WARN" "official_lookup_failed" "Не удалось запросить официальное имя" "${_on_query}"
       return 0
     fi
-    _on_names=$(printf '%s' "${_on_resp}" | jq -r --argjson ms "${OFFICIAL_MIN_SCORE}" '.artists[]? | select(.score >= $ms) | .name' 2>/dev/null || true)
+    _on_names=$(printf '%s' "${_on_resp}" | OFFICIAL_MIN_SCORE="${OFFICIAL_MIN_SCORE}" jq -r '.artists[]? | select(.score >= (env.OFFICIAL_MIN_SCORE | tonumber)) | .name' 2>/dev/null || true)
     while IFS= read -r _on_name; do
       [ -n "${_on_name}" ] || continue
       _on_name_key=$(name_key "${_on_name}")

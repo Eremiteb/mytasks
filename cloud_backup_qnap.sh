@@ -1093,11 +1093,11 @@ if [[ "${OPTIMIZE_MARIADB_BEFORE_BACKUP}" -eq 1 && "${DB_OPTIMIZE_DUE}" -eq 1 ]]
       -e PURGE_BINLOGS='${MARIADB_PURGE_BINLOGS}' \
       -e TRUNCATE_GENERAL_LOG='${MARIADB_TRUNCATE_GENERAL_LOG}' \
       '${MARIADB_SERVICE_NAME}' sh -lc 'set -e; \
-        mariadb-check -uroot -p\"\$MARIADB_ROOT_PASSWORD\" --optimize --skip-write-binlog --all-databases --skip-database=information_schema --skip-database=performance_schema --skip-database=mysql --skip-database=sys; \
-        if [ \"\$PURGE_BINLOGS\" = \"1\" ]; then \
-          mariadb -uroot -p\"\$MARIADB_ROOT_PASSWORD\" -e \"PURGE BINARY LOGS BEFORE NOW();\"; \
+        mariadb-check -uroot -p\"\${MARIADB_ROOT_PASSWORD}\" --optimize --skip-write-binlog --all-databases --skip-database=information_schema --skip-database=performance_schema --skip-database=mysql --skip-database=sys; \
+        if [ \"\${PURGE_BINLOGS}\" = \"1\" ]; then \
+          mariadb -uroot -p\"\${MARIADB_ROOT_PASSWORD}\" -e \"PURGE BINARY LOGS BEFORE NOW();\"; \
         fi; \
-        if [ \"\$TRUNCATE_GENERAL_LOG\" = \"1\" ]; then \
+        if [ \"\${TRUNCATE_GENERAL_LOG}\" = \"1\" ]; then \
           : > /var/lib/mysql/general.log || true; \
         fi'" 2>&1)
   mariadb_opt_rc=$?
