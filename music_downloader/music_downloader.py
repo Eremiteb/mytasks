@@ -15,16 +15,6 @@ from pathlib import Path
 
 import cloudscraper
 from mutagen.id3 import COMM, ID3, ID3NoHeaderError, TextFrame, UrlFrame
-from requests.adapters import HTTPAdapter
-from urllib3.util.ssl_ import create_urllib3_context
-
-
-class SSLAdapter(HTTPAdapter):
-    def init_poolmanager(self, *args, **kwargs):
-        context = create_urllib3_context()
-        context.set_ciphers("DEFAULT@SECLEVEL=1")
-        kwargs["ssl_context"] = context
-        return super().init_poolmanager(*args, **kwargs)
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1106,7 +1096,9 @@ def run():
     scraper = cloudscraper.create_scraper(
         browser={"browser": "chrome", "platform": "windows", "desktop": True}
     )
-    scraper.mount("https://", SSLAdapter())
+    # TLS — штатный CipherSuiteAdapter cloudscraper (проверка сертификата и имени,
+    # уровень безопасности OpenSSL по умолчанию). Свой адаптер с SECLEVEL=1 снят
+    # 2026-11-12: все хосты драйверов проходят рукопожатие без ослабления.
     logger.info("Scraper инициализирован")
 
     # Очистка старых логов

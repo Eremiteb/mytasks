@@ -182,6 +182,8 @@ class TestMusicDownloader(unittest.TestCase):
                 music_downloader.run()
 
             check.assert_called_once_with(paths, "system")
+            # TLS не ослабляется: штатный адаптер cloudscraper не подменяется
+            scraper.mount.assert_not_called()
             self.assertEqual(scraper.get.call_count, 2)
             for folder in paths:
                 for title, body in bodies.items():
