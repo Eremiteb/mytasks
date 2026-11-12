@@ -1,0 +1,32 @@
+[Unit]
+Description=Квитанции ЖКУ: письма из почты → разбор PDF → база SQLite (utility_bills.sh)
+Documentation=file://@MYTASKS_DIR@/utility_bills/README.md
+# Повторы при сбое (см. Restart=): не больше 4 запусков за 2 часа.
+StartLimitIntervalSec=2h
+StartLimitBurst=4
+
+[Service]
+Type=oneshot
+ExecStart=@MYTASKS_DIR@/utility_bills.sh
+# Persistent=true запускает пропущенный запуск сразу после загрузки, когда сеть (VPN до почтового
+# сервера) может быть ещё не поднята: при сбое — повтор через 15 минут. Ошибка конфигурации (2) и
+# параллельный запуск (3) повтором не лечатся.
+Restart=on-failure
+RestartSec=15min
+RestartPreventExitStatus=2 3
+# Зависший OCR или IMAP не держит юнит бесконечно (обычный запуск — минуты).
+TimeoutStartSec=2h
+
+# Ограничения: квитанции и пароль IMAP — персональные данные и секрет (права файлов задаёт umask обёртки).
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# Запись — только в каталог проекта (БД, блокировка) и логи; PDF разбирается во временном каталоге
+# (PrivateTmp). Если в utility_bills.json db_path вынесен за пределы проекта, добавить его сюда.
+ReadWritePaths=@MYTASKS_DIR@/utility_bills @MYTASKS_DIR@/logs
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native

@@ -1,0 +1,37 @@
+{
+  "_comment": "Скопируйте в utility_bills.json; search.from — массив email отправителей квитанций (письма отбираются только по ним) (файл не попадает в Git). Пароль: поле imap.password (файл с правами 600); если оно заполнено, переменная UTILITY_BILLS_IMAP_PASSWORD игнорируется, если пустое — берётся из неё; для Gmail/Yandex/Mail.ru нужен пароль приложения. Описание всех ключей — README.md.",
+  "imap": {
+    "host": "imap.example.kz",
+    "port": 993,
+    "security": "ssl",
+    "username": "user@example.kz",
+    "password": "",
+    "password_env": "UTILITY_BILLS_IMAP_PASSWORD",
+    "folder": "INBOX",
+    "timeout_seconds": 60
+  },
+  "search": {
+    "from": [
+      "noreply@example.kz"
+    ],
+    "attachment_glob": "*.pdf",
+    "max_attachment_mb": 20
+  },
+  "db_path": "utility_bills.db",
+  "ocr": {
+    "languages": "rus+kaz+eng",
+    "cell_scales": [
+      2,
+      1,
+      3
+    ],
+    "workers": 8,
+    "timeout_seconds": 60,
+    "tier_bounds": [
+      70,
+      140
+    ],
+    "tier_bounds_per_resident": true,
+    "tier_residents_default": 2
+  }
+}

@@ -47,6 +47,7 @@ mytasks не нужен; оставшиеся от прежней установ
 - `llamactl.conf.example`;
 - `log_template.conf.example`;
 - `music_downloader.conf.example`;
+- `utility_bills.conf.example`;
 - `sources.conf.example`;
 - `split_by_dash.conf.example`, `split_by_dash.keep.conf.example`;
 - `system_monitor.conf.example`.
@@ -449,7 +450,7 @@ journalctl --user -u check-backups.service -n 20
 2. **Обязательно обновляет систему** штатной командой своего семейства (столбец «Обновление системы»; одно повышение прав) — до любых изменений. Если обновление не удалось или для ОС не поддерживается, пакеты в этом запуске не ставятся (в rolling-дистрибутивах установка без обновления — неподдерживаемое частичное обновление), остальные проверки идут. После обновления ядра или при флаге `/run/reboot-required` скрипт напоминает о перезагрузке. В режимах `--status`, `--no-create` и без терминала/окон без `--yes` обновление не выполняется; `GARUDA_UPDATE="no"` — на Garuda чистый `pacman -Syu` вместо `garuda-update`.
 3. Затем прописывает себя в автозагрузку: user-юнит `check-mytasks.service` при входе в графический сеанс запускает `check_mytasks.sh --no-create --notify` (таблица в журнале и уведомление о проблемах).
 4. Записывает каталог mytasks — каталог, откуда запущен скрипт, — в `conf/check_mytasks.conf` (`MYTASKS_DIR`). Если репозиторий перенесён и каталог в конфиге другой, предупреждает и предлагает обновить его, а затем и все юниты.
-5. При первом запуске (нет `conf/check_mytasks.conf`) проводит мастер всех отсутствующих конфигов по `conf/*.conf.example` и `music_downloader/*.json.example` (кроме `cloud_backup_qnap.conf`): окна `zenity` (без него — `kdialog`), без графики — вопросы в терминале. Описание каждого значения берётся из комментариев примера, значения по умолчанию — из примера с подстановкой `@MYTASKS_DIR@`/`@HOME@`. Строки примера без изменений копируются как есть (`${HOME}` и т.п. сохраняются).
+5. При первом запуске (нет `conf/check_mytasks.conf`) проводит мастер всех отсутствующих конфигов по `conf/*.conf.example`, `music_downloader/*.json.example` и `utility_bills/*.json.example` (кроме `cloud_backup_qnap.conf`): окна `zenity` (без него — `kdialog`), без графики — вопросы в терминале. Описание каждого значения берётся из комментариев примера, значения по умолчанию — из примера с подстановкой `@MYTASKS_DIR@`/`@HOME@`. Строки примера без изменений копируются как есть (`${HOME}` и т.п. сохраняются).
 6. Проверяет зависимости (обязательные и необязательные) и ставит пакеты менеджером своего семейства одним запросом прав.
 7. Проверяет задания и для каждого отсутствующего или неработающего выводит предупреждение с описанием и вопрос «создать?»: «да» — создаёт, «нет» — ничего не меняет и в этом запуске больше не спрашивает.
 
@@ -471,11 +472,12 @@ journalctl --user -u check-backups.service -n 20
 | `enable-linger` | linger | `loginctl enable-linger` пользователя: user-службы (запись эфира) работают с загрузки, без входа в сеанс |
 | `beufm-recorder` | работа службы | запись эфира идёт: лог `logs/beufm_recorder-*.jsonl` обновлялся не позже 20 мин назад и без ошибок, иначе `systemctl --user restart` |
 | `music-downloader.timer` | user-юнит | `music_downloader.sh` ежедневно в 21:00, пропущенный запуск — после загрузки |
+| `utility-bills.timer` | user-юнит | `utility_bills.sh` 20-го числа в 10:00, пропущенный запуск — после загрузки: квитанции ЖКУ из почты в SQLite |
 | `btrfs-monitor.timer` | user-юнит | `btrfs_monitor.sh` в 00/06/12/18 ч, пропущенный — после загрузки (только если `/` на Btrfs) |
 | `getip.timer` | user-юнит | `getip.sh` через 2 мин после загрузки и каждые 30 мин |
-| `crontab` | старый cron | в crontab нет строк `music_downloader.sh`, `sources.sh`, `btrfs_monitor.sh`, `getip.sh` (иначе — второй, параллельный запуск); исправление — удаление строк вместе с комментарием `# mytasks:` |
-| `conf/check_backups.conf`, `conf/sources.conf`, `music_downloader/music_downloader.json` | конфиг | создаются мастером |
-| `music_downloader/venv` | venv | `music_downloader/setup_venv.sh` |
+| `crontab` | старый cron | в crontab нет строк `music_downloader.sh`, `sources.sh`, `btrfs_monitor.sh`, `getip.sh`, `utility_bills.sh` (иначе — второй, параллельный запуск); исправление — удаление строк вместе с комментарием `# mytasks:` |
+| `conf/check_backups.conf`, `conf/sources.conf`, `music_downloader/music_downloader.json`, `utility_bills/utility_bills.json` | конфиг | создаются мастером |
+| `music_downloader/venv`, `utility_bills/venv` | venv | `music_downloader/setup_venv.sh`, `utility_bills/setup_venv.sh` |
 | `llamactl`, `llamactl-tray`, `llamactl-tray.desktop`, `llama-server.service`, `llama-fim.service` | ссылки, автозапуск, сервисы | только если есть каталог `LLAMA_PREFIX` (из `conf/check_mytasks.conf`, иначе из `conf/llamactl.conf`, иначе `/opt/llama.cpp`) |
 
 Шаблоны юнитов и автозапуска лежат в `systemd/` (`systemd/*.service|timer` — системные, `systemd/user/` — пользовательские, `systemd/autostart/` — XDG autostart) и содержат плейсхолдер `@MYTASKS_DIR@`; установленный файл, отличающийся от отрисованного шаблона (старая версия или другой каталог), отмечается «отличается» и предлагается к обновлению. Порядок между заданиями задан `After=`: `sources.service` начинается после `music-downloader.service`, `check-backups.service` — после `sources.service` (действует и когда оба таймера догоняют пропуск сразу после загрузки). Таймеры включаются с `--now`, сервисы входа в сеанс — только `enable`.
@@ -1055,6 +1057,32 @@ journalctl --user -u sources.service
 ./unpack-fb2zip.sh -p /книги --dry-run
 ```
 
+### `utility_bills.sh`
+
+Квитанции ЖКУ: заходит в почтовый ящик (IMAP, только чтение), в указанной папке ищет письма с
+указанных отправителей (`search.from` — массив email), скачивает PDF-квитанции «Единый платёжный документ» Астана ЕРЦ, распознаёт их
+(страница — картинка без текста: `pdfimages` + `tesseract` по ячейкам таблицы) и записывает все
+данные — шапку, каждую услугу, показания, тарифы по ступеням, суммы и результаты проверок — в
+SQLite `utility_bills/utility_bills.db` с представлениями для отчётов и графиков. PDF хранится в
+базе как BLOB, рядом сохраняются метаданные исходного файла и письма. Обработанные письма
+запоминаются и при следующих запусках пропускаются. Выполняются сверки строк, тарифов и «Итого»;
+результаты проверки могут потребовать ручного просмотра.
+
+```bash
+./utility_bills.sh --check            # конфигурация, tesseract (rus, kaz, eng), pdfimages
+./utility_bills.sh --dry-run          # план: что будет скачано и записано; ничего не меняет
+./utility_bills.sh                    # почта → PDF → БД
+./utility_bills.sh --file ~/A000123456-2026-*.PDF   # импорт уже скачанных квитанций
+```
+
+**Настройки:** обёртка — `conf/utility_bills.conf` (`PYTHON_BIN`, `VENV_PATH`, `CRON_LOG`),
+программа — `utility_bills/utility_bills.json` (ящик, папка, отправители, БД, OCR, ступени
+тарифа). **Расписание:** `systemd/user/utility-bills.timer` — 20-го числа в 10:00,
+`Persistent=true` (ставит `check_mytasks.sh`). **Логи:** `logs/utility_bills-*.jsonl` (обёртка),
+`logs/utility_bills_engine-*.jsonl` (программа), вывод — `logs/cron_execution.log`; в `--dry-run`
+план печатается в терминал. Подробно — [README проекта](utility_bills/README.md), CI —
+`.github/workflows/utility-bills.yml`.
+
 ---
 
 ## Зависимости
@@ -1080,6 +1108,7 @@ journalctl --user -u sources.service
 | `lowercase_ext.sh` | Bash, `find`, `mv` |
 | `mht_to_fb2.py` | Python 3, `pandoc` |
 | `music_downloader.sh` | Bash, Python 3, локальный проект `music_downloader/`; после успеха — `split_by_dash.sh` |
+| `utility_bills.sh` | Bash, Python 3 (venv: numpy, pillow), `tesseract` с языками rus/kaz/eng, `pdfimages` (poppler) |
 | `replace_encoding.sh` | Bash, `grep`, `sed` |
 | `sources.sh` | POSIX shell, `rsync`, `xargs`, `7z` (для строк `7z`) |
 | `split_by_dash.sh` | POSIX shell, `find`, `mv`, `sed`, `gawk` |
@@ -1094,7 +1123,7 @@ journalctl --user -u sources.service
 после пуша; состав проверок и порядок чтения результата — в разделе
 «Валидация» [`ai-md/AI.md`](ai-md/AI.md), не дублируются здесь. Инструменты
 проверки на рабочую машину не ставятся: `pytest` и `ruff` для загрузчика —
-в `music_downloader/requirements-ci.txt`, который использует только CI.
+в `music_downloader/requirements-ci.txt` и `utility_bills/requirements-ci.txt`, которые использует только CI.
 
 Кратко: `tests/` — по Bats-файлу на актуальный корневой скрипт плюс общий
 `all_scripts_syntax.bats` (синтаксис каждого корневого `*.sh` и `llamactl/*.sh` по шебангу); внешние
@@ -1104,5 +1133,5 @@ journalctl --user -u sources.service
 `.github/workflows/shellcheck.yml` (ShellCheck `error`+`style`+`-o all`, Ruff трея и статуса `llamactl`, синтаксис
 `bash -n`/`sh -n`, сканер небракетированных `$VAR`, `py_compile` (корневые `*.sh`/`*.py` и `llamactl/*.sh`/`llamactl/*.py`) — только
 при изменении `*.sh`/`*.py`), `.github/workflows/music-downloader.yml` (Ruff и
-pytest загрузчика на Python 3.14) и `.github/workflows/security-scan.yml`
+pytest загрузчика на Python 3.14), `.github/workflows/utility-bills.yml` (Ruff и pytest `utility_bills/`) и `.github/workflows/security-scan.yml`
 (Semgrep, Trivy, OSV-Scanner, Gitleaks, CodeQL; еженедельно и на push/PR).

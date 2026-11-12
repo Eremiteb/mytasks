@@ -1,0 +1,13 @@
+# Конфигурация обёртки utility_bills.sh
+# Скопируйте этот файл в utility_bills.conf и при необходимости измените значения.
+# Настройки самой программы (почтовый ящик, папка, отправители, каталог PDF, база, OCR) —
+# в utility_bills/utility_bills.json. Срок хранения логов обёртки (KEEP_LOGS) — в conf/log_template.conf.
+
+# Интерпретатор Python, если нет виртуального окружения utility_bills/venv (имя команды или полный путь).
+PYTHON_BIN="python3"
+
+# Каталог виртуального окружения (используется его bin/python, если он есть).
+VENV_PATH="@MYTASKS_DIR@/utility_bills/venv"
+
+# Файл, куда пишется вывод программы (stdout/stderr) при обычном запуске; в --dry-run вывод идёт в терминал.
+CRON_LOG="@MYTASKS_DIR@/logs/cron_execution.log"

@@ -1,0 +1,92 @@
+name: Utility bills
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "utility_bills/**"
+      - "utility_bills.sh"
+      - ".github/workflows/utility-bills.yml"
+  pull_request:
+    branches: ["**"]
+    paths:
+      - "utility_bills/**"
+      - "utility_bills.sh"
+      - ".github/workflows/utility-bills.yml"
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.1.0
+        with:
+          python-version: "3.14"
+          cache: "pip"
+          cache-dependency-path: |
+            utility_bills/requirements.txt
+            utility_bills/requirements-ci.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r utility_bills/requirements-ci.txt
+
+      - name: Run static analysis (Ruff)
+        id: ruff
+        run: |
+          mkdir -p reports
+
+          set +e
+          ruff check utility_bills/ --output-format=github | tee reports/ruff-github.txt
+          RUFF_EXIT=${PIPESTATUS[0]}
+
+          ruff check utility_bills/ --output-format=full | tee reports/ruff.txt
+          ruff check utility_bills/ --output-format=json > reports/ruff.json
+          ruff check utility_bills/ --output-format=sarif > reports/ruff.sarif
+          set -e
+
+          echo "ruff_exit=$RUFF_EXIT" >> "$GITHUB_OUTPUT"
+
+      - name: Publish static analysis summary
+        if: always()
+        run: |
+          {
+            echo "## Static Analysis"
+            echo ""
+            echo "Ruff completed."
+            echo ""
+            echo "- PR annotations: enabled (GitHub format)."
+            echo "- Human-readable report: reports/ruff.txt (artifact)."
+            echo "- Machine-readable reports: reports/ruff.json, reports/ruff.sarif (artifact)."
+            echo "- SARIF is stored as artifact only (Code Scanning upload disabled for current plan)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload static analysis reports
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: static-analysis-reports
+          path: reports/
+
+      - name: Validate config example
+        run: python -m json.tool utility_bills/utility_bills.json.example >/dev/null
+
+      - name: Run tests
+        run: python -m pytest utility_bills/tests -q
+
+      - name: Fail build if Ruff found issues
+        if: steps.ruff.outputs.ruff_exit != '0'
+        run: |
+          echo "Ruff found issues. See annotations, summary, and artifact static-analysis-reports."
+          exit 1

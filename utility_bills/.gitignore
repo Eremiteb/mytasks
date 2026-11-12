@@ -1,0 +1,8 @@
+# Рабочие данные и секреты (машинно-зависимые)
+utility_bills.json
+utility_bills.db*
+# Квитанции с ПДн — не в Git, где бы ни лежали.
+*.pdf
+*.PDF
+.utility_bills.lock
+*.sync-conflict*

@@ -101,15 +101,18 @@ JOBS=(
     "linger|enable-linger||cmd:loginctl|Пользовательские службы без входа в сеанс (loginctl enable-linger): запись эфира beufm-recorder.service работает с загрузки системы, а не только пока вы в сеансе."
     "user-unit|sources.timer|||Ежедневно в 21:30 (пропущенный при выключенном компьютере запуск выполняется после загрузки): синхронизация каталогов через rsync и архивы 7z по списку conf/sources.conf. Ждёт окончания скачивания музыки и блокирует выключение до конца копирования. Скрипт sources.sh."
     "user-unit|music-downloader.timer|||Ежедневно в 21:00 (пропущенный при выключенном компьютере запуск выполняется после загрузки): скачивание новой музыки с сайтов из music_downloader/music_downloader.json и раскладка по папкам исполнителей (split_by_dash.sh). Скрипт music_downloader.sh."
+    "user-unit|utility-bills.timer|||20-го числа каждого месяца в 10:00 (пропущенный при выключенном компьютере запуск выполняется после загрузки): письма с квитанциями ЖКУ из почтового ящика, разбор PDF (OCR) и запись платежей в SQLite для отчётов. Обработанные письма пропускаются. Скрипт utility_bills.sh, настройки — utility_bills/utility_bills.json."
     "user-unit|btrfs-monitor.timer||fs:/=btrfs|Каждые 6 ч (00, 06, 12, 18 ч; пропущенный запуск — после загрузки): проверка счётчиков ошибок Btrfs корневого раздела, уведомление при их росте. Скрипт btrfs_monitor.sh."
     "user-unit|getip.timer|||Через 2 мин после загрузки и каждые 30 мин: проверка внешнего IP-адреса, история изменений. Скрипт getip.sh."
-    "no-cron|crontab|music_downloader.sh,sources.sh,btrfs_monitor.sh,getip.sh|cmd:crontab|Скрипты mytasks запускают таймеры systemd, а не cron: оставшаяся от прежней установки строка crontab дала бы второй, параллельный запуск."
+    "no-cron|crontab|music_downloader.sh,sources.sh,btrfs_monitor.sh,getip.sh,utility_bills.sh|cmd:crontab|Скрипты mytasks запускают таймеры systemd, а не cron: оставшаяся от прежней установки строка crontab дала бы второй, параллельный запуск."
     "user-unit|agent-skills-sync.timer|||Раз в сутки ставит навык model-routing и раздел «Выбор модели под шаг» для Claude Code, Codex и Gemini на этом устройстве и на удалённых хостах из conf/install_agent_skills.conf (недоступные пропускает до следующего запуска). Скрипт install_agent_skills.sh."
     "user-unit|check-store-mount.service|||При входе в графический сеанс проверяет, смонтированы ли точки из /etc/fstab, и показывает уведомление о несмонтированных. Скрипт check-store-mount.sh."
     "conf|conf/check_backups.conf|conf/check_backups.conf.example||Настройки check_backups.sh: каталоги с архивами (BACKUP_DIRS), допустимый возраст и размер архивов."
     "conf|conf/sources.conf|conf/sources.conf.example||Список каталогов для sources.sh: строки «источник, назначение, опции rsync» либо «7z, каталог, каталог архивов, сколько хранить, опции 7z» через вертикальную черту."
     "conf|music_downloader/music_downloader.json|music_downloader/music_downloader.json.example||Настройки загрузчика музыки: сайты, общий список каталогов download_paths, лимит размера."
     "venv|music_downloader/venv|requests,bs4,cloudscraper,mutagen||Виртуальное окружение Python загрузчика музыки: music_downloader/setup_venv.sh ставит зависимости из requirements.txt."
+    "conf|utility_bills/utility_bills.json|utility_bills/utility_bills.json.example||Настройки квитанций ЖКУ: почтовый ящик (IMAP), папка, отправители (search.from), каталог PDF, база SQLite, OCR и ступени тарифа электроэнергии. Пароль — в файле или переменной UTILITY_BILLS_IMAP_PASSWORD."
+    "venv|utility_bills/venv|numpy,PIL||Виртуальное окружение Python квитанций ЖКУ: utility_bills/setup_venv.sh ставит зависимости из requirements.txt."
     "link|llamactl|llamactl/llamactl.sh|path:@LLAMA_PREFIX@|Команда llamactl в ~/.local/bin: управление локальным llama.cpp (модели, VRAM, сервисы, пресеты, обновление)."
     "link|llamactl-tray|llamactl/llamactl_tray.py|path:@LLAMA_PREFIX@|Команда llamactl-tray в ~/.local/bin: значок llama.cpp в трее."
     "autostart|llamactl-tray.desktop||path:@LLAMA_PREFIX@|Автозапуск значка llama.cpp в трее при входе в графический сеанс."
@@ -144,6 +147,8 @@ DEPS=(
     "gnu:find|findutils||GNU find (-printf): ротация логов во всех скриптах; в busybox (Alpine) его нет"
     "gnu:stat|coreutils||GNU coreutils (stat -c, date -d, sort -V, readlink -f, install -t); в busybox (Alpine) их нет"
     "btrfs|btrfs-progs|fs:/=btrfs|btrfs_monitor.sh: счётчики ошибок Btrfs"
+    "tesseract|tesseract;debian=tesseract-ocr;suse=tesseract-ocr;alpine=tesseract-ocr;gentoo=app-text/tesseract||utility_bills: распознавание квитанций (нужны языки rus, kaz, eng: Arch — tesseract-data-rus/-kaz/-eng, Debian — tesseract-ocr-rus/-kaz/-eng; проверка — utility_bills.sh --check)"
+    "pdfimages|poppler;debian=poppler-utils;redhat=poppler-utils;suse=poppler-tools;alpine=poppler-utils;gentoo=app-text/poppler||utility_bills: извлечение изображения страницы из PDF-квитанции"
     "zenity,kdialog|zenity|opt|Окна вопросов этого скрипта (кнопка «Стоп» во всех окнах — только у zenity) и графический askpass для sudo"
     "sensors|lm_sensors;debian=lm-sensors;suse=sensors;alpine=lm-sensors;gentoo=sys-apps/lm-sensors|opt|system_monitor.sh: температура CPU"
     "ffmpeg|ffmpeg;redhat=ffmpeg-free|opt|all_to_mp3.sh, music_downloader (YouTube Music): перекодирование в MP3; beufm_recorder.py: проверка дублей"
@@ -156,7 +161,7 @@ DEPS=(
 )
 
 # Примеры, по которым при первом запуске проходит мастер конфигов
-# (пусто — все conf/*.conf.example и music_downloader/*.json.example)
+# (пусто — все conf/*.conf.example, music_downloader/*.json.example и utility_bills/*.json.example)
 CONF_EXAMPLES=()
 # Конфиги, которые мастер не предлагает: cloud_backup_qnap.sh работает на
 # самом QNAP (Entware), а не на этой машине
@@ -1930,7 +1935,7 @@ configure_all() {
     if [[ ${#CONF_EXAMPLES[@]} -gt 0 ]]; then
         examples=("${CONF_EXAMPLES[@]}")
     else
-        for example in "${CONF_DIR}"/*.conf.example "${SCRIPT_DIR}"/music_downloader/*.json.example; do
+        for example in "${CONF_DIR}"/*.conf.example "${SCRIPT_DIR}"/music_downloader/*.json.example "${SCRIPT_DIR}"/utility_bills/*.json.example; do
             [[ -f "${example}" ]] && examples+=("${example#"${SCRIPT_DIR}"/}")
         done
     fi

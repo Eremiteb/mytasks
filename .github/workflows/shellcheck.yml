@@ -43,19 +43,19 @@ jobs:
           shellcheck --version
 
       - name: ShellCheck error level
-        run: shellcheck -S error ./*.sh llamactl/*.sh
+        run: shellcheck -S error ./*.sh llamactl/*.sh utility_bills/*.sh
 
       # Все дополнительные проверки (в том числе SC2312) — обязательное
       # требование к скриптам; локально shellcheck не запускается.
       - name: ShellCheck all optional checks
-        run: shellcheck -o all ./*.sh llamactl/*.sh
+        run: shellcheck -o all ./*.sh llamactl/*.sh utility_bills/*.sh
 
       - name: ShellCheck style level
-        run: shellcheck -S style ./*.sh llamactl/*.sh
+        run: shellcheck -S style ./*.sh llamactl/*.sh utility_bills/*.sh
 
       - name: Bash/sh syntax
         run: |
-          for f in ./*.sh llamactl/*.sh; do
+          for f in ./*.sh llamactl/*.sh utility_bills/*.sh; do
             if head -1 "$f" | grep -qi bash; then
               bash -n "$f" || { echo "SYNTAX FAIL: $f"; exit 1; }
             else
@@ -66,7 +66,7 @@ jobs:
       - name: Unbraced variable scan
         run: |
           fail=0
-          for f in ./*.sh llamactl/*.sh; do
+          for f in ./*.sh llamactl/*.sh utility_bills/*.sh; do
             out=$(grep -nP '(?<!")\$(?!\{)[A-Za-z_][A-Za-z0-9_]*' "$f" \
               | grep -vP '^\d+:\s*#' \
               | grep -v "\\\\'" \

@@ -160,6 +160,15 @@ Dry-run скриптов (`--dry-run`) — не проверка кода, а о
 - Логи движка — `logs/music_downloader_engine-<timestamp>.jsonl`, отдельно от логов обёртки `logs/music_downloader-<timestamp>.jsonl`.
 - `tests/test_music_downloader.py` загружает `music_downloader/music_downloader.py` напрямую через `spec_from_file_location`, чтобы Zed не принимал одноимённый каталог за namespace-пакет; перед Python-тестами установить requirements. Актуальная связанная документация: корневой README, этот файл и `music_downloader/README.md`; старые заметки QNAP не являются changelog загрузчика.
 
+## `utility_bills`: квитанции ЖКУ
+
+- Подпроект `utility_bills/` (исходники, тесты, README, конфиг-пример в Git; рабочий `utility_bills.json`, БД, venv — нет), обёртка `utility_bills.sh`, таймер и юнит в `systemd/user/`, CI `.github/workflows/utility-bills.yml`. Устройство, настройки, проверки и ограничения — `utility_bills/README.md`; не дублировать их здесь.
+- Тесты — только синтетические данные (репозиторий публичный): реальные квитанции с адресом и лицевым счётом в Git и фикстуры не добавлять.
+- Схема БД меняется только миграцией (`PRAGMA user_version`), не правкой существующей схемы.
+- При выносе `db_path` за каталог проекта дополнять `ReadWritePaths=` в `systemd/user/utility-bills.service`.
+- Заполненный `imap.password` в конфиге главнее переменной окружения.
+- Перед боевым запуском — `./utility_bills.sh --dry-run` (на реальных PDF — `--dry-run --file …`).
+
 ## Библиотека `/mnt/copy/Books`
 
 - Библиотека находится вне Git. Не добавлять книги и сгенерированные отчёты из `state/` в репозиторий. Перед удалениями создавать локальный JSON-отчёт с путями, размерами и причинами.
