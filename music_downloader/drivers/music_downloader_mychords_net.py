@@ -11,6 +11,10 @@ from bs4 import BeautifulSoup
 logger = logging.LoggerAdapter(logging.getLogger("Engine"), {"site": "mychords_net"})
 
 _TRACK_ID_RE = re.compile(r"/(\d+)-[^/]+\.html?$")
+# Разделитель «Исполнитель - Название»: дефис, короткое или длинное тире в пробелах.
+# С 2026-10 MyChords пишет « – »; при поиске только « - » исполнитель терялся
+# и трек сохранялся как «Unknown Artist - <вся строка>».
+_ARTIST_TITLE_SEP_RE = re.compile(r"\s+[-\u2013\u2014]\s+")
 
 # Значения по умолчанию; переопределяются блоком drivers.music_downloader_mychords_net в music_downloader.json.
 SETTINGS = {
@@ -48,11 +52,12 @@ def parse_listing(html, base_url):
         if track_id is None:
             continue
         text = unescape(link.get_text(" ", strip=True))
-        artist, separator, title = text.partition(" - ")
+        parts = _ARTIST_TITLE_SEP_RE.split(text, maxsplit=1)
+        has_artist = len(parts) == 2
         tracks.append({
             "id": track_id[1],
-            "artist": artist.strip() if separator else None,
-            "title": title.strip() if separator else text,
+            "artist": parts[0].strip() if has_artist else None,
+            "title": parts[1].strip() if has_artist else text,
             "src": urljoin(base_url, href),
         })
     return tracks

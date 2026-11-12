@@ -16,6 +16,9 @@ LISTING = """
 <li class="b-listing__full__item"><span class="b-listing__full__item__position">Вчера</span>
 <a class="b-listing__full__item__name" href="/ru/augxst/281200-augxst-tenoh-money-fever.html">Augxst &amp; Tenoh - Money Fever</a></li>
 <li class="b-listing__full__item"><a class="b-listing__full__item__name" href="/ru/x/281031-anna.html">Anna Grey - Das was bleibt</a></li>
+<li class="b-listing__full__item"><a class="b-listing__full__item__name" href="/ru/samra/284389-samra.html">SAMRA, CAPITAL BRA, FINJA – RAUCHEN IST TÖDLICH</a></li>
+<li class="b-listing__full__item"><a class="b-listing__full__item__name" href="/ru/x/284390-em.html">Liya Li — Перший раз</a></li>
+<li class="b-listing__full__item"><a class="b-listing__full__item__name" href="/ru/x/284391-hyphen.html">Jay-Z - Song</a></li>
 <li class="b-listing__full__item"><a class="b-listing__full__item__name" href="/ru/x/no-id.html">Без номера</a></li>
 <li class="b-listing__full__item"><a class="b-listing__full__item__name" href="/ru/x/5-solo.html">Только название</a></li>
 """
@@ -37,6 +40,14 @@ def test_parse_listing_extracts_ids_and_splits_artist_title():
             "src": "https://music.mychords.net/ru/augxst/281200-augxst-tenoh-money-fever.html",
         },
         {"id": "281031", "artist": "Anna Grey", "title": "Das was bleibt", "src": "https://music.mychords.net/ru/x/281031-anna.html"},
+        {
+            "id": "284389",
+            "artist": "SAMRA, CAPITAL BRA, FINJA",
+            "title": "RAUCHEN IST TÖDLICH",
+            "src": "https://music.mychords.net/ru/samra/284389-samra.html",
+        },
+        {"id": "284390", "artist": "Liya Li", "title": "Перший раз", "src": "https://music.mychords.net/ru/x/284390-em.html"},
+        {"id": "284391", "artist": "Jay-Z", "title": "Song", "src": "https://music.mychords.net/ru/x/284391-hyphen.html"},
         {"id": "5", "artist": None, "title": "Только название", "src": "https://music.mychords.net/ru/x/5-solo.html"},
     ]
 
