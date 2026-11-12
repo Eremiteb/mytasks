@@ -94,6 +94,11 @@ DEFAULT_CONFIG = {
         # Отбор писем только по отправителю: email из заголовка From совпадает с одним из адресов (целиком,
         # без учёта регистра). Тема письма не учитывается.
         "from": [],
+        # Подлинность отправителя: письмо принимается, только если свой почтовый сервер (authserv_id)
+        # записал в Authentication-Results dkim=pass или spf=pass с выравниванием по домену From (RFC 8601).
+        # Fail closed: по умолчанию проверка включена, authserv_id обязателен.
+        "require_auth": True,
+        "authserv_id": "",
         "attachment_glob": "*.pdf",
         # Вложение больше лимита не сохраняется и не разбирается (защита от огромных файлов в письмах).
         "max_attachment_mb": 20,
@@ -403,6 +408,106 @@ def sender_matches(header: str, addresses: frozenset[str]) -> bool:
     return len(found) == 1 and found[0].casefold() in addresses
 
 
+# ---------------------------------------------------------------------------
+# Подлинность письма (RFC 8601, Authentication-Results)
+# ---------------------------------------------------------------------------
+
+
+def _strip_comments(value: str) -> str:
+    """Убирает комментарии «(…)» (вложенные — тоже; скобки в кавычках не комментарий) и сворачивает пробелы."""
+    out: list[str] = []
+    depth = 0
+    quoted = False
+    escaped = False
+    for char in value:
+        if escaped:
+            escaped = False
+            if depth == 0:
+                out.append(char)
+        elif char == "\\" and (quoted or depth):
+            escaped = True
+            if depth == 0:
+                out.append(char)
+        elif char == '"' and depth == 0:
+            quoted = not quoted
+            out.append(char)
+        elif char == "(" and not quoted:
+            depth += 1
+        elif char == ")" and not quoted and depth:
+            depth -= 1
+        elif depth == 0:
+            out.append(char)
+    return "".join(out)
+
+
+def _split_unquoted(value: str, separator: str) -> list[str]:
+    parts: list[str] = []
+    current: list[str] = []
+    quoted = False
+    for char in value:
+        if char == '"':
+            quoted = not quoted
+        if char == separator and not quoted:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    parts.append("".join(current))
+    return parts
+
+
+def parse_authentication_results(value: str) -> tuple[str, list[dict[str, str]]]:
+    """Заголовок Authentication-Results: (authserv-id, результаты). Результат — словарь ключей в нижнем
+    регистре: «dkim» → pass, «header.d» → example.kz и т.д. Порядок: authserv-id [версия] ; resinfo ; …"""
+    sections = _split_unquoted(_strip_comments(value), ";")
+    head = sections[0].split()
+    authserv_id = head[0].strip('"').casefold() if head else ""
+    results = []
+    for section in sections[1:]:
+        entry: dict[str, str] = {}
+        for token in section.split():
+            key, equals, val = token.partition("=")
+            if equals and key:
+                entry.setdefault(key.strip().casefold(), val.strip().strip('"'))
+        if entry:
+            results.append(entry)
+    return authserv_id, results
+
+
+def _domain_of(identity: str) -> str:
+    """Домен из значения header.d / header.i / smtp.mailfrom: «user@mail.example.kz» и «@example.kz» → домен."""
+    return identity.rpartition("@")[2].strip().rstrip(".").casefold()
+
+
+def _domain_aligned(auth_domain: str, from_domain: str) -> bool:
+    """Домен проверки совпадает с доменом From или является его родительским (не короче второго уровня)."""
+    if not auth_domain or "." not in auth_domain:
+        return False
+    return from_domain == auth_domain or from_domain.endswith("." + auth_domain)
+
+
+def sender_authenticated(headers: list[str], authserv_id: str, from_domain: str) -> bool:
+    """Свой сервер (authserv-id без учёта регистра) подтвердил dkim=pass (header.d / header.i) или spf=pass
+    (smtp.mailfrom) в домене отправителя. Заголовки других authserv-id игнорируются: их мог подставить
+    отправитель. В записи берётся первое вхождение каждого ключа."""
+    wanted = authserv_id.strip().casefold()
+    domain = from_domain.strip().rstrip(".").casefold()
+    if not wanted or not domain:
+        return False
+    for header in headers:
+        server, results = parse_authentication_results(header)
+        if server != wanted:
+            continue
+        for entry in results:
+            if entry.get("dkim", "").casefold() == "pass" and any(
+                _domain_aligned(_domain_of(entry.get(key, "")), domain) for key in ("header.d", "header.i")
+            ):
+                return True
+            if entry.get("spf", "").casefold() == "pass" and _domain_aligned(_domain_of(entry.get("smtp.mailfrom", "")), domain):
+                return True
+    return False
+
+
 def _resolve(value: str) -> Path:
     path = Path(value).expanduser()
     return path if path.is_absolute() else BASE_DIR / path
@@ -424,6 +529,8 @@ def validate_imap(config: Config) -> None:
         missing.append(f"password (или переменная {imap['password_env']})")
     if not config["search"]["from"]:
         missing.append("search.from (email отправителей квитанций, иначе были бы все письма папки)")
+    if config["search"]["require_auth"] and not config["search"]["authserv_id"].strip():
+        missing.append("search.authserv_id (имя своего почтового сервера в Authentication-Results; или require_auth = false)")
     if missing:
         raise ConfigError("в конфигурации не заполнено: " + ", ".join(missing))
     if imap["security"] not in ("ssl", "starttls", "none"):
@@ -677,6 +784,36 @@ def _rebuild_table(conn: sqlite3.Connection, table: str, out: Callable[[str], No
     out(f"Миграция: таблица {table}: {new_count} строк, колонки {', '.join(new_columns)}")
 
 
+def rebuild_formats(conn: sqlite3.Connection, now: str) -> None:
+    """Справочник bill_formats из bills: по подписи — описание, признаки последней квитанции, период.
+
+    conn — с row_factory = sqlite3.Row; функция общая для миграции и Database (без обхода __init__)."""
+    rows = conn.execute(
+        "SELECT id, format_signature AS signature, format_features AS features, "
+        "COALESCE(service_period, period) AS month FROM bills WHERE format_signature IS NOT NULL ORDER BY month, id"
+    ).fetchall()
+    formats: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        entry = formats.setdefault(
+            row["signature"], {"signature": row["signature"], "first_period": row["month"], "first_bill_id": row["id"], "bills_count": 0}
+        )
+        features = json.loads(row["features"] or "{}")
+        entry.update(
+            description=features.get("description"),
+            features=row["features"],
+            last_period=row["month"],
+            last_bill_id=row["id"],
+            bills_count=entry["bills_count"] + 1,
+        )
+    latest = rows[-1]["signature"] if rows else None
+    conn.execute("DELETE FROM bill_formats")
+    for entry in formats.values():
+        entry.update(is_current=int(entry["signature"] == latest), updated_at=now)
+        columns = ", ".join(entry)
+        marks = ", ".join("?" for _ in entry)
+        conn.execute(f"INSERT INTO bill_formats ({columns}) VALUES ({marks})", list(entry.values()))
+
+
 def _migration_1(conn: sqlite3.Connection, out: Callable[[str], None]) -> None:
     for table in DB_SCHEMA:
         _rebuild_table(conn, table, out)
@@ -685,9 +822,7 @@ def _migration_1(conn: sqlite3.Connection, out: Callable[[str], None]) -> None:
 def _migration_2(conn: sqlite3.Connection, out: Callable[[str], None]) -> None:
     _rebuild_table(conn, "bills", out)
     _rebuild_table(conn, "bill_formats", out)
-    db = Database.__new__(Database)
-    db.conn = conn
-    db._rebuild_formats(datetime.now().astimezone().isoformat(timespec="seconds"))
+    rebuild_formats(conn, datetime.now().astimezone().isoformat(timespec="seconds"))
 
 
 def _migration_3(conn: sqlite3.Connection, out: Callable[[str], None]) -> None:
@@ -994,31 +1129,7 @@ class Database:
         self._rebuild_formats(now)
 
     def _rebuild_formats(self, now: str) -> None:
-        """Справочник bill_formats из bills: по подписи — описание, признаки последней квитанции, период."""
-        rows = self.conn.execute(
-            "SELECT id, format_signature AS signature, format_features AS features, "
-            "COALESCE(service_period, period) AS month FROM bills WHERE format_signature IS NOT NULL ORDER BY month, id"
-        ).fetchall()
-        formats: dict[str, dict[str, Any]] = {}
-        for row in rows:
-            entry = formats.setdefault(
-                row["signature"], {"signature": row["signature"], "first_period": row["month"], "first_bill_id": row["id"], "bills_count": 0}
-            )
-            features = json.loads(row["features"] or "{}")
-            entry.update(
-                description=features.get("description"),
-                features=row["features"],
-                last_period=row["month"],
-                last_bill_id=row["id"],
-                bills_count=entry["bills_count"] + 1,
-            )
-        latest = rows[-1]["signature"] if rows else None
-        self.conn.execute("DELETE FROM bill_formats")
-        for entry in formats.values():
-            entry.update(is_current=int(entry["signature"] == latest), updated_at=now)
-            columns = ", ".join(entry)
-            marks = ", ".join("?" for _ in entry)
-            self.conn.execute(f"INSERT INTO bill_formats ({columns}) VALUES ({marks})", list(entry.values()))
+        rebuild_formats(self.conn, now)
 
     def _replace_history(self, table: str, segments: list[dict[str, Any]], now: str) -> None:
         # table — константа кода (tariffs | quantities), значения — только параметрами.
@@ -1223,7 +1334,7 @@ def safe_name(name: str | None, fallback: str) -> str:
 def describe_bill(bill: Any) -> str:
     check = "сходится" if bill.checksum_ok else "НЕ сходится"
     return (
-        f"счёт {bill.account}, {bill.period} (услуги за {bill.service_period or '?'}), "
+        f"счёт {bp.mask_account(bill.account)}, {bill.period} (услуги за {bill.service_period or '?'}), "
         f"итого {bill.total}, строк {len(bill.items)}, сверка с «Итого» {check}, проверка строк "
         f"{bill.rows_ok} ок/{bill.rows_failed} нет, тарифов {bill.tariff_checks_ok} ок/{bill.tariff_checks_failed} нет"
     )
@@ -1239,11 +1350,11 @@ def _parse(ctx: RunContext, path: Path, file_name: str) -> tuple[Any | None, str
     try:
         return bp.parse_bill(path, ctx.config["ocr"], pdf_name=file_name), None
     except bp.BillParseError as error:
-        ctx.say(f"{file_name}: не разобран: {error}", event="parse_failed", level=logging.ERROR, detail=str(path))
+        ctx.say(f"{bp.mask_digits(file_name)}: не разобран: {error}", event="parse_failed", level=logging.ERROR, detail=bp.mask_digits(str(path)))
         return None, str(error)
     except PARSE_CRASH_ERRORS as error:
         reason = f"сбой разбора ({type(error).__name__}): {error}"
-        ctx.say(f"{file_name}: {reason}", event="parse_crashed", level=logging.ERROR, detail=str(path))
+        ctx.say(f"{bp.mask_digits(file_name)}: {reason}", event="parse_crashed", level=logging.ERROR, detail=bp.mask_digits(str(path)))
         return None, reason
 
 
@@ -1258,11 +1369,12 @@ def process_pdf(ctx: RunContext, data: bytes, file_name: str, meta: dict[str, An
     """
     sha = hashlib.sha256(data).hexdigest()
     say, stats = ctx.say, ctx.stats
+    shown = bp.mask_digits(file_name)  # имя файла содержит лицевой счёт: в лог — только маска
     stats["pdfs"] += 1
     existing = ctx.db.bill_by_sha(sha)
     if existing is not None and not ctx.force:
         stats["bills_unchanged"] += 1
-        say(f"{file_name}: уже в базе (счёт {existing['account']}, {existing['period']}) — пропуск", event="pdf_known")
+        say(f"{shown}: уже в базе (счёт {bp.mask_account(existing['account'])}, {existing['period']}) — пропуск", event="pdf_known")
         return True
     meta = {**meta, "file_name": file_name, "file_sha256": sha, "file_size": len(data), "pdf": data}
     # Каталог создаётся с правами 700 (tempfile), файл — 600 (umask 077 обёртки и main).
@@ -1273,12 +1385,12 @@ def process_pdf(ctx: RunContext, data: bytes, file_name: str, meta: dict[str, An
     if bill is None:
         return False
     for note in bill.notes:
-        say(f"{file_name}: {note}", event="parse_note")
+        say(f"{shown}: {note}", event="parse_note")
     for warning in bill.warnings:
-        say(f"{file_name}: {warning}", event="parse_warning", level=logging.WARNING)
+        say(f"{shown}: {warning}", event="parse_warning", level=logging.WARNING)
     if bill.warnings:
         say(
-            f"{file_name}: требует сверки ({len(bill.warnings)} предупр.), флаг bills.needs_review",
+            f"{shown}: требует сверки ({len(bill.warnings)} предупр.), флаг bills.needs_review",
             event="bill_needs_review",
             level=logging.WARNING,
         )
@@ -1313,7 +1425,7 @@ def process_pdf(ctx: RunContext, data: bytes, file_name: str, meta: dict[str, An
             event="quantity_changed",
         )
     verb = "заменена" if result == "replaced" else "записана"
-    say(f"Квитанция {verb}: {describe_bill(bill)}", event=f"bill_{result}", detail=str(path))
+    say(f"Квитанция {verb}: {describe_bill(bill)}", event=f"bill_{result}", detail=bp.mask_digits(str(path)))
     return True
 
 
@@ -1324,7 +1436,7 @@ def process_pdf_isolated(ctx: RunContext, data: bytes, file_name: str, meta: dic
     try:
         return process_pdf(ctx, data, file_name, meta)
     except (sqlite3.Error, OSError, *PARSE_CRASH_ERRORS) as error:
-        ctx.say(f"{file_name}: не обработан ({type(error).__name__}): {error}", event="pdf_failed", level=logging.ERROR)
+        ctx.say(f"{bp.mask_digits(file_name)}: не обработан ({type(error).__name__}): {error}", event="pdf_failed", level=logging.ERROR)
         return False
 
 
@@ -1446,6 +1558,7 @@ _UID_RE = re.compile(rb"\bUID (\d+)")
 _SIZE_RE = re.compile(rb"\bRFC822\.SIZE (\d+)")
 # Текст письма в БД — не больше этого числа символов (письма ЕРЦ короткие; защита от огромных писем).
 MAX_BODY_CHARS = 100_000
+PDF_SIGNATURE = b"%PDF-"
 
 
 def _uidvalidity(conn: imaplib.IMAP4) -> int:
@@ -1471,7 +1584,7 @@ def attachment_limit(config: Config) -> int:
     return int(config["search"]["max_attachment_mb"] * MIB)
 
 
-def find_messages(conn: imaplib.IMAP4, config: Config) -> list[dict[str, Any]]:
+def find_messages(conn: imaplib.IMAP4, config: Config, warn: Warn | None = None) -> list[dict[str, Any]]:
     """Полный список писем папки от отправителей из search.from (за всё время), по дате: [{key, uid, …}].
 
     Только заголовки, ящик открыт на чтение. Отбор — на нашей стороне по заголовку From (sender_matches),
@@ -1507,6 +1620,17 @@ def find_messages(conn: imaplib.IMAP4, config: Config) -> list[dict[str, Any]]:
             sender = ", ".join(str(header) for header in message.get_all("From") or [])
             if not sender_matches(sender, config["search"]["from"]):
                 continue
+            if config["search"]["require_auth"]:
+                from_domain = _domain_of(getaddresses([sender])[0][1])
+                results = [str(header) for header in message.get_all("Authentication-Results") or []]
+                if not sender_authenticated(results, config["search"]["authserv_id"], from_domain):
+                    if warn is not None:
+                        warn(
+                            f"Письмо UID {uid} (домен {from_domain}): нет подтверждения DKIM/SPF от {config['search']['authserv_id']} — пропуск",
+                            event="message_auth_failed",
+                            level=logging.WARNING,
+                        )
+                    continue
             message_id = str(message.get("Message-ID", "")).strip() or None
             size_match = _SIZE_RE.search(head)
             found.append(
@@ -1562,10 +1686,11 @@ def fetch_message(conn: imaplib.IMAP4, uid: int, glob: str, max_bytes: int, warn
             continue  # альтернативная часть текста письма, а не вложение
         file_name = safe_name(name, f"uid{uid}-{index}")
         is_pdf = content_type == "application/pdf" or bool(name and fnmatch.fnmatch(name.casefold(), glob.casefold()))
+        is_pdf = is_pdf and payload[:5] == PDF_SIGNATURE  # тип и имя заявлены отправителем: верим только содержимому
         taken = is_pdf and 0 < len(payload) <= max_bytes
         if is_pdf and len(payload) > max_bytes:
             warn(
-                f"{file_name}: вложение {len(payload) / MIB:.1f} МиБ больше лимита {max_bytes / MIB:.0f} МиБ — пропуск",
+                f"{bp.mask_digits(file_name)}: вложение {len(payload) / MIB:.1f} МиБ больше лимита {max_bytes / MIB:.0f} МиБ — пропуск",
                 event="attachment_too_large",
                 level=logging.WARNING,
             )
@@ -1591,7 +1716,7 @@ def run_mail(ctx: RunContext) -> None:
     validate_imap(config)
     imap = config["imap"]
     max_bytes = attachment_limit(config)
-    say(f"Подключение к {imap['host']}:{imap['port']} ({imap['username']}), папка «{imap['folder']}»", event="imap_connect")
+    say(f"Подключение к {imap['host']}:{imap['port']}, папка «{imap['folder']}»", event="imap_connect")
     try:
         conn = connect_imap(config, say)
     except (OSError, imaplib.IMAP4.error) as error:
@@ -1601,7 +1726,7 @@ def run_mail(ctx: RunContext) -> None:
     say(f"Подключено к {imap['host']}", event="imap_connected")
     try:
         # Шаг 1: список писем.
-        messages = find_messages(conn, config)
+        messages = find_messages(conn, config, say)
         known = ctx.db.processed_keys()
         new = [message for message in messages if message["key"] not in known]
         stats["messages_found"] = len(messages)
@@ -1651,7 +1776,15 @@ def _process_message(ctx: RunContext, conn: imaplib.IMAP4, message: dict[str, An
     subject, sender = display_text(message["subject"]), display_text(message["sender"])
     say(f"{progress} Письмо «{subject}» от {sender}, {message['date']}".lstrip(), event="message")
     size, limit = message.get("size"), message_size_limit(max_bytes)
-    if size is not None and size > limit:
+    if size is None:
+        # Без RFC822.SIZE лимит не проверить: письмо не скачивается (fail closed) и повторится в следующий запуск.
+        say(
+            f"Сервер не вернул RFC822.SIZE письма UID {message['uid']} — пропуск без скачивания",
+            event="message_size_unknown",
+            level=logging.WARNING,
+        )
+        return
+    if size > limit:
         say(
             f"Письмо {size / MIB:.1f} МиБ больше лимита {limit / MIB:.1f} МиБ (search.max_attachment_mb с запасом "
             "на base64) — пропуск без скачивания",
@@ -1688,15 +1821,15 @@ def run_files(ctx: RunContext, paths: Iterable[str]) -> None:
     for raw in paths:
         path = Path(raw)
         if not path.is_file():
-            ctx.say(f"Файл не найден: {path}", event="file_missing", level=logging.ERROR)
+            ctx.say(f"Файл не найден: {bp.mask_digits(str(path))}", event="file_missing", level=logging.ERROR)
             continue
         try:
             if path.stat().st_size > max_bytes:
-                ctx.say(f"{path}: файл больше лимита search.max_attachment_mb — пропуск", event="file_too_large", level=logging.ERROR)
+                ctx.say(f"{bp.mask_digits(str(path))}: файл больше лимита search.max_attachment_mb — пропуск", event="file_too_large", level=logging.ERROR)
                 continue
             data = path.read_bytes()
         except OSError as error:
-            ctx.say(f"{path}: не прочитан: {error}", event="file_failed", level=logging.ERROR)
+            ctx.say(f"{bp.mask_digits(str(path))}: не прочитан: {error}", event="file_failed", level=logging.ERROR)
             continue
         process_pdf_isolated(ctx, data, safe_name(path.name, "bill.pdf"), {"email_subject": None})
 

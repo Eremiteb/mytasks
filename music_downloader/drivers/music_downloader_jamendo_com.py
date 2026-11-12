@@ -188,7 +188,8 @@ def _get_client_id():
     try:
         with open(_CONFIG_PATH, encoding="utf-8") as f:
             cfg = json.load(f)
-    except Exception:
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
+        logger.warning(f"Не удалось прочитать client_id из {_CONFIG_PATH}: {error}")
         return None
 
     for site_cfg in cfg.get("sites", []):

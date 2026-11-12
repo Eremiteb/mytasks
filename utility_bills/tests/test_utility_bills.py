@@ -33,6 +33,7 @@ def write_config(tmp_path, **overrides):
         "db_path": str(tmp_path / "bills.db"),
     }
     config.update(overrides)
+    config["search"].setdefault("require_auth", False)  # проверка DKIM/SPF — в отдельных тестах
     path = tmp_path / "utility_bills.json"
     path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
     path.chmod(0o600)  # конфиг с паролем с правами шире 600 отклоняется
@@ -191,7 +192,7 @@ def test_read_only_database_without_file(tmp_path):
 
 
 def make_email(
-    subject, message_id, pdf_name="A000123456-2026-03.PDF", pdf=b"%PDF-1.3 fake", sender="ЕРЦ <noreply@example.test>"
+    subject, message_id, pdf_name="A000123456-2026-03.PDF", pdf=b"%PDF-1.3 fake", sender="ЕРЦ <noreply@example.test>", auth=None
 ):
     message = EmailMessage()
     message["Subject"] = subject
@@ -199,6 +200,8 @@ def make_email(
     message["Date"] = "Tue, 10 Mar 2026 07:37:03 +0500"
     if message_id:
         message["Message-ID"] = message_id
+    for value in auth or []:
+        message["Authentication-Results"] = value
     message.set_content("Квитанция во вложении")
     if pdf is not None:
         message.add_attachment(pdf, maintype="application", subtype="pdf", filename=pdf_name)
@@ -615,7 +618,7 @@ def test_database_is_private(tmp_path):
 
 
 def test_large_attachment_skipped():
-    big = b"%PDF" + b"0" * (2 * 1048576)
+    big = b"%PDF-" + b"0" * (2 * 1048576)
     fake = FakeIMAP({1: make_email("Квитанция", "<big@example.test>", pdf=big)})
     warnings = []
     content = ub.fetch_message(fake, 1, "*.pdf", 1048576, lambda message, **_kw: warnings.append(message))
@@ -632,8 +635,8 @@ def test_max_attachment_must_be_positive(tmp_path):
 def test_db_error_does_not_stop_run(tmp_path, monkeypatch):
     fake = FakeIMAP(
         {
-            1: make_email("Квитанция 1", "<m1@example.test>", pdf_name="A000123456-2026-02.PDF", pdf=b"%PDF one"),
-            2: make_email("Квитанция 2", "<m2@example.test>", pdf_name="A000123456-2026-03.PDF", pdf=b"%PDF two"),
+            1: make_email("Квитанция 1", "<m1@example.test>", pdf_name="A000123456-2026-02.PDF", pdf=b"%PDF-one"),
+            2: make_email("Квитанция 2", "<m2@example.test>", pdf_name="A000123456-2026-03.PDF", pdf=b"%PDF-two"),
         }
     )
     original = ub.Database.save_bill
@@ -988,8 +991,8 @@ def test_find_messages_searches_all_time_by_senders(tmp_path):
 def test_list_printed_before_processing(tmp_path, monkeypatch, capsys):
     fake = FakeIMAP(
         {
-            1: make_email("Квитанция 1", "<m1@example.test>", pdf_name="A000123456-2026-02.PDF", pdf=b"%PDF a"),
-            2: make_email("Квитанция 2", "<m2@example.test>", pdf_name="A000123456-2026-03.PDF", pdf=b"%PDF b"),
+            1: make_email("Квитанция 1", "<m1@example.test>", pdf_name="A000123456-2026-02.PDF", pdf=b"%PDF-a"),
+            2: make_email("Квитанция 2", "<m2@example.test>", pdf_name="A000123456-2026-03.PDF", pdf=b"%PDF-b"),
         }
     )
     run_mail(tmp_path, monkeypatch, fake)  # первый прогон: оба письма новые
@@ -1018,7 +1021,7 @@ def test_fetch_message_collects_body_and_all_attachments():
     message["From"] = "ЕРЦ <noreply@example.test>"
     message["Subject"] = "Квитанция"
     message.set_content("Уважаемый абонент, квитанция во вложении.")
-    message.add_attachment(b"%PDF one", maintype="application", subtype="pdf", filename="A000123456-2026-03.PDF")
+    message.add_attachment(b"%PDF-one", maintype="application", subtype="pdf", filename="A000123456-2026-03.PDF")
     message.add_attachment(b"PNG", maintype="image", subtype="png", filename="logo.png")
     fake = FakeIMAP({7: message.as_bytes()})
     content = ub.fetch_message(fake, 7, "*.pdf", 1048576, noop)
@@ -1027,7 +1030,7 @@ def test_fetch_message_collects_body_and_all_attachments():
         ("A000123456-2026-03.PDF", "application/pdf", True),
         ("logo.png", "image/png", False),
     ]
-    assert content.pdfs == [("A000123456-2026-03.PDF", b"%PDF one")]
+    assert content.pdfs == [("A000123456-2026-03.PDF", b"%PDF-one")]
 
 
 def test_everything_is_stored_in_database(tmp_path, monkeypatch):
@@ -1048,3 +1051,118 @@ def test_everything_is_stored_in_database(tmp_path, monkeypatch):
     assert size > 0 and "Message-ID: <m1@example.test>" in headers
     assert json.loads(attachments)[0]["name"] == "A000123456-2026-03.PDF"
     assert "Квитанция во вложении" in body_text
+
+
+# ---------------------------------------------------------------------------
+# Подлинность письма: Authentication-Results (RFC 8601)
+# ---------------------------------------------------------------------------
+
+AUTH = {"search": {"from": ["noreply@example.test"], "require_auth": True, "authserv_id": "mail.example.kz"}}
+
+
+def auth_run(tmp_path, monkeypatch, auth, **overrides):
+    fake = FakeIMAP({1: make_email("Квитанция", "<m1@example.test>", auth=auth)})
+    _config, stats, _calls, say = run_mail(tmp_path, monkeypatch, fake, **(overrides or AUTH))
+    return fake, stats, say
+
+
+def test_auth_dkim_pass_accepts_message(tmp_path, monkeypatch):
+    header = "mail.example.kz; dkim=pass (2048-bit key) header.d=example.test header.i=@example.test; spf=none"
+    fake, stats, say = auth_run(tmp_path, monkeypatch, [header])
+    assert stats["messages_processed"] == 1 and say.warnings == 0 and fake.full_fetches == [1]
+
+
+def test_auth_spf_pass_aligned_with_parent_domain_and_case_insensitive_id(tmp_path, monkeypatch):
+    # From — noreply@example.test; smtp.mailfrom в том же домене; authserv-id сравнивается без учёта регистра.
+    header = "MAIL.Example.KZ 1; dkim=fail; spf=pass smtp.mailfrom=bounce@example.test"
+    _fake, stats, _say = auth_run(tmp_path, monkeypatch, [header])
+    assert stats["messages_processed"] == 1
+
+
+def test_auth_spf_pass_in_subdomain_is_not_aligned(tmp_path, monkeypatch):
+    header = "mail.example.kz; spf=pass smtp.mailfrom=bounce@mail.example.test"
+    _fake, stats, _say = auth_run(tmp_path, monkeypatch, [header])
+    assert stats["messages_found"] == 0
+
+
+def test_auth_fail_skips_with_warning_without_personal_data(tmp_path, monkeypatch):
+    fake, stats, say = auth_run(tmp_path, monkeypatch, ["mail.example.kz; dkim=fail header.d=example.test; spf=softfail smtp.mailfrom=example.test"])
+    assert stats["messages_found"] == 0 and fake.full_fetches == [] and say.warnings == 1
+
+
+def test_auth_foreign_authserv_id_ignored(tmp_path, monkeypatch):
+    fake, stats, _say = auth_run(tmp_path, monkeypatch, ["evil.example.net; dkim=pass header.d=example.test"])
+    assert stats["messages_found"] == 0 and fake.full_fetches == []
+
+
+def test_auth_missing_header_rejected(tmp_path, monkeypatch):
+    _fake, stats, say = auth_run(tmp_path, monkeypatch, None)
+    assert stats["messages_found"] == 0 and say.warnings == 1
+
+
+def test_auth_domain_mismatch_rejected(tmp_path, monkeypatch):
+    _fake, stats, _say = auth_run(tmp_path, monkeypatch, ["mail.example.kz; dkim=pass header.d=evil.test; spf=pass smtp.mailfrom=evil.test"])
+    assert stats["messages_found"] == 0
+
+
+def test_auth_not_required_accepts_unsigned_message(tmp_path, monkeypatch):
+    _fake, stats, _say = auth_run(tmp_path, monkeypatch, None, search={"from": ["noreply@example.test"], "require_auth": False})
+    assert stats["messages_processed"] == 1
+
+
+def test_auth_required_without_authserv_id_is_config_error(tmp_path, monkeypatch):
+    monkeypatch.delenv("UTILITY_BILLS_IMAP_PASSWORD", raising=False)
+    config = ub.load_config(write_config(tmp_path, search={"from": ["noreply@example.test"], "require_auth": True}), noop)
+    with pytest.raises(ub.ConfigError, match="authserv_id"):
+        ub.validate_imap(config)
+
+
+def test_parse_authentication_results_handles_comments_and_quotes():
+    server, results = ub.parse_authentication_results(
+        'Mail.Example.KZ (internal; relay) 1 ; dkim=pass (ok; signature) header.d="example.test" ; spf=pass smtp.mailfrom=a@example.test'
+    )
+    assert server == "mail.example.kz"
+    assert results[0]["dkim"] == "pass" and results[0]["header.d"] == "example.test" and results[1]["spf"] == "pass"
+
+
+def test_sender_authenticated_rejects_public_suffix_alignment():
+    assert not ub.sender_authenticated(["mail.example.kz; dkim=pass header.d=kz"], "mail.example.kz", "example.kz")
+    assert ub.sender_authenticated(["mail.example.kz; dkim=pass header.i=user@example.kz"], "mail.example.kz", "sub.example.kz")
+
+
+# ---------------------------------------------------------------------------
+# Персональные данные в логах, размер письма, сигнатура PDF, миграция
+# ---------------------------------------------------------------------------
+
+
+def test_logs_mask_account_and_hide_username(tmp_path, monkeypatch, capsys):
+    fake = FakeIMAP({1: make_email("Квитанция", "<m1@example.test>")})
+    run_mail(tmp_path, monkeypatch, fake)
+    out = capsys.readouterr().out
+    assert "0000123456" not in out and "000123456" not in out and "user@example.test" not in out
+    assert "***3456" in out
+
+
+def test_message_without_size_is_skipped_with_warning(tmp_path, monkeypatch):
+    class NoSize(FakeIMAP):
+        def uid(self, command, *args):
+            status, response = super().uid(command, *args)
+            return status, [(item[0].replace(b" RFC822.SIZE", b" X"), item[1]) if isinstance(item, tuple) else item for item in response]
+
+    fake = NoSize({1: make_email("Квитанция", "<m1@example.test>")})
+    _config, stats, _calls, say = run_mail(tmp_path, monkeypatch, fake)
+    assert fake.full_fetches == [] and stats["messages_processed"] == 0 and say.warnings == 1
+
+
+def test_non_pdf_content_is_not_taken_even_with_pdf_type_and_name():
+    fake = FakeIMAP({1: make_email("Квитанция", "<m1@example.test>", pdf=b"MZ\x90 not a pdf")})
+    content = ub.fetch_message(fake, 1, "*.pdf", 1048576, noop)
+    assert content.pdfs == [] and content.attachments[0]["parsed"] is False
+
+
+def test_migration_2_rebuilds_formats_without_database_instance(tmp_path):
+    with closing(sqlite3.connect(tmp_path / "x.db")) as conn:
+        conn.row_factory = sqlite3.Row
+        ub._migration_1(conn, noop)
+        ub._migration_2(conn, noop)
+        assert conn.execute("SELECT COUNT(*) FROM bill_formats").fetchone()[0] == 0

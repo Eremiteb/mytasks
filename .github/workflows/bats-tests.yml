@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   bats:
     runs-on: ubuntu-latest
@@ -19,7 +22,7 @@ jobs:
 
       - name: Install bats-core
         run: |
-          git clone --depth 1 https://github.com/bats-core/bats-core.git /tmp/bats-core
+          git clone --depth 1 --branch v1.11.1 https://github.com/bats-core/bats-core.git /tmp/bats-core
           sudo /tmp/bats-core/install.sh /usr/local
 
       - name: Run bats tests

@@ -591,3 +591,48 @@ EOF
   [ "$status" -eq 0 ]
   grep -qF "| gzip -3" "$ssh_cmd_file"
 }
+
+@test "конфиг с недопустимым NEXTCLOUD_CONTAINER отвергается до действий" {
+  printf 'NEXTCLOUD_CONTAINER="app; reboot"\n' >> "$TMP_DIR/conf/cloud_backup.conf"
+  run env PATH="$STUB_DIR:$PATH" bash "$TMP_DIR/cloud_backup.sh"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"NEXTCLOUD_CONTAINER"* ]]
+}
+
+@test "конфиг с REMOTE_PATH с апострофом отвергается" {
+  printf "REMOTE_PATH=\"/opt/it's\"\n" >> "$TMP_DIR/conf/cloud_backup.conf"
+  run env PATH="$STUB_DIR:$PATH" bash "$TMP_DIR/cloud_backup.sh"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"REMOTE_PATH"* ]]
+}
+
+@test "пользователь Nextcloud с апострофом пропускается при пересоздании files_trashbin" {
+  cat > "$STUB_DIR/ssh" <<EOF2
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$TMP_DIR/ssh_commands"
+case "\$*" in
+  *"config:system:get datadirectory"*) echo /srv/data; exit 0 ;;
+  *"php occ user:list"*) printf '%s\n' "  - bad'user: Bad" "  - alice: Alice"; exit 0 ;;
+  *) printf '\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00'; exit 0 ;;
+esac
+EOF2
+  chmod +x "$STUB_DIR/ssh"
+
+  run env PATH="$STUB_DIR:$PATH" bash "$TMP_DIR/cloud_backup.sh"
+
+  log_file=$(ls "$TMP_DIR/logs"/cloud_backup-*.jsonl 2>/dev/null | head -1)
+  run grep -q '"event":"occ_trashbin_uid_skipped"' "$log_file"
+  [ "$status" -eq 0 ]
+  run grep -F "bad'user" "$TMP_DIR/ssh_commands"
+  [ "$status" -ne 0 ]
+  run grep -F "mkdir -p '/srv/data/alice/files_trashbin'" "$TMP_DIR/ssh_commands"
+  [ "$status" -eq 0 ]
+}
+
+@test "json_escape экранирует перевод строки и управляющие символы" {
+  sed -n '/^json_escape() {/,/^}/p' "$TMP_DIR/cloud_backup.sh" > "$TMP_DIR/je.sh"
+  # shellcheck source=/dev/null
+  source "$TMP_DIR/je.sh"
+  out="$(json_escape $'a\nb"c\\d\te\x01')"
+  [ "$out" = 'a\nb\"c\\d\te\u0001' ]
+}

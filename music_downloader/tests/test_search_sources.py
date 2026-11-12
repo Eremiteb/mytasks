@@ -123,7 +123,36 @@ def test_youtube_music_search_reads_full_metadata_of_top_results(monkeypatch):
     tracks = youtube_music.search_tracks(None, "https://music.youtube.com", "/search?q=Cynthia+Luz#songs")
     assert [track["title"] for track in tracks] == ["Setembro"]
     assert calls[0][-1] == "https://music.youtube.com/search?q=Cynthia+Luz#songs"
-    assert calls[1] == ["--skip-download", "-J", "https://music.youtube.com/watch?v=a"]
+    assert calls[0][-2:] == ["--", "https://music.youtube.com/search?q=Cynthia+Luz#songs"]
+    assert calls[1] == ["--skip-download", "-J", "--", "https://music.youtube.com/watch?v=a"]
+
+
+def test_youtube_music_skips_non_http_entries_and_ends_options_before_url(monkeypatch):
+    monkeypatch.setattr(youtube_music, "available", lambda: True)
+    calls = []
+
+    def run_json(args, timeout):
+        calls.append(args)
+        if "--flat-playlist" in args:
+            return {"entries": [{"url": "file:///etc/passwd"}, {"url": "--exec=evil"}]}
+        pytest.fail("кандидаты без http/https пропускаются")
+
+    monkeypatch.setattr(youtube_music, "_run_json", run_json)
+    assert youtube_music.search_tracks(None, "https://music.youtube.com", "/search?q=x#songs") == []
+    assert len(calls) == 1
+
+
+def test_youtube_music_download_puts_double_dash_before_url(monkeypatch):
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        return __import__("types").SimpleNamespace(returncode=1, stderr="")
+
+    monkeypatch.setattr(youtube_music.subprocess, "run", fake_run)
+    with pytest.raises(RuntimeError):
+        youtube_music.download_mp3("https://music.youtube.com/watch?v=a")
+    assert seen["cmd"][-2:] == ["--", "https://music.youtube.com/watch?v=a"]
 
 
 def test_youtube_music_is_empty_without_tools(monkeypatch):

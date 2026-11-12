@@ -37,8 +37,35 @@ LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
 ###############################################################################
 ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }
 
+# Экранирует строку для JSON: \ и ", перевод строки, \r, табуляция и прочие управляющие
+# символы (<0x20) — имя файла с переводом строки не должно ломать JSONL (CWE-117).
 json_escape() {
-    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\r//g'
+    local input="$1" output="" char="" code="" escaped="" index
+    local special=$'[[:cntrl:]\\\\"]'
+    if [[ ! "${input}" =~ ${special} ]]; then
+        printf '%s' "${input}"
+        return 0
+    fi
+    for ((index = 0; index < ${#input}; index++)); do
+        char="${input:index:1}"
+        case "${char}" in
+            '\') output+='\\' ;;
+            '"') output+='\"' ;;
+            $'\n') output+='\n' ;;
+            $'\r') output+='\r' ;;
+            $'\t') output+='\t' ;;
+            *)
+                printf -v code '%d' "'${char}"
+                if ((code < 32)); then
+                    printf -v escaped '\\u%04x' "${code}"
+                    output+="${escaped}"
+                else
+                    output+="${char}"
+                fi
+                ;;
+        esac
+    done
+    printf '%s' "${output}"
 }
 
 log_json() {

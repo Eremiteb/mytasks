@@ -144,10 +144,11 @@ EOF
 case "\$*" in
   *"command -v zstd >/dev/null 2>&1"*) echo gzip; exit 0 ;;
   *"command -v nc >/dev/null 2>&1 && echo yes"*) echo yes; exit 0 ;;
+  *"mktemp "*) printf "%s\n" /tmp/.cloud_backup_qnap-raw-status.AAA111 /tmp/.cloud_backup_qnap-raw-err.BBB222; exit 0 ;;
   *"nohup bash -c"*) exit 0 ;;
   *"rm -f '"*) exit 0 ;;
-  *"cat '"*"raw-status-"*) echo 0; exit 0 ;;
-  *"cat '"*"raw-err-"*) exit 0 ;;
+  *"cat '"*"raw-status."*) echo 0; exit 0 ;;
+  *"cat '"*"raw-err."*) exit 0 ;;
   *) exit 0 ;;
 esac
 EOF
@@ -194,10 +195,11 @@ EOF
 case "\$*" in
   *"command -v zstd >/dev/null 2>&1"*) echo gzip; exit 0 ;;
   *"command -v nc >/dev/null 2>&1 && echo yes"*) echo yes; exit 0 ;;
+  *"mktemp "*) printf "%s\n" /tmp/.cloud_backup_qnap-raw-status.AAA111 /tmp/.cloud_backup_qnap-raw-err.BBB222; exit 0 ;;
   *"nohup bash -c"*) exit 0 ;;
   *"rm -f '"*) exit 0 ;;
-  *"cat '"*"raw-status-"*) echo 1; exit 0 ;;
-  *"cat '"*"raw-err-"*) echo "remote tar failed: disk full"; exit 0 ;;
+  *"cat '"*"raw-status."*) echo 1; exit 0 ;;
+  *"cat '"*"raw-err."*) echo "remote tar failed: disk full"; exit 0 ;;
   *) exit 0 ;;
 esac
 EOF
@@ -231,10 +233,11 @@ EOF
 case "\$*" in
   *"command -v zstd >/dev/null 2>&1"*) echo gzip; exit 0 ;;
   *"command -v nc >/dev/null 2>&1 && echo yes"*) echo yes; exit 0 ;;
+  *"mktemp "*) printf "%s\n" /tmp/.cloud_backup_qnap-raw-status.AAA111 /tmp/.cloud_backup_qnap-raw-err.BBB222; exit 0 ;;
   *"nohup bash -c"*) exit 0 ;;
   *"rm -f '"*) exit 0 ;;
-  *"cat '"*"raw-status-"*) echo 1; exit 0 ;;
-  *"cat '"*"raw-err-"*) echo "nc: invalid option -- 'N'"; exit 0 ;;
+  *"cat '"*"raw-status."*) echo 1; exit 0 ;;
+  *"cat '"*"raw-err."*) echo "nc: invalid option -- 'N'"; exit 0 ;;
   *"tar --create"*) printf '$GZIP_FIXTURE'; exit 0 ;;
   *) exit 0 ;;
 esac
@@ -498,4 +501,85 @@ EOF
   grep -qF "| gzip -3" "$ssh_cmd_file"
   log_file=$(ls "$TMP_DIR/logs"/cloud_backup_qnap-*.jsonl 2>/dev/null | head -1)
   grep -q 'sleep_sec=0' "$log_file"
+}
+
+@test "raw transfer: временные файлы на сервере создаются через mktemp, а не по PID" {
+  cat >> "$TMP_DIR/conf/cloud_backup_qnap.conf" <<'CONF'
+RAW_TRANSFER_ENABLED="1"
+CONF
+
+  cat > "$STUB_DIR/ssh" <<EOF2
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$TMP_DIR/ssh_commands"
+case "\$*" in
+  *"command -v zstd >/dev/null 2>&1"*) echo gzip; exit 0 ;;
+  *"command -v nc >/dev/null 2>&1 && echo yes"*) echo yes; exit 0 ;;
+  *"mktemp "*) printf "%s\n" /tmp/.cloud_backup_qnap-raw-status.AAA111 /tmp/.cloud_backup_qnap-raw-err.BBB222; exit 0 ;;
+  *"cat '"*"raw-status."*) echo 0; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF2
+  chmod +x "$STUB_DIR/ssh"
+
+  cat > "$STUB_DIR/ncat" <<EOF2
+#!/usr/bin/env bash
+printf '$GZIP_FIXTURE'
+exit 0
+EOF2
+  chmod +x "$STUB_DIR/ncat"
+
+  run_script
+
+  [ "$status" -eq 0 ]
+  run grep -F "/tmp/.cloud_backup_qnap-raw-status.AAA111" "$TMP_DIR/ssh_commands"
+  [ "$status" -eq 0 ]
+  run grep -E 'raw-(status|err)-[0-9]+' "$TMP_DIR/ssh_commands"
+  [ "$status" -ne 0 ]
+}
+
+@test "raw transfer: mktemp не вернул пути — фолбэк на SSH" {
+  cat >> "$TMP_DIR/conf/cloud_backup_qnap.conf" <<'CONF'
+RAW_TRANSFER_ENABLED="1"
+CONF
+
+  cat > "$STUB_DIR/ssh" <<EOF2
+#!/usr/bin/env bash
+case "\$*" in
+  *"command -v zstd >/dev/null 2>&1"*) echo gzip; exit 0 ;;
+  *"command -v nc >/dev/null 2>&1 && echo yes"*) echo yes; exit 0 ;;
+  *"mktemp "*) exit 1 ;;
+  *"tar --create"*) printf '$GZIP_FIXTURE'; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF2
+  chmod +x "$STUB_DIR/ssh"
+
+  run_script
+
+  [ "$status" -eq 0 ]
+  log_file=$(ls "$TMP_DIR/logs"/cloud_backup_qnap-*.jsonl 2>/dev/null | head -1)
+  run grep -q '"event":"raw_transfer_mktemp_failed"' "$log_file"
+  [ "$status" -eq 0 ]
+}
+
+@test "конфиг с недопустимым NEXTCLOUD_SERVICE_NAME отвергается до действий" {
+  printf 'NEXTCLOUD_SERVICE_NAME="x; rm -rf /"\n' >> "$TMP_DIR/conf/cloud_backup_qnap.conf"
+  run_script
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"NEXTCLOUD_SERVICE_NAME"* ]]
+}
+
+@test "конфиг с REMOTE_PATH с апострофом отвергается" {
+  printf "REMOTE_PATH=\"/opt/it's\"\n" >> "$TMP_DIR/conf/cloud_backup_qnap.conf"
+  run_script
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"REMOTE_PATH"* ]]
+}
+
+@test "json_escape экранирует перевод строки и управляющие символы" {
+  sed -n '/^json_escape() {/,/^}/p' "$TMP_DIR/cloud_backup_qnap.sh" > "$TMP_DIR/je.sh"
+  # shellcheck source=/dev/null
+  source "$TMP_DIR/je.sh"
+  out="$(json_escape $'a\nb"c\\d\te\x01')"
+  [ "$out" = 'a\nb\"c\\d\te\u0001' ]
 }

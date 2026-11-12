@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
 
       - name: Установить semgrep
-        run: pip install --user semgrep
+        run: pip install --user "semgrep==1.95.0"
 
       - name: Запустить semgrep
         run: |

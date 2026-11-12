@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 
 set -eu
 
@@ -27,8 +27,26 @@ LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
 ###############################################################################
 ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }
 
+# Экранирование строки для JSON: \ и ", \t, \n, прочие управляющие символы
+# (в т.ч. CR) — \u00XX; иначе табуляция или перевод строки в имени файла
+# дают невалидную строку JSONL. Замена циклом, а не gsub: обратная косая
+# черта в строке замены gsub трактуется по-разному в gawk и mawk.
 json_escape() {
-  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\r//g'
+  printf '%s' "${1-}" | awk 'BEGIN { ORS = ""; for (i = 1; i < 32; i++) code[sprintf("%c", i)] = i }
+    {
+      out = ""; s = $0
+      while (match(s, /[\\"\001-\037]/)) {
+        c = substr(s, RSTART, 1)
+        if (c == "\\") e = "\\\\"
+        else if (c == "\"") e = "\\\""
+        else if (c == "\t") e = "\\t"
+        else e = sprintf("\\u%04x", code[c])
+        out = out substr(s, 1, RSTART - 1) e
+        s = substr(s, RSTART + 1)
+      }
+      if (NR > 1) print "\\n"
+      print out s
+    }'
 }
 
 cleanup_logs() {
@@ -125,6 +143,20 @@ if [ -z "${EXTENSION}" ]; then
   exit 2
 fi
 
+# Расширение попадает в шаблон find -name: допускаются только безопасные символы
+# (без *, ?, [ ], / и пробелов), иначе шаблон мог бы совпасть с лишними файлами.
+if ! printf '%s' "${EXTENSION}" | grep -Eq '^[A-Za-z0-9_-]+$'; then
+  echo "Ошибка: расширение должно состоять только из букв, цифр, '_' и '-'" >&2
+  exit 2
+fi
+
+# Массовое удаление в корне или во всём домашнем каталоге — почти всегда ошибка.
+TARGET_REAL=$(realpath -- "${TARGET_DIR}") || { echo "Ошибка: не удалось разрешить путь: ${TARGET_DIR}" >&2; exit 2; }
+if [ "${TARGET_REAL}" = "/" ] || [ "${TARGET_REAL}" = "$(realpath -- "${HOME:-/nonexistent}" 2>/dev/null)" ]; then
+  echo "Отказ: нельзя обрабатывать корневой или домашний каталог целиком: ${TARGET_REAL}" >&2
+  exit 2
+fi
+
 ###############################################################################
 # MAIN
 ###############################################################################
@@ -137,9 +169,9 @@ MATCHED_COUNT=0
 LIST_FILE=$(mktemp)
 trap 'rm -f -- "${LIST_FILE}"' EXIT INT TERM
 
-find "${TARGET_DIR}" -type f -name "*.${EXTENSION}" -print > "${LIST_FILE}"
+find "${TARGET_DIR}" -type f -name "*.${EXTENSION}" -print0 > "${LIST_FILE}"
 
-while IFS= read -r file; do
+while IFS= read -r -d '' file; do
   [ -z "${file}" ] && continue
   MATCHED_COUNT=$((MATCHED_COUNT + 1))
 

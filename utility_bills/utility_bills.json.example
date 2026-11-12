@@ -14,6 +14,8 @@
     "from": [
       "noreply@example.kz"
     ],
+    "require_auth": true,
+    "authserv_id": "mail.example.kz",
     "attachment_glob": "*.pdf",
     "max_attachment_mb": 20
   },

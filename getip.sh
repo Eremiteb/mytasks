@@ -30,8 +30,26 @@ LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
 ###############################################################################
 ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }
 
+# Экранирование строки для JSON: \ и ", \t, \n, прочие управляющие символы
+# (в т.ч. CR) — \u00XX; иначе табуляция или перевод строки в имени файла
+# дают невалидную строку JSONL. Замена циклом, а не gsub: обратная косая
+# черта в строке замены gsub трактуется по-разному в gawk и mawk.
 json_escape() {
-    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\r//g'
+  printf '%s' "${1-}" | awk 'BEGIN { ORS = ""; for (i = 1; i < 32; i++) code[sprintf("%c", i)] = i }
+    {
+      out = ""; s = $0
+      while (match(s, /[\\"\001-\037]/)) {
+        c = substr(s, RSTART, 1)
+        if (c == "\\") e = "\\\\"
+        else if (c == "\"") e = "\\\""
+        else if (c == "\t") e = "\\t"
+        else e = sprintf("\\u%04x", code[c])
+        out = out substr(s, 1, RSTART - 1) e
+        s = substr(s, RSTART + 1)
+      }
+      if (NR > 1) print "\\n"
+      print out s
+    }'
 }
 
 log_json() {
@@ -118,12 +136,32 @@ fi
 ###############################################################################
 log_json "INFO" "start" "Запуск проверки внешнего IP" "service=${IP_SERVICE_URL}; ip_file=${IP_FILE}; history=${IP_HISTORY_FILE}" 0
 
-IP=$(curl -fsS --max-time "${IP_TIMEOUT_SECS}" "${IP_SERVICE_URL}" 2>/dev/null | tr -d '[:space:]' || true)
+IP=$(curl -fsS --max-time "${IP_TIMEOUT_SECS}" --max-filesize 1024 "${IP_SERVICE_URL}" 2>/dev/null | tr -d '[:space:]' || true)
 
 if [ -z "${IP:-}" ]; then
     err_msg="Не удалось получить IP от ${IP_SERVICE_URL}"
     echo "Ошибка: ${err_msg}" >&2
     log_json "ERROR" "ip_fetch_failed" "${err_msg}" "empty response" 1
+    cleanup_logs
+    exit 1
+fi
+
+# Ответ сервиса — недоверенные данные: принимается только IPv4 или IPv6.
+is_ip() {
+    case "$1" in
+        *[!0-9A-Fa-f:.]*|'') return 1 ;;
+        *) ;;
+    esac
+    case "$1" in
+        *:*) printf '%s' "$1" | grep -Eq '^[0-9A-Fa-f:]*(:[0-9]{1,3}(\.[0-9]{1,3}){3})?$' && [ "${#1}" -le 45 ] && [ "$(printf '%s' "$1" | tr -cd ':' | wc -c)" -ge 2 ] ;;
+        *) printf '%s' "$1" | grep -Eq '^(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}$' ;;
+    esac
+}
+
+if ! is_ip "${IP}"; then
+    err_msg="Ответ ${IP_SERVICE_URL} не является IP-адресом"
+    echo "Ошибка: ${err_msg}" >&2
+    log_json "ERROR" "ip_invalid" "${err_msg}" "response rejected" 1
     cleanup_logs
     exit 1
 fi

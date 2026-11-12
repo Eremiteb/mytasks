@@ -39,6 +39,7 @@ DEFAULT_SOURCES = (
 
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _DRIVERS = {}
+_DRIVERS_DIR = os.path.join(_BASE_DIR, "drivers")
 _SETTINGS_MODULE = None
 _OWN_SETTINGS_APPLIED = False
 
@@ -281,7 +282,10 @@ def _load_driver(path, driver_settings=None):
     """Загружает драйвер источника по пути (каталог загрузчика не входит в sys.path) и кеширует его.
 
     Настройки из `driver_settings` применяются один раз — при первой загрузке модуля."""
-    full_path = path if os.path.isabs(path) else os.path.join(_BASE_DIR, path)
+    full_path = os.path.realpath(os.path.join(_BASE_DIR, path))
+    drivers_dir = os.path.realpath(_DRIVERS_DIR)
+    if not full_path.endswith(".py") or os.path.commonpath([drivers_dir, full_path]) != drivers_dir:
+        raise ImportError(f"Драйвер поиска должен быть файлом .py внутри {drivers_dir}: {path}")
     if full_path not in _DRIVERS:
         spec = importlib.util.spec_from_file_location(
             "audio_search_" + os.path.splitext(os.path.basename(full_path))[0], full_path

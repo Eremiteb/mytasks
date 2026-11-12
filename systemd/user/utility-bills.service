@@ -16,6 +16,9 @@ RestartSec=15min
 RestartPreventExitStatus=2 3
 # Зависший OCR или IMAP не держит юнит бесконечно (обычный запуск — минуты).
 TimeoutStartSec=2h
+# OCR запускает до ocr.workers процессов tesseract: потолок памяти и CPU, чтобы не вытеснить остальное.
+MemoryMax=1G
+CPUQuota=200%
 
 # Ограничения: квитанции и пароль IMAP — персональные данные и секрет (права файлов задаёт umask обёртки).
 NoNewPrivileges=yes

@@ -214,3 +214,13 @@ def test_empty_html_logged(session, caplog):
         and "в HTML не найдено треков" in record.getMessage()
         for record in caplog.records
     )
+
+
+def test_get_client_id_warns_on_unreadable_config(tmp_path, monkeypatch, caplog):
+    monkeypatch.delenv("JAMENDO_CLIENT_ID", raising=False)
+    monkeypatch.setattr(jamendo, "_CONFIG_PATH", str(tmp_path / "missing.json"))
+    monkeypatch.setattr(jamendo, "_CONFIG_CLIENT_ID", None)
+    monkeypatch.setattr(jamendo, "_CONFIG_CLIENT_ID_LOADED", False)
+    with caplog.at_level(logging.WARNING):
+        assert jamendo._get_client_id() is None
+    assert any("client_id" in record.getMessage() for record in caplog.records)

@@ -179,6 +179,8 @@ OFFICIAL_API="${OFFICIAL_API:-https://musicbrainz.org/ws/2/artist}"
 OFFICIAL_UA="${OFFICIAL_UA:-mytasks-split_by_dash/1.0 (https://github.com/Eremiteb/mytasks)}"
 OFFICIAL_CACHE="${OFFICIAL_CACHE:-${SCRIPT_DIR}/state/${SCRIPT_BASE}_official.tsv}"
 OFFICIAL_TIMEOUT="${OFFICIAL_TIMEOUT:-20}"
+# Предел размера ответа MusicBrainz, байт (защита от аномально больших ответов).
+OFFICIAL_MAX_BYTES="${OFFICIAL_MAX_BYTES:-5242880}"
 OFFICIAL_DELAY="${OFFICIAL_DELAY:-1}"
 OFFICIAL_MIN_SCORE="${OFFICIAL_MIN_SCORE:-90}"
 OFFICIAL_MAX_TRIES="${OFFICIAL_MAX_TRIES:-3}"
@@ -188,8 +190,26 @@ OFFICIAL_MAX_TRIES="${OFFICIAL_MAX_TRIES:-3}"
 ###############################################################################
 ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }
 
+# Экранирование строки для JSON: \ и ", \t, \n, прочие управляющие символы
+# (в т.ч. CR) — \u00XX; иначе табуляция или перевод строки в имени файла
+# дают невалидную строку JSONL. Замена циклом, а не gsub: обратная косая
+# черта в строке замены gsub трактуется по-разному в gawk и mawk.
 json_escape() {
-  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\r//g'
+  printf '%s' "${1-}" | awk 'BEGIN { ORS = ""; for (i = 1; i < 32; i++) code[sprintf("%c", i)] = i }
+    {
+      out = ""; s = $0
+      while (match(s, /[\\"\001-\037]/)) {
+        c = substr(s, RSTART, 1)
+        if (c == "\\") e = "\\\\"
+        else if (c == "\"") e = "\\\""
+        else if (c == "\t") e = "\\t"
+        else e = sprintf("\\u%04x", code[c])
+        out = out substr(s, 1, RSTART - 1) e
+        s = substr(s, RSTART + 1)
+      }
+      if (NR > 1) print "\\n"
+      print out s
+    }'
 }
 
 log_json() {
@@ -379,8 +399,8 @@ member_tag_names() {
 # («имя<TAB>id<TAB>официальное_имя», «-» = не найдено); при сетевой ошибке кэш не пишется.
 mb_ids() {
   _mi_cache="${SCRIPT_DIR}/state/${SCRIPT_BASE}_mbid.tsv"
-  if [ -r "${_mi_cache}" ] && awk -F'\t' -v n="$1" '$1 == n { f = 1 } END { exit !f }' "${_mi_cache}"; then
-    awk -F'\t' -v n="$1" '$1 == n && $2 != "-" { print $2 "\t" $3 }' "${_mi_cache}"
+  if [ -r "${_mi_cache}" ] && SBD_N="$1" awk -F'\t' '$1 == ENVIRON["SBD_N"] { f = 1 } END { exit !f }' "${_mi_cache}"; then
+    SBD_N="$1" awk -F'\t' '$1 == ENVIRON["SBD_N"] && $2 != "-" { print $2 "\t" $3 }' "${_mi_cache}"
     return 0
   fi
   if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
@@ -388,17 +408,17 @@ mb_ids() {
   fi
   _mi_query=$(printf '%s' "$1" | tr '_' ' ')
   sleep "${OFFICIAL_DELAY}"
-  if ! _mi_resp=$(curl -sf -m "${OFFICIAL_TIMEOUT}" -A "${OFFICIAL_UA}" -G "${OFFICIAL_API}" \
+  if ! _mi_resp=$(curl -sf -m "${OFFICIAL_TIMEOUT}" --max-filesize "${OFFICIAL_MAX_BYTES}" -A "${OFFICIAL_UA}" -G "${OFFICIAL_API}" \
       --data-urlencode "query=artist:\"${_mi_query}\"" --data-urlencode "fmt=json" --data-urlencode "limit=5"); then
     log_json "WARN" "official_lookup_failed" "Не удалось запросить MusicBrainz" "${_mi_query}"
     return 0
   fi
   _mi_found=$(printf '%s' "${_mi_resp}" \
     | OFFICIAL_MIN_SCORE="${OFFICIAL_MIN_SCORE}" jq -r '.artists[]? | select(.score >= (env.OFFICIAL_MIN_SCORE | tonumber)) | [.id, .name, ([.aliases[]?.name] | join("\u0001"))] | @tsv' 2>/dev/null \
-    | LC_ALL=C.UTF-8 awk -F'\t' -v n="$1" 'BEGIN { w = tolower(n) } { ok = (tolower($2) == w); m = split($3, a, "\001"); for (i = 1; i <= m; i++) if (tolower(a[i]) == w) ok = 1; if (ok) print $1 "\t" $2 }' || true)
+    | SBD_N="$1" LC_ALL=C.UTF-8 awk -F'\t' 'BEGIN { w = tolower(ENVIRON["SBD_N"]) } { ok = (tolower($2) == w); m = split($3, a, "\001"); for (i = 1; i <= m; i++) if (tolower(a[i]) == w) ok = 1; if (ok) print $1 "\t" $2 }' || true)
   mkdir -p "$(dirname -- "${_mi_cache}")"
   if [ -n "${_mi_found}" ]; then
-    printf '%s\n' "${_mi_found}" | awk -F'\t' -v n="$1" '{ print n "\t" $1 "\t" $2 }' >> "${_mi_cache}"
+    printf '%s\n' "${_mi_found}" | SBD_N="$1" awk -F'\t' '{ print ENVIRON["SBD_N"] "\t" $1 "\t" $2 }' >> "${_mi_cache}"
   else
     printf '%s\t-\t-\n' "$1" >> "${_mi_cache}"
   fi
@@ -437,7 +457,7 @@ verify_group() {
   _vg_members=$(wc -l < "${_vg_group}")
   _vg_cache="${SCRIPT_DIR}/state/${SCRIPT_BASE}_verdicts.tsv"
   if [ -r "${_vg_cache}" ]; then
-    _vg_hit=$(awk -F'\t' -v k="${_vg_key}" '$1 == k { print $2 "\t" $3; exit }' "${_vg_cache}")
+    _vg_hit=$(SBD_K="${_vg_key}" awk -F'\t' '$1 == ENVIRON["SBD_K"] { print $2 "\t" $3; exit }' "${_vg_cache}")
     if [ -n "${_vg_hit}" ]; then
       VERDICT="${_vg_hit%%	*}"
       VERIFIED_NAME=""
@@ -497,7 +517,7 @@ VG_TAGS_EOF
       _vg_off_verdict=$(common_verdict "${_vg_ids_file}" "${_vg_members}" "${_vg_with}")
       if [ "${_vg_off_verdict}" = "same" ]; then
         _vg_common=$(awk -F'\t' -v total="${_vg_members}" '{ if (!(($1 SUBSEP $2) in s)) { s[$1 SUBSEP $2] = 1; c[$2]++ } } END { for (k in c) if (c[k] == total) { print k; exit } }' "${_vg_ids_file}")
-        VERIFIED_NAME=$(awk -F'\t' -v id="${_vg_common}" '$2 == id { print $3; exit }' "${_vg_files}")
+        VERIFIED_NAME=$(SBD_ID="${_vg_common}" awk -F'\t' '$2 == ENVIRON["SBD_ID"] { print $3; exit }' "${_vg_files}")
       fi
       rm -f -- "${_vg_ids_file}"
     fi
@@ -662,7 +682,7 @@ name_key() {
 official_name() {
   _on_key="$1"
   if [ -r "${OFFICIAL_CACHE}" ]; then
-    _on_hit=$(awk -F'\t' -v k="${_on_key}" '$1 == k { print $2; exit }' "${OFFICIAL_CACHE}")
+    _on_hit=$(SBD_K="${_on_key}" awk -F'\t' '$1 == ENVIRON["SBD_K"] { print $2; exit }' "${OFFICIAL_CACHE}")
     if [ -n "${_on_hit}" ]; then
       [ "${_on_hit}" = "-" ] || printf '%s\n' "${_on_hit}"
       return 0
@@ -683,7 +703,7 @@ official_name() {
     [ "${_on_tried}" -lt "${OFFICIAL_MAX_TRIES}" ] || break
     _on_tried=$((_on_tried+1))
     sleep "${OFFICIAL_DELAY}"
-    if ! _on_resp=$(curl -sf -m "${OFFICIAL_TIMEOUT}" -A "${OFFICIAL_UA}" -G "${OFFICIAL_API}" \
+    if ! _on_resp=$(curl -sf -m "${OFFICIAL_TIMEOUT}" --max-filesize "${OFFICIAL_MAX_BYTES}" -A "${OFFICIAL_UA}" -G "${OFFICIAL_API}" \
         --data-urlencode "query=artist:\"${_on_query}\"" --data-urlencode "fmt=json" --data-urlencode "limit=5"); then
       log_json "WARN" "official_lookup_failed" "Не удалось запросить официальное имя" "${_on_query}"
       return 0
@@ -856,7 +876,8 @@ sanitize_names() {
 # Значение тега key (artist, album_artist, title) из вывода ffprobe «TAG:ключ=значение»
 # (ключ без учёта регистра); печатает первое найденное значение без пробелов по краям.
 tag_field() {
-  awk -v tags="$1" -v k="tag:$2" 'BEGIN {
+  SBD_TAGS="$1" SBD_K="tag:$2" awk 'BEGIN {
+    tags = ENVIRON["SBD_TAGS"]; k = ENVIRON["SBD_K"]
     n = split(tags, L, "\n")
     for (i = 1; i <= n; i++) {
       p = index(L[i], "=")
@@ -1127,6 +1148,7 @@ if [ -r "${CONFIG_FILE}" ]; then
   conf_value=$(conf_get OFFICIAL_UA); [ -z "${conf_value}" ] || OFFICIAL_UA="${conf_value}"
   conf_value=$(conf_get OFFICIAL_CACHE); [ -z "${conf_value}" ] || OFFICIAL_CACHE="${conf_value}"
   conf_value=$(conf_get OFFICIAL_TIMEOUT); [ -z "${conf_value}" ] || OFFICIAL_TIMEOUT="${conf_value}"
+  conf_value=$(conf_get OFFICIAL_MAX_BYTES); [ -z "${conf_value}" ] || OFFICIAL_MAX_BYTES="${conf_value}"
   conf_value=$(conf_get OFFICIAL_DELAY); [ -z "${conf_value}" ] || OFFICIAL_DELAY="${conf_value}"
   conf_value=$(conf_get OFFICIAL_MIN_SCORE); [ -z "${conf_value}" ] || OFFICIAL_MIN_SCORE="${conf_value}"
   conf_value=$(conf_get OFFICIAL_MAX_TRIES); [ -z "${conf_value}" ] || OFFICIAL_MAX_TRIES="${conf_value}"

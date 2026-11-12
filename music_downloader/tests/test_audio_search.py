@@ -48,7 +48,8 @@ def test_missing_config_falls_back_to_default_sources():
     assert [source["name"] for source in audio_search.enabled_sources(None)] == ["sefon.pro", "lmusic_kz"]
 
 
-def test_query_source_loads_driver_and_quotes_query(tmp_path):
+def test_query_source_loads_driver_and_quotes_query(tmp_path, monkeypatch):
+    monkeypatch.setattr(audio_search, "_DRIVERS_DIR", str(tmp_path))
     driver = tmp_path / "driver.py"
     driver.write_text(
         "def search_tracks(session, base_url, search_path):\n"
@@ -61,7 +62,23 @@ def test_query_source_loads_driver_and_quotes_query(tmp_path):
     assert candidates == [{"artist": "https://t.test", "title": url.removeprefix("https://t.test")}]
 
 
-def test_query_path_placeholder_quotes_query_for_url_path(tmp_path):
+def test_load_driver_rejects_paths_outside_drivers_dir_and_non_py(tmp_path, monkeypatch):
+    drivers = tmp_path / "drivers"
+    drivers.mkdir()
+    (drivers / "ok.py").write_text("def search_tracks(*a):\n    return []\n", encoding="utf-8")
+    (drivers / "data.txt").write_text("x", encoding="utf-8")
+    (tmp_path / "evil.py").write_text("raise SystemExit(9)\n", encoding="utf-8")
+    monkeypatch.setattr(audio_search, "_BASE_DIR", str(tmp_path))
+    monkeypatch.setattr(audio_search, "_DRIVERS_DIR", str(drivers))
+    monkeypatch.setattr(audio_search, "_DRIVERS", {})
+    assert hasattr(audio_search._load_driver("drivers/ok.py"), "search_tracks")
+    for bad in ("evil.py", "../evil.py", str(tmp_path / "evil.py"), "drivers/data.txt"):
+        with pytest.raises(ImportError):
+            audio_search._load_driver(bad)
+
+
+def test_query_path_placeholder_quotes_query_for_url_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(audio_search, "_DRIVERS_DIR", str(tmp_path))
     driver = tmp_path / "driver.py"
     driver.write_text("def search_tracks(session, base_url, search_path):\n    return []\n", encoding="utf-8")
     source = {"name": "t", "driver": str(driver), "base_url": "https://t.test", "search_path": "/search/{query_path}"}

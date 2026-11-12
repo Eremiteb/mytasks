@@ -111,3 +111,21 @@ EOF2
     [ "$(stat -c '%a' "$log_file")" = "600" ]
   done
 }
+
+@test "в лог пишутся имена ключей без значений аргументов (имена файлов содержат лицевой счёт)" {
+  run bash "$TMP_DIR/utility_bills.sh" --dry-run --file "A0001234567-2026-03.PDF"
+
+  [ "$status" -eq 0 ]
+  ! grep -q "A0001234567" "$TMP_DIR"/logs/utility_bills-*.jsonl
+  grep -q '"event":"start".*--dry-run --file' "$TMP_DIR"/logs/utility_bills-*.jsonl
+}
+
+@test "json_escape экранирует перевод строки, CR, табуляцию, управляющие символы, кавычку и обратную косую" {
+  eval "$(sed -n '/^json_escape() {/,/^}/p' "$TMP_DIR/utility_bills.sh")"
+  local input=$'a\nb\rc\td\x01"e\\f'
+
+  run json_escape "$input"
+
+  [ "$status" -eq 0 ]
+  [ "$output" = 'a\nb\rc\td\u0001\"e\\f' ]
+}

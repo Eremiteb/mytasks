@@ -300,3 +300,10 @@ def test_seed_aired_from_takes_is_idempotent_and_keeps_new_entries(tmp_path):
     aired = recorder.list_aired(str(tmp_path), "aired.jsonl", since=0)
     assert [(e["artist"], e["ts"]) for e in aired] == [("Umay", 150), ("WinL", 200), ("Mr.Kuna", 300)]
     assert recorder.seed_aired_from_takes(str(tmp_path), "aired.jsonl") == 0  # повтор ничего не добавляет
+
+
+@pytest.mark.parametrize("url", ["file:///etc/passwd", "ftp://example.test/stream", "/local/stream"])
+def test_open_url_rejects_non_http_schemes(url, monkeypatch):
+    monkeypatch.setattr(recorder.urllib.request, "urlopen", lambda *a, **k: pytest.fail("urlopen не должен вызываться"))
+    with pytest.raises(ValueError):
+        recorder.open_url(recorder.urllib.request.Request(url), timeout=1)

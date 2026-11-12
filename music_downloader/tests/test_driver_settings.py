@@ -148,6 +148,7 @@ def _write_driver(path, timeout=5):
 
 def test_audio_search_applies_driver_settings_once_on_load(tmp_path, monkeypatch):
     monkeypatch.setattr(audio_search, "_DRIVERS", {})
+    monkeypatch.setattr(audio_search, "_DRIVERS_DIR", str(tmp_path))
     driver = tmp_path / "music_downloader_fake.py"
     _write_driver(driver)
     source = {"name": "fake", "driver": str(driver), "base_url": "https://d.test", "search_path": "/?q={query}"}
@@ -161,6 +162,7 @@ def test_audio_search_applies_driver_settings_once_on_load(tmp_path, monkeypatch
 
 def test_find_audio_passes_engine_driver_settings_to_source_driver_and_itself(tmp_path, monkeypatch):
     monkeypatch.setattr(audio_search, "_DRIVERS", {})
+    monkeypatch.setattr(audio_search, "_DRIVERS_DIR", str(tmp_path))
     monkeypatch.setattr(audio_search, "_OWN_SETTINGS_APPLIED", False)
     monkeypatch.setattr(audio_search, "SETTINGS", dict(audio_search.SETTINGS))
     pauses = []

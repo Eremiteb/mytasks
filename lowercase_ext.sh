@@ -25,8 +25,26 @@ LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
 ###############################################################################
 ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }
 
+# Экранирование строки для JSON: \ и ", \t, \n, прочие управляющие символы
+# (в т.ч. CR) — \u00XX; иначе табуляция или перевод строки в имени файла
+# дают невалидную строку JSONL. Замена циклом, а не gsub: обратная косая
+# черта в строке замены gsub трактуется по-разному в gawk и mawk.
 json_escape() {
-  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\r//g'
+  printf '%s' "${1-}" | awk 'BEGIN { ORS = ""; for (i = 1; i < 32; i++) code[sprintf("%c", i)] = i }
+    {
+      out = ""; s = $0
+      while (match(s, /[\\"\001-\037]/)) {
+        c = substr(s, RSTART, 1)
+        if (c == "\\") e = "\\\\"
+        else if (c == "\"") e = "\\\""
+        else if (c == "\t") e = "\\t"
+        else e = sprintf("\\u%04x", code[c])
+        out = out substr(s, 1, RSTART - 1) e
+        s = substr(s, RSTART + 1)
+      }
+      if (NR > 1) print "\\n"
+      print out s
+    }'
 }
 
 log_json() {
@@ -89,7 +107,8 @@ total=$(find "${DIR}" -type f -name '*.*' -print0 | tr -cd '\0' | wc -c)
 i=0
 renamed=0
 
-find "${DIR}" -type f -name '*.*' -print0 |
+# Цикл читает из подстановки процесса, а не из конвейера: счётчики остаются
+# в основной оболочке и попадают в итоговую запись журнала.
 while IFS= read -r -d '' file; do
   i=$((i+1))
   percent=$((i * 100 / total))
@@ -105,11 +124,18 @@ while IFS= read -r -d '' file; do
     printf "\nWOULD RENAME: %s -> %s\n" "${file}" "${new}"
     log_json "INFO" "would_rename" "Файл будет переименован" "${file} -> ${new}"
   else
-    mv -n -- "${file}" "${new}"
-    renamed=$((renamed + 1))
-    log_json "INFO" "renamed" "Файл переименован" "${file} -> ${new}"
+    if [[ -e "${new}" && ! "${file}" -ef "${new}" ]]; then
+      printf "\nSKIP (target exists): %s -> %s\n" "${file}" "${new}" >&2
+      log_json "WARN" "skip_exists" "Цель уже существует, пропуск" "${file} -> ${new}"
+    elif mv -n -- "${file}" "${new}"; then
+      renamed=$((renamed + 1))
+      log_json "INFO" "renamed" "Файл переименован" "${file} -> ${new}"
+    else
+      printf "\nERROR: mv failed: %s -> %s\n" "${file}" "${new}" >&2
+      log_json "ERROR" "rename_failed" "Не удалось переименовать" "${file} -> ${new}"
+    fi
   fi
-done
+done < <(find "${DIR}" -type f -name '*.*' -print0)
 
 echo
 echo "Done."

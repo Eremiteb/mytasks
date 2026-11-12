@@ -36,6 +36,17 @@ fi
 : "${ERROR_LOG:=audio_to_mp3_errors.log}"
 : "${REPORT_FILE:=audio_to_mp3_report.txt}"
 
+case "${JOBS}" in
+  ''|*[!0-9]*) echo "Ошибка: JOBS должен быть неотрицательным целым числом" >&2; exit 2 ;;
+  *) ;;
+esac
+# QUALITY — качество VBR libmp3lame (-q:a), целое 0..9; значение попадает в
+# аргументы ffmpeg, поэтому принимается только число.
+case "${QUALITY}" in
+  [0-9]) ;;
+  *) echo "Ошибка: QUALITY должен быть целым числом 0..9" >&2; exit 2 ;;
+esac
+
 [ "${JOBS}" -eq 0 ] && JOBS=$(nproc 2>/dev/null || echo 1)
 
 ###############################################################################
@@ -66,13 +77,18 @@ if [ "${DRY_RUN}" -eq 0 ]; then
   echo "===== Отчёт конвертации | ${current_date} =====" >> "${OUTPUT_DIR}/${REPORT_FILE}"
 fi
 
+# Значения передаются дочерним оболочкам через окружение, а не подставляются
+# в текст программы sh -c: пути и имена с кавычками не становятся кодом.
+export ROOT_DIR OUTPUT_DIR ERROR_LOG REPORT_FILE COVER_NAMES QUALITY DRY_RUN
+
 # shellcheck disable=SC2016
 process_file='
+set -f
 FILE="$1"
-REL_PATH=$(realpath --relative-to="'"${ROOT_DIR}"'" "${FILE}" 2>/dev/null || echo "${FILE}")
+REL_PATH=$(realpath --relative-to="${ROOT_DIR}" "${FILE}" 2>/dev/null || echo "${FILE}")
 DIRNAME=$(dirname "${REL_PATH}")
 BASENAME=$(basename "${FILE}")
-OUTPUT_DIR_FULL="'"${OUTPUT_DIR}"'/${DIRNAME}"
+OUTPUT_DIR_FULL="${OUTPUT_DIR}/${DIRNAME}"
 OUTPUT="${OUTPUT_DIR_FULL}/${BASENAME%.*}.mp3"
 TMP_COVER=""
 
@@ -81,48 +97,50 @@ echo "Обрабатываю: ${REL_PATH}"
 [ -f "${OUTPUT}" ] && exit 0
 
 ffprobe -v error "${FILE}" 2>/dev/null || {
-  if [ '"${DRY_RUN}"' -eq 1 ]; then
+  if [ "${DRY_RUN}" -eq 1 ]; then
     echo "[dry-run] будет: пропуск неподдерживаемого файла: ${FILE}"
   else
-    echo "UNSUPPORTED | ${FILE}" >> "'"${OUTPUT_DIR}/${ERROR_LOG}"'"
+    echo "UNSUPPORTED | ${FILE}" >> "${OUTPUT_DIR}/${ERROR_LOG}"
   fi
   exit 0
 }
 
-if [ '"${DRY_RUN}"' -eq 1 ]; then
+if [ "${DRY_RUN}" -eq 1 ]; then
   echo "[dry-run] будет: конвертация ${FILE} -> ${OUTPUT}"
   exit 0
 fi
 mkdir -p "${OUTPUT_DIR_FULL}"
 
 COVER=""
-for name in '"${COVER_NAMES}"'; do
+for name in ${COVER_NAMES}; do
   [ -f "$(dirname "${FILE}")/${name}" ] && COVER="$(dirname "${FILE}")/${name}" && break
 done
 
 if [ -z "${COVER}" ]; then
   TMP_COVER=$(mktemp --suffix=.jpg 2>/dev/null || mktemp XXXXXXXXXX.jpg)
   ffmpeg -y -i "${FILE}" -an -vcodec copy "${TMP_COVER}" 2>/dev/null || true
-  [ -f "${TMP_COVER}" ] && COVER="${TMP_COVER}"
+  [ -s "${TMP_COVER}" ] && COVER="${TMP_COVER}"
 fi
 
 if [ -n "${COVER}" ]; then
   ffmpeg -y -i "${FILE}" -i "${COVER}" -map 0:a -map 1:v -map_metadata 0 -vn \
-  -c:a libmp3lame -q:a '"${QUALITY}"' -c:v mjpeg \
+  -c:a libmp3lame -q:a "${QUALITY}" -c:v mjpeg \
   -metadata:s:v title="Album cover" -metadata:s:v comment="Cover (front)" \
-  "${OUTPUT}" 2>> "'"${OUTPUT_DIR}/${ERROR_LOG}"'"
+  "${OUTPUT}" 2>> "${OUTPUT_DIR}/${ERROR_LOG}"
 else
-  ffmpeg -y -i "${FILE}" -map_metadata 0 -vn -c:a libmp3lame -q:a '"${QUALITY}"' \
-  "${OUTPUT}" 2>> "'"${OUTPUT_DIR}/${ERROR_LOG}"'"
+  ffmpeg -y -i "${FILE}" -map_metadata 0 -vn -c:a libmp3lame -q:a "${QUALITY}" \
+  "${OUTPUT}" 2>> "${OUTPUT_DIR}/${ERROR_LOG}"
 fi
+rc=$?
 
-if [ $? -eq 0 ]; then
-  echo "OK | ${FILE} -> ${OUTPUT}" >> "'"${OUTPUT_DIR}/${REPORT_FILE}"'"
+if [ "${rc}" -eq 0 ]; then
+  echo "OK | ${FILE} -> ${OUTPUT}" >> "${OUTPUT_DIR}/${REPORT_FILE}"
 else
-  echo "ERROR | ${FILE}" >> "'"${OUTPUT_DIR}/${ERROR_LOG}"'"
+  echo "ERROR | ${FILE}" >> "${OUTPUT_DIR}/${ERROR_LOG}"
 fi
 
 [ -n "${TMP_COVER:-}" ] && [ -f "${TMP_COVER}" ] && rm -f "${TMP_COVER}"
+exit 0
 '
 
 # Выражение для find собирается в позиционных параметрах: каждое расширение

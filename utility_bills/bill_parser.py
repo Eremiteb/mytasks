@@ -511,6 +511,28 @@ def inner_lines(grid: Grid, x0: int, x1: int, y0: int, y1: int, inset: int) -> l
 # ---------------------------------------------------------------------------
 
 
+# Переменные окружения, которые нужны внешним программам; остальные (в том числе пароль IMAP) в
+# подпроцессы не передаются.
+TOOL_ENV_KEYS = ("PATH", "LANG", "LC_ALL", "TESSDATA_PREFIX")
+
+
+def tool_env(**extra: str) -> dict[str, str]:
+    """Минимальное окружение для pdfimages/tesseract (CWE-200: секреты родителя не наследуются)."""
+    env = {key: os.environ[key] for key in TOOL_ENV_KEYS if key in os.environ}
+    env.update(extra)
+    return env
+
+
+def mask_account(account: str | None) -> str:
+    """Лицевой счёт для логов: только последние 4 символа (***3456)."""
+    return f"***{account[-4:]}" if account else "***"
+
+
+def mask_digits(text: str) -> str:
+    """Длинные цифровые последовательности (лицевой счёт в имени файла) → ***NNNN для логов."""
+    return re.sub(r"\d{6,}", lambda match: mask_account(match.group()), text)
+
+
 def run_tesseract(image: Image.Image, settings: Settings, numeric: bool = False, psm: int = 6) -> str:
     """Распознаёт PIL-изображение через tesseract (stdin → stdout)."""
     buffer = BytesIO()
@@ -519,7 +541,7 @@ def run_tesseract(image: Image.Image, settings: Settings, numeric: bool = False,
     if numeric:
         command += ["-c", "tessedit_char_whitelist=0123456789.,-"]
     # Параллелизм — на уровне процессов (ocr_many), поэтому внутри tesseract один поток.
-    env = {**os.environ, "OMP_THREAD_LIMIT": "1"}
+    env = tool_env(OMP_THREAD_LIMIT="1")
     try:
         result = subprocess.run(
             command,
@@ -549,6 +571,7 @@ def check_tools(settings: Settings | None = None) -> list[str]:
                 text=True,
                 timeout=settings["timeout_seconds"],
                 check=False,
+                env=tool_env(),
             )
         except (OSError, subprocess.TimeoutExpired) as error:
             return [f"tesseract не запускается: {error}"]
@@ -563,7 +586,12 @@ def _run_pdfimages(arguments: list[str], settings: Settings) -> str:
     """pdfimages с тайм-аутом; сбой запуска или ненулевой код — BillParseError. Возвращает stdout."""
     try:
         result = subprocess.run(
-            [settings["pdfimages"], *arguments], capture_output=True, text=True, timeout=settings["timeout_seconds"], check=False
+            [settings["pdfimages"], *arguments],
+            capture_output=True,
+            text=True,
+            timeout=settings["timeout_seconds"],
+            check=False,
+            env=tool_env(),
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise BillParseError(f"pdfimages не запустился: {error}") from error
@@ -1257,9 +1285,9 @@ def _crosscheck_filename(bill: Bill, pdf_name: str) -> None:
         bill.warnings.append(f"месяц квитанции {bill.period} не совпадает с именем файла ({file_period})")
     if bill.account is None and file_account:
         bill.account = file_account.zfill(10)
-        bill.notes.append(f"лицевой счёт не распознан в квитанции, взят из имени файла: {bill.account}")
+        bill.notes.append(f"лицевой счёт не распознан в квитанции, взят из имени файла: {mask_account(bill.account)}")
     elif file_account and bill.account and bill.account.lstrip("0") != file_account.lstrip("0"):
-        bill.warnings.append(f"лицевой счёт {bill.account} не совпадает с именем файла ({file_account})")
+        bill.warnings.append(f"лицевой счёт {mask_account(bill.account)} не совпадает с именем файла ({mask_account(file_account)})")
 
 
 def format_features(page_size: tuple[int, int], grid: Grid, items: list[BillItem], table_header: str) -> tuple[dict, str]:

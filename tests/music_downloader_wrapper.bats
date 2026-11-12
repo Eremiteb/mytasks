@@ -78,3 +78,14 @@ EOF2
   [ "$status" -eq 0 ]
   grep -q "mypython called" "$TMP_DIR/my_cron.log"
 }
+
+@test "json_escape escapes backslash, quote, newline, CR, tab and control chars" {
+  eval "$(sed -n '/^json_escape() {/,/^}/p' "$REPO_ROOT/music_downloader.sh")"
+
+  run json_escape $'a\\b"c\nd\re\tf\001g Привет'
+  [ "$status" -eq 0 ]
+  [ "$output" = 'a\\b\"c\nd\re\tf\u0001g Привет' ]
+
+  run json_escape 'plain text'
+  [ "$output" = 'plain text' ]
+}

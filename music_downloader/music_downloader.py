@@ -12,6 +12,7 @@ import unicodedata
 from contextlib import ExitStack, closing, suppress
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import cloudscraper
 from mutagen.id3 import COMM, ID3, ID3NoHeaderError, TextFrame, UrlFrame
@@ -559,25 +560,59 @@ def cleanup_old_logs(cleanup_days=None, max_files=None):
                 os.remove(fp)
 
 
+MAX_FILENAME_BYTES = 200
+# Папки синхронизируются Syncthing с Windows: эти имена там зарезервированы (с любым расширением).
+WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{n}" for n in range(1, 10)}
+    | {f"LPT{n}" for n in range(1, 10)}
+)
+
+
 def safe_filename(s: str) -> str:
-    """Удаляет опасные символы из имени файла, сохраняя Unicode буквы и цифры."""
+    """Удаляет опасные символы из имени файла, сохраняя Unicode буквы и цифры.
+
+    Имя не длиннее MAX_FILENAME_BYTES байт UTF-8 (расширение сохраняется), основа
+    без хвостовых точек и пробелов, зарезервированные имена Windows получают префикс «_».
+    """
     if not s:
         return ""
-    
 
     # Удаляем опасные для файловой системы символы
     dangerous = r'[\\/:*?"<>|\x00-\x1f]'
     cleaned = re.sub(dangerous, '', s)
-    
-    # Удаляем любые вариации кавычек и скобок
-    # Включаем все известные типы кавычек на всех языках
-    # Это более надежный способ чем перечисление всех вариантов
-    # Удаляем символы которые НЕ являются буквами/цифрами/пробелами/дефисами/точками/амперсандом
-    # но сохраняем Unicode буквы
+
+    # Оставляем только Unicode буквы/цифры/пробелы/дефисы/точки/амперсанд; скобки и кавычки
+    # любых языков удаляются.
     cleaned = re.sub(r"[^\w\s\-\.&]", '', cleaned, flags=re.UNICODE)
-    cleaned = re.sub(r'[\(\)\[\]\{\}]', '', cleaned)  # удаляем скобки для верности
-    
-    return cleaned.strip()
+    cleaned = re.sub(r'[\(\)\[\]\{\}]', '', cleaned)
+    cleaned = cleaned.strip()
+
+    stem, ext = os.path.splitext(cleaned)
+    if len(ext.encode("utf-8")) > 16 or re.search(r"\s", ext):  # «Mr. Smith» — точка в названии, не расширение
+        stem, ext = cleaned, ""
+    budget = MAX_FILENAME_BYTES - len(ext.encode("utf-8"))
+    stem = stem.encode("utf-8")[:budget].decode("utf-8", "ignore")
+    stem = stem.rstrip(". ")
+    if stem.split(".", 1)[0].rstrip().upper() in WINDOWS_RESERVED_NAMES:
+        stem = f"_{stem}"
+    return f"{stem}{ext}" if stem else ""
+
+
+def require_http_url(url):
+    """Адрес для скачивания: только http/https (без file://, ftp:// и т.п.); иначе ValueError."""
+    if not isinstance(url, str) or urlsplit(url).scheme not in ("http", "https"):
+        raise ValueError(f"Недопустимая схема адреса скачивания: {url!r}")
+    return url
+
+
+def resolve_driver_path(path):
+    """Путь драйвера после realpath: только `*.py` внутри BASE_DIR/drivers; иначе ValueError."""
+    drivers_dir = os.path.realpath(os.path.join(BASE_DIR, "drivers"))
+    full_path = os.path.realpath(os.path.join(BASE_DIR, path))
+    if not full_path.endswith(".py") or os.path.commonpath([drivers_dir, full_path]) != drivers_dir:
+        raise ValueError(f"Драйвер должен быть файлом .py внутри {drivers_dir}: {path}")
+    return full_path
 
 
 def capitalize_first(value):
@@ -864,12 +899,22 @@ class DownloadLimitExceeded(OSError):
     """Трек не помещается хотя бы в одну из общих папок."""
 
 
-def save_response(response, download_paths, filename, expected_size=0):
+class TrackDownloadError(OSError):
+    """Ошибка одного трека (дедлайн или лимит размера файла): остальной запуск продолжается."""
+
+
+DOWNLOAD_MAX_SECONDS = 600
+DOWNLOAD_MAX_MB = 100
+
+
+def save_response(response, download_paths, filename, expected_size=0, max_seconds=None, max_bytes=None):
     """Сохраняет поток во все каталоги, не превышая доступный для трека объём.
 
     Перед публикацией файла теги ID3 очищаются (``clean_mp3_tags``). Возвращает
     ``(число_байт, список_путей, sha256_hex)`` — размер и хеш относятся к итоговому
     файлу на диске (после очистки тегов); хеш используется для дедупликации.
+    ``max_seconds`` — общий дедлайн на трек, ``max_bytes`` — лимит размера одного файла;
+    превышение — ``TrackDownloadError`` (``.part`` удаляются).
     """
     if not download_paths:
         raise ValueError("Не заданы папки для сохранения")
@@ -888,6 +933,9 @@ def save_response(response, download_paths, filename, expected_size=0):
         raise DownloadLimitExceeded(
             f"Лимит папки {limiting_path}: доступно {max(available, 0)} байт, размер трека {expected_size} байт"
         )
+    if max_bytes is not None and expected_size > max_bytes:
+        raise TrackDownloadError(f"Размер трека {expected_size} байт больше лимита файла {max_bytes} байт")
+    deadline = None if max_seconds is None else time.monotonic() + max_seconds
     files = []
     temp_paths = []
     final_paths = []
@@ -898,13 +946,19 @@ def save_response(response, download_paths, filename, expected_size=0):
             for folder in download_paths:
                 final_path = os.path.join(folder["path"], filename)
                 temp_path = f"{final_path}.part"
-                files.append(stack.enter_context(open(temp_path, "wb")))
+                # O_NOFOLLOW: симлинк на месте .part — ошибка, а не запись по чужому пути.
+                fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+                files.append(stack.enter_context(os.fdopen(fd, "wb")))
                 temp_paths.append(temp_path)
                 final_paths.append(final_path)
 
             for chunk in response.iter_content(chunk_size=131072):
+                if deadline is not None and time.monotonic() > deadline:
+                    raise TrackDownloadError(f"Превышено время скачивания трека ({max_seconds} с)")
                 if not chunk:
                     continue
+                if max_bytes is not None and downloaded_bytes + len(chunk) > max_bytes:
+                    raise TrackDownloadError(f"Трек превышает лимит файла {max_bytes} байт")
                 if downloaded_bytes + len(chunk) > available:
                     raise DownloadLimitExceeded(
                         f"Лимит папки {limiting_path}: трек превышает доступные {available} байт"
@@ -1087,6 +1141,8 @@ def run():
     if check_paths_and_limits(download_paths, "system"):
         raise SystemExit(2)
 
+    download_max_seconds = number_setting(config, "download_max_seconds", DOWNLOAD_MAX_SECONDS, minimum=1)
+    download_max_bytes = int(number_setting(config, "download_max_mb", DOWNLOAD_MAX_MB, minimum=1) * 1048576)
     logger.info("Инициализирую scraper...")
     try:
         db = DatabaseManager(DB_PATH)
@@ -1113,9 +1169,12 @@ def run():
         s_name = site_cfg["site_name"]
         logger.info(f"Выбираю драйвер: {s_name}", extra={"site": s_name})
 
-        spec = importlib.util.spec_from_file_location(
-            "mod", os.path.join(BASE_DIR, site_cfg["site_script"])
-        )
+        try:
+            driver_path = resolve_driver_path(site_cfg["site_script"])
+        except ValueError as error:
+            logger.error(f"Драйвер {s_name} не загружен: {error}", extra={"site": s_name})
+            continue
+        spec = importlib.util.spec_from_file_location("mod", driver_path)
         if spec is None or spec.loader is None:
             logger.error(f"Не удалось загрузить драйвер {s_name}", extra={"site": s_name})
             continue
@@ -1240,7 +1299,7 @@ def run():
                     fetch = t.get("fetch")
                     with (
                         fetch() if callable(fetch)
-                        else scraper.get(t["download_url"], timeout=download_timeout, headers=headers, stream=True)
+                        else scraper.get(require_http_url(t["download_url"]), timeout=download_timeout, headers=headers, stream=True)
                     ) as r:
                         if r.status_code == 200:
                             # Получаем размер файла из заголовка Content-Length
@@ -1257,7 +1316,8 @@ def run():
 
                             logger.info(f"Сохраняю файл: {clean_fn}", extra={"site": s_name})
                             downloaded_bytes, saved_paths, filehash = save_response(
-                                r, download_paths, clean_fn, content_length
+                                r, download_paths, clean_fn, content_length,
+                                max_seconds=download_max_seconds, max_bytes=download_max_bytes,
                             )
 
                             # Тот же файл уже скачан (другое имя/источник): физические

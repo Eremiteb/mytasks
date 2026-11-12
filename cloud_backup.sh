@@ -3,6 +3,9 @@
 
 set -uo pipefail
 
+# Архивы бэкапа и логи доступны только владельцу.
+umask 077
+
 ###############################################################################
 # SCRIPT ID / PATHS
 ###############################################################################
@@ -33,12 +36,22 @@ LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
 ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }
 
 json_escape() {
-  # Удаляем/нормализуем управляющие символы, чтобы каждая запись оставалась
-  # корректной одной строкой JSONL даже при шумном stderr внешних команд.
-  printf '%s' "$1" \
-    | tr '\n\t' '  ' \
-    | tr -d '\000-\010\013\014\016-\037' \
-    | sed 's/\\/\\\\/g; s/"/\\"/g; s/\r//g'
+  # Экранируем \ и ", а также \n, \r, \t и прочие управляющие символы (<0x20),
+  # чтобы значение (например, имя файла) не могло разорвать запись JSONL
+  # (CWE-117). Чистый bash, без внешних утилит (BusyBox-совместимо).
+  local s="$1" i o1 o2 o3 c u
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  for i in 1 2 3 4 5 6 7 8 11 12 {14..31}; do
+    o1=$(( i / 64 )); o2=$(( (i / 8) % 8 )); o3=$(( i % 8 ))
+    printf -v c '%b' "\\0${o1}${o2}${o3}"
+    printf -v u '\\u%04x' "${i}"
+    s=${s//"${c}"/"${u}"}
+  done
+  printf '%s' "${s}"
 }
 
 log_json() {
@@ -183,6 +196,26 @@ COMP_ZSTD_CMD="${COMP_ZSTD_CMD:-zstd --fast=1 --threads=0 -c}"
 COMP_PIGZ_CMD="${COMP_PIGZ_CMD:-pigz -1}"
 COMP_GZIP_CMD="${COMP_GZIP_CMD:-gzip -1}"
 PROGRESS_INTERVAL_SECS="${PROGRESS_INTERVAL_SECS:-60}"
+
+# Значения из conf подставляются в команды, исполняемые на удалённой стороне
+# через ssh "…"/bash -c '…': допускаем только строгие шаблоны, иначе отказ до
+# каких-либо действий (защита от внедрения команд).
+for var in NEXTCLOUD_CONTAINER NEXTCLOUD_EXEC_USER MARIADB_SERVICE_NAME; do
+  if [[ ! "${!var}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "Ошибка конфигурации: ${var} содержит недопустимые символы (разрешено: A-Za-z0-9._-): ${CONFIG_FILE}" >&2
+    exit 1
+  fi
+done
+for var in MARIADB_PURGE_BINLOGS MARIADB_TRUNCATE_GENERAL_LOG; do
+  if [[ ! "${!var}" =~ ^[01]$ ]]; then
+    echo "Ошибка конфигурации: ${var} должен быть 0 или 1: ${CONFIG_FILE}" >&2
+    exit 1
+  fi
+done
+if [[ ! "${REMOTE_PATH}" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
+  echo "Ошибка конфигурации: REMOTE_PATH должен быть абсолютным путём из символов A-Za-z0-9._/-: ${CONFIG_FILE}" >&2
+  exit 1
+fi
 
 ###############################################################################
 # WireGuard
@@ -449,9 +482,20 @@ log_json "INFO" "occ_user_list" "Получен список пользоват�
 if [[ -z "${remote_datadir}" || -z "${remote_users}" ]]; then
   occ_trash_repair_rc=1
   occ_trash_repair_detail="не удалось получить datadirectory или список пользователей"
+elif [[ ! "${remote_datadir}" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
+  # Путь подставляется в удалённую команду в одинарных кавычках.
+  occ_trash_repair_rc=1
+  occ_trash_repair_detail="datadirectory содержит недопустимые символы, пересоздание files_trashbin пропущено"
+  log_json "WARN" "occ_trashbin_datadir_invalid" "datadirectory не подходит под строгий шаблон пути" "${remote_datadir}"
 else
   while IFS= read -r _uid; do
     [[ -z "${_uid}" ]] && continue
+    # _uid и путь подставляются в удалённую команду в одинарных кавычках —
+    # пропускаем всё, что не подходит под строгий шаблон (апостроф и т.п.).
+    if [[ ! "${_uid}" =~ ^[A-Za-z0-9._@-]+$ ]]; then
+      log_json "WARN" "occ_trashbin_uid_skipped" "Идентификатор пользователя пропущен: недопустимые символы" "user=${_uid}"
+      continue
+    fi
     export SSHPASS="${REMOTE_PASSWORD}"
     _repair_err=$(sshpass -e ssh "${SSH_OPTS[@]}" "${REMOTE_USER}@${REMOTE_HOST}" \
       "docker exec -u ${NEXTCLOUD_EXEC_USER} ${NEXTCLOUD_CONTAINER} mkdir -p '${remote_datadir}/${_uid}/files_trashbin'" 2>&1)

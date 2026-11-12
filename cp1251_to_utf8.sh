@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 
 set -eu
 
@@ -26,8 +26,26 @@ LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
 ###############################################################################
 ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }
 
+# Экранирование строки для JSON: \ и ", \t, \n, прочие управляющие символы
+# (в т.ч. CR) — \u00XX; иначе табуляция или перевод строки в имени файла
+# дают невалидную строку JSONL. Замена циклом, а не gsub: обратная косая
+# черта в строке замены gsub трактуется по-разному в gawk и mawk.
 json_escape() {
-    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\r//g'
+  printf '%s' "${1-}" | awk 'BEGIN { ORS = ""; for (i = 1; i < 32; i++) code[sprintf("%c", i)] = i }
+    {
+      out = ""; s = $0
+      while (match(s, /[\\"\001-\037]/)) {
+        c = substr(s, RSTART, 1)
+        if (c == "\\") e = "\\\\"
+        else if (c == "\"") e = "\\\""
+        else if (c == "\t") e = "\\t"
+        else e = sprintf("\\u%04x", code[c])
+        out = out substr(s, 1, RSTART - 1) e
+        s = substr(s, RSTART + 1)
+      }
+      if (NR > 1) print "\\n"
+      print out s
+    }'
 }
 
 log_json() {
@@ -97,30 +115,49 @@ echo "Каталог: ${DIR}"
 [ "${DRY_RUN}" -eq 1 ] && echo "Режим: DRY-RUN"
 log_json "INFO" "start" "Запуск перекодировки" "${DIR}"
 
-find "${DIR}" -type f | while IFS= read -r file; do
-    if ! file -b --mime "${file}" | grep -q 'text'; then
-        continue
-    fi
+# Кандидаты — только текстовые файлы, у которых libmagic определяет 8-битную
+# кодировку (cp1251 он выдаёт как iso-8859-1 / windows-1252 / unknown-8bit).
+# Валидный UTF-8, ASCII, UTF-16/32 и бинарные файлы не трогаются: их перекодировка
+# из windows-1251 «всегда проходит» и испортила бы содержимое.
+is_candidate() {
+    local f="$1" enc
+    file -b --mime "${f}" | grep -q 'text' || return 1
+    enc="$(file -b --mime-encoding "${f}")" || return 1
+    case "${enc}" in
+        iso-8859-1|windows-1252|unknown-8bit) ;;
+        *) return 1 ;;
+    esac
+    iconv -f utf-8 -t utf-8 "${f}" >/dev/null 2>&1 && return 1
+    iconv -f windows-1251 -t utf-8 "${f}" >/dev/null 2>&1
+}
 
-    if iconv -f utf-8 -t utf-8 "${file}" >/dev/null 2>&1; then
-        continue
+convert_file() {
+    local f="$1" tmp
+    tmp="$(mktemp -- "${f}.XXXXXXXX")" || return 1
+    if iconv -f windows-1251 -t utf-8 "${f}" > "${tmp}" \
+        && chmod --reference="${f}" -- "${tmp}" \
+        && { chown --reference="${f}" -- "${tmp}" 2>/dev/null || true; } \
+        && mv -- "${tmp}" "${f}"; then
+        return 0
     fi
+    rm -f -- "${tmp}"
+    return 1
+}
 
-    if iconv -f windows-1251 -t utf-8 "${file}" >/dev/null 2>&1; then
-        if [ "${DRY_RUN}" -eq 1 ]; then
-            echo "[DRY-RUN] перекодировать: ${file}"
-            log_json "INFO" "would_convert" "Файл требует перекодировки" "${file}"
-        else
-            tmp="$(mktemp)"
-            iconv -f windows-1251 -t utf-8 "${file}" > "${tmp}"
-            chmod --reference="${file}" "${tmp}"
-            chown --reference="${file}" "${tmp}" 2>/dev/null || true
-            mv "${tmp}" "${file}"
-            echo "[OK] перекодирован: ${file}"
-            log_json "INFO" "converted" "Файл перекодирован" "${file}"
-        fi
+while IFS= read -r -d '' file; do
+    is_candidate "${file}" || continue
+
+    if [ "${DRY_RUN}" -eq 1 ]; then
+        echo "[DRY-RUN] перекодировать: ${file}"
+        log_json "INFO" "would_convert" "Файл требует перекодировки" "${file}"
+    elif convert_file "${file}"; then
+        echo "[OK] перекодирован: ${file}"
+        log_json "INFO" "converted" "Файл перекодирован" "${file}"
+    else
+        echo "[ОШИБКА] не удалось перекодировать: ${file}" >&2
+        log_json "ERROR" "convert_failed" "iconv завершился с ошибкой" "${file}"
     fi
-done
+done < <(find "${DIR}" -type f -print0)
 
 echo "Готово."
 log_json "INFO" "done" "Обработка завершена"

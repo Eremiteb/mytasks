@@ -25,6 +25,8 @@ OFFICIAL_CACHE=@MYTASKS_DIR@/state/split_by_dash_official.tsv
 
 # Тайм-аут одного запроса к MusicBrainz, секунды.
 OFFICIAL_TIMEOUT=20
+# Предел размера ответа MusicBrainz, байт (по умолчанию 5 МБ).
+OFFICIAL_MAX_BYTES=5242880
 
 # Пауза перед каждым запросом, секунды (MusicBrainz допускает не чаще 1 запроса в секунду).
 OFFICIAL_DELAY=1

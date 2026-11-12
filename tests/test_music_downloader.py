@@ -907,5 +907,79 @@ class TestMusicDownloader(unittest.TestCase):
                 create_scraper.assert_not_called()
 
 
+class TestDownloadHardening(unittest.TestCase):
+    def test_deadline_aborts_track_and_removes_part(self):
+        class Response:
+            def iter_content(self, chunk_size):
+                yield b"abc"
+                yield b"def"
+
+        with tempfile.TemporaryDirectory() as root:
+            # старт дедлайна = 0, после первого чанка «прошло» 100 с при лимите 10 с
+            with patch.object(music_downloader.time, "monotonic", side_effect=[0, 1, 100]):
+                with self.assertRaises(music_downloader.TrackDownloadError):
+                    save_response(Response(), [{"path": root}], "t.mp3", max_seconds=10)
+            self.assertEqual(os.listdir(root), [])
+
+    def test_file_size_limit_aborts_track_and_is_not_folder_limit(self):
+        class Response:
+            def iter_content(self, chunk_size):
+                yield b"abcd"
+                yield b"efgh"
+
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaises(music_downloader.TrackDownloadError) as error:
+                save_response(Response(), [{"path": root}], "t.mp3", max_bytes=6)
+            self.assertNotIsInstance(error.exception, music_downloader.DownloadLimitExceeded)
+            self.assertEqual(os.listdir(root), [])
+            with self.assertRaises(music_downloader.TrackDownloadError):
+                save_response(Response(), [{"path": root}], "t.mp3", expected_size=7, max_bytes=6)
+
+    def test_limits_not_exceeded_save_normally(self):
+        class Response:
+            def iter_content(self, chunk_size):
+                yield b"abc"
+
+        with tempfile.TemporaryDirectory() as root:
+            size, _, _ = save_response(Response(), [{"path": root}], "t.mp3", 3, max_seconds=60, max_bytes=3)
+            self.assertEqual(size, 3)
+
+    def test_symlink_at_part_path_is_track_error(self):
+        class Response:
+            def iter_content(self, chunk_size):
+                yield b"abc"
+
+        with tempfile.TemporaryDirectory() as root:
+            victim = os.path.join(root, "victim")
+            Path(victim).write_text("keep")
+            os.symlink(victim, os.path.join(root, "t.mp3.part"))
+            with self.assertRaises(OSError):
+                save_response(Response(), [{"path": root}], "t.mp3")
+            self.assertEqual(Path(victim).read_text(), "keep")
+
+    def test_require_http_url(self):
+        self.assertEqual(music_downloader.require_http_url("https://a.test/x.mp3"), "https://a.test/x.mp3")
+        for bad in ("file:///etc/passwd", "ftp://a.test/x", "/local/path", "", None):
+            with self.assertRaises(ValueError):
+                music_downloader.require_http_url(bad)
+
+    def test_resolve_driver_path_only_py_inside_drivers(self):
+        ok = music_downloader.resolve_driver_path("drivers/music_downloader_sefon_pro.py")
+        self.assertTrue(ok.endswith("music_downloader_sefon_pro.py"))
+        for bad in ("../music_downloader.py", "/etc/passwd.py", "drivers/../music_downloader.py", "drivers/x.txt"):
+            with self.assertRaises(ValueError):
+                music_downloader.resolve_driver_path(bad)
+
+    def test_safe_filename_length_windows_names_and_trailing_dots(self):
+        long_name = safe_filename("Я" * 300 + ".mp3")
+        self.assertLessEqual(len(long_name.encode("utf-8")), 200)
+        self.assertTrue(long_name.endswith(".mp3"))
+        self.assertEqual(safe_filename("Name. . .mp3"), "Name.mp3")
+        self.assertEqual(safe_filename("CON.mp3"), "_CON.mp3")
+        self.assertEqual(safe_filename("lpt1.mp3"), "_lpt1.mp3")
+        self.assertEqual(safe_filename("Console.mp3"), "Console.mp3")
+        self.assertEqual(safe_filename("Mr. Smith"), "Mr. Smith")
+
+
 if __name__ == "__main__":
     unittest.main()

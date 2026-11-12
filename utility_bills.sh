@@ -40,8 +40,30 @@ LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
 ###############################################################################
 ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }
 
+# Экранирование строки для JSON: \ и ", а также перевод строки, \r, табуляция и прочие управляющие
+# символы (< 0x20) — имя файла с переводом строки не должно ломать JSONL (CWE-117). Чистый bash.
 json_escape() {
-    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\r//g'
+    local text="$1" out="" ch code esc i
+    for ((i = 0; i < ${#text}; i++)); do
+        ch="${text:${i}:1}"
+        case "${ch}" in
+            '\') out+='\\' ;;
+            '"') out+='\"' ;;
+            $'\n') out+='\n' ;;
+            $'\r') out+='\r' ;;
+            $'\t') out+='\t' ;;
+            *)
+                printf -v code '%d' "'${ch}"
+                if ((code < 32)); then
+                    printf -v esc '\\u%04x' "${code}"
+                    out+="${esc}"
+                else
+                    out+="${ch}"
+                fi
+                ;;
+        esac
+    done
+    printf '%s' "${out}"
 }
 
 log_json() {
@@ -96,15 +118,22 @@ acquire_lock() {
 ###############################################################################
 DRY_RUN=0
 PY_ARGS=()
+# В лог попадают только имена ключей (--file, --dry-run…), без значений: имена файлов содержат лицевой счёт.
+LOG_ARG_KEYS=()
 for arg in "$@"; do
     case "${arg}" in
         -n|--dry-run)
             DRY_RUN=1
             PY_ARGS+=("--dry-run")
+            LOG_ARG_KEYS+=("--dry-run")
             ;;
         -h|--help)
             usage
             exit 0
+            ;;
+        -*)
+            PY_ARGS+=("${arg}")
+            LOG_ARG_KEYS+=("${arg%%=*}")
             ;;
         *)
             PY_ARGS+=("${arg}")
@@ -115,7 +144,7 @@ done
 ###############################################################################
 # MAIN
 ###############################################################################
-log_json "INFO" "start" "Запуск utility_bills" "${PY_ARGS[*]}"
+log_json "INFO" "start" "Запуск utility_bills" "ключи: ${LOG_ARG_KEYS[*]:-нет}; аргументов: ${#PY_ARGS[@]}"
 
 if [[ ! -f "${PROJECT_PATH}/utility_bills.py" ]]; then
     log_json "ERROR" "project_missing" "Проект не найден" "${PROJECT_PATH}"

@@ -178,6 +178,11 @@
 
 set -uo pipefail
 
+# Архивы и логи — запись только владельцу (admin, uid 0). Чтение для остальных
+# сохраняется: check_backups.sh проверяет архивы с рабочей машины по NFS от обычного
+# пользователя, с 077 (600 root) он не смог бы их прочитать. Без umask QNAP создаёт 666.
+umask 022
+
 # Entware-утилиты (wg-quick, wg, zstd и т.д.) лежат в /opt/*bin,
 # которых обычно нет в PATH при запуске из Task Scheduler/cron.
 export PATH="/opt/sbin:/opt/bin:${PATH}"
@@ -252,12 +257,22 @@ LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
 ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }
 
 json_escape() {
-  # Удаляем/нормализуем управляющие символы, чтобы каждая запись оставалась
-  # корректной одной строкой JSONL даже при шумном stderr внешних команд.
-  printf '%s' "$1" \
-    | tr '\n\t' '  ' \
-    | tr -d '\001\002\003\004\005\006\007\010\013\014\016\017\020\021\022\023\024\025\026\027\030\031\032\033\034\035\036\037' \
-    | sed 's/\\/\\\\/g; s/"/\\"/g; s/\r//g'
+  # Экранируем \ и ", а также \n, \r, \t и прочие управляющие символы (<0x20),
+  # чтобы значение (например, имя файла) не могло разорвать запись JSONL
+  # (CWE-117). Чистый bash, без внешних утилит (BusyBox-совместимо).
+  local s="$1" i o1 o2 o3 c u
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  for i in 1 2 3 4 5 6 7 8 11 12 {14..31}; do
+    o1=$(( i / 64 )); o2=$(( (i / 8) % 8 )); o3=$(( i % 8 ))
+    printf -v c '%b' "\\0${o1}${o2}${o3}"
+    printf -v u '\\u%04x' "${i}"
+    s=${s//"${c}"/"${u}"}
+  done
+  printf '%s' "${s}"
 }
 
 log_json() {
@@ -397,6 +412,36 @@ RAW_TRANSFER_PORT="${RAW_TRANSFER_PORT:-8873}"
 RAW_TRANSFER_CONNECT_RETRIES="${RAW_TRANSFER_CONNECT_RETRIES:-10}"
 RAW_TRANSFER_REMOTE_TIMEOUT_SEC="${RAW_TRANSFER_REMOTE_TIMEOUT_SEC:-21600}"
 RAW_TRANSFER_STATUS_POLL_RETRIES="${RAW_TRANSFER_STATUS_POLL_RETRIES:-5}"
+
+# Значения из conf подставляются в команды, исполняемые на удалённой стороне
+# через ssh "…"/bash -c '…': допускаем только строгие шаблоны, иначе отказ до
+# каких-либо действий (защита от внедрения команд).
+for var in NEXTCLOUD_SERVICE_NAME MARIADB_SERVICE_NAME; do
+  if [[ ! "${!var}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "Ошибка конфигурации: ${var} содержит недопустимые символы (разрешено: A-Za-z0-9._-): ${CONFIG_FILE}" >&2
+    exit 1
+  fi
+done
+for var in MARIADB_PURGE_BINLOGS MARIADB_TRUNCATE_GENERAL_LOG; do
+  if [[ ! "${!var}" =~ ^[01]$ ]]; then
+    echo "Ошибка конфигурации: ${var} должен быть 0 или 1: ${CONFIG_FILE}" >&2
+    exit 1
+  fi
+done
+for var in RAW_TRANSFER_PORT RAW_TRANSFER_REMOTE_TIMEOUT_SEC; do
+  if [[ ! "${!var}" =~ ^[0-9]+$ ]]; then
+    echo "Ошибка конфигурации: ${var} должен быть числом: ${CONFIG_FILE}" >&2
+    exit 1
+  fi
+done
+if [[ ! "${REMOTE_HOST}" =~ ^[A-Za-z0-9._:-]+$ ]]; then
+  echo "Ошибка конфигурации: REMOTE_HOST содержит недопустимые символы: ${CONFIG_FILE}" >&2
+  exit 1
+fi
+if [[ ! "${REMOTE_PATH}" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
+  echo "Ошибка конфигурации: REMOTE_PATH должен быть абсолютным путём из символов A-Za-z0-9._/-: ${CONFIG_FILE}" >&2
+  exit 1
+fi
 
 # Замер реальной скорости сети QNAP<->REMOTE_HOST перед началом бэкапа —
 # тем же способом (nc -N + ncat --recv-only), что и сама передача, поэтому
@@ -916,7 +961,13 @@ measure_network_speed() {
   fi
 
   local test_status_file test_out test_launch test_start test_end test_dur test_bytes test_mib_s test_rc
-  test_status_file="/tmp/.${SCRIPT_BASE}-speedtest-status-$$"
+  # Временный файл статуса создаётся на удалённой стороне через mktemp
+  # (непредсказуемое имя, права 600), а не по имени с PID.
+  test_status_file="$(ssh_remote "mktemp /tmp/.${SCRIPT_BASE}-speedtest-status.XXXXXX" 2>/dev/null)"
+  if [[ ! "${test_status_file}" =~ ^/tmp/\.[A-Za-z0-9._-]+$ ]]; then
+    log_json "WARN" "network_speed_test_skip_mktemp" "Не удалось создать временный файл на удалённой стороне — замер скорости сети пропущен" ""
+    return
+  fi
   test_out="$(mktemp)"
 
   test_launch="rm -f '${test_status_file}'; \
@@ -1226,7 +1277,17 @@ USE_RAW_TRANSFER=0
 if [[ "${RAW_TRANSFER_ENABLED}" -eq 1 ]]; then
   _nc_check_raw="$(ssh_remote "command -v nc >/dev/null 2>&1 && echo yes" 2>/dev/null)"
   if [[ "${_nc_check_raw}" = "yes" ]]; then
-    USE_RAW_TRANSFER=1
+    # Временные файлы статуса/ошибок создаются на сервере через mktemp
+    # (непредсказуемые имена, права 600); имена возвращаются сюда двумя строками.
+    _raw_tmp_names="$(ssh_remote "mktemp /tmp/.${SCRIPT_BASE}-raw-status.XXXXXX && mktemp /tmp/.${SCRIPT_BASE}-raw-err.XXXXXX" 2>/dev/null)"
+    REMOTE_STATUS_FILE="${_raw_tmp_names%%$'\n'*}"
+    REMOTE_ERR_FILE="${_raw_tmp_names#*$'\n'}"
+    if [[ "${REMOTE_STATUS_FILE}" =~ ^/tmp/\.[A-Za-z0-9._-]+$ && "${REMOTE_ERR_FILE}" =~ ^/tmp/\.[A-Za-z0-9._-]+$ \
+      && "${REMOTE_STATUS_FILE}" != "${REMOTE_ERR_FILE}" ]]; then
+      USE_RAW_TRANSFER=1
+    else
+      log_json "WARN" "raw_transfer_mktemp_failed" "Не удалось создать временные файлы на удалённом сервере — используется передача через SSH" ""
+    fi
   else
     log_json "WARN" "raw_transfer_nc_missing" "На удалённом сервере не найден nc — используется передача через SSH" ""
   fi
@@ -1236,8 +1297,6 @@ if [[ "${USE_RAW_TRANSFER}" -eq 1 ]]; then
   # Раздельные каналы: SSH запускает и останавливает удалённый листенер
   # (служебная команда), а сами байты бэкапа идут напрямую по TCP поверх
   # WireGuard, без дополнительного слоя SSH-шифрования поверх него.
-  REMOTE_STATUS_FILE="/tmp/.${SCRIPT_BASE}-raw-status-$$"
-  REMOTE_ERR_FILE="/tmp/.${SCRIPT_BASE}-raw-err-$$"
   # nohup + явный "bash -c" (а не логин-шелл, который может оказаться dash и
   # не понимать "set -o pipefail") запускает пайплайн в фоне на удалённой
   # стороне и переживает завершение этой SSH-сессии — ssh_remote() ниже

@@ -42,6 +42,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 from datetime import datetime
 
@@ -747,12 +748,19 @@ def changed_at_from_headers(headers, received_at):
     return modified + (received_at - server_now)
 
 
+def open_url(request, timeout):
+    """urlopen только для http/https: file:// и другие схемы из конфигурации недопустимы."""
+    if urllib.parse.urlsplit(request.full_url).scheme not in ("http", "https"):
+        raise ValueError(f"Недопустимая схема адреса (нужен http/https): {request.full_url}")
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
 def read_now_playing(url, timeout=10, user_agent=USER_AGENT):
     """((исполнитель, название) или None для джингла, момент изменения 1.txt или None)."""
     request = urllib.request.Request(
         f"{url}?{time.time():.0f}", headers={"User-Agent": user_agent, "Cache-Control": "no-cache"}
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with open_url(request, timeout=timeout) as response:
         text = response.read().decode("utf-8", "replace")
         changed_at = changed_at_from_headers(response.headers, time.time())
     return beufm.parse_now_playing(text), changed_at
@@ -763,7 +771,7 @@ def stream_worker(settings, buffer, stop):
     while not stop.is_set():
         try:
             request = urllib.request.Request(settings["stream_url"], headers={"User-Agent": settings["user_agent"]})
-            with urllib.request.urlopen(request, timeout=settings["stream_timeout_seconds"]) as response:
+            with open_url(request, timeout=settings["stream_timeout_seconds"]) as response:
                 connected = time.time()
                 # Icecast при подключении отдаёт «запас» из прошлого (замер: ~2.4 с):
                 # начало буфера сдвигается назад на то, что пришло быстрее реального времени.
@@ -865,7 +873,7 @@ def run_service(settings):
 def dry_run(settings):
     """Проверки без записи: настройки, поток, название, инструменты; план — `[dry-run] будет: …`."""
     request = urllib.request.Request(settings["stream_url"], headers={"User-Agent": settings["user_agent"]})
-    with urllib.request.urlopen(request, timeout=settings["stream_timeout_seconds"]) as response:
+    with open_url(request, timeout=settings["stream_timeout_seconds"]) as response:
         content_type = response.headers.get("Content-Type")
         sample = response.read(16384)
     if not any(is_frame_header(sample, index) for index in range(len(sample))):

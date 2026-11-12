@@ -26,8 +26,26 @@ LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
 ###############################################################################
 ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }
 
+# Экранирование строки для JSON: \ и ", \t, \n, прочие управляющие символы
+# (в т.ч. CR) — \u00XX; иначе табуляция или перевод строки в имени файла
+# дают невалидную строку JSONL. Замена циклом, а не gsub: обратная косая
+# черта в строке замены gsub трактуется по-разному в gawk и mawk.
 json_escape() {
-    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\r//g'
+  printf '%s' "${1-}" | awk 'BEGIN { ORS = ""; for (i = 1; i < 32; i++) code[sprintf("%c", i)] = i }
+    {
+      out = ""; s = $0
+      while (match(s, /[\\"\001-\037]/)) {
+        c = substr(s, RSTART, 1)
+        if (c == "\\") e = "\\\\"
+        else if (c == "\"") e = "\\\""
+        else if (c == "\t") e = "\\t"
+        else e = sprintf("\\u%04x", code[c])
+        out = out substr(s, 1, RSTART - 1) e
+        s = substr(s, RSTART + 1)
+      }
+      if (NR > 1) print "\\n"
+      print out s
+    }'
 }
 
 log_json() {
@@ -118,9 +136,9 @@ echo
 
 # Сначала собираем все файлы в массив и считаем общее количество
 if ${RECURSIVE}; then
-    mapfile -t files < <(grep -rlI -- "${FROM_STR}" "${TARGET_DIR}" 2>/dev/null || true)
+    mapfile -d '' -t files < <(grep -rlIFZ -- "${FROM_STR}" "${TARGET_DIR}" 2>/dev/null || true)
 else
-    mapfile -t files < <(grep -lI -- "${FROM_STR}" "${TARGET_DIR}"/* 2>/dev/null || true)
+    mapfile -d '' -t files < <(grep -lIFZ -- "${FROM_STR}" "${TARGET_DIR}"/* 2>/dev/null || true)
 fi
 total=${#files[@]}
 
@@ -149,9 +167,26 @@ progress_bar() {
     printf "] %3d%% (%d/%d)" "${percent}" "${current}" "${total}"
 }
 
-# Экранирование для sed
-SED_FROM=$(printf '%s\n' "${FROM_STR}" | sed 's/[\/&]/\\&/g')
-SED_TO=$(printf '%s\n' "${TO_STR}" | sed 's/[\/&]/\\&/g')
+# Замена фиксированной строки без интерпретации метасимволов (и & в замене):
+# файл читается целиком, шаблон в кавычках — литерал. Результат пишется во
+# временный файл рядом с оригиналом и атомарно переносится mv.
+if shopt -q patsub_replacement 2>/dev/null; then
+    shopt -u patsub_replacement
+fi
+
+replace_in_file() {
+    local file="$1" content tmp
+    content="$(cat -- "${file}"; printf x)" || return 1
+    content="${content%x}"
+    tmp="$(mktemp -- "${file}.XXXXXXXX")" || return 1
+    if printf '%s' "${content//"${FROM_STR}"/"${TO_STR}"}" > "${tmp}" \
+        && chmod --reference="${file}" -- "${tmp}" \
+        && mv -- "${tmp}" "${file}"; then
+        return 0
+    fi
+    rm -f -- "${tmp}"
+    return 1
+}
 
 # Обработка файлов с прогресс-баром
 counter=0
@@ -163,16 +198,15 @@ for file in "${files[@]}"; do
 
     if ${DRY_RUN}; then
         echo -e "\nНайдено в: ${file}"
-        grep -n -- "${FROM_STR}" "${file}" | sed "s/${SED_FROM}/[31m&[0m/g; s/$/  ← заменится на \"${TO_STR}\"/"
+        grep -nF -- "${FROM_STR}" "${file}" | REPLACE_TO="${TO_STR}" awk '{ print $0 "  ← заменится на \"" ENVIRON["REPLACE_TO"] "\"" }'
         log_json "INFO" "would_replace" "Найдено совпадение" "${file}"
     else
         echo -e "\nОбрабатываем: ${file}"
-        if sed -i.bak "s/${SED_FROM}/${SED_TO}/g" "${file}" 2>/dev/null; then
-            rm -f "${file}.bak"
+        if replace_in_file "${file}"; then
             log_json "INFO" "replaced" "Замена выполнена" "${file}"
         else
-            sed -i "s/${SED_FROM}/${SED_TO}/g" "${file}"
-            log_json "INFO" "replaced" "Замена выполнена (fallback sed -i)" "${file}"
+            echo "Ошибка: не удалось обработать ${file}" >&2
+            log_json "ERROR" "replace_failed" "Замена не выполнена" "${file}"
         fi
     fi
 done

@@ -18,7 +18,7 @@ import os
 import shutil
 import subprocess
 import tempfile
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 logger = logging.getLogger("Engine")
 
@@ -68,7 +68,7 @@ def download_mp3(url):
             [
                 "yt-dlp", "--no-warnings", "--ignore-config", "--no-playlist", "--quiet",
                 "-f", "bestaudio", "-x", "--audio-format", "mp3", "--audio-quality", SETTINGS["mp3_quality"],
-                "-o", os.path.join(workdir, "track.%(ext)s"), url,
+                "-o", os.path.join(workdir, "track.%(ext)s"), "--", url,
             ],
             capture_output=True, text=True, timeout=SETTINGS["download_timeout_seconds"], check=False,
         )
@@ -103,15 +103,15 @@ def search_tracks(session, base_url, search_path):
     if not available():
         return []
     search_url = urljoin(base_url, search_path)
-    found = _run_json(["--flat-playlist", "--playlist-end", str(SETTINGS["max_candidates"]), "-J", search_url],
+    found = _run_json(["--flat-playlist", "--playlist-end", str(SETTINGS["max_candidates"]), "-J", "--", search_url],
                       SETTINGS["search_timeout_seconds"])
     tracks = []
     for entry in found.get("entries") or []:
         url = entry.get("url")
-        if not url:
+        if not url or urlsplit(url).scheme not in ("http", "https"):
             continue
         try:
-            candidate = parse_info(_run_json(["--skip-download", "-J", url], SETTINGS["search_timeout_seconds"]))
+            candidate = parse_info(_run_json(["--skip-download", "-J", "--", url], SETTINGS["search_timeout_seconds"]))
         except Exception as error:
             logger.warning(f"YouTube Music: не удалось прочитать {url}: {error}")
             continue

@@ -1,4 +1,4 @@
-cloudscraper>=1.2.71
-beautifulsoup4>=4.15.0
-requests>=2.34.0
-mutagen>=1.47.0
+cloudscraper>=1.2.71,<2
+beautifulsoup4>=4.15.0,<5
+requests>=2.34.0,<3
+mutagen>=1.47.0,<2

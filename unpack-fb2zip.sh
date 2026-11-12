@@ -23,20 +23,33 @@ LOG_SCHEMA_VERSION="${LOG_SCHEMA_VERSION:-1.0}"
 LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
 
 DRY_RUN=0
+# Предел размера одной распакованной записи, МБ (защита от zip-бомб).
+MAX_ENTRY_MB="${UNPACK_FB2ZIP_MAX_MB:-200}"
 ROOT_DIR=""
 LOG_FILE=""
 
 ts_now() { date '+%Y-%m-%d %H:%M:%S'; }
 
+# Экранирование строки для JSON: \ и ", \t, \n, прочие управляющие символы
+# (в т.ч. CR) — \u00XX; иначе табуляция или перевод строки в имени файла
+# дают невалидную строку JSONL. Замена циклом, а не gsub: обратная косая
+# черта в строке замены gsub трактуется по-разному в gawk и mawk.
 json_escape() {
-  # экранирование строки для JSON
-  local s="${1-}"
-  s=${s//\\/\\\\}
-  s=${s//\"/\\\"}
-  s=${s//$'\n'/\\n}
-  s=${s//$'\r'/\\r}
-  s=${s//$'\t'/\\t}
-  printf '%s' "${s}"
+  printf '%s' "${1-}" | awk 'BEGIN { ORS = ""; for (i = 1; i < 32; i++) code[sprintf("%c", i)] = i }
+    {
+      out = ""; s = $0
+      while (match(s, /[\\"\001-\037]/)) {
+        c = substr(s, RSTART, 1)
+        if (c == "\\") e = "\\\\"
+        else if (c == "\"") e = "\\\""
+        else if (c == "\t") e = "\\t"
+        else e = sprintf("\\u%04x", code[c])
+        out = out substr(s, 1, RSTART - 1) e
+        s = substr(s, RSTART + 1)
+      }
+      if (NR > 1) print "\\n"
+      print out s
+    }'
 }
 
 log_json() {
@@ -70,6 +83,8 @@ usage() {
   -p, --path DIR     корневая папка для поиска (обязательно)
   --dry-run          ничего не извлекать, только показать/залогировать действия
   --log FILE         путь к JSONL-логу (по умолчанию: logs/unpack-fb2zip_YYYY-MM-DD.jsonl)
+  --max-mb N         предел размера одной распакованной записи, МБ (по умолчанию 200;
+                     переменная окружения UNPACK_FB2ZIP_MAX_MB); больше — запись пропускается
   -h, --help         помощь
 
 Формат лога:
@@ -121,6 +136,7 @@ while [[ $# -gt 0 ]]; do
     -p|--path) ROOT_DIR="${2-}"; shift 2;;
     --dry-run) DRY_RUN=1; shift;;
     --log) LOG_FILE="${2-}"; shift 2;;
+    --max-mb) MAX_ENTRY_MB="${2-}"; shift 2;;
     -h|--help) usage; exit 0;;
     *) echo "Неизвестный аргумент: $1" >&2; usage; exit 2;;
   esac
@@ -128,6 +144,9 @@ done
 
 [[ -z "${ROOT_DIR}" ]] && { echo "Ошибка: укажите -p DIR" >&2; usage; exit 2; }
 [[ -d "${ROOT_DIR}" ]] || { echo "Ошибка: нет такой папки: ${ROOT_DIR}" >&2; exit 2; }
+
+[[ "${MAX_ENTRY_MB}" =~ ^[1-9][0-9]{0,5}$ ]] || { echo "Ошибка: --max-mb должен быть положительным целым числом" >&2; exit 2; }
+MAX_ENTRY_BYTES=$((MAX_ENTRY_MB * 1024 * 1024))
 
 if [[ -z "${LOG_FILE}" ]]; then
   LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}_$(date '+%Y-%m-%d').jsonl"
@@ -166,13 +185,29 @@ while IFS= read -r -d '' zipfile; do
       continue
     fi
 
-    # unzip -p: печатает файл на stdout; пишем в итоговый файл
-    if unzip -p -- "${zipfile}" "${entry}" >"${out_path}" 2>/dev/null; then
+    # Имя записи — не шаблон: [ ] * ? и \ экранируются, иначе unzip истолкует их
+    # как подстановочные знаки и извлечёт другую запись.
+    entry_pat="${entry//\\/\\\\}"
+    entry_pat="${entry_pat//\[/\\[}"
+    entry_pat="${entry_pat//\*/\\*}"
+    entry_pat="${entry_pat//\?/\\?}"
+
+    # unzip -p печатает запись на stdout; head ограничивает размер (+1 байт —
+    # признак превышения). Пишем во временный файл рядом и переносим mv -n.
+    tmp_out="$(mktemp -- "${dir}/.unpack-fb2zip.XXXXXXXX")" || {
+      log_json "error" "extract_failed" "Не удалось создать временный файл" "${zipfile}" "${out_path}" 1 ""
+      continue
+    }
+    unzip -p -- "${zipfile}" "${entry_pat}" 2>/dev/null | head -c "$((MAX_ENTRY_BYTES + 1))" >"${tmp_out}"
+    rc="${PIPESTATUS[0]}"
+    size="$(stat -c %s -- "${tmp_out}" 2>/dev/null || echo 0)"
+    if [[ "${size}" -gt "${MAX_ENTRY_BYTES}" ]]; then
+      rm -f -- "${tmp_out}"
+      log_json "error" "entry_too_large" "Запись больше ${MAX_ENTRY_MB} МБ, пропущена" "${zipfile}" "${out_path}" 1 "\"entry\":\"$(json_escape "${entry}" || true)\""
+    elif [[ "${size}" -gt 0 && ( "${rc}" -eq 0 || "${rc}" -eq 141 ) ]] && mv -n -- "${tmp_out}" "${out_path}"; then
       log_json "info" "extracted" "Файл извлечён" "${zipfile}" "${out_path}" 0 "\"entry\":\"$(json_escape "${entry}" || true)\""
     else
-      rc=$?
-      # на случай частично созданного файла
-      [[ -f "${out_path}" ]] && rm -f -- "${out_path}"
+      rm -f -- "${tmp_out}"
       log_json "error" "extract_failed" "Ошибка извлечения" "${zipfile}" "${out_path}" "${rc}" "\"entry\":\"$(json_escape "${entry}" || true)\""
     fi
   done <<<"${entries}"

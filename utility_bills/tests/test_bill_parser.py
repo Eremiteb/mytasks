@@ -617,3 +617,17 @@ def test_matching_row_has_no_mismatch_mark():
     row = item()
     bp._fill_item(row, unanimous_values(50.0), SETTINGS)
     assert row.row_check_ok is True and "to_pay_mismatch" not in row.raw
+
+
+def test_tool_env_does_not_leak_secrets(monkeypatch):
+    monkeypatch.setenv("UTILITY_BILLS_IMAP_PASSWORD", "secret")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("TESSDATA_PREFIX", "/tessdata")
+    env = bp.tool_env(OMP_THREAD_LIMIT="1")
+    assert "UTILITY_BILLS_IMAP_PASSWORD" not in env
+    assert env["PATH"] == "/usr/bin" and env["TESSDATA_PREFIX"] == "/tessdata" and env["OMP_THREAD_LIMIT"] == "1"
+
+
+def test_mask_account_and_digits():
+    assert bp.mask_account("0001234567") == "***4567"
+    assert bp.mask_digits("A0001234567-2026-03.PDF") == "A***4567-2026-03.PDF"

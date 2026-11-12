@@ -3,6 +3,8 @@
     "log_max_files": 10,
     "download_timeout_seconds": 60,
     "download_pause_seconds": 1.2,
+    "download_max_seconds": 600,
+    "download_max_mb": 100,
 
     "file_permissions": {
         "enabled": true,
@@ -207,7 +209,7 @@
             "site_name": "jamendo_com",
             "site_script": "drivers/music_downloader_jamendo_com.py",
             "base_url": "https://jamendo.com",
-            "client_id": "60c4cb2b",
+            "client_id": "YOUR_JAMENDO_CLIENT_ID",
             "categories": [
                 "/"
             ]

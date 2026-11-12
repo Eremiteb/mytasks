@@ -68,17 +68,26 @@ EOF
 
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 
+# Экранирование строки для JSON: \ и ", \t, \n, прочие управляющие символы
+# (в т.ч. CR) — \u00XX; иначе табуляция или перевод строки в имени файла
+# дают невалидную строку JSONL. Замена циклом, а не gsub: обратная косая
+# черта в строке замены gsub трактуется по-разному в gawk и mawk.
 json_escape() {
-  awk 'BEGIN{ORS=""; first=1}
-  {
-    if(!first) printf "\\n";
-    first=0;
-    gsub(/\\/,"\\\\");
-    gsub(/"/,"\\\"");
-    gsub(/\t/,"\\t");
-    gsub(/\r/,"\\r");
-    printf "%s",$0;
-  }'
+  awk 'BEGIN { ORS = ""; for (i = 1; i < 32; i++) code[sprintf("%c", i)] = i }
+    {
+      out = ""; s = $0
+      while (match(s, /[\\"\001-\037]/)) {
+        c = substr(s, RSTART, 1)
+        if (c == "\\") e = "\\\\"
+        else if (c == "\"") e = "\\\""
+        else if (c == "\t") e = "\\t"
+        else e = sprintf("\\u%04x", code[c])
+        out = out substr(s, 1, RSTART - 1) e
+        s = substr(s, RSTART + 1)
+      }
+      if (NR > 1) print "\\n"
+      print out s
+    }'
 }
 
 log_json() {
@@ -123,13 +132,14 @@ OVERWRITE=0
 SKIP_NEWER=0
 
 AUTHOR_SET=0
-AUTHOR="${USER:-}"
+AUTHOR=""
 
 # Значения по умолчанию; conf/doc2fb2.conf их переопределяет, ключи командной
 # строки главнее конфига. Из окружения не берутся (LOG_LEVEL, TOC — общие имена).
 TITLE_MODE="auto"
 TOC=1
 TOC_DEPTH=3
+PANDOC_TIMEOUT=300   # секунды на один запуск pandoc (нужен timeout из coreutils)
 LOG_KEEP_DAYS=10
 LOG_LEVEL="info"   # info|error
 CONFIG_FILE="${SCRIPT_DIR}/conf/${SCRIPT_BASE}.conf"
@@ -137,6 +147,11 @@ if [[ -r "${CONFIG_FILE}" ]]; then
   # shellcheck source=/dev/null
   source "${CONFIG_FILE}"
 fi
+
+case "${PANDOC_TIMEOUT}" in
+  ''|*[!0-9]*|0) echo "Ошибка: PANDOC_TIMEOUT должен быть положительным числом секунд" >&2; exit 2 ;;
+  *) ;;
+esac
 
 ONLY="all"
 EXCLUDES=()
@@ -363,13 +378,16 @@ run_pandoc_to_fb2() {
     tauthor="${AUTHOR}"
   else
     if [[ -n "${meta_creator}" ]]; then tauthor="${meta_creator}"
-    elif [[ -n "${USER:-}" ]]; then tauthor="${USER}"
     else tauthor=""
     fi
   fi
   [[ -n "${tauthor}" ]] && meta+=( "--metadata" "author=${tauthor}" )
 
-  if pandoc "${fmtarg[@]}" "${in}" -o "${out}" "${meta[@]}" "${toc[@]}" >>"${errfile}" 2>&1; then
+  # --sandbox: pandoc не читает посторонние файлы и не ходит в сеть при разборе
+  # недоверенного документа; timeout (coreutils) ограничивает время разбора.
+  local -a pandoc_cmd=( pandoc --sandbox )
+  if have_cmd timeout; then pandoc_cmd=( timeout --kill-after=10 "${PANDOC_TIMEOUT}" "${pandoc_cmd[@]}" ); fi
+  if "${pandoc_cmd[@]}" "${fmtarg[@]}" "${in}" -o "${out}" "${meta[@]}" "${toc[@]}" >>"${errfile}" 2>&1; then
     log_info "ok" "${src}" "${out}" "Успешно" ""
     return 0
   else
@@ -467,7 +485,15 @@ convert_one() {
 
   ensure_outdir_for "${out}"
 
-  tmproot="${TMPDIR:-/tmp}/doc2fb2.$$.${RANDOM}"
+  tmproot="$(mktemp -d "${TMPDIR:-/tmp}/doc2fb2.XXXXXXXX")" || {
+    log_error "stage_failed" "${src}" "${out}" "Не удалось создать временный каталог" "tmp=${TMPDIR:-/tmp}"
+    echo "FAIL|tmpdir|${src}|${out}"
+    return 0
+  }
+  # convert_one выполняется в подоболочке $(...): trap EXIT чистит каталог и при
+  # аварийном выходе (явные rm -rf ниже остаются для раннего освобождения).
+  DOC2FB2_TMPROOT="${tmproot}"
+  trap 'rm -rf -- "${DOC2FB2_TMPROOT:-}"' EXIT
   workdir="${tmproot}/work"
   mkdir -p "${workdir}" 2>/dev/null || {
     log_error "stage_failed" "${src}" "${out}" "Не удалось создать временный каталог" "tmp=${workdir}"
