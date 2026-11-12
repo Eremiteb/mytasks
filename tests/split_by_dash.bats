@@ -928,31 +928,61 @@ make_ffprobe_tag_stub() {
   ! grep -q '"event":"tags_swapped"' "$MYTASKS_LOG_DIR"/split_by_dash-*.jsonl
 }
 
-@test "tag rename name conflict gets suffix before extension" {
+@test "tag name conflict keeps the larger file" {
   make_ffprobe_tag_stub
   mkdir -p "$TMP_DIR/music"
   printf 'TAG:artist=Captown, Landau\nTAG:title=Gangsta Party\n' > "$TMP_DIR/music/captown-landau-gangsta-party.mp3"
   printf 'TAG:artist=Captown, Landau\nTAG:title=Gangsta Party\nextra\n' > "$TMP_DIR/music/captown-landau-gangsta-party-mp3.mp3"
+  big="$(cat "$TMP_DIR/music/captown-landau-gangsta-party-mp3.mp3")"
 
   run env PATH="$TMP_DIR/stubs:$PATH" bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
 
   [ "$status" -eq 0 ]
   d="$TMP_DIR/music/Captown, Landau"
-  [ -f "$d/Captown, Landau - Gangsta Party.mp3" ]
-  [ -f "$d/Captown, Landau - Gangsta Party (2).mp3" ]
-  ! ls "$d" | grep -q '\.mp3\.[0-9]'
+  [ "$(cat "$d/Captown, Landau - Gangsta Party.mp3")" = "$big" ]
+  [ "$(find "$TMP_DIR/music" -type f -name '*.mp3' | wc -l)" -eq 1 ]
+  grep -q '"event":"tag_dup_removed"' "$MYTASKS_LOG_DIR"/split_by_dash-*.jsonl
 }
 
-@test "identical file with same tag name is kept as skip_duplicate" {
+# Папки исполнителей после прогона переезжают в --dest: одноимённый файл ищется и там
+@test "same-size tag-named file already in dest: the new one is removed" {
   make_ffprobe_tag_stub
-  mkdir -p "$TMP_DIR/music"
-  printf 'TAG:artist=Captown, Landau\nTAG:title=Gangsta Party\n' > "$TMP_DIR/music/captown-landau-gangsta-party.mp3"
-  printf 'TAG:artist=Captown, Landau\nTAG:title=Gangsta Party\n' > "$TMP_DIR/music/captown-landau-gangsta-party-mp3.mp3"
+  mkdir -p "$TMP_DIR/music" "$TMP_DIR/dest/Artist"
+  printf 'TAG:artist=Artist\nTAG:title=Song\nold\n' > "$TMP_DIR/dest/Artist/Artist - Song.mp3"
+  printf 'TAG:artist=Artist\nTAG:title=Song\nnew\n' > "$TMP_DIR/music/artist-song.mp3"
 
-  run env PATH="$TMP_DIR/stubs:$PATH" bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+  run env PATH="$TMP_DIR/stubs:$PATH" bash "$TMP_DIR/split_by_dash.sh" --dest "$TMP_DIR/dest" "$TMP_DIR/music"
 
   [ "$status" -eq 0 ]
-  [ -f "$TMP_DIR/music/Captown, Landau/Captown, Landau - Gangsta Party.mp3" ]
-  [ "$(find "$TMP_DIR/music" -maxdepth 1 -type f | wc -l)" -eq 1 ]
-  grep -q '"event":"skip_duplicate"' "$MYTASKS_LOG_DIR"/split_by_dash-*.jsonl
+  [ ! -e "$TMP_DIR/music/artist-song.mp3" ]
+  grep -q old "$TMP_DIR/dest/Artist/Artist - Song.mp3"
+  [ -z "$(find "$TMP_DIR/dest" -name '*.mp3.*')" ]
+  grep -q '"event":"tag_dup_removed"' "$MYTASKS_LOG_DIR"/split_by_dash-*.jsonl
+}
+
+@test "larger new tag-named file replaces the smaller one in dest, no .mp3.1" {
+  make_ffprobe_tag_stub
+  mkdir -p "$TMP_DIR/music" "$TMP_DIR/dest/Artist"
+  printf 'TAG:artist=Artist\nTAG:title=Song\nold\n' > "$TMP_DIR/dest/Artist/Artist - Song.mp3"
+  printf 'TAG:artist=Artist\nTAG:title=Song\nnew-and-longer\n' > "$TMP_DIR/music/artist-song.mp3"
+
+  run env PATH="$TMP_DIR/stubs:$PATH" bash "$TMP_DIR/split_by_dash.sh" --dest "$TMP_DIR/dest" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  grep -q new-and-longer "$TMP_DIR/dest/Artist/Artist - Song.mp3"
+  [ -z "$(find "$TMP_DIR/dest" -name '*.mp3.*' -o -name '*(2)*')" ]
+}
+
+@test "tag name conflict dry-run removes nothing" {
+  make_ffprobe_tag_stub
+  mkdir -p "$TMP_DIR/music" "$TMP_DIR/dest/Artist"
+  printf 'TAG:artist=Artist\nTAG:title=Song\nold\n' > "$TMP_DIR/dest/Artist/Artist - Song.mp3"
+  printf 'TAG:artist=Artist\nTAG:title=Song\nnew\n' > "$TMP_DIR/music/artist-song.mp3"
+
+  run env PATH="$TMP_DIR/stubs:$PATH" bash "$TMP_DIR/split_by_dash.sh" --dry-run --dest "$TMP_DIR/dest" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/music/artist-song.mp3" ]
+  [ -f "$TMP_DIR/dest/Artist/Artist - Song.mp3" ]
+  grep -q '"event":"dry_tag_dup_removed"' "$MYTASKS_LOG_DIR"/split_by_dash-*.jsonl
 }

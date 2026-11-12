@@ -779,9 +779,12 @@ rename_safe() {
 
 # Из группы файлов (пути в group_file, по одному в строке), различающихся только
 # регистром имени, оставляет самый большой по размеру (при равенстве — первый в
-# порядке сортировки по кодовым точкам); остальные удаляются.
+# списке); остальные удаляются. Необязательные event и reason — событие и пояснение
+# в логе для других конфликтов имён (по умолчанию — конфликт регистра).
 resolve_case_files() {
   group_file="$1"
+  dup_event="${2:-case_dup_removed}"
+  dup_reason="${3:-отличавшийся от оставленного только регистром имени}"
   keep=""
   keep_size=-1
   while IFS= read -r candidate; do
@@ -795,7 +798,7 @@ resolve_case_files() {
     [ "${candidate}" = "${keep}" ] && continue
     candidate_size=$(stat -c %s -- "${candidate}")
     if [ "${DRY_RUN}" -eq 1 ] || rm -f -- "${candidate}"; then
-      log_action "INFO" "case_dup_removed" "Удалён файл меньшего размера, отличавшийся от оставленного только регистром имени (${candidate_size} Б, оставлен ${keep_size} Б)" "${candidate} (оставлен ${keep})"
+      log_action "INFO" "${dup_event}" "Удалён файл меньшего размера, ${dup_reason} (${candidate_size} Б, оставлен ${keep_size} Б)" "${candidate} (оставлен ${keep})"
     fi
   done < "${group_file}"
 }
@@ -965,23 +968,6 @@ name_from_tags() {
   win_safe_name "${_nt_artist} - ${_nt_title}${_nt_ext}"
 }
 
-# Свободное имя для переименования по тегам: проверяются каталог dir и папка
-# исполнителя dir/folder; при занятом имени суффикс « (2)», « (3)» … ставится перед
-# расширением.
-tag_free_name() {
-  _tf_cand="$3"
-  case "$3" in
-    *.*) _tf_stem="${3%.*}"; _tf_ext=".${3##*.}" ;;
-    *) _tf_stem="$3"; _tf_ext="" ;;
-  esac
-  _tf_i=2
-  while [ -e "$1/${_tf_cand}" ] || [ -e "$1/$2/${_tf_cand}" ]; do
-    _tf_cand="${_tf_stem} (${_tf_i})${_tf_ext}"
-    _tf_i=$((_tf_i+1))
-  done
-  printf '%s\n' "${_tf_cand}"
-}
-
 process_directory() {
   current_dir="$1"
   if [ ! -d "${current_dir}" ]; then
@@ -991,6 +977,8 @@ process_directory() {
 
   log_json "INFO" "dir_start" "Обработка директории" "${current_dir}"
   find "${current_dir}" -maxdepth 1 -type f | while IFS= read -r file; do
+    # Файл мог быть удалён раньше в этом же цикле (конфликт имён по тегам)
+    [ -f "${file}" ] || continue
     name=$(basename -- "${file}")
     folder_raw=$(printf '%s\n' "${name}" | sed -n 's/^\(.*\)[[:space:]][-–—][[:space:]].*/\1/p' | sed 's/[[:space:]]*$//' | sed -n '1p')
     if [ -z "${folder_raw}" ]; then
@@ -1017,11 +1005,31 @@ process_directory() {
       tag_folder_raw=$(printf '%s\n' "${tag_name}" | sed -n 's/^\(.*\)[[:space:]][-–—][[:space:]].*/\1/p' | sed 's/[[:space:]]*$//' | sed -n '1p')
       tag_folder_safe=$(win_safe_name "${tag_folder_raw}")
       tag_folder=$(folder_name "${tag_folder_safe}")
-      if [ -n "${tag_folder}" ] && [ -f "${current_dir}/${tag_folder}/${tag_name}" ] && cmp -s -- "${file}" "${current_dir}/${tag_folder}/${tag_name}"; then
-        log_json "WARN" "skip_duplicate" "Файл с таким именем по тегам уже есть и совпадает по содержимому, исходник оставлен" "${file} == ${current_dir}/${tag_folder}/${tag_name}"
-        continue
+      # Одноимённый файл ищется в каталоге, в папке исполнителя и в ней же в целевом
+      # каталоге (после прогона папки исполнителей переезжают в DEST_DIR). Конфликт
+      # решает размер: остаётся больший, при равном размере удаляется новый (исходник)
+      tag_dest_dir=""
+      [ -n "${DEST_DIR}" ] && [ -n "${tag_folder}" ] && tag_dest_dir="${DEST_DIR}/${tag_folder}"
+      tag_other=""
+      for tag_cand in "${current_dir}/${tag_name}" "${current_dir}/${tag_folder}/${tag_name}" "${tag_dest_dir}/${tag_name}"; do
+        # Без DEST_DIR третий путь вырождается в «/имя» — его не проверяем
+        [ "${tag_cand}" = "/${tag_name}" ] && continue
+        if [ -f "${tag_cand}" ]; then
+          tag_other="${tag_cand}"
+          break
+        fi
+      done
+      if [ -n "${tag_other}" ]; then
+        tag_src_size=$(stat -c %s -- "${file}")
+        tag_other_size=$(stat -c %s -- "${tag_other}")
+        tag_group="$(mktemp)"
+        printf '%s\n%s\n' "${tag_other}" "${file}" > "${tag_group}"
+        resolve_case_files "${tag_group}" "tag_dup_removed" "одноимённый по тегам с оставленным"
+        rm -f -- "${tag_group}"
+        # Исходник не больше уже лежащего — он удалён (в dry-run — по плану)
+        [ "${tag_src_size}" -gt "${tag_other_size}" ] || continue
       fi
-      tag_free=$(tag_free_name "${current_dir}" "${tag_folder}" "${tag_name}")
+      tag_free="${tag_name}"
       # В dry-run файл не трогаем: дальше план строится для нового имени
       if [ "${DRY_RUN}" -eq 1 ] || mv -f -- "${file}" "${current_dir}/${tag_free}"; then
         log_action "INFO" "renamed_by_tag" "Файл переименован по тегам" "${name} -> ${tag_free}"
