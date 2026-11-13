@@ -21,15 +21,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
 
-      # Свой Python для semgrep: под системным Python 3.14 раннера его
-      # зависимость protobuf падает при импорте («Metaclasses with custom
-      # tp_new are not supported»).
+      # Свой Python для semgrep — установка не зависит от системного Python
+      # раннера. Версия semgrep не старее 1.18x: в 1.95.0 зависимости падали
+      # при импорте (старый protobuf под Python 3.14, pkg_resources, которого
+      # нет в свежем setuptools).
       - uses: actions/setup-python@v7.1.0
         with:
           python-version: "3.12"
 
       - name: Установить semgrep
-        run: python -m pip install "semgrep==1.95.0"
+        run: python -m pip install "semgrep==1.183.0"
 
       - name: Запустить semgrep
         run: |
