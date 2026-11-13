@@ -95,9 +95,10 @@ Usage:
 
 Ставит навык model-routing и раздел «Выбор модели под шаг» для Claude Code,
 Codex и Gemini CLI на этом устройстве (local) и на удалённых хостах по ssh.
-Для Claude Code ещё подключает хук ~/.claude/hooks/model-routing-plan-guard.py
-(PreToolUse update_plan в ~/.claude/settings.json): план без меток
-[Haiku]/[Sonnet]/[Opus] у шагов не принимается.
+Для Claude Code ещё подключает хуки в ~/.claude/settings.json: PreToolUse update_plan
+(~/.claude/hooks/model-routing-plan-guard.py — план без меток [Haiku]/[Opus] у шагов не
+принимается) и UserPromptSubmit (~/.claude/skills/model-routing/remind.py — напоминание
+о навыке на моделях старше Haiku).
 Хосты — из HOSTS в conf/${SCRIPT_BASE}.conf либо аргументами.
 
 Options:
@@ -116,14 +117,15 @@ encode_file() {
 
 # Сценарий, который выполняется на целевом устройстве (stdin у bash -s).
 build_payload() {
-  local dry="$1" claude_skill agents_skill claude_section agents_section plan_guard
+  local dry="$1" claude_skill agents_skill claude_section agents_section plan_guard remind
   claude_skill="$(encode_file claude.SKILL.md)"
   agents_skill="$(encode_file agents.SKILL.md)"
   claude_section="$(encode_file section.claude.md)"
   agents_section="$(encode_file section.agents.md)"
   plan_guard="$(encode_file plan-guard.py)"
-  printf 'DRY=%s\nCLAUDE_SKILL=%s\nAGENTS_SKILL=%s\nCLAUDE_SECTION=%s\nAGENTS_SECTION=%s\nPLAN_GUARD=%s\n' \
-    "${dry}" "${claude_skill}" "${agents_skill}" "${claude_section}" "${agents_section}" "${plan_guard}"
+  remind="$(encode_file remind.py)"
+  printf 'DRY=%s\nCLAUDE_SKILL=%s\nAGENTS_SKILL=%s\nCLAUDE_SECTION=%s\nAGENTS_SECTION=%s\nPLAN_GUARD=%s\nREMIND=%s\n' \
+    "${dry}" "${claude_skill}" "${agents_skill}" "${claude_section}" "${agents_section}" "${plan_guard}" "${remind}"
   cat <<'PAYLOAD'
 put() {
   local dest="$1" b64="$2"
@@ -161,36 +163,42 @@ section() {
   fi
   rm -f "${tmp}"
 }
-# Хук PreToolUse на update_plan в ~/.claude/settings.json: одна запись, без дублей,
-# остальные настройки и хуки не трогаются; перед записью — копия settings.json.bak-model-routing
+# Хук Claude Code в ~/.claude/settings.json: одна запись на событие, без дублей (поиск по
+# метке marker в command), остальные настройки и хуки не трогаются; перед записью —
+# копия settings.json.bak-model-routing. Аргументы: файл, событие, matcher ("" — без него),
+# команда, метка, тайм-аут, statusMessage ("" — без него).
 hook() {
-  local settings="$1" guard="$2"
+  local settings="$1" event="$2" matcher="$3" command="$4" marker="$5" timeout="$6" status="$7"
   if ! command -v python3 >/dev/null 2>&1; then
-    echo "[пропуск] нет python3: хук плана не подключён"; return 0
+    echo "[пропуск] нет python3: хуки не подключены"; return 0
   fi
-  python3 -I - "$settings" "$guard" "$DRY" <<'PY'
+  python3 -I - "$settings" "$event" "$matcher" "$command" "$marker" "$timeout" "$status" "$DRY" <<'PY'
 import json, os, shutil, sys
 
-path, guard, dry = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
-want = {"matcher": "mcp__ccd_turn__update_plan",
-        "hooks": [{"type": "command", "command": f"python3 -I {guard}", "timeout": 10,
-                   "statusMessage": "Проверка меток модели в плане"}]}
+path, event, matcher, command, marker, timeout, status, dry = sys.argv[1:9]
+dry = dry == "1"
+entry = {"type": "command", "command": command, "timeout": int(timeout)}
+if status:
+    entry["statusMessage"] = status
+want = {"hooks": [entry]}
+if matcher:
+    want = {"matcher": matcher, "hooks": [entry]}
 try:
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
 except FileNotFoundError:
     data = {}
 except ValueError:
-    print(f"[ошибка] {path}: неверный JSON, хук плана не подключён")
+    print(f"[ошибка] {path}: неверный JSON, хук {event} не подключён")
     sys.exit(0)
-pre = data.setdefault("hooks", {}).setdefault("PreToolUse", [])
+pre = data.setdefault("hooks", {}).setdefault(event, [])
 idx = [i for i, e in enumerate(pre)
-       if any("model-routing-plan-guard" in str(h.get("command", "")) for h in e.get("hooks", []))]
+       if any(marker in str(h.get("command", "")) for h in e.get("hooks", []))]
 if len(idx) == 1 and pre[idx[0]] == want:
-    print(f"[ok] хук плана подключён: {path}")
+    print(f"[ok] хук {event} подключён: {path}")
     sys.exit(0)
 if dry:
-    print(f"[dry-run] будет: подключить хук плана в {path}")
+    print(f"[dry-run] будет: подключить хук {event} в {path}")
     sys.exit(0)
 pos = idx[0] if idx else len(pre)
 for i in reversed(idx):
@@ -204,16 +212,21 @@ with open(tmp, "w", encoding="utf-8") as f:
     json.dump(data, f, ensure_ascii=False, indent=2)
     f.write("\n")
 os.replace(tmp, path)
-print(f"[готово] подключён хук плана: {path}")
+print(f"[готово] подключён хук {event}: {path}")
 PY
 }
 found=0
 if [ -d "$HOME/.claude" ]; then
   found=1
   put "$HOME/.claude/skills/model-routing/SKILL.md" "$CLAUDE_SKILL"
+  put "$HOME/.claude/skills/model-routing/remind.py" "$REMIND"
   section "$HOME/.claude/CLAUDE.md" "$CLAUDE_SECTION"
   put "$HOME/.claude/hooks/model-routing-plan-guard.py" "$PLAN_GUARD"
-  hook "$HOME/.claude/settings.json" "$HOME/.claude/hooks/model-routing-plan-guard.py"
+  hook "$HOME/.claude/settings.json" PreToolUse mcp__ccd_turn__update_plan \
+    "python3 -I $HOME/.claude/hooks/model-routing-plan-guard.py" model-routing-plan-guard 10 \
+    "Проверка меток модели в плане"
+  hook "$HOME/.claude/settings.json" UserPromptSubmit "" \
+    "python3 -I ~/.claude/skills/model-routing/remind.py" model-routing/remind.py 5 ""
 fi
 if [ -d "$HOME/.codex" ] || [ -d "$HOME/.gemini" ] || [ -d "$HOME/.agents" ]; then
   found=1

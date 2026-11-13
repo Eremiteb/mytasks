@@ -787,14 +787,18 @@ sudo ./hp_p1005_garuda.sh --all
 решения и необратимое — старшей; пороги лимитов плана и размера контекста; политика расходов без зашитых
 цен) и одноимённый раздел в инструкции агентов: Claude Code (`~/.claude/skills`, `~/.claude/CLAUDE.md`),
 Codex и Gemini CLI (`~/.agents/skills`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md`). Источники — каталог
-`agent-skills/model-routing/` (`claude.SKILL.md`, `agents.SKILL.md`, `section.*.md`, `plan-guard.py`), правятся только там.
+`agent-skills/model-routing/` (`claude.SKILL.md`, `agents.SKILL.md`, `section.*.md`, `plan-guard.py`, `remind.py`), правятся только там.
 
 Для Claude Code ставится и хук `~/.claude/hooks/model-routing-plan-guard.py` (PreToolUse на
-`mcp__ccd_turn__update_plan` в `~/.claude/settings.json`): план, у шага которого нет метки `[Haiku]`,
-`[Sonnet]` или `[Opus]`, отклоняется, и агент получает причину. Так выбор модели под шаг не держится на памяти
-агента. Запись хука одна, без дублей, остальные настройки и хуки не меняются, перед записью — копия
+`mcp__ccd_turn__update_plan` в `~/.claude/settings.json`): план, у шага которого нет метки `[Haiku]`
+или `[Opus]`, отклоняется, и агент получает причину. Так выбор модели под шаг не держится на памяти
+агента. Младшая модель — только Haiku: Sonnet в метках и подагентах не используется. Запись хука одна, без дублей, остальные настройки и хуки не меняются, перед записью — копия
 `settings.json.bak-model-routing`; без `python3` на хосте хук пропускается. Хук работает только с планом
 приложения Claude (вкладка Code, SSH-сессии из него); в терминальном `claude` такого инструмента нет.
+
+Ещё один хук Claude Code — `UserPromptSubmit` с `~/.claude/skills/model-routing/remind.py`: на любой модели,
+кроме Haiku, перед каждым запросом напоминает применить навык model-routing (рутину — Haiku, Sonnet не
+использовать). На Haiku хук молчит; ошибка хука не блокирует запрос.
 
 ```bash
 ./install_agent_skills.sh --dry-run          # план для хостов из HOSTS, на хостах только чтение
