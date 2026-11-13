@@ -182,8 +182,11 @@ class TestMusicDownloader(unittest.TestCase):
                 music_downloader.run()
 
             check.assert_called_once_with(paths, "system")
-            # TLS не ослабляется: штатный адаптер cloudscraper не подменяется
-            scraper.mount.assert_not_called()
+            # TLS: штатный HTTPAdapter requests без своего ssl_context (без ослабления)
+            scraper.mount.assert_called_once()
+            prefix, adapter = scraper.mount.call_args.args
+            self.assertEqual(prefix, "https://")
+            self.assertIs(type(adapter), music_downloader.HTTPAdapter)
             self.assertEqual(scraper.get.call_count, 2)
             for folder in paths:
                 for title, body in bodies.items():

@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 import cloudscraper
 from mutagen.id3 import COMM, ID3, ID3NoHeaderError, TextFrame, UrlFrame
+from requests.adapters import HTTPAdapter
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1152,9 +1153,11 @@ def run():
     scraper = cloudscraper.create_scraper(
         browser={"browser": "chrome", "platform": "windows", "desktop": True}
     )
-    # TLS — штатный CipherSuiteAdapter cloudscraper (проверка сертификата и имени,
-    # уровень безопасности OpenSSL по умолчанию). Свой адаптер с SECLEVEL=1 снят
-    # 2026-11-12: все хосты драйверов проходят рукопожатие без ослабления.
+    # TLS — штатный HTTPAdapter requests: проверка сертификата и имени хоста,
+    # уровень безопасности OpenSSL по умолчанию (прежний SSLAdapter с SECLEVEL=1 снят
+    # 2026-11-12). CipherSuiteAdapter cloudscraper не годится: он разрешает только
+    # кривую prime256v1, и CDN Sefon (cdn2/cdn3.sefon.pro) обрывают рукопожатие.
+    scraper.mount("https://", HTTPAdapter())
     logger.info("Scraper инициализирован")
 
     # Очистка старых логов
