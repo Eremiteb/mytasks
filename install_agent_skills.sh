@@ -223,7 +223,7 @@ if [ -d "$HOME/.claude" ]; then
   section "$HOME/.claude/CLAUDE.md" "$CLAUDE_SECTION"
   put "$HOME/.claude/hooks/model-routing-plan-guard.py" "$PLAN_GUARD"
   hook "$HOME/.claude/settings.json" PreToolUse mcp__ccd_turn__update_plan \
-    "python3 -I $HOME/.claude/hooks/model-routing-plan-guard.py" model-routing-plan-guard 10 \
+    "python3 -I ${HOME}/.claude/hooks/model-routing-plan-guard.py" model-routing-plan-guard 10 \
     "Проверка меток модели в плане"
   hook "$HOME/.claude/settings.json" UserPromptSubmit "" \
     "python3 -I ~/.claude/skills/model-routing/remind.py" model-routing/remind.py 5 ""

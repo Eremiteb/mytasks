@@ -107,7 +107,9 @@ validate_target_dir() {
     echo "Ошибка: не удалось определить реальный путь: ${_target_candidate}" >&2
     exit 2
   }
-  _target_depth="$(printf '%s' "${_target_real}" | awk -F/ '{ n = 0; for (i = 1; i <= NF; i++) if ($i != "") n++; print n }')"
+  # Глубина — число «/» в пути: realpath отдаёт путь без пустых компонентов и «/» в конце.
+  _target_slashes="${_target_real//[!\/]/}"
+  _target_depth="${#_target_slashes}"
   if [[ "${_target_real}" == "/" || "${_target_real}" == "${HOME_REAL}" || "${_target_depth}" -lt 2 ]]; then
     log_json "ERROR" "target_unsafe" "Каталог слишком общий (корень, домашний каталог или глубина < 2)" "${_target_real}" 2
     echo "Ошибка: небезопасный каталог: ${_target_real}" >&2
