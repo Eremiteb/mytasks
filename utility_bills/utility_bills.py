@@ -1584,14 +1584,18 @@ def attachment_limit(config: Config) -> int:
     return int(config["search"]["max_attachment_mb"] * MIB)
 
 
-def find_messages(conn: imaplib.IMAP4, config: Config, warn: Warn | None = None) -> list[dict[str, Any]]:
+def find_messages(
+    conn: imaplib.IMAP4, config: Config, warn: Warn | None = None, known: frozenset[str] | set[str] = frozenset()
+) -> list[dict[str, Any]]:
     """Полный список писем папки от отправителей из search.from (за всё время), по дате: [{key, uid, …}].
 
     Только заголовки, ящик открыт на чтение. Отбор — на нашей стороне по заголовку From (sender_matches),
     а не серверным UID SEARCH FROM: почтовый сервер в частной сети (VPN) возвращал по FROM 0 писем при
     12 подходящих (проверено 2026-11-11), и программа молча пропустила бы все квитанции. Заголовки всех
     писем папки запрашиваются пачками по 100 — это дёшево. Письмо с несколькими заголовками From не
-    отбирается: неясно, какому отправителю верить.
+    отбирается: неясно, какому отправителю верить. Подлинность (require_auth) проверяется только у писем,
+    ключа которых нет в known (уже обработанные): старые письма из прежнего почтового сервера могут быть
+    без Authentication-Results, и без этого каждый запуск предупреждал бы о них заново.
     """
     folder = config["imap"]["folder"]
     status, data = conn.select(imap_quote(imap_utf7(folder)), readonly=True)
@@ -1620,7 +1624,9 @@ def find_messages(conn: imaplib.IMAP4, config: Config, warn: Warn | None = None)
             sender = ", ".join(str(header) for header in message.get_all("From") or [])
             if not sender_matches(sender, config["search"]["from"]):
                 continue
-            if config["search"]["require_auth"]:
+            message_id = str(message.get("Message-ID", "")).strip() or None
+            key = message_id or f"uid:{folder}:{uidvalidity}:{uid}"
+            if config["search"]["require_auth"] and key not in known:
                 from_domain = _domain_of(getaddresses([sender])[0][1])
                 results = [str(header) for header in message.get_all("Authentication-Results") or []]
                 if not sender_authenticated(results, config["search"]["authserv_id"], from_domain):
@@ -1631,11 +1637,10 @@ def find_messages(conn: imaplib.IMAP4, config: Config, warn: Warn | None = None)
                             level=logging.WARNING,
                         )
                     continue
-            message_id = str(message.get("Message-ID", "")).strip() or None
             size_match = _SIZE_RE.search(head)
             found.append(
                 {
-                    "key": message_id or f"uid:{folder}:{uidvalidity}:{uid}",
+                    "key": key,
                     "message_id": message_id,
                     "folder": folder,
                     "uidvalidity": uidvalidity,
@@ -1726,8 +1731,8 @@ def run_mail(ctx: RunContext) -> None:
     say(f"Подключено к {imap['host']}", event="imap_connected")
     try:
         # Шаг 1: список писем.
-        messages = find_messages(conn, config, say)
         known = ctx.db.processed_keys()
+        messages = find_messages(conn, config, say, known)
         new = [message for message in messages if message["key"] not in known]
         stats["messages_found"] = len(messages)
         stats["messages_skipped"] = len(messages) - len(new)

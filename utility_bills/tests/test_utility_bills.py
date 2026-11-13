@@ -1100,6 +1100,16 @@ def test_auth_missing_header_rejected(tmp_path, monkeypatch):
     assert stats["messages_found"] == 0 and say.warnings == 1
 
 
+def test_auth_not_rechecked_for_processed_message(tmp_path, monkeypatch):
+    # Уже обработанное письмо прежнего сервера без Authentication-Results: в списке, без предупреждения.
+    fake = FakeIMAP({1: make_email("Квитанция", "<old@example.test>", auth=None)})
+    config = ub.load_config(write_config(tmp_path, **AUTH), noop)
+    warnings = []
+    found = ub.find_messages(fake, config, lambda message, **_kw: warnings.append(message), {"<old@example.test>"})
+    assert [message["key"] for message in found] == ["<old@example.test>"] and warnings == []
+    assert ub.find_messages(fake, config, lambda message, **_kw: warnings.append(message)) == [] and len(warnings) == 1
+
+
 def test_auth_domain_mismatch_rejected(tmp_path, monkeypatch):
     _fake, stats, _say = auth_run(tmp_path, monkeypatch, ["mail.example.kz; dkim=pass header.d=evil.test; spf=pass smtp.mailfrom=evil.test"])
     assert stats["messages_found"] == 0

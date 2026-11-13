@@ -492,7 +492,8 @@ class TestMusicDownloader(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             db_path = os.path.join(root, "music.db")
             with sqlite3.connect(db_path) as conn:
-                schema = "(id TEXT PRIMARY KEY, artist TEXT, title TEXT, site TEXT, timestamp DATETIME, src TEXT, X
+                schema = "(id TEXT PRIMARY KEY, artist TEXT, title TEXT, site TEXT, timestamp DATETIME, src TEXT, filename TEXT, filesize INTEGER)"
+                conn.execute(f"CREATE TABLE downloads {schema}")
                 conn.executemany(
                     "INSERT INTO downloads (id, artist, title, site, timestamp, src, filename, filesize) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",

@@ -147,24 +147,40 @@ if [ -z "${IP:-}" ]; then
 fi
 
 # Ответ сервиса — недоверенные данные: принимается только IPv4 или IPv6.
-is_ip() {
-    case "$1" in
-        *[!0-9A-Fa-f:.]*|'') return 1 ;;
-        *) ;;
-    esac
-    case "$1" in
-        *:*) printf '%s' "$1" | grep -Eq '^[0-9A-Fa-f:]*(:[0-9]{1,3}(\.[0-9]{1,3}){3})?$' && [ "${#1}" -le 45 ] && [ "$(printf '%s' "$1" | tr -cd ':' | wc -c)" -ge 2 ] ;;
-        *) printf '%s' "$1" | grep -Eq '^(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}$' ;;
-    esac
-}
-
-if ! is_ip "${IP}"; then
+# При отказе функция сама пишет журнал и завершает скрипт с кодом 1, поэтому
+# вызывается без условия (set -e не отключается внутри, SC2310).
+reject_ip() {
     err_msg="Ответ ${IP_SERVICE_URL} не является IP-адресом"
     echo "Ошибка: ${err_msg}" >&2
     log_json "ERROR" "ip_invalid" "${err_msg}" "response rejected" 1
     cleanup_logs
     exit 1
-fi
+}
+
+validate_ip() {
+    case "$1" in
+        *[!0-9A-Fa-f:.]*|'') reject_ip ;;
+        *) ;;
+    esac
+    case "$1" in
+        # IPv6: не меньше двух двоеточий, не длиннее 45 символов
+        *:*:*)
+            if printf '%s' "$1" | grep -Eq '^[0-9A-Fa-f:]*(:[0-9]{1,3}(\.[0-9]{1,3}){3})?$' && [ "${#1}" -le 45 ]; then
+                return 0
+            fi
+            reject_ip
+            ;;
+        *:*) reject_ip ;;
+        *)
+            if printf '%s' "$1" | grep -Eq '^(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}$'; then
+                return 0
+            fi
+            reject_ip
+            ;;
+    esac
+}
+
+validate_ip "${IP}"
 
 if [ "${DRY_RUN}" -eq 1 ]; then
     printf '[dry-run] будет: записан IP %s в %s\n' "${IP}" "${IP_FILE}"

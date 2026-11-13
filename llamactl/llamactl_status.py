@@ -79,7 +79,7 @@ def http_get(url: str, timeout: float) -> bytes | None:
         return None
     try:
         # Схема проверена выше (S310: urlopen с произвольной схемой)
-        with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
             data = resp.read(MAX_RESPONSE_BYTES + 1)
     except (OSError, ValueError, urllib.error.URLError):
         return None

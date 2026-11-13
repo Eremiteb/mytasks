@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 
 set -eu
+# Функции в подстановках команд наследуют set -e (SC2311).
+shopt -s inherit_errexit
 
 ###############################################################################
 # SCRIPT ID / PATHS
@@ -15,7 +17,7 @@ LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}-${TIMESTAMP}.jsonl"
 LOG_TEMPLATE_FILE="${SCRIPT_DIR}/conf/log_template.conf"
 mkdir -p "${LOG_DIR}"
 
-if [ -r "${LOG_TEMPLATE_FILE}" ]; then
+if [[ -r "${LOG_TEMPLATE_FILE}" ]]; then
   # shellcheck source=/dev/null
   . "${LOG_TEMPLATE_FILE}"
 fi
@@ -50,12 +52,19 @@ json_escape() {
 }
 
 cleanup_logs() {
-  find "${LOG_DIR}" -maxdepth 1 -type f -name "${SCRIPT_BASE}-*.jsonl" -printf '%T@|%p\n' 2>/dev/null \
-    | sort -nr \
-    | awk -F'|' -v keep="${KEEP_LOGS:-10}" 'NR > keep { print $2 }' \
-    | while IFS= read -r old_log; do
-        [ -n "${old_log}" ] && rm -f -- "${old_log}"
-      done
+  local listing="" sorted old_logs old_log find_rc=0
+  # Сбой find не должен прерывать запуск: чистим по тому, что удалось перечислить.
+  listing="$(find "${LOG_DIR}" -maxdepth 1 -type f -name "${SCRIPT_BASE}-*.jsonl" -printf '%T@|%p\n' 2>/dev/null)" || find_rc=$?
+  if [[ "${find_rc}" -ne 0 ]]; then
+    log_json "WARN" "cleanup_logs_partial" "find не смог перечислить журналы полностью" "${LOG_DIR}"
+  fi
+  sorted="$(sort -nr <<<"${listing}")"
+  old_logs="$(awk -F'|' -v keep="${KEEP_LOGS:-10}" 'NR > keep { print $2 }' <<<"${sorted}")"
+  while IFS= read -r old_log; do
+    if [[ -n "${old_log}" ]]; then
+      rm -f -- "${old_log}"
+    fi
+  done <<<"${old_logs}"
 }
 
 log_json() {
@@ -64,7 +73,11 @@ log_json() {
   msg="$3"
   detail="${4:-}"
   rc="${5:-null}"
-  dry_run_json="$( [ "${DRY_RUN}" -eq 1 ] && echo true || echo false )"
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    dry_run_json=true
+  else
+    dry_run_json=false
+  fi
   level_norm="$(printf '%s' "${level}" | tr '[:upper:]' '[:lower:]')"
 
   msg_esc="$(json_escape "${msg}")"
@@ -99,15 +112,21 @@ DRY_RUN=0
 TARGET_DIR=""
 EXTENSION=""
 
-while [ $# -gt 0 ]; do
+while [[ $# -gt 0 ]]; do
   case "$1" in
     -d)
-      [ $# -lt 2 ] && { echo "Ошибка: для -d требуется значение" >&2; exit 1; }
+      if [[ $# -lt 2 ]]; then
+        echo "Ошибка: для -d требуется значение" >&2
+        exit 1
+      fi
       TARGET_DIR="$2"
       shift 2
       ;;
     -e)
-      [ $# -lt 2 ] && { echo "Ошибка: для -e требуется значение" >&2; exit 1; }
+      if [[ $# -lt 2 ]]; then
+        echo "Ошибка: для -e требуется значение" >&2
+        exit 1
+      fi
       EXTENSION="$2"
       shift 2
       ;;
@@ -127,18 +146,18 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-if [ -z "${TARGET_DIR}" ] || [ -z "${EXTENSION}" ]; then
+if [[ -z "${TARGET_DIR}" ]] || [[ -z "${EXTENSION}" ]]; then
   usage >&2
   exit 1
 fi
 
-if [ ! -d "${TARGET_DIR}" ]; then
+if [[ ! -d "${TARGET_DIR}" ]]; then
   echo "Каталог не найден: ${TARGET_DIR}" >&2
   exit 2
 fi
 
 EXTENSION=${EXTENSION#.}
-if [ -z "${EXTENSION}" ]; then
+if [[ -z "${EXTENSION}" ]]; then
   echo "Ошибка: расширение не может быть пустым" >&2
   exit 2
 fi
@@ -152,7 +171,8 @@ fi
 
 # Массовое удаление в корне или во всём домашнем каталоге — почти всегда ошибка.
 TARGET_REAL=$(realpath -- "${TARGET_DIR}") || { echo "Ошибка: не удалось разрешить путь: ${TARGET_DIR}" >&2; exit 2; }
-if [ "${TARGET_REAL}" = "/" ] || [ "${TARGET_REAL}" = "$(realpath -- "${HOME:-/nonexistent}" 2>/dev/null)" ]; then
+HOME_REAL="$(realpath -- "${HOME:-/nonexistent}" 2>/dev/null || printf '%s' "${HOME:-}")"
+if [[ "${TARGET_REAL}" = "/" ]] || [[ "${TARGET_REAL}" = "${HOME_REAL}" ]]; then
   echo "Отказ: нельзя обрабатывать корневой или домашний каталог целиком: ${TARGET_REAL}" >&2
   exit 2
 fi
@@ -172,10 +192,12 @@ trap 'rm -f -- "${LIST_FILE}"' EXIT INT TERM
 find "${TARGET_DIR}" -type f -name "*.${EXTENSION}" -print0 > "${LIST_FILE}"
 
 while IFS= read -r -d '' file; do
-  [ -z "${file}" ] && continue
+  if [[ -z "${file}" ]]; then
+    continue
+  fi
   MATCHED_COUNT=$((MATCHED_COUNT + 1))
 
-  if [ "${DRY_RUN}" -eq 1 ]; then
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
     echo "[DRY-RUN] ${file}"
     log_json "INFO" "would_delete" "Найден файл для удаления" "${file}" 0
     continue
@@ -192,7 +214,7 @@ while IFS= read -r -d '' file; do
   fi
 done < "${LIST_FILE}"
 
-if [ "${ERROR_COUNT}" -gt 0 ]; then
+if [[ "${ERROR_COUNT}" -gt 0 ]]; then
   log_json "ERROR" "done" "Завершено с ошибками" "matched=${MATCHED_COUNT}; deleted=${DELETED_COUNT}; errors=${ERROR_COUNT}" 1
   cleanup_logs
   exit 1

@@ -18,7 +18,6 @@ import cloudscraper
 from mutagen.id3 import COMM, ID3, ID3NoHeaderError, TextFrame, UrlFrame
 from requests.adapters import HTTPAdapter
 
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DRIVER_SETTINGS_PATH = os.path.join(BASE_DIR, "drivers", "music_downloader_driver_settings.py")
 

@@ -30,7 +30,7 @@ setup() {
   write_smart_json sdb '{"smart_status":{"passed":true},"model_name":"TestDisk-B","serial_number":"SNBBB","temperature":{"current":36},"power_on_time":{"hours":2000},"ata_smart_attributes":{"table":[{"name":"Reallocated_Sector_Ct","raw":{"value":0}},{"name":"Current_Pending_Sector","raw":{"value":0}},{"name":"Offline_Uncorrectable","raw":{"value":0}}]}}'
 
   # Стаб lsblk: обслуживает три разных вызова скрипта —
-  # discover_disks (-dn -o NAME,TYPE), disk_mountpoints (-J -o NAME,MOUNTPOINTS -- <dev>,
+  # discover_disks (-dn -o NAME,TYPE), disk_mountpoints (-J -o NAME,PATH -- <dev>,
   # разбирается через jq, поэтому отдаём настоящий JSON в формате lsblk -J)
   # и disk_size_bytes (-bdn -o SIZE -- <dev>)
   cat > "$STUB_DIR/lsblk" <<'EOF'
@@ -39,12 +39,12 @@ case "$*" in
   *NAME,TYPE*)
     printf 'sda disk\nsdb disk\nzram0 disk\n'
     ;;
-  *NAME,MOUNTPOINTS*)
+  *NAME,PATH*)
     dev="${!#}"
-    case "$(basename -- "$dev")" in
-      sda) printf '{"blockdevices":[{"name":"sda","mountpoints":[],"children":[{"name":"sda1","mountpoints":["/"]}]}]}\n' ;;
-      sdb) printf '{"blockdevices":[{"name":"sdb","mountpoints":[],"children":[{"name":"sdb1","mountpoints":["/home"]}]}]}\n' ;;
-      *) printf '{"blockdevices":[{"name":"%s","mountpoints":[]}]}\n' "$(basename -- "$dev")" ;;
+    name="$(basename -- "$dev")"
+    case "$name" in
+      sda|sdb) printf '{"blockdevices":[{"name":"%s","path":"/dev/%s","children":[{"name":"%s1","path":"/dev/%s1"}]}]}\n' "$name" "$name" "$name" "$name" ;;
+      *) printf '{"blockdevices":[{"name":"%s","path":"/dev/%s"}]}\n' "$name" "$name" ;;
     esac
     ;;
   *SIZE*)
@@ -59,6 +59,20 @@ case "$*" in
 esac
 EOF
   chmod +x "$STUB_DIR/lsblk"
+
+  # Стаб findmnt: точки монтирования берутся из таблицы хоста (--task 1), а не
+  # из своей — в песочнице systemd своя таблица содержит bind-монтирования.
+  # Без --task 1 стаб ничего не находит (код 1), как findmnt для чужого раздела.
+  cat > "$STUB_DIR/findmnt" <<'EOF'
+#!/usr/bin/env bash
+[[ " $* " == *" --task 1 "* ]] || exit 1
+case "${!#}" in
+  /dev/sda1) printf '{"filesystems":[{"target":"/"}]}\n' ;;
+  /dev/sdb1) printf '{"filesystems":[{"target":"/home"}]}\n' ;;
+  *) exit 1 ;;
+esac
+EOF
+  chmod +x "$STUB_DIR/findmnt"
 
   # Стаб smartctl: печатает JSON-фикстуру для устройства из SMART_DIR
   cat > "$STUB_DIR/smartctl" <<'EOF'
@@ -126,6 +140,7 @@ db_query() {
   local iso="$TMP_DIR/iso_no_smartctl"
   mkdir -p "$iso"
   cp "$STUB_DIR/lsblk" "$iso/lsblk"
+  cp "$STUB_DIR/findmnt" "$iso/findmnt"
   cp "$STUB_DIR/notify-send" "$iso/notify-send"
   for _cmd in bash env date mkdir ls rm sed grep tr awk mktemp basename dirname cat printf cp find sort sqlite3 jq; do
     _bin="$(command -v "$_cmd" 2>/dev/null)"
@@ -281,6 +296,7 @@ iso_path_without() {
   local iso="$1"
   mkdir -p "$iso"
   cp "$STUB_DIR/lsblk" "$iso/lsblk"
+  cp "$STUB_DIR/findmnt" "$iso/findmnt"
   cp "$STUB_DIR/smartctl" "$iso/smartctl"
   cp "$STUB_DIR/notify-send" "$iso/notify-send"
   for _cmd in bash env date mkdir ls rm mv chmod sed grep tr awk sleep mktemp basename dirname cat printf cp find sort sqlite3 jq; do

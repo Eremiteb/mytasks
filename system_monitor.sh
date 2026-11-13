@@ -835,24 +835,29 @@ discover_disks() {
 # Точки монтирования диска (по всем его разделам/дочерним устройствам).
 # Собирает точки монтирования диска, привязанные к конкретному разделу —
 # "nvme0n1p1: /, /var/log; nvme0n1p2: /boot/efi", а не единым списком.
-# Через JSON (lsblk -J + jq), а не построчный разбор: на btrfs один и тот же
-# раздел обычно смонтирован сразу в несколько мест через подтома (subvolumes,
-# например / и /var/log с одного и того же раздела), и лёгкий способ узнать,
-# какому именно разделу принадлежит каждая точка — рекурсивно обойти дерево
-# lsblk -J по каждому "name" с непустым mountpoints. MOUNTPOINT (ед. число)
-# в построчном режиме отдаёт только одну точку на раздел и может молча
-# потерять корень "/", а раздельный построчный разбор MOUNTPOINTS (мн. число)
-# неоднозначен на продолжающихся строках без имени раздела.
+# Дерево разделов (с путями /dev/..., в т.ч. /dev/mapper/... для LUKS/LVM) —
+# из lsblk -J через jq; точки монтирования — из таблицы монтирования хоста
+# (findmnt --task 1, т.е. /proc/1/mountinfo), а не своей: служба работает в
+# песочнице systemd (ProtectSystem, ReadWritePaths, PrivateTmp), где lsblk
+# видит и служебные bind-монтирования вроде .../state или второго /var/tmp.
+# findmnt -S /dev/<раздел> на btrfs отдаёт все подтома раздела (/ и /var/log
+# с одного и того же раздела).
 disk_mountpoints() {
-    local dev="$1" json
-    json="$(lsblk -J -o NAME,MOUNTPOINTS -- "${dev}" 2>/dev/null)"
+    local dev="$1" json paths name path fm_json targets out=""
+    json="$(lsblk -J -o NAME,PATH -- "${dev}" 2>/dev/null)"
     [[ -z "${json}" ]] && return
-    jq -r '
-        [ .. | objects | select(has("name")) |
-          select((.mountpoints // []) | length > 0) |
-          "\(.name): " + ((.mountpoints // []) | join(", "))
-        ] | join("; ")
-    ' 2>/dev/null <<< "${json}"
+    paths="$(jq -r '.. | objects | select(has("name") and has("path")) | "\(.name)\t\(.path)"' 2>/dev/null <<< "${json}")"
+    while IFS=$'\t' read -r name path; do
+        [[ -n "${name}" && -n "${path}" ]] || continue
+        # findmnt завершается с кодом 1, если раздел не смонтирован
+        if ! fm_json="$(findmnt --task 1 -J -o TARGET -S "${path}" 2>/dev/null)"; then
+            continue
+        fi
+        targets="$(jq -r '[.filesystems[]?.target] | join(", ")' 2>/dev/null <<< "${fm_json}")"
+        [[ -n "${targets}" ]] && out+="${out:+; }${name}: ${targets}"
+    done <<< "${paths}"
+    [[ -n "${out}" ]] && printf '%s\n' "${out}"
+    return 0
 }
 
 # Объём диска в байтах. Через lsblk (а не только smartctl), т.к. lsblk
@@ -1754,6 +1759,7 @@ if ((REPORT_ONLY == 0)); then
     require_cmd smartctl
     require_cmd jq
     require_cmd lsblk
+    require_cmd findmnt
 
     declare -a DEVICES=()
     discover_disks

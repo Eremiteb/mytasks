@@ -564,7 +564,7 @@ journalctl --user -u check-backups.service -n 20
 - Определяет физические диски автоматически через `lsblk` (или берёт список из `DISKS` в конфиге), пропуская `zram`, `loop`, `ram`, `sr`, `dm-`
 - Опрашивает каждый диск через `smartctl -a -j` (JSON) и разбирает результат через `jq`: health, модель, серийный номер, температура, наработка (power-on hours), `Reallocated_Sector_Ct`, `Current_Pending_Sector`, `Offline_Uncorrectable` (для NVMe — соответствующие поля `nvme_smart_health_information_log`)
 - Определяет устойчивое системное имя диска (`/dev/disk/by-id/...`, например `ata-ST4000DM004-2U9104_WW608PYW`) — не меняется при перестановке дисков/перезагрузке, в отличие от `/dev/sdX`; хранится в SQLite вместе с остальными метриками
-- Определяет точки монтирования диска через `lsblk -J` + `jq`, **с привязкой к разделу** (например `nvme0n1p1: /, /var/log, /var/cache, /var/tmp, /root, /srv; nvme0n1p2: /boot/efi`) — на btrfs один и тот же раздел часто смонтирован сразу в несколько мест через подтома (subvolumes); JSON-разбор через `jq` берётся не случайно: построчный `lsblk -o MOUNTPOINT` (ед. число) отдаёт только одну точку на раздел и может молча потерять корень `/`
+- Определяет точки монтирования диска **с привязкой к разделу**: разделы — из `lsblk -J` + `jq`, точки — из таблицы монтирования хоста `findmnt --task 1` (служба работает в песочнице systemd, и своя таблица `lsblk` показала бы её bind-монтирования `…/state`, `…/logs`, второй `/var/tmp`) (например `nvme0n1p1: /, /var/log, /var/cache, /var/tmp, /root, /srv; nvme0n1p2: /boot/efi`) — на btrfs один и тот же раздел часто смонтирован сразу в несколько мест через подтома (subvolumes); JSON-разбор через `jq` берётся не случайно: построчный `lsblk -o MOUNTPOINT` (ед. число) отдаёт только одну точку на раздел и может молча потерять корень `/`
 - Определяет объём диска в байтах через `lsblk -bdn -o SIZE` (не зависит от `smartctl` — доступен даже если SMART недоступен/диск не поддерживается) и показывает его в отчёте в человекочитаемом виде (КиБ/МиБ/ГиБ/ТиБ)
 
 CPU:
@@ -1144,7 +1144,7 @@ SQLite `utility_bills/utility_bills.db` с представлениями для
 | `replace_encoding.sh` | Bash, `grep`, `sed` |
 | `sources.sh` | POSIX shell, `rsync`, `xargs`, `7z` (для строк `7z`) |
 | `split_by_dash.sh` | POSIX shell, `find`, `mv`, `sed`, `gawk` |
-| `system_monitor.sh` | Bash, `smartctl` (root), `jq`, `sqlite3`, `lsblk`; опц.: `sensors`, `nvidia-smi`, `notify-send` |
+| `system_monitor.sh` | Bash, `smartctl` (root), `jq`, `sqlite3`, `lsblk`, `findmnt`; опц.: `sensors`, `nvidia-smi`, `notify-send` |
 | `unpack-fb2zip.sh` | Bash, `find`, `unzip` |
 
 ---

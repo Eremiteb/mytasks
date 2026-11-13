@@ -101,14 +101,24 @@ DIR="$2"
 ###############################################################################
 log_json "INFO" "start" "Запуск изменения регистра расширений" "mode=${MODE}; dir=${DIR}"
 
-total=$(find "${DIR}" -type f -name '*.*' -print0 | tr -cd '\0' | wc -c)
+# Список файлов — во временный файл: цикл читает его без подстановки процесса,
+# счётчики остаются в основной оболочке и попадают в итоговую запись журнала.
+LIST_FILE="$(mktemp)"
+trap 'rm -f -- "${LIST_FILE}"' EXIT
+# Сбой find (например, нечитаемый подкаталог) не прерывает обработку найденного.
+find_rc=0
+find "${DIR}" -type f -name '*.*' -print0 > "${LIST_FILE}" || find_rc=$?
+if (( find_rc != 0 )); then
+  echo "Предупреждение: find завершился с кодом ${find_rc}, список файлов может быть неполным" >&2
+  log_json "WARN" "find_partial" "find завершился с ошибкой, список файлов может быть неполным" "${DIR}"
+fi
+
+total=$(tr -cd '\0' < "${LIST_FILE}" | wc -c)
 (( total == 0 )) && { echo "No files with extensions found."; log_json "INFO" "done" "Файлов с расширением не найдено"; cleanup_logs; exit 0; }
 
 i=0
 renamed=0
 
-# Цикл читает из подстановки процесса, а не из конвейера: счётчики остаются
-# в основной оболочке и попадают в итоговую запись журнала.
 while IFS= read -r -d '' file; do
   i=$((i+1))
   percent=$((i * 100 / total))
@@ -135,7 +145,7 @@ while IFS= read -r -d '' file; do
       log_json "ERROR" "rename_failed" "Не удалось переименовать" "${file} -> ${new}"
     fi
   fi
-done < <(find "${DIR}" -type f -name '*.*' -print0)
+done < "${LIST_FILE}"
 
 echo
 echo "Done."

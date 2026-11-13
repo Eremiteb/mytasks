@@ -1502,7 +1502,8 @@ fix_unit() {
 
 # Root-копия файла (вид root-file): копирует и ставит root:root сам root-шаг
 fix_root_file() {
-    local i="$1" name="${R_NAME[${i}]}" spec dir
+    local i="$1"
+    local name="${R_NAME[${i}]}" spec dir
     IFS='|' read -r _ _ spec _ <<<"${ALL_JOBS[${i}]}"
     if [[ "${DRY_RUN}" -eq 1 ]]; then
         say "[dry-run] будет: ${R_ACTION[${i}]} (с повышением прав)"

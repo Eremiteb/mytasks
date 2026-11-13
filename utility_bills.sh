@@ -44,10 +44,11 @@ ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }
 # символы (< 0x20) — имя файла с переводом строки не должно ломать JSONL (CWE-117). Чистый bash.
 json_escape() {
     local text="$1" out="" ch code esc i
+    local bslash=$'\\'
     for ((i = 0; i < ${#text}; i++)); do
         ch="${text:${i}:1}"
         case "${ch}" in
-            '\') out+='\\' ;;
+            "${bslash}") out+="${bslash}${bslash}" ;;
             '"') out+='\"' ;;
             $'\n') out+='\n' ;;
             $'\r') out+='\r' ;;

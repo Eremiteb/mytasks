@@ -41,6 +41,7 @@ ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }
 # символы (<0x20) — имя файла с переводом строки не должно ломать JSONL (CWE-117).
 json_escape() {
     local input="$1" output="" char="" code="" escaped="" index
+    local bslash=$'\\'
     local special=$'[[:cntrl:]\\\\"]'
     if [[ ! "${input}" =~ ${special} ]]; then
         printf '%s' "${input}"
@@ -49,7 +50,7 @@ json_escape() {
     for ((index = 0; index < ${#input}; index++)); do
         char="${input:index:1}"
         case "${char}" in
-            '\') output+='\\' ;;
+            "${bslash}") output+="${bslash}${bslash}" ;;
             '"') output+='\"' ;;
             $'\n') output+='\n' ;;
             $'\r') output+='\r' ;;

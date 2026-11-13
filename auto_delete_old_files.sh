@@ -3,6 +3,8 @@
 # Автоудаление старых файлов по конфигу
 
 set -eu
+# Функции в подстановках команд наследуют set -e (SC2311).
+shopt -s inherit_errexit
 
 ###############################################################################
 # SCRIPT ID / PATHS
@@ -69,25 +71,33 @@ log_json() {
 }
 
 cleanup_logs() {
-  find "${LOG_DIR}" -maxdepth 1 -type f -name "${SCRIPT_BASE}-*.jsonl" -printf '%T@|%p\n' 2>/dev/null \
-    | sort -nr \
-    | awk -F'|' -v keep="${KEEP_LOGS:-10}" 'NR > keep { print $2 }' \
-    | while IFS= read -r old_log; do
-        [[ -n "${old_log}" ]] && rm -f -- "${old_log}"
-      done
+  local listing="" sorted old_logs old_log find_rc=0
+  # Сбой find не должен прерывать запуск: чистим по тому, что удалось перечислить.
+  listing="$(find "${LOG_DIR}" -maxdepth 1 -type f -name "${SCRIPT_BASE}-*.jsonl" -printf '%T@|%p\n' 2>/dev/null)" || find_rc=$?
+  if [[ "${find_rc}" -ne 0 ]]; then
+    log_json "WARN" "cleanup_logs_partial" "find не смог перечислить журналы полностью" "${LOG_DIR}"
+  fi
+  sorted="$(sort -nr <<<"${listing}")"
+  old_logs="$(awk -F'|' -v keep="${KEEP_LOGS:-10}" 'NR > keep { print $2 }' <<<"${sorted}")"
+  while IFS= read -r old_log; do
+    if [[ -n "${old_log}" ]]; then
+      rm -f -- "${old_log}"
+    fi
+  done <<<"${old_logs}"
 }
 
 trim() {
   printf '%s' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
 }
 
+# Проверяет каталог и добавляет его в список; при ошибке завершает скрипт с кодом 2.
 validate_target_dir() {
   _target_candidate="$1"
 
   if [[ ! -d "${_target_candidate}" ]]; then
     log_json "ERROR" "target_missing" "Каталог не существует" "${_target_candidate}" 2
     echo "Ошибка: каталог не существует: ${_target_candidate}" >&2
-    return 1
+    exit 2
   fi
 
   # Защита от катастрофического удаления: реальный путь не может быть корнем,
@@ -95,20 +105,16 @@ validate_target_dir() {
   _target_real="$(realpath -- "${_target_candidate}")" || {
     log_json "ERROR" "config_invalid" "Не удалось определить реальный путь каталога" "${_target_candidate}" 2
     echo "Ошибка: не удалось определить реальный путь: ${_target_candidate}" >&2
-    return 1
+    exit 2
   }
   _target_depth="$(printf '%s' "${_target_real}" | awk -F/ '{ n = 0; for (i = 1; i <= NF; i++) if ($i != "") n++; print n }')"
   if [[ "${_target_real}" == "/" || "${_target_real}" == "${HOME_REAL}" || "${_target_depth}" -lt 2 ]]; then
     log_json "ERROR" "target_unsafe" "Каталог слишком общий (корень, домашний каталог или глубина < 2)" "${_target_real}" 2
     echo "Ошибка: небезопасный каталог: ${_target_real}" >&2
-    return 1
+    exit 2
   fi
 
   printf '%s\0' "${_target_real}" >> "${TARGET_LIST_FILE}"
-}
-
-cleanup_temp_files() {
-  rm -f -- "${TARGET_LIST_FILE:-}" "${MATCH_LIST_FILE:-}"
 }
 
 ###############################################################################
@@ -146,7 +152,7 @@ TARGET_DIRS_RAW="${TARGET_DIRS:-}"
 FILE_TYPES_RAW="$(trim "${FILE_TYPES:-all}")"
 KEEP_DAYS="$(trim "${KEEP_DAYS:-30}")"
 TARGET_LIST_FILE="$(mktemp)"
-trap cleanup_temp_files EXIT
+trap 'rm -f -- "${TARGET_LIST_FILE:-}" "${MATCH_LIST_FILE:-}"' EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -158,9 +164,7 @@ while IFS= read -r _target_candidate || [[ -n "${_target_candidate}" ]]; do
   _target_trimmed="$(trim "${_target_candidate}")"
   [[ -z "${_target_trimmed}" ]] && continue
   TARGET_COUNT=$((TARGET_COUNT + 1))
-  if ! validate_target_dir "${_target_trimmed}"; then
-    exit 2
-  fi
+  validate_target_dir "${_target_trimmed}"
 done <<EOF
 ${TARGET_DIRS_RAW}
 EOF
