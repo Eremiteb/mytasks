@@ -27,6 +27,7 @@ import shutil
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -45,6 +46,9 @@ LLAMA_SERVE_RE = re.compile(r"(^|/)llama\s+serve(\s|$)")
 PORT_RE = re.compile(r"--port[ =]([0-9]+)")
 CTX_RE = re.compile(r"--ctx-size ([0-9]+)")
 ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+# Схемы адресов роутера/FIM и предел ответа (список моделей — десятки КБ)
+ALLOWED_SCHEMES = frozenset({"http", "https"})
+MAX_RESPONSE_BYTES = 1024 * 1024
 
 
 def load_conf(path: Path) -> dict[str, str]:
@@ -66,12 +70,22 @@ def load_conf(path: Path) -> dict[str, str]:
 
 
 def http_get(url: str, timeout: float) -> bytes | None:
+    """GET роутера/FIM: только http(s) и ответ не больше MAX_RESPONSE_BYTES.
+
+    Адреса берутся из conf/llamactl.conf; без проверки схемы urlopen открыл бы
+    и file:// (чтение локальных файлов), а без лимита — читал бы ответ целиком.
+    """
+    if urllib.parse.urlsplit(url).scheme not in ALLOWED_SCHEMES:
+        return None
     try:
-        # Только адреса роутера и FIM из conf/llamactl.conf (локальные)
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            return resp.read()
+        # Схема проверена выше (S310: urlopen с произвольной схемой)
+        with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310
+            data = resp.read(MAX_RESPONSE_BYTES + 1)
     except (OSError, ValueError, urllib.error.URLError):
         return None
+    if len(data) > MAX_RESPONSE_BYTES:
+        return None
+    return data
 
 
 def models(router_url: str) -> list[dict]:

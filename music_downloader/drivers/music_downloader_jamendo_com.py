@@ -173,6 +173,9 @@ def _dedupe_tracks(tracks):
     return unique
 
 
+CLIENT_ID_PLACEHOLDER = "YOUR_JAMENDO_CLIENT_ID"
+
+
 def _get_client_id():
     env_client_id = os.getenv("JAMENDO_CLIENT_ID")
     if isinstance(env_client_id, str):
@@ -198,8 +201,11 @@ def _get_client_id():
         client_id = site_cfg.get("client_id")
         if isinstance(client_id, str):
             client_id = client_id.strip()
-        if client_id:
+        # Плейсхолдер из music_downloader.json.example — не ключ: в API его не отправляем.
+        if client_id and client_id != CLIENT_ID_PLACEHOLDER:
             _CONFIG_CLIENT_ID = client_id
+        elif client_id:
+            logger.warning(f"client_id Jamendo в {_CONFIG_PATH} — плейсхолдер, задайте свой ключ")
         break
 
     return _CONFIG_CLIENT_ID

@@ -85,6 +85,10 @@ Shell-скрипты с JSONL-логированием читают его, ес
 (`script`, `event`, `msg`, `detail`, `rc` и т.д.), чтобы не ломать
 существующие разборщики.
 
+Значения полей экранирует `json_escape` (во всех shell-скриптах с JSONL-логом): `\` и `"` — с обратной косой
+чертой, табуляция — `\t`, перевод строки — `\n`, прочие управляющие символы, включая `\r`, — `\u00XX`.
+Поэтому имя файла с переводом строки не ломает JSONL: одна запись остаётся одной строкой.
+
 В том же файле задаётся `KEEP_LOGS` — сколько последних JSONL-логов каждого
 скрипта хранить (по умолчанию 10); скрипт может переопределить значение в своём
 `conf/<скрипт>.conf`.
@@ -202,6 +206,11 @@ Shell-скрипты с JSONL-логированием читают его, ес
 - из-за этого встроенный фоновый джоб Nextcloud `ExpireTrash` (запускается через `cron.php` независимо от расписания бэкапа) затем падает с `NotFoundException.../files_trashbin` при каждом своём запуске
 - поэтому сразу после очистки скрипт получает `datadirectory` и список пользователей через `occ` и для каждого пользователя выполняет `mkdir -p <datadir>/<user>/files_trashbin` — это идемпотентно и безопасно
 
+**Безопасность:**
+- `NEXTCLOUD_CONTAINER`, `NEXTCLOUD_EXEC_USER`, `MARIADB_SERVICE_NAME` проверяются по шаблону `A-Za-z0-9._-`, `REMOTE_PATH` — абсолютный путь из `A-Za-z0-9._/-`; значения, которые не подходят, останавливают скрипт до какого-либо действия.
+- Пользователи Nextcloud (допустимы `A-Za-z0-9._@-`) и `datadirectory` (абсолютный путь из `A-Za-z0-9._/-`) вне шаблона пропускаются с WARN (`occ_trashbin_uid_skipped`, `occ_trashbin_datadir_invalid`); пересоздание `files_trashbin` для них не выполняется.
+- `umask 077`: архивы и логи доступны только владельцу. Временные файлы создаются через `mktemp`.
+
 **Производительность:**
 - SSH-шифр: приоритет `aes128-gcm`, `chacha20-poly1305` — используют аппаратное ускорение AES-NI
 - SSH-сжатие отключено (`Compression=no`) — tar уже сжимает данные, двойное сжатие только тратит CPU
@@ -284,6 +293,10 @@ QNAP-версия `cloud_backup.sh` — то же резервное копир�
 | `COMP_PIGZ_CMD`                  | `pigz -1` | Команда сжатия на удалённом сервере при наличии `pigz` |
 | `COMP_GZIP_CMD`                  | `gzip -1` | Команда сжатия на удалённом сервере (запасной вариант) |
 
+**Безопасность:**
+- `NEXTCLOUD_SERVICE_NAME`, `MARIADB_SERVICE_NAME` проверяются по шаблону `A-Za-z0-9._-`; `REMOTE_HOST` — по `A-Za-z0-9._:-` (двоеточие для IPv6); `REMOTE_PATH` — абсолютный путь из `A-Za-z0-9._/-`. Значения, которые не подходят, останавливают скрипт до начала работы.
+- `umask 022`: архивы и логи читаются всеми (их читает `check_backups.sh` по NFS), но записывает только владелец. Временные файлы raw-transfer на удалённом сервере создаются через `mktemp`.
+
 **Логи:** JSONL-файл `logs/cloud_backup_qnap-YYYY-MM-DD-HH-MM-SS.jsonl` на QNAP. Хранится `BACKUP_KEEP_COUNT` последних файлов (см. `cleanup_logs`, тот же параметр, что и для архивов).
 
 **Диагностика скорости:** перед передачей и во время неё скрипт фиксирует
@@ -310,6 +323,11 @@ QNAP-версия `cloud_backup.sh` — то же резервное копир�
 Порт `RAW_TRANSFER_PORT` нужно открыть в фаерволе удалённого сервера. При
 недоступности `nc` или исчерпании попыток подключения скрипт автоматически
 переходит на SSH-передачу.
+
+Raw TCP не имеет собственного шифрования и аутентификации: защиту даёт только WireGuard. Включайте
+`RAW_TRANSFER_ENABLED=1`, только если все пиры WireGuard доверенные; правило фаервола в шапке скрипта
+ограничивает порт подсетью WireGuard. Файлы статуса и ошибок на удалённом сервере создаются через `mktemp`
+(`/tmp/.<имя>-raw-status.XXXXXX`); если это не удалось, передача идёт через SSH (`raw_transfer_mktemp_failed`).
 
 **Имя архива и поведение при дозаписи** — идентично `cloud_backup.sh` (см. выше): `cloud_backup_qnap-YYYY-MM-DD.tar.zst`/`.tar.gz`, проверка целостности и дозапись валидного архива за текущую дату, встроенные excludes для кэшей/preview/tmp.
 
@@ -464,7 +482,8 @@ journalctl --user -u check-backups.service -n 20
 |---|---|---|
 | `check-mytasks.service` | user-юнит | сам скрипт при входе в сеанс |
 | `conf/check_mytasks.conf` | конфиг | каталог mytasks, семейство ОС, способ повышения прав |
-| `system-monitor.timer` | системный юнит | `system_monitor.sh` каждые 6 ч от root |
+| `system-monitor.timer` | системный юнит | `system_monitor.sh` каждые 6 ч: запускает root-копию из `ROOT_LIB_DIR` в песочнице systemd |
+| `system_monitor.sh`, `system_monitor.conf`, `llamactl-root` | root-file | root-копии (`root:root`) в `ROOT_LIB_DIR` и настройки в `ROOT_CONF_DIR`; «отличается» — содержимое или права не совпадают с исходником, обновление с подтверждением |
 | `check-backups.timer` | user-юнит | `check_backups.sh` раз в сутки |
 | `sources.timer` | user-юнит | `sources.sh` ежедневно в 21:30, пропущенный запуск — после загрузки; ждёт окончания скачивания музыки, блокирует выключение до конца |
 | `agent-skills-sync.timer` | user-юнит | `install_agent_skills.sh --apply` раз в сутки: навык `model-routing` на всех устройствах |
@@ -485,9 +504,9 @@ journalctl --user -u check-backups.service -n 20
 
 **Таблица состояния** (`--status`): вид, задание, установлено (есть/нет/отличается/другой путь), автозапуск (включён), состояние (ожидает/работает/при событии/ошибка/не запущен), итог (`OK`, `ВНИМАНИЕ`, «не требуется») и описание; ниже — все зависимости с пакетом для текущего семейства.
 
-**Повышение прав** (обновление системы, системные юниты, пакеты): `SUDO_CMD="auto"` — `sudo -A` при заданном `SUDO_ASKPASS`, иначе `pkexec` в графическом сеансе, иначе `sudo` в терминале. Скрипт перезапускает сам себя с внутренней командой `__root-update`/`__root-install-units`/`__root-enable`/`__root-pkg` — один запрос пароля на действие; эти вызовы логов не пишут.
+**Повышение прав** (обновление системы, системные юниты, пакеты): `SUDO_CMD="auto"` — `sudo -A` при заданном `SUDO_ASKPASS`, иначе `pkexec` в графическом сеансе, иначе `sudo` в терминале. Скрипт перезапускает сам себя с внутренними командами `__root-update`, `__root-install-units`, `__root-install-file`, `__root-enable`, `__root-linger`, `__root-pkg` — один запрос пароля на действие; эти вызовы логов не пишут. Root-шаги разбираются до пользовательского конфига и проверяют аргументы (пакеты — из `DEPS`, юниты и файлы — из `JOBS`, каталоги назначения принадлежат root, linger — только для вызвавшего пользователя). Root-копии (`root-file`: `system_monitor.sh`, его конфиг, `llamactl-root`) ставятся в `ROOT_LIB_DIR` (`/usr/local/lib/mytasks`) и `ROOT_CONF_DIR` (`/etc/mytasks`); сам `check_mytasks.sh` запускается от root из домашнего каталога, как `sudo make install` — это осознанный компромисс. Подробности и порядок обновления root-копий — в разделе `llamactl` и в `ai-md/AI.md`.
 
-**Конфигурация:** `conf/check_mytasks.conf` (пример `conf/check_mytasks.conf.example`, создаётся мастером): `MYTASKS_DIR`, `LLAMA_PREFIX`, `OS_FAMILY` (пусто — автоопределение), `SUDO_CMD`, `UI` (`auto`/`kdialog`/`tty`/`none`), каталоги `SYSTEM_UNIT_DIR`, `USER_UNIT_DIR`, `AUTOSTART_DIR`, `BIN_DIR`, `KEEP_LOGS`, `SYSTEM_PYTHON` (пусто — `/usr/bin/python3`, где его нет — `python3` из PATH), `KERNEL_MODULES_DIR` (`/usr/lib/modules`, по нему определяется, что нужна перезагрузка после обновления ядра), параметры уведомления; при необходимости — свои массивы `JOBS` и `DEPS` (формат описан в начале скрипта). Если конфига нет, скрипт предупреждает и использует каталог запуска.
+**Конфигурация:** `conf/check_mytasks.conf` (пример `conf/check_mytasks.conf.example`, создаётся мастером): `MYTASKS_DIR`, `LLAMA_PREFIX`, `OS_FAMILY` (пусто — автоопределение), `SUDO_CMD`, `UI` (`auto`/`kdialog`/`tty`/`none`), каталоги `SYSTEM_UNIT_DIR`, `ROOT_LIB_DIR` (`/usr/local/lib/mytasks`, root-копии скриптов; подставляется в `@ROOT_LIB_DIR@`), `ROOT_CONF_DIR` (`/etc/mytasks`, root-копии настроек; `@ROOT_CONF_DIR@`), `USER_UNIT_DIR`, `AUTOSTART_DIR`, `BIN_DIR`, `KEEP_LOGS`, `SYSTEM_PYTHON` (пусто — `/usr/bin/python3`, где его нет — `python3` из PATH), `KERNEL_MODULES_DIR` (`/usr/lib/modules`, по нему определяется, что нужна перезагрузка после обновления ядра), параметры уведомления; при необходимости — свои массивы `JOBS` и `DEPS` (формат описан в начале скрипта). Если конфига нет, скрипт предупреждает и использует каталог запуска.
 
 **Коды возврата:** `0` — всё на месте, `1` — есть незапущенные или не прописанные задания, конфиги или обязательные зависимости, `2` — ошибка аргументов.
 
@@ -595,15 +614,24 @@ sudo ./system_monitor.sh
 
 # Только пересобрать HTML-отчёт из уже накопленных данных, без опроса
 sudo ./system_monitor.sh -r
+
+# Явный конфиг (таймер передаёт root-конфиг)
+sudo ./system_monitor.sh -c /etc/mytasks/system_monitor.conf
 ```
 
 **Важно:** для чтения SMART-атрибутов `smartctl` обычно требует root, поэтому
-скрипт запускается от root; CPU/GPU опрашиваются в том же запуске.
+скрипт запускается от root; CPU/GPU опрашиваются в том же запуске. От root
+скрипт отказывает, если в путях каталогов данных или у файлов БД есть симлинк;
+`latest.html` пишется через временный файл и `mv`. Ключ `-c, --config ФАЙЛ`
+задаёт конфиг явно (без ключа: root-копия — только `/etc/mytasks/system_monitor.conf`).
 
 **Расписание — системный systemd timer:** шаблоны `systemd/system-monitor.service`
 и `systemd/system-monitor.timer` (плейсхолдер `@MYTASKS_DIR@`) устанавливает в
-`/etc/systemd/system` и включает `check_mytasks.sh`. Таймер срабатывает в
-00/06/12/18 часов, а благодаря `Persistent=true` пропущенный слот (машина была
+`/etc/systemd/system` и включает `check_mytasks.sh`. Юнит запускает root-копию
+`/usr/local/lib/mytasks/system_monitor.sh --config /etc/mytasks/system_monitor.conf`
+в песочнице systemd (запись только в `state/`, `logs/`, `system_reports/` каталога
+mytasks); изменения скрипта и `conf/system_monitor.conf` действуют после «обновить»
+в `check_mytasks.sh`. Таймер срабатывает в 00/06/12/18 часов, а благодаря `Persistent=true` пропущенный слот (машина была
 выключена) выполняется при первой же загрузке — не более одного раза за интервал.
 
 ```sh
@@ -798,14 +826,14 @@ Codex и Gemini CLI (`~/.agents/skills`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI
 | `kill-foreign` | завершить сторонние `llama-server`/`llama serve` (например, встроенные env `llama-vscode`) |
 | `preset list\|show М\|set М КЛЮЧ ЗНАЧ\|unset М КЛЮЧ\|edit` | правка пресетов: показ diff, резервная копия `models.ini.bak-*`, перечитывание роутера через `GET /models?reload=1` без перезапуска, откат при сбое; `edit` не применяет правку, если `models.ini` изменился, пока был открыт редактор (временный файл с правкой остаётся) |
 | `fit М [ОКНО]` | раскладка слоёв и экспертов MoE по GPU/CPU (`llama-fit-params`) с учётом занятой VRAM |
-| `add РЕПО ФАЙЛ.gguf [--name] [--mmproj] [--ctx]` | загрузка с Hugging Face на SSD с докачкой, прогрессом и проверкой sha256, новая секция пресета (дописывается к `models.ini` после загрузки, поэтому правки, сделанные за время загрузки, сохраняются) |
+| `add РЕПО ФАЙЛ.gguf [--name] [--mmproj] [--ctx]` | загрузка с Hugging Face на SSD с докачкой, прогрессом и проверкой sha256 (без sha256 — отказ; `--no-verify` — скачать без проверки; размер сверяется), новая секция пресета (дописывается к `models.ini` после загрузки, поэтому правки, сделанные за время загрузки, сохраняются) |
 | `remove М [--delete-files]` | убрать модель из пресетов (и удалить её файлы внутри `MODELS_DIR`) |
 | `bench [М]` | замер скорости генерации и обработки промпта |
-| `update [--ref REF] [--bench] [--force]` | `git fetch` исходников, сборка с CUDA (`sm_86`, RPATH `$ORIGIN/../lib`), установка в `/opt/llama.cpp.new`, проверка, замена с сохранением прежней версии в `/opt/llama.cpp.prev`, перезапуск сервисов и автоматический откат, если они не ответили |
+| `update [--ref ТЕГ\|SHA] [--bench] [--force]` | `git fetch` исходников; без `--ref` — последний релизный тег `bNNNN` (`LLAMA_REF`); сборка с CUDA (`sm_86`, RPATH `$ORIGIN/../lib`), установка в `/opt/llama.cpp.new`, проверка, замена с сохранением прежней версии в `/opt/llama.cpp.prev`, перезапуск сервисов и автоматический откат, если они не ответили |
 
 **Статус** (`status`, `status --json`) собирает `llamactl_status.py` — только стандартная библиотека Python: роутер и FIM опрашиваются по HTTP, процессы, пользователи и память читаются из `/proc`, место — через `statvfs`, VRAM и процессы на GPU — напрямую из библиотеки драйвера NVML (`libnvidia-ml.so.1`, без неё — `nvidia-smi`; `LLAMACTL_NO_NVML=1` отключает NVML). Внешний процесс один — `systemctl is-active` на оба юнита. Опрос стоит ~20 мс CPU (трей опрашивает каждые 5 с). `llamactl_status.py` можно запускать и отдельно (`--conf`, `--router-url` и т.п., `--proc` — корень procfs для тестов, `-n/--dry-run` принимается — скрипт только читает).
 
-Root-шаги (systemctl, установка пресета, замена сборки) идут через `sudo -A` (графическое окно пароля), не больше одного запроса пароля на действие: скрипт перезапускает сам себя с внутренней командой `__root-*`.
+Root-шаги (установка пресета, откат пресета, замена сборки) идут только через `sudo -A` (графическое окно пароля) root-хелпера `llamactl-root` (`ROOT_HELPER`): `install-preset`, `restore-preset`, `swap-install`; не больше одного запроса пароля на действие. Хелпер ставит `check_mytasks.sh` копией `llamactl/llamactl-root.sh` (root:root) в `/usr/local/lib/mytasks/llamactl-root`; файлы пользователя он читает с его правами, из сборки копирует только `bin/` и `lib/`. Пути — зашитые или из `/etc/mytasks/llamactl-root.conf` (root-конфиг, не выполняется). После обновления запустите `check_mytasks.sh` и согласитесь обновить root-копии; до этого `llamactl` откажет в root-шагах с подсказкой.
 
 **Параллельные правки пресетов.** Все записи `models.ini` (`add`, `remove`, `preset set/unset/edit`, в том числе из меню и трея) идут под эксклюзивной блокировкой `flock` на `PRESET_LOCK_FILE`: новая версия файла строится из текущего содержимого и устанавливается внутри одной блокировки, второй вызов ждёт до `PRESET_LOCK_TIMEOUT_SECS` (600 с). `add` берёт блокировку только после загрузки модели, поэтому `preset set` во время многоминутной загрузки не ждёт и не теряется. В dry-run блокировка не берётся.
 
@@ -813,7 +841,7 @@ Root-шаги (systemctl, установка пресета, замена сбо
 
 **`llamactl_tray.py`** — иконка в трее KDE (Python с PyQt6, шебанг `/usr/bin/env python3`; если у найденного `python3` нет PyQt6, например активен venv, трей перезапускается системным `/usr/bin/python3`), обёртка над `llamactl.sh`: статус каждые 5 с получает модулем `llamactl_status.py` в фоновом потоке, не запуская `llamactl.sh`; цвет — серый (остановлен), синий (ожидает), жёлтый (загрузка), зелёный (модель загружена), оранжевый (проблемы: FIM не работает, сторонние `llama-server`); подсказка — модель, VRAM, свободная RAM. Меню: модели (загрузить/выгрузить), освободить VRAM, сервисы, логи, проверка, пресеты (редактор, fit, замер), добавление модели с Hugging Face, обновление llama.cpp, консольное меню. Быстрые действия — в фоне с уведомлением, долгие и интерактивные — в терминале (`konsole --hold -e`, переопределяется `--terminal` или `LLAMACTL_TERMINAL`). Щелчок по иконке открывает веб-чат роутера. Автозапуск — `~/.config/autostart/llamactl-tray.desktop` (шаблон `systemd/autostart/llamactl-tray.desktop`, в нём `Exec=@MYTASKS_DIR@/llamactl/llamactl_tray.py`; его и ссылки `~/.local/bin/llamactl`, `~/.local/bin/llamactl-tray` создаёт `check_mytasks.sh`, если есть каталог установки llama.cpp), пункт меню — `~/.local/share/applications/llamactl-tray.desktop`. `--dry-run` передаёт режим всем действиям; `--print-menu [--status-file F]` печатает состояние и меню без графики.
 
-**Конфигурация:** `conf/llamactl.conf` (пример — `conf/llamactl.conf.example`): адреса роутера и FIM, юниты и пользователь сервисов, пути пресетов, моделей, установки и исходников, архитектура CUDA, число потоков сборки, модель для замера, тайм-ауты, команда `sudo`, файл и тайм-аут блокировки пресетов (`PRESET_LOCK_FILE`, `PRESET_LOCK_TIMEOUT_SECS`).
+**Конфигурация:** `conf/llamactl.conf` (пример — `conf/llamactl.conf.example`): адреса роутера и FIM, юниты и пользователь сервисов, пути пресетов, моделей, установки и исходников, архитектура CUDA, число потоков сборки, модель для замера, тайм-ауты, команда `sudo`, файл и тайм-аут блокировки пресетов (`PRESET_LOCK_FILE`, `PRESET_LOCK_TIMEOUT_SECS`), путь root-хелпера (`ROOT_HELPER`, по умолчанию `/usr/local/lib/mytasks/llamactl-root`) и что ставит `update` без `--ref` (`LLAMA_REF`, по умолчанию `latest-tag`).
 
 **Использование:**
 ```sh
@@ -1139,3 +1167,8 @@ SQLite `utility_bills/utility_bills.db` с представлениями для
 при изменении `*.sh`/`*.py`), `.github/workflows/music-downloader.yml` (Ruff и
 pytest загрузчика на Python 3.14), `.github/workflows/utility-bills.yml` (Ruff и pytest `utility_bills/`) и `.github/workflows/security-scan.yml`
 (Semgrep, Trivy, OSV-Scanner, Gitleaks, CodeQL; еженедельно и на push/PR).
+
+Версии инструментов CI закреплены: `shellcheck-py==0.11.0.1` из PyPI (ставится через `pipx`), `semgrep==1.95.0`,
+bats-core — тег `v1.11.1`; ruff в `shellcheck.yml` (для `llamactl`) — `ruff==0.17.0`, в `requirements-ci.txt`
+загрузчика — `ruff>=0.17.0`, у `utility_bills` — `>=0.17.0,<0.18`. У всех workflows на верхнем уровне
+`permissions: contents: read`. Workflow `music-downloader.yml` запускает и `tests/test_mht_to_fb2.py`.

@@ -39,12 +39,8 @@ LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}-${TIMESTAMP}.jsonl"
 LOG_TEMPLATE_FILE="${CONF_DIR}/log_template.conf"
 SELF_UNIT="${SCRIPT_BASE//_/-}.service"
 
-if [[ -r "${LOG_TEMPLATE_FILE}" ]]; then
-    # shellcheck source=/dev/null
-    source "${LOG_TEMPLATE_FILE}"
-fi
-LOG_SCHEMA_VERSION="${LOG_SCHEMA_VERSION:-1.0}"
-LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
+LOG_SCHEMA_VERSION="1.0"
+LOG_COMPAT_TARGETS="elk,opensearch,loki,graylog,splunk"
 
 # Значения по умолчанию; переопределяются в conf/check_mytasks.conf
 MYTASKS_DIR=""
@@ -64,6 +60,10 @@ KERNEL_MODULES_DIR="/usr/lib/modules"
 SUDO_CMD="auto"
 UI="auto"
 SYSTEM_UNIT_DIR="/etc/systemd/system"
+# Root-копии скриптов и их настроек (задания root-file): вне домашнего
+# каталога, владелец root — их запускают системные юниты без пароля
+ROOT_LIB_DIR="/usr/local/lib/mytasks"
+ROOT_CONF_DIR="/etc/mytasks"
 USER_UNIT_DIR=""
 AUTOSTART_DIR=""
 BIN_DIR=""
@@ -90,11 +90,19 @@ URGENCY="normal"
 #        исправление — systemctl --user restart;
 #        no-cron — в crontab не должно быть строк с этими скриптами (параметр —
 #        имена через запятую): их запускают таймеры systemd, а старая строка
-#        cron дала бы второй запуск; исправление — удалить строки.
+#        cron дала бы второй запуск; исправление — удалить строки;
+#        root-file — root-копия файла mytasks вне домашнего каталога (имя —
+#        имя файла назначения, параметр ИСТОЧНИКИ:КАТАЛОГ:РЕЖИМ: исходники
+#        через запятую относительно mytasks, берётся первый существующий,
+#        *.example — с подстановкой; КАТАЛОГ lib = ROOT_LIB_DIR, conf =
+#        ROOT_CONF_DIR, в конфиг дописывается MYTASKS_DIR; РЕЖИМ 0755/0644);
+#        ставится root:root, отличие от исходника — предложение обновить.
 #   условие: пусто — всегда; path:ПУТЬ, cmd:КОМАНДА, fs:ТОЧКА=ТИП,
 #        family:СЕМЕЙСТВО через запятую; при невыполненном — «не требуется».
 JOBS=(
-    "system-unit|system-monitor.timer|||Опрос SMART дисков, CPU и GPU каждые 6 ч (00, 06, 12, 18 ч; пропущенный запуск догоняется после загрузки), запись в SQLite и HTML-отчёт system_reports/latest.html. Скрипт system_monitor.sh, запуск от root."
+    "root-file|system_monitor.sh|system_monitor.sh:lib:0755||Root-копия system_monitor.sh (root:root) в ROOT_LIB_DIR: её запускает системный таймер system-monitor от root, поэтому код вне домашнего каталога и процессы пользователя не могут его подменить. После правки system_monitor.sh в mytasks — «отличается», обновление с подтверждением."
+    "root-file|system_monitor.conf|conf/system_monitor.conf,conf/system_monitor.conf.example:conf:0644||Root-копия настроек system_monitor в ROOT_CONF_DIR (из conf/system_monitor.conf, без него — из примера): root-копия скрипта читает только её. Правки conf/system_monitor.conf действуют после обновления копии (с подтверждением)."
+    "system-unit|system-monitor.timer|||Опрос SMART дисков, CPU и GPU каждые 6 ч (00, 06, 12, 18 ч; пропущенный запуск догоняется после загрузки), запись в SQLite и HTML-отчёт system_reports/latest.html. Запускается root-копия system_monitor.sh из ROOT_LIB_DIR в песочнице systemd."
     "user-unit|check-backups.timer|||Ежедневная проверка каталогов с архивами резервных копий (наличие, возраст, размер, целостность) с уведомлением в трее. Скрипт check_backups.sh, настройки — conf/check_backups.conf."
     "user-unit|beufm-recorder.service|||Постоянная запись эфира Beu FM: каждый выход песни сохраняется дублем, из трёх дублей собирается лучшая запись (общий участок по отпечаткам fpcalc). Загрузчик берёт её, только если песни нет в источниках MP3. Скрипт music_downloader/beufm_recorder.py, настройки — блок recorder сайта beufm_kz в music_downloader/music_downloader.json."
     "health|beufm-recorder|beufm_recorder-*.jsonl:20|cmd:systemctl|Запись эфира Beu FM действительно идёт: служба пишет в лог logs/beufm_recorder-*.jsonl хотя бы раз в 20 мин (смена трека в эфире) и без ошибок. Иначе — перезапуск службы."
@@ -113,6 +121,7 @@ JOBS=(
     "venv|music_downloader/venv|requests,bs4,cloudscraper,mutagen||Виртуальное окружение Python загрузчика музыки: music_downloader/setup_venv.sh ставит зависимости из requirements.txt."
     "conf|utility_bills/utility_bills.json|utility_bills/utility_bills.json.example||Настройки квитанций ЖКУ: почтовый ящик (IMAP), папка, отправители (search.from), каталог PDF, база SQLite, OCR и ступени тарифа электроэнергии. Пароль — в файле или переменной UTILITY_BILLS_IMAP_PASSWORD."
     "venv|utility_bills/venv|numpy,PIL||Виртуальное окружение Python квитанций ЖКУ: utility_bills/setup_venv.sh ставит зависимости из requirements.txt."
+    "root-file|llamactl-root|llamactl/llamactl-root.sh:lib:0755|path:@LLAMA_PREFIX@|Root-хелпер llamactl (root:root) в ROOT_LIB_DIR: через sudo -A llamactl запускает только его — установка models.ini и замена сборки llama.cpp без исполнения кода из домашнего каталога от root."
     "link|llamactl|llamactl/llamactl.sh|path:@LLAMA_PREFIX@|Команда llamactl в ~/.local/bin: управление локальным llama.cpp (модели, VRAM, сервисы, пресеты, обновление)."
     "link|llamactl-tray|llamactl/llamactl_tray.py|path:@LLAMA_PREFIX@|Команда llamactl-tray в ~/.local/bin: значок llama.cpp в трее."
     "autostart|llamactl-tray.desktop||path:@LLAMA_PREFIX@|Автозапуск значка llama.cpp в трее при входе в графический сеанс."
@@ -168,11 +177,22 @@ CONF_EXAMPLES=()
 CONF_WIZARD_SKIP=("conf/cloud_backup_qnap.conf")
 
 CONF_PRESENT=0
-if [[ -r "${CONF_FILE}" ]]; then
-    # shellcheck source=/dev/null
-    source "${CONF_FILE}"
-    CONF_PRESENT=1
-fi
+# Пользовательские конфиги (шаблон логов и conf/check_mytasks.conf) — код
+# пользователя: под root (внутренние шаги __root-*) они не выполняются,
+# поэтому загрузка — только после разбора внутренних шагов (см. ARGS)
+load_user_conf() {
+    if [[ -r "${LOG_TEMPLATE_FILE}" ]]; then
+        # shellcheck source=/dev/null
+        source "${LOG_TEMPLATE_FILE}"
+    fi
+    LOG_SCHEMA_VERSION="${LOG_SCHEMA_VERSION:-1.0}"
+    LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
+    if [[ -r "${CONF_FILE}" ]]; then
+        # shellcheck source=/dev/null
+        source "${CONF_FILE}"
+        CONF_PRESENT=1
+    fi
+}
 
 DRY_RUN=0
 STATUS_ONLY=0
@@ -302,6 +322,8 @@ subst() {
     local text="$1"
     text="${text//@MYTASKS_DIR@/${MYTASKS_DIR}}"
     text="${text//@HOME@/${HOME}}"
+    text="${text//@ROOT_LIB_DIR@/${ROOT_LIB_DIR}}"
+    text="${text//@ROOT_CONF_DIR@/${ROOT_CONF_DIR}}"
     printf '%s' "${text}"
 }
 
@@ -757,28 +779,221 @@ unit_enable_args() {
     return 0
 }
 
+# Аргументы root-шагов проверяются: под root пользовательский конфиг не
+# читается, поэтому имена юнитов, файлов и пакетов сверяются со встроенными
+# JOBS/DEPS (не под root — с JOBS/DEPS конфига: там граница прав не
+# пересекается), пути назначения — только каталоги, принадлежащие root,
+# исходники — только файлы внутри каталога скрипта.
+root_refuse() {
+    printf '%s: root-шаг отклонён: %s\n' "${SCRIPT_NAME}" "$1" >&2
+    return 2
+}
+
+# Каталог назначения root-шага: абсолютный путь без «.», «..», «//» и
+# симлинков; под root каждый существующий компонент принадлежит root и не
+# доступен на запись группе и остальным (запись только в каталоги root)
+valid_dest_dir() {
+    local dir="$1" part cur="" st parts=()
+    [[ "${dir}" =~ ^/[A-Za-z0-9._+/-]+$ ]] || return 1
+    [[ "${dir}" != */ && "${dir}" != *//* ]] || return 1
+    [[ "/${dir}/" != */../* && "/${dir}/" != */./* ]] || return 1
+    IFS='/' read -r -a parts <<<"${dir#/}"
+    for part in "${parts[@]}"; do
+        cur+="/${part}"
+        [[ -L "${cur}" ]] && return 1
+        [[ -e "${cur}" ]] || break
+        [[ -d "${cur}" ]] || return 1
+        if [[ "${EUID}" -eq 0 ]]; then
+            st="$(stat -c '%u %a' -- "${cur}")" || return 1
+            [[ "${st%% *}" == "0" ]] || return 1
+            (( (8#${st##* } & 8#022) == 0 )) || return 1
+        fi
+    done
+    return 0
+}
+
+# Исходник: относительный путь внутри каталога скрипта без «..», обычный
+# файл; ни он, ни каталоги на пути не симлинки (realpath совпадает с путём)
+valid_source() {
+    local rel="$1" real
+    [[ "${rel}" =~ ^[A-Za-z0-9._/-]+$ && "${rel}" != /* ]] || return 1
+    [[ "/${rel}/" != */../* && "/${rel}/" != */./* ]] || return 1
+    [[ -f "${SCRIPT_DIR}/${rel}" && ! -L "${SCRIPT_DIR}/${rel}" ]] || return 1
+    real="$(realpath -e -- "${SCRIPT_DIR}/${rel}" 2>/dev/null)" || return 1
+    [[ "${real}" == "${SCRIPT_DIR}/${rel}" ]]
+}
+
+# Параметр задания вида KIND с именем NAME из JOBS (код 1 — такого нет)
+job_param() {
+    local want_kind="$1" want_name="$2" entry kind name arg
+    for entry in "${JOBS[@]}"; do
+        IFS='|' read -r kind name arg _ <<<"${entry}"
+        if [[ "${kind}" == "${want_kind}" && "${name}" == "${want_name}" ]]; then
+            printf '%s' "${arg}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Каталог скрипта должен совпасть с MYTASKS_DIR пользователя: подстановки
+# root-шага делаются по каталогу, из которого он реально запущен
+root_check_mytasks_dir() {
+    [[ "$1" == "${SCRIPT_DIR}" ]] || root_refuse "MYTASKS_DIR «$1» не совпадает с каталогом скрипта ${SCRIPT_DIR}"
+}
+
+# Разбор параметра root-file: RF_SOURCES, RF_DIRKEY (lib|conf), RF_MODE
+parse_root_file_spec() {
+    IFS=':' read -r RF_SOURCES RF_DIRKEY RF_MODE <<<"$1"
+    [[ "${RF_DIRKEY}" == "lib" || "${RF_DIRKEY}" == "conf" ]] || return 1
+    [[ "${RF_MODE}" == "0755" || "${RF_MODE}" == "0644" ]] || return 1
+    [[ -n "${RF_SOURCES}" ]]
+}
+
+# Отрисовка root-файла в OUT: первый существующий исходник, *.example — с
+# подстановкой; в конфиг (каталог conf) дописывается MYTASKS_DIR, если его нет
+# (root-копия скрипта работает вне каталога mytasks). RF_SRC — выбранный
+# исходник; код 1 — исходника нет.
+render_root_file() {
+    local spec="$1" out="$2" src list=() content rendered re='^MYTASKS_DIR='
+    RF_SRC=""
+    parse_root_file_spec "${spec}" || return 1
+    IFS=',' read -r -a list <<<"${RF_SOURCES}"
+    for src in "${list[@]}"; do
+        if valid_source "${src}"; then
+            RF_SRC="${src}"
+            break
+        fi
+    done
+    [[ -n "${RF_SRC}" ]] || return 1
+    if [[ "${RF_SRC}" == *.example ]]; then
+        content="$(<"${SCRIPT_DIR}/${RF_SRC}")"
+        rendered="$(subst "${content}")"
+        printf '%s\n' "${rendered}" > "${out}" || return 1
+    else
+        cat -- "${SCRIPT_DIR}/${RF_SRC}" > "${out}" || return 1
+    fi
+    if [[ "${RF_DIRKEY}" == "conf" ]] && ! grep -q -- "${re}" "${out}"; then
+        printf '\n# Каталог mytasks (данные: БД, логи, отчёты); добавлено check_mytasks.sh\nMYTASKS_DIR="%s"\n' "${MYTASKS_DIR}" >> "${out}" || return 1
+    fi
+    return 0
+}
+
+# __root-install-units КАТАЛОГ_ЮНИТОВ ROOT_LIB_DIR ROOT_CONF_DIR MYTASKS_DIR ЮНИТ:
+# шаблоны отрисовываются здесь же, из systemd/ каталога скрипта
 root_install_units() {
-    local dest="$1"
-    local primary="$2"
-    shift 2
-    install -d -m 0755 -- "${dest}" || return 1
-    install -m 0644 -t "${dest}" -- "$@" || return 1
-    systemctl daemon-reload || return 1
+    local dest="${1:-}" primary="${5:-}" tpl tmpdir files=() rc=0
+    [[ $# -eq 5 ]] || { root_refuse "ожидалось 5 аргументов"; return; }
+    valid_dest_dir "${dest}" || { root_refuse "каталог юнитов «${dest}» недопустим"; return; }
+    valid_dest_dir "$2" || { root_refuse "ROOT_LIB_DIR «$2» недопустим"; return; }
+    valid_dest_dir "$3" || { root_refuse "ROOT_CONF_DIR «$3» недопустим"; return; }
+    root_check_mytasks_dir "$4" || return
+    job_param system-unit "${primary}" >/dev/null || { root_refuse "юнита «${primary}» нет в JOBS"; return; }
+    ROOT_LIB_DIR="$2"
+    ROOT_CONF_DIR="$3"
+    MYTASKS_DIR="$4"
+    unit_templates system-unit "${primary}"
+    [[ ${#UNIT_TPLS[@]} -gt 0 ]] || { root_refuse "нет шаблона ${primary}"; return; }
+    tmpdir="$(mktemp -d)" || return 1
+    for tpl in "${UNIT_TPLS[@]}"; do
+        if ! valid_source "systemd/${tpl##*/}"; then
+            rm -rf -- "${tmpdir}"
+            root_refuse "шаблон ${tpl} — не обычный файл каталога скрипта"
+            return
+        fi
+        render_file "${tpl}" "${tmpdir}/${tpl##*/}" || rc=1
+        files+=("${tmpdir}/${tpl##*/}")
+    done
+    if [[ "${rc}" -eq 0 ]]; then
+        install -d -m 0755 -- "${dest}" \
+            && install -m 0644 -t "${dest}" -- "${files[@]}" \
+            && systemctl daemon-reload || rc=1
+    fi
+    rm -rf -- "${tmpdir}"
+    [[ "${rc}" -eq 0 ]] || return 1
     unit_enable_args "${primary}"
     systemctl "${ENABLE_ARGS[@]}" -- "${primary}"
 }
 
-root_enable() {
-    systemctl enable --now -- "$1"
+# __root-install-file ИМЯ КАТАЛОГ MYTASKS_DIR: root-копия задания root-file
+# (временный файл в каталоге назначения и rename: без следования симлинкам)
+root_install_file() {
+    local name="${1:-}" dir="${2:-}" spec tmp
+    [[ $# -eq 3 ]] || { root_refuse "ожидалось 3 аргумента"; return; }
+    [[ "${name}" =~ ^[A-Za-z0-9._-]+$ ]] || { root_refuse "недопустимое имя «${name}»"; return; }
+    spec="$(job_param root-file "${name}")" || { root_refuse "файла «${name}» нет в JOBS"; return; }
+    parse_root_file_spec "${spec}" || { root_refuse "некорректное задание ${name}"; return; }
+    valid_dest_dir "${dir}" || { root_refuse "каталог «${dir}» недопустим"; return; }
+    root_check_mytasks_dir "$3" || return
+    MYTASKS_DIR="$3"
+    install -d -m 0755 -- "${dir}" || return 1
+    tmp="$(mktemp -- "${dir}/.${name}.XXXXXX")" || return 1
+    if ! render_root_file "${spec}" "${tmp}"; then
+        rm -f -- "${tmp}"
+        root_refuse "нет исходника ${RF_SOURCES} (обычный файл в ${SCRIPT_DIR})"
+        return
+    fi
+    if ! chmod "${RF_MODE}" -- "${tmp}" || { [[ "${EUID}" -eq 0 ]] && ! chown 0:0 -- "${tmp}"; }; then
+        rm -f -- "${tmp}"
+        return 1
+    fi
+    mv -f -- "${tmp}" "${dir}/${name}"
 }
 
+# Юнит — только system-unit/system-ext из JOBS (или .service/.timer пары system-unit)
+root_enable() {
+    local unit="${1:-}" entry kind name
+    [[ $# -eq 1 ]] || { root_refuse "ожидался 1 аргумент"; return; }
+    for entry in "${JOBS[@]}"; do
+        IFS='|' read -r kind name _ <<<"${entry}"
+        case "${kind}" in
+            system-ext) [[ "${unit}" == "${name}" ]] && { systemctl enable --now -- "${unit}"; return; } ;;
+            system-unit) [[ "${unit}" == "${name}" || "${unit}" == "${name%.*}.service" || "${unit}" == "${name%.*}.timer" ]] \
+                && { systemctl enable --now -- "${unit}"; return; } ;;
+            *) ;;
+        esac
+    done
+    root_refuse "юнита «${unit}» нет в JOBS"
+}
+
+# Linger — только для пользователя, вызвавшего sudo/pkexec (не под root — себя)
 root_linger() {
-    loginctl enable-linger -- "$1"
+    local user="${1:-}" caller=""
+    [[ $# -eq 1 && "${user}" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || { root_refuse "недопустимое имя пользователя «${user}»"; return; }
+    if [[ "${EUID}" -ne 0 ]]; then
+        caller="$(id -un)"
+    elif [[ -n "${SUDO_USER:-}" ]]; then
+        caller="${SUDO_USER}"
+    elif [[ "${PKEXEC_UID:-}" =~ ^[0-9]+$ ]]; then
+        caller="$(id -un -- "${PKEXEC_UID}")" || caller=""
+    else
+        caller="${user}"
+    fi
+    [[ "${user}" == "${caller}" ]] || { root_refuse "linger только для вызвавшего пользователя (${caller:-?})"; return; }
+    loginctl enable-linger -- "${user}"
+}
+
+# Пакет — только имя из таблицы DEPS (любое семейство)
+dep_known_package() {
+    local want="$1" entry spec item items=()
+    [[ "${want}" =~ ^[A-Za-z0-9@._+][A-Za-z0-9@._+/-]*$ ]] || return 1
+    for entry in "${DEPS[@]}"; do
+        IFS='|' read -r _ spec _ <<<"${entry}"
+        IFS=';' read -r -a items <<<"${spec}"
+        for item in "${items[@]}"; do
+            [[ "${item#*=}" == "${want}" ]] && return 0
+        done
+    done
+    return 1
 }
 
 root_pkg() {
-    local mgr="$1"
+    local mgr="${1:-}" pkg
     shift
+    [[ $# -gt 0 ]] || { root_refuse "не указаны пакеты"; return; }
+    for pkg in "$@"; do
+        dep_known_package "${pkg}" || { root_refuse "пакета «${pkg}» нет в таблице DEPS"; return; }
+    done
     case "${mgr}" in
         pacman) pacman -S --needed --noconfirm -- "$@" ;;
         apt-get) apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y -- "$@" ;;
@@ -797,8 +1012,12 @@ root_pkg() {
 
 # Полное обновление системы штатным средством семейства (MODE уточняет вариант)
 root_update() {
-    local mgr="$1"
+    local mgr="${1:-}"
     local mode="${2:-}"
+    case "${mode}" in
+        ""|garuda|dup|update) ;;
+        *) root_refuse "неизвестный вариант обновления «${mode}»"; return ;;
+    esac
     case "${mgr}" in
         pacman)
             if [[ "${mode}" == "garuda" ]]; then
@@ -854,6 +1073,7 @@ kind_label() {
         venv) printf 'venv' ;;
         linger) printf 'linger' ;;
         health) printf 'работа службы' ;;
+        root-file) printf 'файл (root)' ;;
         *) printf '%s' "$1" ;;
     esac
 }
@@ -1147,6 +1367,44 @@ eval_venv() {
     fi
 }
 
+# Каталог назначения root-file по ключу lib|conf
+root_file_dir() {
+    if [[ "$1" == "lib" ]]; then
+        printf '%s' "${ROOT_LIB_DIR}"
+    else
+        printf '%s' "${ROOT_CONF_DIR}"
+    fi
+}
+
+# Root-копия файла: есть / нет / отличается (содержимое или права)
+eval_root_file() {
+    local i="$1" name="$2" spec="$3" dir dest tmp cur_mode
+    if ! parse_root_file_spec "${spec}"; then
+        set_row "${i}" "—" "—" "—" "ВНИМАНИЕ" "некорректный параметр задания «${spec}»" "none" ""
+        return 0
+    fi
+    dir="$(root_file_dir "${RF_DIRKEY}")"
+    dest="${dir}/${name}"
+    tmp="$(mktemp)"
+    if ! render_root_file "${spec}" "${tmp}"; then
+        rm -f -- "${tmp}"
+        set_row "${i}" "—" "—" "—" "ВНИМАНИЕ" "нет исходника ${RF_SOURCES//,/ или } в ${MYTASKS_DIR}" "none" ""
+        return 0
+    fi
+    cur_mode=""
+    [[ -f "${dest}" && ! -L "${dest}" ]] && cur_mode="$(stat -c '%a' -- "${dest}" 2>/dev/null)"
+    if [[ ! -e "${dest}" && ! -L "${dest}" ]]; then
+        set_row "${i}" "нет" "—" "—" "ВНИМАНИЕ" "root-копии ${dest} нет" "root-file" "установить ${dest} (root:root ${RF_MODE}) из ${RF_SRC}"
+    elif [[ -z "${cur_mode}" ]]; then
+        set_row "${i}" "отличается" "—" "—" "ВНИМАНИЕ" "${dest} — не обычный файл" "root-file" "заменить ${dest} копией ${RF_SRC} (root:root ${RF_MODE})"
+    elif ! same_file "${tmp}" "${dest}" || [[ "0${cur_mode}" != "${RF_MODE}" ]]; then
+        set_row "${i}" "отличается" "—" "—" "ВНИМАНИЕ" "root-копия ${dest} отличается от ${RF_SRC} (или права не ${RF_MODE})" "root-file" "обновить ${dest} из ${RF_SRC} (root:root ${RF_MODE})"
+    else
+        set_row "${i}" "есть" "—" "—" "OK" "" "none" ""
+    fi
+    rm -f -- "${tmp}"
+}
+
 # Проверка одного задания
 eval_job() {
     local i="$1"
@@ -1172,6 +1430,7 @@ eval_job() {
         venv) eval_venv "${i}" "${name}" "${arg}" ;;
         linger) eval_linger "${i}" ;;
         health) eval_health "${i}" "${name}" "${arg}" ;;
+        root-file) eval_root_file "${i}" "${name}" "${arg}" ;;
         *) set_row "${i}" "—" "—" "—" "ВНИМАНИЕ" "неизвестный вид задания «${kind}»" "none" "" ;;
     esac
 }
@@ -1212,33 +1471,46 @@ fix_unit() {
 
     unit_templates "${kind}" "${name}"
     templates=("${UNIT_TPLS[@]}")
+    unit_enable_args "${name}"
+    args=("${ENABLE_ARGS[@]}")
+    if [[ "${scope}" == "system" ]]; then
+        # Системные юниты root-шаг отрисовывает сам из systemd/ каталога скрипта
+        if [[ "${DRY_RUN}" -eq 1 ]]; then
+            say "[dry-run] будет: установить ${templates[*]##*/} в ${dest}, systemctl daemon-reload, systemctl ${args[*]} ${name} (с повышением прав)"
+        else
+            as_root __root-install-units "${dest}" "${ROOT_LIB_DIR}" "${ROOT_CONF_DIR}" "${MYTASKS_DIR}" "${name}" || rc=$?
+        fi
+        return "${rc}"
+    fi
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        say "[dry-run] будет: установить ${templates[*]##*/} в ${dest}, systemctl --user daemon-reload, systemctl --user ${args[*]} ${name}"
+        return 0
+    fi
     tmpdir="$(mktemp -d)"
     for tpl in "${templates[@]}"; do
         render_file "${tpl}" "${tmpdir}/${tpl##*/}"
         chmod 0644 -- "${tmpdir}/${tpl##*/}"
         files+=("${tmpdir}/${tpl##*/}")
     done
-    chmod 0755 -- "${tmpdir}"
-    unit_enable_args "${name}"
-    args=("${ENABLE_ARGS[@]}")
-    if [[ "${scope}" == "system" ]]; then
-        if [[ "${DRY_RUN}" -eq 1 ]]; then
-            say "[dry-run] будет: установить ${templates[*]##*/} в ${dest}, systemctl daemon-reload, systemctl ${args[*]} ${name} (с повышением прав)"
-        else
-            as_root __root-install-units "${dest}" "${name}" "${files[@]}" || rc=$?
-        fi
-    else
-        if [[ "${DRY_RUN}" -eq 1 ]]; then
-            say "[dry-run] будет: установить ${templates[*]##*/} в ${dest}, systemctl --user daemon-reload, systemctl --user ${args[*]} ${name}"
-        else
-            mkdir -p -- "${dest}" \
-                && install -m 0644 -t "${dest}" -- "${files[@]}" \
-                && systemctl --user daemon-reload \
-                && systemctl --user "${args[@]}" -- "${name}" || rc=$?
-        fi
-    fi
+    mkdir -p -- "${dest}" \
+        && install -m 0644 -t "${dest}" -- "${files[@]}" \
+        && systemctl --user daemon-reload \
+        && systemctl --user "${args[@]}" -- "${name}" || rc=$?
     rm -rf -- "${tmpdir}"
     return "${rc}"
+}
+
+# Root-копия файла (вид root-file): копирует и ставит root:root сам root-шаг
+fix_root_file() {
+    local i="$1" name="${R_NAME[${i}]}" spec dir
+    IFS='|' read -r _ _ spec _ <<<"${ALL_JOBS[${i}]}"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        say "[dry-run] будет: ${R_ACTION[${i}]} (с повышением прав)"
+        return 0
+    fi
+    parse_root_file_spec "${spec}" || return 1
+    dir="$(root_file_dir "${RF_DIRKEY}")"
+    as_root __root-install-file "${name}" "${dir}" "${MYTASKS_DIR}"
 }
 
 fix_cron() {
@@ -1366,6 +1638,7 @@ fix_job() {
         venv) fix_venv "${i}" ;;
         linger) fix_linger "${i}" ;;
         restart) fix_health "${i}" ;;
+        root-file) fix_root_file "${i}" ;;
         conf-dir) fix_conf_dir ;;
         conf)
             IFS='|' read -r _ name arg _ <<<"${ALL_JOBS[${i}]}"
@@ -2059,15 +2332,29 @@ notify_alert() {
 ###############################################################################
 # ARGS
 ###############################################################################
-# Внутренние root-шаги (запускаются этим же скриптом через sudo/pkexec)
+# Внутренние root-шаги (этот же скрипт через sudo/pkexec) — до загрузки
+# пользовательского конфига: под root он не выполняется, значения — встроенные
+# JOBS/DEPS и проверенные аргументы. Не под root (SUDO_CMD="", тесты) граница
+# прав не пересекается, и JOBS/DEPS берутся из конфига, как у основного запуска.
 case "${1:-}" in
-    __root-install-units) shift; root_install_units "$@"; rc=$?; exit "${rc}" ;;
-    __root-enable) shift; root_enable "$@"; rc=$?; exit "${rc}" ;;
-    __root-linger) shift; root_linger "$@"; rc=$?; exit "${rc}" ;;
-    __root-pkg) shift; root_pkg "$@"; rc=$?; exit "${rc}" ;;
-    __root-update) shift; root_update "$@"; rc=$?; exit "${rc}" ;;
+    __root-*)
+        [[ "${EUID}" -eq 0 ]] || load_user_conf
+        root_cmd="$1"
+        shift
+        case "${root_cmd}" in
+            __root-install-units) root_install_units "$@" ;;
+            __root-install-file) root_install_file "$@" ;;
+            __root-enable) root_enable "$@" ;;
+            __root-linger) root_linger "$@" ;;
+            __root-pkg) root_pkg "$@" ;;
+            __root-update) root_update "$@" ;;
+            *) root_refuse "неизвестный шаг ${root_cmd}" ;;
+        esac
+        exit "$?"
+        ;;
     *) ;;
 esac
+load_user_conf
 
 while [[ $# -gt 0 ]]; do
     case "$1" in

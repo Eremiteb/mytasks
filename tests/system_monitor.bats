@@ -16,6 +16,9 @@ setup() {
   SMART_DIR="$TMP_DIR/smart"
   NOTIFY_LOG="$TMP_DIR/notify.log"
   export SMART_DIR NOTIFY_LOG
+  # Root-конфиг — во временном каталоге (по умолчанию его нет): реальный
+  # /etc/mytasks машины на тесты не влияет
+  export SYSTEM_MONITOR_TEST_ROOT_CONF="$TMP_DIR/etc-mytasks/system_monitor.conf"
 
   mkdir -p "$STUB_DIR" "$SMART_DIR" "$TMP_DIR/conf" "$TMP_DIR/logs" "$TMP_DIR/state"
 
@@ -737,4 +740,90 @@ seed_own_files() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"[dry-run] будет: сменить владельца на nobodyx:nogroupx: "* ]]
   [ ! -s "$CHOWN_LOG" ]
+}
+
+# ---------------------------------------------------------------------------
+# Root-копия и запись под root без следования симлинкам (root — SYSTEM_MONITOR_EUID)
+# ---------------------------------------------------------------------------
+
+@test "root: latest.html — симлинк: цель не меняется, ссылка заменяется отчётом" {
+  mkdir -p "$TMP_DIR/system_reports"
+  printf 'keep\n' > "$TMP_DIR/victim"
+  chmod 600 "$TMP_DIR/victim"
+  ln -s "$TMP_DIR/victim" "$TMP_DIR/system_reports/latest.html"
+
+  run env PATH="$STUB_DIR:$PATH" SYSTEM_MONITOR_EUID=0 bash "$TMP_DIR/system_monitor.sh"
+
+  [ "$status" -eq 0 ]
+  [ "$(cat "$TMP_DIR/victim")" = "keep" ]
+  [ "$(stat -c '%a' "$TMP_DIR/victim")" = "600" ]
+  [ ! -L "$TMP_DIR/system_reports/latest.html" ]
+  grep -q '</html>' "$TMP_DIR/system_reports/latest.html"
+  [ "$(stat -c '%a' "$TMP_DIR/system_reports/latest.html")" = "644" ]
+  ! ls "$TMP_DIR"/system_reports/.latest.html.* >/dev/null 2>&1
+}
+
+@test "root: база — симлинк: отказ, цель не меняется" {
+  printf 'keep\n' > "$TMP_DIR/victim"
+  ln -s "$TMP_DIR/victim" "$TMP_DIR/state/system_monitor.db"
+
+  run env PATH="$STUB_DIR:$PATH" SYSTEM_MONITOR_EUID=0 bash "$TMP_DIR/system_monitor.sh"
+
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"симлинк"* ]]
+  [ "$(cat "$TMP_DIR/victim")" = "keep" ]
+}
+
+@test "root-копия: читается только root-конфиг, файлы пользователя не выполняются" {
+  mkdir -p "$TMP_DIR/lib" "$TMP_DIR/etc-mytasks"
+  cp "$TMP_DIR/system_monitor.sh" "$TMP_DIR/lib/system_monitor.sh"
+  printf 'touch "%s/pwned-conf"\n' "$TMP_DIR" > "$TMP_DIR/conf/system_monitor.conf"
+  printf 'touch "%s/pwned-tpl"\n' "$TMP_DIR" > "$TMP_DIR/conf/log_template.conf"
+  printf 'MYTASKS_DIR="%s"\nREPORT_KEEP=3\n' "$TMP_DIR" > "$SYSTEM_MONITOR_TEST_ROOT_CONF"
+  chmod 0644 "$SYSTEM_MONITOR_TEST_ROOT_CONF"
+
+  run env PATH="$STUB_DIR:$PATH" SYSTEM_MONITOR_EUID=0 bash "$TMP_DIR/lib/system_monitor.sh"
+
+  [ "$status" -eq 0 ]
+  [ ! -e "$TMP_DIR/pwned-conf" ]
+  [ ! -e "$TMP_DIR/pwned-tpl" ]
+  # Данные — в каталоге mytasks из root-конфига, а не рядом с копией скрипта
+  [ -f "$TMP_DIR/state/system_monitor.db" ]
+  [ -f "$TMP_DIR/system_reports/latest.html" ]
+  [ ! -e "$TMP_DIR/lib/state" ]
+  ls "$TMP_DIR"/logs/system_monitor-*.jsonl >/dev/null
+}
+
+@test "root-копия: нет root-конфига, нет MYTASKS_DIR или запись для группы — отказ" {
+  mkdir -p "$TMP_DIR/lib" "$TMP_DIR/etc-mytasks"
+  cp "$TMP_DIR/system_monitor.sh" "$TMP_DIR/lib/system_monitor.sh"
+
+  run env PATH="$STUB_DIR:$PATH" SYSTEM_MONITOR_EUID=0 bash "$TMP_DIR/lib/system_monitor.sh"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"не доверенный"* ]]
+
+  printf 'REPORT_KEEP=3\n' > "$SYSTEM_MONITOR_TEST_ROOT_CONF"
+  chmod 0644 "$SYSTEM_MONITOR_TEST_ROOT_CONF"
+  run env PATH="$STUB_DIR:$PATH" SYSTEM_MONITOR_EUID=0 bash "$TMP_DIR/lib/system_monitor.sh"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"MYTASKS_DIR"* ]]
+
+  printf 'MYTASKS_DIR="%s"\n' "$TMP_DIR" > "$SYSTEM_MONITOR_TEST_ROOT_CONF"
+  chmod 0664 "$SYSTEM_MONITOR_TEST_ROOT_CONF"
+  run env PATH="$STUB_DIR:$PATH" SYSTEM_MONITOR_EUID=0 bash "$TMP_DIR/lib/system_monitor.sh"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"не доверенный"* ]]
+  [ ! -e "$TMP_DIR/state/system_monitor.db" ]
+}
+
+@test "запуск из mytasks: при наличии root-конфига читается он, а не conf/" {
+  mkdir -p "$TMP_DIR/etc-mytasks"
+  printf 'touch "%s/pwned-conf"\n' "$TMP_DIR" > "$TMP_DIR/conf/system_monitor.conf"
+  printf 'MYTASKS_DIR="%s"\nREPORT_KEEP=3\n' "$TMP_DIR" > "$SYSTEM_MONITOR_TEST_ROOT_CONF"
+  chmod 0644 "$SYSTEM_MONITOR_TEST_ROOT_CONF"
+
+  run env PATH="$STUB_DIR:$PATH" SYSTEM_MONITOR_EUID=0 bash "$TMP_DIR/system_monitor.sh"
+
+  [ "$status" -eq 0 ]
+  [ ! -e "$TMP_DIR/pwned-conf" ]
 }

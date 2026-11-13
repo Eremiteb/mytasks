@@ -6,6 +6,32 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=@MYTASKS_DIR@/system_monitor.sh
+# Root-копия скрипта и её настройки (root:root, ставит check_mytasks.sh): код,
+# выполняемый от root без пароля, не лежит в домашнем каталоге пользователя
+ExecStart=@ROOT_LIB_DIR@/system_monitor.sh --config @ROOT_CONF_DIR@/system_monitor.conf
 # Скрипт возвращает 1 при критическом состоянии — это штатный результат, а не сбой юнита
 SuccessExitStatus=1
+
+# Песочница. Скрипту нужны: чтение SMART через ioctl к /dev/sd*, /dev/nvme*
+# (smartctl: CAP_SYS_RAWIO/CAP_SYS_ADMIN), /dev/nvidia* (nvidia-smi), sysfs
+# (sensors, lsblk), запись только в каталоги данных mytasks. Поэтому НЕ заданы
+# PrivateDevices (скрыл бы диски и GPU), DevicePolicy/DeviceAllow,
+# ProtectClock (неявно ограничивает устройства), ProtectKernelLogs и
+# CapabilityBoundingSet (smartctl для разных типов дисков нужны разные
+# возможности — без замеров на всех дисках не сужаем).
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# Запись — только данные mytasks (БД, логи, отчёты); «-» — нет каталога, не сбой запуска
+ReadWritePaths=-@MYTASKS_DIR@/state -@MYTASKS_DIR@/logs -@MYTASKS_DIR@/system_reports
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+MemoryDenyWriteExecute=yes
+# Сеть не нужна: AF_UNIX — журнал и D-Bus (notify-send), AF_NETLINK — запросы
+# к ядру/udev, которые делают библиотеки lsblk и драйвера NVIDIA
+RestrictAddressFamilies=AF_UNIX AF_NETLINK

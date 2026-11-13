@@ -20,6 +20,9 @@ setup() {
   unset DISPLAY WAYLAND_DISPLAY SUDO_ASKPASS
   USER_UNITS="$HOME/.config/systemd/user"
   SYS_UNITS="$TMP_DIR/etc-systemd"
+  # Каталоги root-копий (задания root-file) — во временном каталоге
+  ROOT_LIB="$TMP_DIR/usr-lib-mytasks"
+  ROOT_CONFD="$TMP_DIR/etc-mytasks"
   mkdir -p "$STUB_DIR" "$STATE/enabled" "$STATE/ext" "$HOME" "$SYS_UNITS" "$USER_UNITS"
   export STATE CALLS USER_UNITS SYS_UNITS
 
@@ -141,6 +144,8 @@ OS_RELEASE_FILE="$STATE/os-release"
 SUDO_CMD=""
 UI="tty"
 SYSTEM_UNIT_DIR="$SYS_UNITS"
+ROOT_LIB_DIR="$ROOT_LIB"
+ROOT_CONF_DIR="$ROOT_CONFD"
 USER_UNIT_DIR="$USER_UNITS"
 AUTOSTART_DIR="$HOME/.config/autostart"
 BIN_DIR="$HOME/.local/bin"
@@ -607,4 +612,105 @@ health_log() {  # $1 — время последней записи (date -d), $
   write_conf "" ""
   run "$WORK/check_mytasks.sh" --bogus
   [ "$status" -eq 2 ]
+}
+
+@test "root-file: нет — установка копии и конфига из примера с MYTASKS_DIR; отличие — обновление" {
+  printf '# Демо\nDATA_DIR="@MYTASKS_DIR@/state"\n' > "$WORK/conf/rootdemo.conf.example"
+  write_conf '"root-file|demo.sh|demo.sh:lib:0755||Демо root-копия"
+"root-file|rootdemo.conf|conf/rootdemo.conf,conf/rootdemo.conf.example:conf:0644||Демо root-конфиг"' ""
+  run "$WORK/check_mytasks.sh" --status
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"demo.sh"*"нет"* ]]
+  run "$WORK/check_mytasks.sh" --dry-run --no-gui
+  [[ "$output" == *"[dry-run] будет: установить $ROOT_LIB/demo.sh (root:root 0755) из demo.sh (с повышением прав)"* ]]
+  [ ! -e "$ROOT_LIB/demo.sh" ]
+
+  run "$WORK/check_mytasks.sh" --yes --no-gui
+  [ "$status" -eq 0 ]
+  cmp "$WORK/demo.sh" "$ROOT_LIB/demo.sh"
+  [ "$(stat -c '%a' "$ROOT_LIB/demo.sh")" = "755" ]
+  grep -q "^DATA_DIR=\"$WORK/state\"$" "$ROOT_CONFD/rootdemo.conf"
+  grep -q "^MYTASKS_DIR=\"$WORK\"$" "$ROOT_CONFD/rootdemo.conf"
+  [ "$(stat -c '%a' "$ROOT_CONFD/rootdemo.conf")" = "644" ]
+
+  # Исходник изменился — «отличается» и обновление
+  printf '#!/bin/sh\necho changed\n' > "$WORK/demo.sh"
+  run "$WORK/check_mytasks.sh" --status
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"demo.sh"*"отличается"* ]]
+  run "$WORK/check_mytasks.sh" --yes --no-gui
+  [ "$status" -eq 0 ]
+  grep -q 'echo changed' "$ROOT_LIB/demo.sh"
+
+  # Рабочий конфиг важнее примера
+  printf 'DATA_DIR="/data"\nMYTASKS_DIR="%s"\n' "$WORK" > "$WORK/conf/rootdemo.conf"
+  run "$WORK/check_mytasks.sh" --yes --no-gui
+  [ "$status" -eq 0 ]
+  cmp "$WORK/conf/rootdemo.conf" "$ROOT_CONFD/rootdemo.conf"
+}
+
+@test "системный юнит: @ROOT_LIB_DIR@ и @ROOT_CONF_DIR@ подставляются" {
+  printf '[Service]\nType=oneshot\nExecStart=@ROOT_LIB_DIR@/demo.sh --config @ROOT_CONF_DIR@/demo.conf\n' > "$WORK/systemd/sysdemo.service"
+  write_conf '"system-unit|sysdemo.timer|||Системный демо-таймер"' ""
+  run "$WORK/check_mytasks.sh" --yes --no-gui
+  [ "$status" -eq 0 ]
+  grep -q "^ExecStart=$ROOT_LIB/demo.sh --config $ROOT_CONFD/demo.conf$" "$SYS_UNITS/sysdemo.service"
+  run grep -c '@ROOT_' "$SYS_UNITS/sysdemo.service"
+  [ "$output" = "0" ]
+  run "$WORK/check_mytasks.sh" --status
+  [ "$status" -eq 0 ]
+}
+
+@test "root-шаги: пакет не из DEPS, юнит не из JOBS, чужие пути и каталог — отказ" {
+  write_conf "$ALL_DEMO_JOBS
+\"root-file|demo.sh|demo.sh:lib:0755||Демо root-копия\"" '"democmd|demo-arch;debian=demo-deb||Демо-зависимость"'
+  mkdir -p "$TMP_DIR/elsewhere"
+  ln -s "$TMP_DIR/elsewhere" "$TMP_DIR/link-dir"
+
+  run "$WORK/check_mytasks.sh" __root-pkg pacman evil-pkg
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"нет в таблице DEPS"* ]]
+  run "$WORK/check_mytasks.sh" __root-pkg pacman --root=/tmp
+  [ "$status" -eq 2 ]
+  run "$WORK/check_mytasks.sh" __root-install-units "$SYS_UNITS" "$ROOT_LIB" "$ROOT_CONFD" "$WORK" evil.timer
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"нет в JOBS"* ]]
+  run "$WORK/check_mytasks.sh" __root-install-units "$SYS_UNITS/../evil" "$ROOT_LIB" "$ROOT_CONFD" "$WORK" sysdemo.timer
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"недопустим"* ]]
+  run "$WORK/check_mytasks.sh" __root-install-units "$TMP_DIR/link-dir" "$ROOT_LIB" "$ROOT_CONFD" "$WORK" sysdemo.timer
+  [ "$status" -eq 2 ]
+  run "$WORK/check_mytasks.sh" __root-install-units "$SYS_UNITS" "$TMP_DIR/link-dir" "$ROOT_CONFD" "$WORK" sysdemo.timer
+  [ "$status" -eq 2 ]
+  run "$WORK/check_mytasks.sh" __root-install-units "$SYS_UNITS" "$ROOT_LIB" "$ROOT_CONFD" "/other/place" sysdemo.timer
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"не совпадает"* ]]
+  run "$WORK/check_mytasks.sh" __root-install-file demo.sh "$TMP_DIR/link-dir" "$WORK"
+  [ "$status" -eq 2 ]
+  run "$WORK/check_mytasks.sh" __root-install-file passwd "$ROOT_LIB" "$WORK"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"нет в JOBS"* ]]
+  run "$WORK/check_mytasks.sh" __root-enable sshd.service
+  [ "$status" -eq 2 ]
+  run "$WORK/check_mytasks.sh" __root-update pacman 'garuda; rm'
+  [ "$status" -eq 2 ]
+  run "$WORK/check_mytasks.sh" __root-linger someone-else
+  [ "$status" -eq 2 ]
+  run "$WORK/check_mytasks.sh" __root-evil
+  [ "$status" -eq 2 ]
+
+  [ ! -e "$TMP_DIR/elsewhere/sysdemo.timer" ]
+  [ ! -e "$TMP_DIR/elsewhere/demo.sh" ]
+  [ ! -e "$SYS_UNITS/sysdemo.timer" ]
+  [ ! -e "$ROOT_LIB/passwd" ]
+  run grep -qE 'pacman|systemctl enable|loginctl enable' "$CALLS"
+  [ "$status" -ne 0 ]
+
+  # Разрешённое проходит: пакет из DEPS (любое семейство) и юнит из JOBS
+  run "$WORK/check_mytasks.sh" __root-pkg pacman demo-deb
+  [ "$status" -eq 0 ]
+  grep -q 'pacman -S --needed --noconfirm -- demo-deb' "$CALLS"
+  run "$WORK/check_mytasks.sh" __root-install-units "$SYS_UNITS" "$ROOT_LIB" "$ROOT_CONFD" "$WORK" sysdemo.timer
+  [ "$status" -eq 0 ]
+  [ -f "$SYS_UNITS/sysdemo.timer" ]
 }

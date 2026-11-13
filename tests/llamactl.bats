@@ -1,8 +1,9 @@
 #!/usr/bin/env bats
 
-# Тесты llamactl.sh и llamactl_tray.py: роутер, systemctl, nvidia-smi, git и
-# cmake подменяются заглушками; пресеты и модели — во временном каталоге,
-# SUDO_CMD пустой (root-шаги выполняются напрямую).
+# Тесты llamactl.sh, llamactl-root.sh и llamactl_tray.py: роутер, systemctl,
+# nvidia-smi, git и cmake подменяются заглушками; пресеты и модели — во
+# временном каталоге, SUDO_CMD пустой: root-хелпер запускается напрямую в
+# тестовом режиме (LLAMACTL_ROOT_TEST=1, root-конфиг во временном каталоге).
 
 setup() {
   export MYTASKS_LOG_DIR="$BATS_TEST_TMPDIR/logs"
@@ -15,8 +16,10 @@ setup() {
   CALLS="$TMP_DIR/calls.log"
   STATE="$TMP_DIR/model_state"
   mkdir -p "$WORK_DIR/conf" "$WORK_DIR/llamactl" "$STUB_DIR" "$MODELS/m9" "$TMP_DIR/prefix/bin" "$TMP_DIR/src"
-  cp "$REPO_ROOT/llamactl/llamactl.sh" "$REPO_ROOT/llamactl/llamactl_tray.py" "$REPO_ROOT/llamactl/llamactl_status.py" "$WORK_DIR/llamactl/"
-  chmod +x "$WORK_DIR/llamactl/llamactl.sh" "$WORK_DIR/llamactl/llamactl_tray.py"
+  cp "$REPO_ROOT/llamactl/llamactl.sh" "$REPO_ROOT/llamactl/llamactl-root.sh" "$REPO_ROOT/llamactl/llamactl_tray.py" "$REPO_ROOT/llamactl/llamactl_status.py" "$WORK_DIR/llamactl/"
+  chmod +x "$WORK_DIR/llamactl/llamactl.sh" "$WORK_DIR/llamactl/llamactl-root.sh" "$WORK_DIR/llamactl/llamactl_tray.py"
+  HELPER="$WORK_DIR/llamactl/llamactl-root.sh"
+  ROOT_CONF="$TMP_DIR/llamactl-root.conf"
   : > "$CALLS"
   echo unloaded > "$STATE"
   : > "$MODELS/m9/m9.gguf"
@@ -48,7 +51,18 @@ SUDO_CMD=""
 HEALTH_TIMEOUT_SECS="4"
 LOAD_TIMEOUT_SECS="6"
 PRESET_LOCK_FILE="$TMP_DIR/models.ini.lock"
+ROOT_HELPER="$HELPER"
 EOF
+
+  # Root-конфиг хелпера (в тестах — файл текущего пользователя, режим 644)
+  cat > "$ROOT_CONF" <<EOF
+PRESET_FILE="$PRESET"
+LLAMA_PREFIX="$TMP_DIR/prefix"
+ROUTER_URL="http://router.test"
+FIM_URL="http://fim.test"
+HEALTH_TIMEOUT_SECS="4"
+EOF
+  chmod 0644 "$ROOT_CONF"
 
   # Заглушка curl: роутер, FIM и Hugging Face. Загрузка (-o) пишет GGUF_DATA;
   # если есть файл edit_during_download — во время «загрузки» models.ini
@@ -68,6 +82,8 @@ while (( \$# > 0 )); do
 done
 oid="abc"
 [ -f "$TMP_DIR/oid" ] && oid="\$(cat "$TMP_DIR/oid")"
+size=9
+[ -f "$TMP_DIR/size" ] && size="\$(cat "$TMP_DIR/size")"
 case "\$url" in
   */health) [ -e "$TMP_DIR/down" ] && exit 7; exit 0 ;;
   */models/load) echo loaded > "$STATE"; echo '{"success":true}' ;;
@@ -76,7 +92,12 @@ case "\$url" in
     st="\$(cat "$STATE")"
     printf '{"data":[{"id":"m9","status":{"value":"%s","args":["llama-server","--ctx-size","32768"]}}]}\n' "\$st" ;;
   */v1/chat/completions) echo '{"timings":{"predicted_per_second":42.42,"prompt_per_second":900.4}}' ;;
-  */api/models/*) printf '[{"path":"x.gguf","size":1000,"lfs":{"oid":"%s"}}]\n' "\$oid" ;;
+  */api/models/*)
+    if [ -e "$TMP_DIR/no_oid" ]; then
+      printf '[{"path":"x.gguf","size":%s}]\n' "\$size"
+    else
+      printf '[{"path":"x.gguf","size":%s,"lfs":{"oid":"%s"}}]\n' "\$size" "\$oid"
+    fi ;;
   */resolve/main/*)
     printf 'gguf-data' > "\$out"
     [ -e "$TMP_DIR/edit_during_download" ] && sed -i 's/^temp = 0.6\$/temp = 0.9/' "$PRESET"
@@ -113,6 +134,14 @@ EOF
 #!/usr/bin/env bash
 echo "git \$*" >> "$CALLS"
 case "\$*" in
+  # Релизные теги: b1000 — аннотированный (коммит в строке ^{}), b999 и b200 — лёгкие;
+  # не-релизные теги не учитываются
+  *ls-remote*--tags*)
+    printf 'cccccccccccccccccccccccccccccccccccccccc\trefs/tags/b200\n'
+    printf 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\trefs/tags/b1000\n'
+    printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/tags/b1000^{}\n'
+    printf 'dddddddddddddddddddddddddddddddddddddddd\trefs/tags/b999\n'
+    printf 'ffffffffffffffffffffffffffffffffffffffff\trefs/tags/gguf-v9\n' ;;
   *ls-remote*) printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tHEAD\n' ;;
   *fetch*|*checkout*) exit 0 ;;
   *) exec "$real_git" "\$@" ;;
@@ -146,7 +175,13 @@ teardown() {
 
 # NVML отключён: статус берёт VRAM из заглушки nvidia-smi, а не с реальной GPU
 ctl() {
-  env PATH="$STUB_DIR:$PATH" LLAMACTL_NO_NVML=1 "$WORK_DIR/llamactl/llamactl.sh" "$@"
+  env PATH="$STUB_DIR:$PATH" LLAMACTL_NO_NVML=1 LLAMACTL_ROOT_TEST=1 LLAMACTL_ROOT_CONF="$ROOT_CONF" \
+    "$WORK_DIR/llamactl/llamactl.sh" "$@"
+}
+
+# Root-хелпер напрямую, в тестовом режиме
+helper() {
+  env PATH="$STUB_DIR:$PATH" LLAMACTL_ROOT_TEST=1 LLAMACTL_ROOT_CONF="$ROOT_CONF" "$HELPER" "$@"
 }
 
 # Локальный HTTP-«роутер» для статуса (llamactl_status.py ходит по HTTP, не через curl):
@@ -430,10 +465,11 @@ EOF
   ! kill -0 "$FOREIGN_PID" 2>/dev/null
 }
 
-@test "update --dry-run: план без fetch и сборки" {
+@test "update --dry-run: план без fetch и сборки, ставится последний релизный тег" {
   run ctl --dry-run update
   [ "$status" -eq 0 ]
-  [[ "$output" == *"Установлено: aaaaaaa; в origin HEAD: bbbbbbb"* ]]
+  [[ "$output" == *"Установлено: aaaaaaa; ставится последний релизный тег b1000: bbbbbbb"* ]]
+  [[ "$output" == *"[dry-run] будет: git fetch refs/tags/b1000"* ]]
   [[ "$output" == *"[dry-run] будет: установить в $TMP_DIR/prefix.new"* ]]
   ! grep -q 'git .*fetch' "$CALLS"
   ! grep -q '^cmake' "$CALLS"
@@ -493,4 +529,118 @@ EOF
   run /usr/bin/python3 "$WORK_DIR/llamactl/llamactl_tray.py" --print-menu --status-file "$TMP_DIR/status.json"
   [ "$status" -eq 0 ]
   [[ "$output" == *"state: down"* ]]
+}
+
+@test "update --ref: тег из origin; недопустимое значение — код 2" {
+  run ctl --dry-run update --ref b999
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ставится тег b999: ddddddd"* ]]
+  run ctl --dry-run update --ref --upload-pack=evil
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"недопустимое --ref"* ]]
+  ! grep -q 'upload-pack' "$CALLS"
+}
+
+@test "update --ref SHA: полный SHA коммита ставится без запроса тегов" {
+  run ctl --dry-run update --ref 1111111111111111111111111111111111111111
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"ставится коммит 1111111111111111111111111111111111111111: 1111111"* ]]
+}
+
+@test "add: нет sha256 от Hugging Face — отказ, с --no-verify — загрузка" {
+  touch "$TMP_DIR/no_oid"
+  run ctl add user/repo x.gguf --name newm
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"не вернул sha256"* ]]
+  [ ! -e "$MODELS/newm" ]
+  ! grep -q 'resolve/main' "$CALLS"
+  run ctl add user/repo x.gguf --name newm --no-verify
+  [ "$status" -eq 0 ]
+  [ "$(cat "$MODELS/newm/x.gguf")" = "gguf-data" ]
+  grep -q '^\[newm\]$' "$PRESET"
+}
+
+@test "add: размер файла не совпал с API — отказ, модель не добавляется" {
+  printf 'gguf-data' | sha256sum | cut -d' ' -f1 > "$TMP_DIR/oid"
+  echo 1000 > "$TMP_DIR/size"
+  run ctl add user/repo x.gguf --name newm
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"размер не совпал"* ]]
+  [ ! -e "$MODELS/newm/x.gguf" ]
+  ! grep -q '^\[newm\]$' "$PRESET"
+}
+
+@test "preset set: без root-хелпера — понятная ошибка, models.ini не меняется" {
+  before="$(sha256sum "$PRESET")"
+  echo "ROOT_HELPER=\"$TMP_DIR/no-helper\"" >> "$WORK_DIR/conf/llamactl.conf"
+  run ctl preset set m9 ctx-size 65536
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"нет root-хелпера"*"check_mytasks.sh"* ]]
+  [ "$(sha256sum "$PRESET")" = "$before" ]
+}
+
+@test "llamactl-root: пути вне разрешённых и неизвестная команда — отказ" {
+  printf 'x = 1\n' > "$TMP_DIR/new.ini"
+  before="$(sha256sum "$PRESET")"
+  run helper install-preset "$TMP_DIR/new.ini" "$TMP_DIR/other.ini"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"вне разрешённых"* ]]
+  [ ! -e "$TMP_DIR/other.ini" ]
+  run helper restore-preset "$TMP_DIR/new.ini"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"вне разрешённых"* ]]
+  run helper restore-preset "$PRESET.bak-../../x"
+  [ "$status" -eq 2 ]
+  mkdir -p "$TMP_DIR/stage/bin"
+  run helper swap-install "$TMP_DIR/stage" "$TMP_DIR/other-prefix"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"вне разрешённых"* ]]
+  run helper shell
+  [ "$status" -eq 2 ]
+  [ "$(sha256sum "$PRESET")" = "$before" ]
+}
+
+@test "llamactl-root: источник-симлинк и слишком большой файл не ставятся" {
+  before="$(sha256sum "$PRESET")"
+  ln -s "$PRESET" "$TMP_DIR/link.ini"
+  run helper install-preset "$TMP_DIR/link.ini" "$PRESET"
+  [ "$status" -eq 2 ]
+  head -c 1048577 /dev/zero > "$TMP_DIR/big.ini"
+  run helper install-preset "$TMP_DIR/big.ini" "$PRESET"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"больше"* ]]
+  [ "$(sha256sum "$PRESET")" = "$before" ]
+  ! ls "$TMP_DIR"/.models.ini.* >/dev/null 2>&1
+}
+
+@test "llamactl-root: root-конфиг с записью для группы не принимается" {
+  chmod 0664 "$ROOT_CONF"
+  printf 'x = 1\n' > "$TMP_DIR/new.ini"
+  run helper install-preset "$TMP_DIR/new.ini" "$PRESET"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"не доверенный"* ]]
+}
+
+@test "llamactl-root swap-install: копирует bin и lib без исполнения, симлинк наружу — отказ" {
+  mkdir -p "$TMP_DIR/stage/bin" "$TMP_DIR/stage/lib/cmake"
+  printf '#!/usr/bin/env bash\necho "version: 2 (build 2, commit bbbbbbb)"\n' > "$TMP_DIR/stage/bin/llama-server"
+  printf '#!/usr/bin/env bash\ntouch "%s/executed"\n' "$TMP_DIR" > "$TMP_DIR/stage/bin/llama-cli"
+  chmod +x "$TMP_DIR/stage/bin/"*
+  printf 'lib' > "$TMP_DIR/stage/lib/libllama.so.0.1"
+  ln -s libllama.so.0.1 "$TMP_DIR/stage/lib/libllama.so"
+  run helper swap-install "$TMP_DIR/stage" "$TMP_DIR/prefix"
+  [ "$status" -eq 0 ]
+  [ -x "$TMP_DIR/prefix/bin/llama-server" ]
+  [ "$(readlink "$TMP_DIR/prefix/lib/libllama.so")" = "libllama.so.0.1" ]
+  [ ! -e "$TMP_DIR/prefix/lib/cmake" ]
+  [ -x "$TMP_DIR/prefix.prev/bin/llama-fit-params" ]
+  [ ! -e "$TMP_DIR/executed" ]
+  grep -q 'systemctl restart -- llama-server llama-fim' "$CALLS"
+
+  ln -s /etc/passwd "$TMP_DIR/stage/lib/evil"
+  run helper swap-install "$TMP_DIR/stage" "$TMP_DIR/prefix"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"за пределы каталога"* ]]
+  [ ! -e "$TMP_DIR/prefix.new" ]
+  [ ! -e "$TMP_DIR/prefix/lib/evil" ]
 }

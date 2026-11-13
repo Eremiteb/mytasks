@@ -52,6 +52,8 @@ bash ../music_downloader.sh
 - `log_cleanup_days` и `log_max_files` задают очистку логов движка; оба значения по умолчанию равны `10`.
 - `download_timeout_seconds` (60) — тайм-аут HTTP при скачивании файла, с.
 - `download_pause_seconds` (1.2) — пауза после успешной загрузки, с (0 допустим).
+- `download_max_seconds` (600) — общий дедлайн скачивания одного трека, с; проверяется во время записи потока.
+- `download_max_mb` (100) — лимит размера одного файла, МиБ, помимо остатка папки (`max_size_mb`). Превышение — ошибка одного трека: `.part` удаляется, запуск продолжается.
 
 ## Очистка тегов ID3
 
@@ -176,7 +178,7 @@ def get_tracks(session, base_url, category):
 
 ### Jamendo, Shazam, MyChords и Beu FM
 
-- **Jamendo:** `/` запрашивает одну страницу до 200 последних треков из `tracks` API с `order=releasedate_desc`. Периодические пустые ответы CDN и сетевые сбои API обрабатываются повторными попытками по `api_retry_delays_seconds` (по умолчанию `1, 3, 5` с, блок `drivers` → `music_downloader_jamendo_com`). Принимаются только записи с `audiodownload_allowed: true` и непустым `audiodownload`; потоковое поле `audio` не используется. Инструментальная музыка отсеивается (`vocal_only`, по умолчанию `true` в блоке `drivers.music_downloader_jamendo_com`): к `tracks` добавляются `include=musicinfo` и `vocalinstrumental=vocal`, к плейлистам — `include=musicinfo`, и трек, у которого `musicinfo.vocalinstrumental` не `vocal` (`instrumental` или пусто), пропускается с INFO-строкой «пропущено треков без вокала: N»; трек без `musicinfo` не отбрасывается. Замер 2026-11-08: из 200 последних релизов 126 инструментальных, 48 без пометки и 26 с вокалом; с фильтром API отдаёт 200 треков с вокалом, из них 73 разрешены к скачиванию. `vocal_only: false` возвращает прежнее поведение. Нужен `client_id` сайта или `JAMENDO_CLIENT_ID` (переменная окружения имеет приоритет). `/playlist/<ID>` обрабатывается через API плейлистов с пагинацией. Ошибки API и пустые результаты явно логируются с `site=jamendo_com`.
+- **Jamendo:** `/` запрашивает одну страницу до 200 последних треков из `tracks` API с `order=releasedate_desc`. Периодические пустые ответы CDN и сетевые сбои API обрабатываются повторными попытками по `api_retry_delays_seconds` (по умолчанию `1, 3, 5` с, блок `drivers` → `music_downloader_jamendo_com`). Принимаются только записи с `audiodownload_allowed: true` и непустым `audiodownload`; потоковое поле `audio` не используется. Инструментальная музыка отсеивается (`vocal_only`, по умолчанию `true` в блоке `drivers.music_downloader_jamendo_com`): к `tracks` добавляются `include=musicinfo` и `vocalinstrumental=vocal`, к плейлистам — `include=musicinfo`, и трек, у которого `musicinfo.vocalinstrumental` не `vocal` (`instrumental` или пусто), пропускается с INFO-строкой «пропущено треков без вокала: N»; трек без `musicinfo` не отбрасывается. Замер 2026-11-08: из 200 последних релизов 126 инструментальных, 48 без пометки и 26 с вокалом; с фильтром API отдаёт 200 треков с вокалом, из них 73 разрешены к скачиванию. `vocal_only: false` возвращает прежнее поведение. Ключ ищется сначала в переменной `JAMENDO_CLIENT_ID`, затем в `music_downloader.json` (корень) в записи `sites` с `site_name: jamendo_com`, поле `client_id`. В `music_downloader.json.example` стоит плейсхолдер `YOUR_JAMENDO_CLIENT_ID`; код его не отбраковывает, поэтому реальный ключ нужно вписать в рабочий конфиг или задать в окружении. `/playlist/<ID>` обрабатывается через API плейлистов с пагинацией. Ошибки API и пустые результаты явно логируются с `site=jamendo_com`.
 - **Shazam:** мост принимает только мировой Top 200 и требует ровно 200 уникальных `adam_<id>`. Для запроса обязательны проверенные `chart_headers` (`SETTINGS`); браузер и превью Shazam/Apple не используются. Shazam (Next.js за Fastly) периодически отдаёт по адресу чарта HTTP 200 с чужой страницей (иной canonical, ~1.8 МБ вместо ~3.7 МБ) — дефект держится на пограничном узле до истечения TTL, и HTML-страница и RSC-поток того же адреса ломаются независимо. Поэтому каждая попытка `get_tracks` сначала читает обычную страницу (`parse_chart`: canonical + карточки `data-test-id="songItem"` с восстановлением SSR-вставок `$RS(...)`, ранги `1…200`), а при неудаче — RSC-поток (`parse_flight_chart`: заголовок `RSC: 1`, ответ `text/x-component`, те же данные в `self.__next_f`; ранг = порядок карточек, совпадает с DOM). Попытки повторяются по `retry_delays_seconds` (`SETTINGS`) (`15, 45, 90` с) с `Connection: close`. Query-параметр-«антикэш» не добавляется — у Fastly он чаще ведёт на битую копию. `ERROR` пишется только после того, как оба источника промолчали на всех попытках, и означает временный сбой Shazam/CDN, а не поломку разбора (на неё указывают `В карточке чарта…` / `Ожидался полный Top 200…` / `RSC-поток Shazam…` при живом чарте). RSC-поток приходит как `text/x-component` без charset, и `requests` по умолчанию декодирует его как ISO-8859-1 («NatÃ©», «Ð¢Ð°Ñ…» вместо «Naté», «Тат…»): искажённые имена не находились в источниках MP3 и попадали бы в БД, поэтому ответ Shazam всегда читается как UTF-8. Для нового трека MP3 ищется в общих `search_sources` (см. выше).
 - **MyChords:** `/ru/novinki` разбирается по `li.b-listing__full__item a.b-listing__full__item__name`, ID — из `/<id>-slug.html`. Исполнитель и название делятся по первому дефису, короткому « – » или длинному « — » тире в пробелах (с октября 2026 сайт пишет « – »; при поиске только « - » трек сохранялся как «Unknown Artist - <вся строка>»). Для нового трека мост проходит цепочку `div.b-words__player[data-src]` → iframe `audio.xpleer.com/embed/` → `#file[data-mp3]` на `storage.xpleer.com`. Если плеера или ссылки нет либо запрос не удался, пишется предупреждение и трек ищется в общих `search_sources` по исполнителю и названию из списка; не найден и там — `None`.
 
@@ -248,13 +250,20 @@ sqlite3 music_downloader/music_downloader.db \
    from runs, json_each(runs.sources) j group by 1 order by 2 desc"
 ```
 
+## Безопасность
+
+- Адрес скачивания — только `http` или `https` (`require_http_url`): `file://`, `ftp://` и другие схемы отклоняются. URL в вызовах `yt-dlp` идёт после `--`, чтобы не читался как опция.
+- Драйверы (`site_script` и `search_sources[].driver`) загружаются только как `.py` внутри `music_downloader/drivers`: путь сначала приводится через `realpath`, поэтому симлинк наружу каталога отклоняется.
+- Имя файла — до 200 байт UTF-8 вместе с расширением (расширение сохраняется), без хвостовых точек и пробелов. Зарезервированные имена Windows (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, в том числе с расширением) получают префикс `_`.
+- `.part` открывается с `O_NOFOLLOW`: симлинк на месте временного файла — ошибка, запись по чужому пути не выполняется.
+
 ## Проверки
 
 Тесты и проверки кода локально не запускаются — их выполняет CI
 (`.github/workflows/music-downloader.yml`) после пуша при изменениях загрузчика,
 общих тестов или workflow: зависимости из `requirements-ci.txt` (рабочие +
 `pytest`, `ruff`), Ruff `music_downloader/`, pytest
-`tests/test_music_downloader.py` и `music_downloader/tests` (временные каталоги,
+`tests/test_music_downloader.py`, `tests/test_mht_to_fb2.py` и `music_downloader/tests` (временные каталоги,
 подменённый HTTP, реальная музыка не скачивается), проверка
 `music_downloader.json.example` через `json.tool`. Bats-обёртка
 `tests/music_downloader_wrapper.bats` идёт в `bats-tests.yml`, синтаксис

@@ -39,6 +39,18 @@ UI="auto"
 # Каталог системных юнитов systemd
 SYSTEM_UNIT_DIR="/etc/systemd/system"
 
+# Каталог root-копий скриптов (system_monitor.sh, root-хелпер llamactl-root):
+# их запускают системные юниты и sudo, поэтому они лежат вне домашнего
+# каталога, принадлежат root и не доступны пользователю на запись.
+# Подставляется вместо @ROOT_LIB_DIR@ в системные юниты. Каталог (и все
+# каталоги над ним) должен принадлежать root — иначе root-шаг откажет
+ROOT_LIB_DIR="/usr/local/lib/mytasks"
+
+# Каталог root-копий настроек (system_monitor.conf): root-копия скрипта
+# читает только их. Подставляется вместо @ROOT_CONF_DIR@; требования — как
+# у ROOT_LIB_DIR
+ROOT_CONF_DIR="/etc/mytasks"
+
 # Каталог пользовательских юнитов systemd
 USER_UNIT_DIR="@HOME@/.config/systemd/user"
 

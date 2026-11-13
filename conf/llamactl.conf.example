@@ -39,6 +39,17 @@ LOG_KEEP="10"
 # Команда повышения прав (графическое окно пароля через SUDO_ASKPASS)
 SUDO_CMD="sudo -A"
 
+# Root-хелпер: все root-шаги (models.ini, замена сборки) llamactl выполняет
+# только через него. Ставит check_mytasks.sh копией llamactl/llamactl-root.sh
+# (root:root 0755) — код, запускаемый от root, лежит вне домашнего каталога.
+# Пути хелпера (models.ini, /opt/llama.cpp, юниты) задаются не здесь, а в
+# root-конфиге /etc/mytasks/llamactl-root.conf (по умолчанию не нужен)
+ROOT_HELPER="/usr/local/lib/mytasks/llamactl-root"
+
+# Что ставит `llamactl update` без --ref: latest-tag — последний релизный тег
+# bNNNN из origin; либо имя тега (b4500) или полный SHA коммита (40 знаков)
+LLAMA_REF="latest-tag"
+
 # Блокировка записи пресетов (flock): add/remove/preset set|unset|edit ждут
 # друг друга и не затирают чужие правки models.ini; тайм-аут ожидания, секунды
 PRESET_LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/llamactl-models-ini.lock"

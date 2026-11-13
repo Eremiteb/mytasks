@@ -1,3 +1,10 @@
+# Каталог mytasks: в нём данные (state/, logs/, system_reports/). Обязателен
+# для root-копии скрипта (/usr/local/lib/mytasks/system_monitor.sh), которую
+# запускает таймер: она читает только root-копию этого конфига
+# /etc/mytasks/system_monitor.conf (её ставит и обновляет check_mytasks.sh).
+# Пусто при запуске из mytasks = каталог скрипта
+MYTASKS_DIR="@MYTASKS_DIR@"
+
 # Список дисков через запятую (имена или полные пути), например: sda,sdb
 # Пусто = автоопределение всех физических дисков через lsblk
 DISKS=""
@@ -8,10 +15,13 @@ DB_FILE="@MYTASKS_DIR@/state/system_monitor.db"
 # Владелец создаваемых файлов (БД, копии, логи, отчёты): «пользователь» или
 # «пользователь:группа». Скрипт работает от root и после записи передаёт файлы
 # этому владельцу (не от root — ничего не меняет). Пусто = владелец и группа
-# каталога скрипта
+# каталога MYTASKS_DIR
 FILE_OWNER=""
 
-# Каталог для HTML-отчётов (по умолчанию system_reports рядом со скриптом)
+# Каталог для HTML-отчётов (по умолчанию MYTASKS_DIR/system_reports). Таймер
+# работает в песочнице systemd: запись разрешена только в state/, logs/ и
+# system_reports/ каталога mytasks — другие пути для DB_FILE/REPORT_DIR
+# потребуют правки ReadWritePaths в systemd/system-monitor.service
 REPORT_DIR="@MYTASKS_DIR@/system_reports"
 
 # Сколько последних HTML-отчётов хранить

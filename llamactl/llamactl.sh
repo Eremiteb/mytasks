@@ -6,7 +6,9 @@
 # Работает с роутером llama-server (llama-server.service, :8080), FIM-сервером
 # автодополнения (llama-fim.service, :8012) и пресетами /etc/llama.cpp/models.ini.
 # Root-шаги выполняются через `sudo -A` (графическое окно пароля), не больше
-# одного запроса пароля на действие.
+# одного запроса пароля на действие: models.ini и замену сборки делает только
+# root-хелпер ROOT_HELPER (копия llamactl-root.sh root:root вне домашнего
+# каталога), сам llamactl.sh от root не запускается.
 #
 # Без аргументов в терминале открывает интерактивное меню.
 # Не используем set -e: ошибки отдельных проверок обрабатываются явно.
@@ -47,6 +49,12 @@ LOAD_TIMEOUT_SECS="900"
 HEALTH_TIMEOUT_SECS="90"
 LOG_KEEP="10"
 SUDO_CMD="sudo -A"
+# Root-хелпер (копия llamactl/llamactl-root.sh, root:root вне домашнего
+# каталога; ставит check_mytasks.sh): все root-шаги — только через него
+ROOT_HELPER="/usr/local/lib/mytasks/llamactl-root"
+# Что ставит `update` без --ref: latest-tag — последний релизный тег bNNNN
+# из origin; иначе — имя тега или полный (40 знаков) SHA коммита
+LLAMA_REF="latest-tag"
 # Блокировка записи models.ini (flock): параллельные add/remove/preset ждут
 # друг друга и не затирают чужие правки
 PRESET_LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/llamactl-models-ini.lock"
@@ -581,8 +589,9 @@ preset_apply() {
     diff -u --label "${PRESET_FILE}" --label "новый" "${PRESET_FILE}" "${new_file}"
     act "preset_apply" "установить ${PRESET_FILE} (${what}) с резервной копией и перечитать роутер" || return 0
     local backup
-    backup="${PRESET_FILE}.bak-$(date '+%Y%m%d-%H%M%S')"
-    "${SUDO[@]}" "${SCRIPT_PATH}" __root-install-preset "${new_file}" "${PRESET_FILE}" "${backup}" \
+    need_root_helper
+    # Хелпер сам копирует файл под root, делает резервную копию и печатает её путь
+    backup="$("${SUDO[@]}" "${ROOT_HELPER}" install-preset "${new_file}" "${PRESET_FILE}")" \
         || die "не удалось установить пресет"
     info "резервная копия: ${backup}"
     if router_up && api_get '/models?reload=1' >/dev/null 2>&1; then
@@ -594,8 +603,15 @@ preset_apply() {
         return 0
     fi
     warn "роутер не поднялся — откатываю пресет"
-    "${SUDO[@]}" "${SCRIPT_PATH}" __root-restore-preset "${backup}" "${PRESET_FILE}" "${SERVER_UNIT}"
+    "${SUDO[@]}" "${ROOT_HELPER}" restore-preset "${backup}"
     die "пресет откатан из ${backup}"
+}
+
+# Root-шаги выполняет только установленный root-хелпер (код вне домашнего
+# каталога): без него — понятная ошибка, а не запуск кода пользователя от root
+need_root_helper() {
+    [[ -x "${ROOT_HELPER}" ]] \
+        || die "нет root-хелпера ${ROOT_HELPER}: запустите check_mytasks.sh — он установит его (задание llamactl-root)" 2
 }
 
 # Эксклюзивная блокировка записи пресетов. Чтение models.ini для новой версии
@@ -745,8 +761,10 @@ hf_file_info() {
     F="${file}" jq -r '.[] | select(.path == env.F) | "\(.size)|\(.lfs.oid // "")"' <<<"${tree}" | head -1
 }
 
+# Скачивание с проверкой: sha256 (пустой — только при --no-verify, решение
+# принимает cmd_add) и размер из API Hugging Face, если он известен
 hf_download() {
-    local repo="$1" file="$2" dest="$3" sha="$4" i
+    local repo="$1" file="$2" dest="$3" sha="$4" size="${5:-}" i got
     mkdir -p -- "$(dirname -- "${dest}")"
     info "Загрузка ${repo}/${file} → ${dest}"
     for i in 1 2 3 4 5 6; do
@@ -754,9 +772,15 @@ hf_download() {
         warn "обрыв загрузки, попытка ${i}/6"
         sleep 3
     done
+    if [[ "${size}" =~ ^[0-9]+$ ]] && ((size > 0)); then
+        got="$(stat -c '%s' -- "${dest}.part" 2>/dev/null)" || got=""
+        [[ "${got}" == "${size}" ]] || { rm -f -- "${dest}.part"; die "размер не совпал: ${file} (${got:-нет файла} вместо ${size} байт)"; }
+    fi
     if [[ -n "${sha}" ]]; then
         info "Проверка sha256…"
         echo "${sha}  ${dest}.part" | sha256sum -c --status || { rm -f -- "${dest}.part"; die "sha256 не совпал: ${file}"; }
+    else
+        warn "sha256 для ${file} не проверен (--no-verify)"
     fi
     mv -f -- "${dest}.part" "${dest}"
     info "Готово: ${dest}"
@@ -810,9 +834,10 @@ remove_apply_preset() {
 }
 
 cmd_add() {
-    local repo="" file="" name="" mmproj="" ctx=""
+    local repo="" file="" name="" mmproj="" ctx="" verify=1
     while (($# > 0)); do
         case "$1" in
+            --no-verify) verify=0 ;;
             --name) shift; name="${1:-}" ;;
             --mmproj) shift; mmproj="${1:-}" ;;
             --ctx) shift; ctx="${1:-}" ;;
@@ -821,7 +846,7 @@ cmd_add() {
         esac
         shift
     done
-    [[ -n "${repo}" && -n "${file}" ]] || die "llamactl add РЕПОЗИТОРИЙ ФАЙЛ.gguf [--name ИМЯ] [--mmproj ФАЙЛ] [--ctx N]" 2
+    [[ -n "${repo}" && -n "${file}" ]] || die "llamactl add РЕПОЗИТОРИЙ ФАЙЛ.gguf [--name ИМЯ] [--mmproj ФАЙЛ] [--ctx N] [--no-verify]" 2
     [[ -n "${name}" ]] || { name="$(basename -- "${file}" .gguf)"; name="${name,,}"; }
     [[ "${name}" =~ ^[A-Za-z0-9._-]+$ ]] || die "недопустимое имя модели «${name}»" 2
     [[ -z "${ctx}" || "${ctx}" =~ ^[0-9]+$ ]] || die "окно должно быть числом" 2
@@ -835,6 +860,17 @@ cmd_add() {
         [[ -n "${fi_mm}" ]] || die "в ${repo} нет файла ${mmproj}"
         IFS='|' read -r mm_size mm_sha <<<"${fi_mm}"
     fi
+    # Без sha256 из API целостность проверить нечем — отказ (fail closed);
+    # осознанно скачать без проверки — только явным --no-verify
+    # (если sha256 есть, он проверяется и с --no-verify)
+    if ((verify == 1)); then
+        [[ -n "${sha}" ]] || die "Hugging Face не вернул sha256 для ${file}: проверить файл нечем. Скачать без проверки — llamactl add … --no-verify" 2
+        [[ -z "${mmproj}" || -n "${mm_sha}" ]] || die "Hugging Face не вернул sha256 для ${mmproj}: проверить файл нечем. Скачать без проверки — llamactl add … --no-verify" 2
+    fi
+    local sha_label="без проверки, --no-verify"
+    [[ -n "${sha}" ]] && sha_label="${sha:0:12}…"
+    [[ "${size}" =~ ^[0-9]+$ ]] || size=0
+    [[ "${mm_size}" =~ ^[0-9]+$ ]] || mm_size=0
     avail="$(df -B1 --output=avail "${MODELS_DIR}" | tail -1 | tr -d ' ')"
     need=$((size + mm_size + 1073741824))
     local hs ha
@@ -846,13 +882,13 @@ cmd_add() {
     [[ -n "${mmproj}" ]] && mm_dest="${dir}/$(basename -- "${mmproj}")"
 
     if [[ "${DRY_RUN}" -eq 1 ]]; then
-        act "download" "скачать ${repo}/${file} → ${dest} (sha256 ${sha:0:12}…)" || true
+        act "download" "скачать ${repo}/${file} → ${dest} (sha256 ${sha_label})" || true
         [[ -n "${mm_dest}" ]] && { act "download" "скачать ${repo}/${mmproj} → ${mm_dest}" || true; }
         add_apply_preset "${name}" "${repo}" "${ctx}" "${dest}" "${mm_dest}"
         return 0
     fi
-    act "download" "скачать ${repo}/${file} → ${dest}" && hf_download "${repo}" "${file}" "${dest}" "${sha}"
-    [[ -n "${mm_dest}" ]] && hf_download "${repo}" "${mmproj}" "${mm_dest}" "${mm_sha}"
+    act "download" "скачать ${repo}/${file} → ${dest}" && hf_download "${repo}" "${file}" "${dest}" "${sha}" "${size}"
+    [[ -n "${mm_dest}" ]] && hf_download "${repo}" "${mmproj}" "${mm_dest}" "${mm_sha}" "${mm_size}"
     add_apply_preset "${name}" "${repo}" "${ctx}" "${dest}" "${mm_dest}"
     cmd_fit "${name}" || true
     info "Модель ${name} добавлена: llamactl load ${name}"
@@ -907,8 +943,62 @@ installed_commit() {
     printf '%s' "${v}"
 }
 
+# Последний релизный тег bNNNN в origin: печатает «ТЕГ SHA_КОММИТА»
+# (для аннотированного тега — SHA из строки ^{}, то есть сам коммит)
+latest_release_tag() {
+    local listing
+    listing="$(git -C "${LLAMA_SRC}" ls-remote --tags origin 'refs/tags/b*')" || return 1
+    awk '
+        BEGIN { best = -1 }
+        {
+            sha = $1; ref = $2
+            peeled = sub(/\^\{\}$/, "", ref)
+            tag = ref
+            sub(/^refs\/tags\//, "", tag)
+            if (tag !~ /^b[0-9]+$/) next
+            if (peeled || !(tag in shas)) shas[tag] = sha
+            n = substr(tag, 2) + 0
+            if (n > best) { best = n; bt = tag }
+        }
+        END { if (bt != "") print bt, shas[bt] }' <<<"${listing}"
+}
+
+# Что ставить: UPD_FETCH (что запрашивать у origin), UPD_SHA (ожидаемый
+# коммит), UPD_LABEL (для вывода). REF — latest-tag, имя тега или полный SHA.
+resolve_update_ref() {
+    local ref="$1" line
+    UPD_FETCH=""
+    UPD_SHA=""
+    UPD_LABEL=""
+    if [[ "${ref}" == "latest-tag" ]]; then
+        line="$(latest_release_tag)" || die "не удалось получить список тегов origin"
+        [[ -n "${line}" ]] || die "в origin нет релизных тегов bNNNN"
+        UPD_FETCH="refs/tags/${line%% *}"
+        UPD_SHA="${line##* }"
+        UPD_LABEL="последний релизный тег ${line%% *}"
+    elif [[ "${ref}" =~ ^[0-9a-f]{40}$ ]]; then
+        UPD_FETCH="${ref}"
+        UPD_SHA="${ref}"
+        UPD_LABEL="коммит ${ref}"
+    elif [[ "${ref}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        line="$(git -C "${LLAMA_SRC}" ls-remote --tags origin "refs/tags/${ref}" "refs/tags/${ref}^{}")" \
+            || die "не удалось получить список тегов origin"
+        # Аннотированный тег: коммит — в строке «тег^{}»
+        UPD_SHA="$(T="refs/tags/${ref}" awk '
+            $2 == ENVIRON["T"] "^{}" { p = $1 }
+            $2 == ENVIRON["T"] && s == "" { s = $1 }
+            END { print (p != "" ? p : s) }' <<<"${line}")"
+        [[ -n "${UPD_SHA}" ]] || die "тега ${ref} нет в origin (--ref: тег или полный SHA коммита)" 2
+        UPD_FETCH="refs/tags/${ref}"
+        UPD_LABEL="тег ${ref}"
+    else
+        die "недопустимое --ref «${ref}»: нужен тег (например b4500) или полный SHA коммита из 40 знаков" 2
+    fi
+    [[ "${UPD_SHA}" =~ ^[0-9a-f]{40}$ ]] || die "origin вернул некорректный SHA «${UPD_SHA}» для ${UPD_LABEL}"
+}
+
 cmd_update() {
-    local ref="" bench=0 force=0
+    local ref="${LLAMA_REF:-latest-tag}" bench=0 force=0
     while (($# > 0)); do
         case "$1" in
             --ref) shift; ref="${1:-}" ;;
@@ -923,42 +1013,56 @@ cmd_update() {
     local dirty
     dirty="$(git -C "${LLAMA_SRC}" status --porcelain --untracked-files=no)"
     [[ -z "${dirty}" ]] || die "в ${LLAMA_SRC} есть незакоммиченные изменения — обновление прервано"
-    local cur remote target
+    local cur target
     cur="$(installed_commit)"
-    remote="$(git -C "${LLAMA_SRC}" ls-remote origin "${ref:-HEAD}" | awk 'NR == 1 { print $1 }')"
-    [[ -n "${remote}" ]] || die "не удалось узнать ${ref:-HEAD} в origin"
-    target="${remote:0:7}"
-    info "Установлено: ${cur:-?}; в origin ${ref:-HEAD}: ${target}"
-    if [[ -n "${cur}" && "${remote}" == "${cur}"* && "${force}" -eq 0 ]]; then
+    resolve_update_ref "${ref}"
+    target="${UPD_SHA:0:7}"
+    info "Установлено: ${cur:-?}; ставится ${UPD_LABEL}: ${target}"
+    if [[ -n "${cur}" && "${UPD_SHA}" == "${cur}"* && "${force}" -eq 0 ]]; then
         info "llama.cpp уже актуален (повторить сборку: --force)"
         return 0
     fi
+    # Готовая установка сборки (cmake --install от пользователя): её проверяет
+    # пользователь, а root-хелпер только копирует bin/ и lib/
+    local stage="${LLAMA_SRC}/build/llamactl-stage"
     if [[ "${DRY_RUN}" -eq 1 ]]; then
-        act "fetch" "git fetch ${ref:-HEAD} и переключить ${LLAMA_SRC} на ${target}" || true
-        act "build" "cmake (CUDA, sm_${CUDA_ARCH}, RPATH ${RPATH_LIT}) и сборка в ${BUILD_JOBS} потоков" || true
-        act "install" "установить в ${LLAMA_PREFIX}.new, проверить, заменить ${LLAMA_PREFIX} (старая версия → ${LLAMA_PREFIX}.prev), перезапустить ${SERVER_UNIT} ${FIM_UNIT}; при сбое — откат" || true
+        act "fetch" "git fetch ${UPD_FETCH} и переключить ${LLAMA_SRC} на ${target} (${UPD_LABEL})" || true
+        act "build" "cmake (CUDA, sm_${CUDA_ARCH}, RPATH ${RPATH_LIT}) и сборка в ${BUILD_JOBS} потоков, установка в ${stage} и проверка llama-server --version и ldd от пользователя" || true
+        act "install" "установить в ${LLAMA_PREFIX}.new root-хелпером ${ROOT_HELPER}, заменить ${LLAMA_PREFIX} (старая версия → ${LLAMA_PREFIX}.prev), перезапустить ${SERVER_UNIT} ${FIM_UNIT}; при сбое — откат" || true
         ((bench == 1)) && { act "bench" "замер ${BENCH_MODEL} до и после" || true; }
         return 0
     fi
+    # Хелпер нужен в конце; проверяем до долгой сборки
+    need_root_helper
     local before=""
     if ((bench == 1)); then
         info "== Замер до обновления"
         cmd_bench "${BENCH_MODEL}" && before="${BENCH_LAST}"
     fi
-    info "== [1/4] Получение исходников ${target}"
-    log_json "INFO" "fetch" "${ref:-HEAD} ${target}"
-    git -C "${LLAMA_SRC}" fetch --depth 1 origin "${ref:-HEAD}" || die "git fetch не удался"
+    info "== [1/4] Получение исходников: ${UPD_LABEL} (${target})"
+    log_json "INFO" "fetch" "${UPD_LABEL} ${UPD_SHA}"
+    git -C "${LLAMA_SRC}" fetch --depth 1 origin "${UPD_FETCH}" || die "git fetch не удался"
     git -C "${LLAMA_SRC}" checkout --detach FETCH_HEAD || die "git checkout не удался"
+    local got
+    got="$(git -C "${LLAMA_SRC}" rev-parse 'HEAD^{commit}')" || die "git rev-parse не удался"
+    [[ "${got}" == "${UPD_SHA}" ]] || die "получен коммит ${got}, а origin объявил ${UPD_SHA} — обновление прервано"
     info "== [2/4] Сборка (прогресс — проценты cmake)"
     local rpath="${RPATH_LIT}"
     log_json "INFO" "build" "sm_${CUDA_ARCH} -j${BUILD_JOBS}"
     cmake -S "${LLAMA_SRC}" -B "${LLAMA_SRC}/build" -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}" \
-        -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+        -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DCMAKE_INSTALL_LIBDIR=lib \
         -DCMAKE_INSTALL_PREFIX="${LLAMA_PREFIX}" "-DCMAKE_INSTALL_RPATH=${rpath}" >/dev/null || die "cmake configure не удался"
     cmake --build "${LLAMA_SRC}/build" -j "${BUILD_JOBS}" 2>&1 | grep --line-buffered -E '^\[ *[0-9]+%\]' | awk '{ p = $1 " " $2; if (p != last) { print "  " p; last = p } }' | uniq
     [[ -x "${LLAMA_SRC}/build/bin/llama-server" ]] || die "сборка не удалась (cmake --build ${LLAMA_SRC}/build)"
-    info "== [3/4] Установка с заменой и проверкой (один запрос пароля)"
-    "${SUDO[@]}" "${SCRIPT_PATH}" __root-swap-install "${LLAMA_SRC}/build" "${LLAMA_PREFIX}" "${SERVER_UNIT}" "${FIM_UNIT}" "${ROUTER_URL}" "${FIM_URL}" \
+    info "== [3/4] Проверка сборки и установка с заменой (один запрос пароля)"
+    rm -rf -- "${stage}"
+    cmake --install "${LLAMA_SRC}/build" --prefix "${stage}" >/dev/null || die "cmake --install в ${stage} не удался"
+    [[ -x "${stage}/bin/llama-server" ]] || die "в ${stage}/bin нет llama-server"
+    "${stage}/bin/llama-server" --version >/dev/null 2>&1 || die "новая сборка не запускается (${stage}/bin/llama-server --version)"
+    local libs
+    libs="$(ldd "${stage}/bin/llama-server" 2>&1)" || die "ldd ${stage}/bin/llama-server не удался"
+    [[ "${libs}" != *"not found"* ]] || die "у новой сборки не найдены библиотеки (ldd ${stage}/bin/llama-server)"
+    "${SUDO[@]}" "${ROOT_HELPER}" swap-install "${stage}" "${LLAMA_PREFIX}" \
         || die "установка не удалась, прежняя версия возвращена"
     local now
     now="$(installed_commit)"
@@ -970,50 +1074,6 @@ cmd_update() {
         info "Скорость ${BENCH_MODEL}: было ${before:-?} → стало ${BENCH_LAST:-?} ток/с"
     fi
     info "Откат при необходимости: прежняя версия в ${LLAMA_PREFIX}.prev"
-}
-
-###############################################################################
-# ВНУТРЕННИЕ root-КОМАНДЫ (запускаются самим скриптом через sudo -A)
-###############################################################################
-root_install_preset() {
-    local src="$1" dst="$2" backup="$3"
-    cp -p -- "${dst}" "${backup}" || exit 1
-    install -m 0644 -- "${src}" "${dst}" || exit 1
-}
-
-root_restore_preset() {
-    local backup="$1" dst="$2" unit="$3"
-    install -m 0644 -- "${backup}" "${dst}" && systemctl restart "${unit}"
-}
-
-root_swap_install() {
-    local build="$1" prefix="$2" su="$3" fu="$4" rurl="$5" furl="$6"
-    local new="${prefix}.new" prev="${prefix}.prev"
-    rm -rf -- "${new}"
-    cmake --install "${build}" --prefix "${new}" >/dev/null || { echo "cmake --install не удался" >&2; exit 1; }
-    "${new}/bin/llama-server" --version >/dev/null 2>&1 || { echo "новая сборка не запускается" >&2; rm -rf -- "${new}"; exit 1; }
-    if ldd "${new}/bin/llama-server" | grep -q 'not found'; then
-        echo "у новой сборки не найдены библиотеки" >&2; rm -rf -- "${new}"; exit 1
-    fi
-    rm -rf -- "${prev}"
-    mv -- "${prefix}" "${prev}" && mv -- "${new}" "${prefix}" || exit 1
-    systemctl restart "${su}" "${fu}"
-    local t=0 ok=0
-    while ((t < HEALTH_TIMEOUT_SECS)); do
-        if curl -fsS --max-time 3 "${rurl}/health" >/dev/null 2>&1 && curl -fsS --max-time 3 "${furl}/health" >/dev/null 2>&1; then
-            ok=1; break
-        fi
-        sleep 3; t=$((t + 3))
-    done
-    if ((ok == 1)); then
-        echo "  сервисы отвечают (${t} с)"
-        exit 0
-    fi
-    echo "сервисы не поднялись — откат на ${prev}" >&2
-    rm -rf -- "${new}"
-    mv -- "${prefix}" "${new}" && mv -- "${prev}" "${prefix}"
-    systemctl restart "${su}" "${fu}"
-    exit 1
 }
 
 ###############################################################################
@@ -1095,11 +1155,14 @@ usage() {
 Пресеты и модели:
   preset list|show М|set М КЛЮЧ ЗНАЧ|unset М КЛЮЧ|edit
   fit МОДЕЛЬ [ОКНО]            раскладка слоёв по GPU/CPU (llama-fit-params)
-  add РЕПО ФАЙЛ.gguf [--name ИМЯ] [--mmproj ФАЙЛ] [--ctx N]
+  add РЕПО ФАЙЛ.gguf [--name ИМЯ] [--mmproj ФАЙЛ] [--ctx N] [--no-verify]
+                               без sha256 от Hugging Face — отказ; --no-verify — скачать без проверки
   remove МОДЕЛЬ [--delete-files]
   bench [МОДЕЛЬ]               замер скорости генерации
 Обновление:
-  update [--ref REF] [--bench] [--force]   пересборка llama.cpp с CUDA, замена с откатом
+  update [--ref ТЕГ|SHA] [--bench] [--force]   пересборка llama.cpp с CUDA, замена с откатом;
+                               без --ref — LLAMA_REF (по умолчанию последний релизный тег bNNNN)
+Root-шаги — только через ${ROOT_HELPER} (ставит check_mytasks.sh)
 
   -n, --dry-run   ничего не менять, напечатать план «[dry-run] будет: …»
   --json          машиночитаемый вывод (status, models)
@@ -1131,13 +1194,6 @@ CMD="${1:-}"
 ###############################################################################
 # MAIN
 ###############################################################################
-case "${CMD}" in
-    __root-install-preset) NO_LOG=1; root_install_preset "$@"; exit 0 ;;
-    __root-restore-preset) NO_LOG=1; root_restore_preset "$@"; exit "$?" ;;
-    __root-swap-install) NO_LOG=1; root_swap_install "$@" ;;
-    *) ;;
-esac
-
 need_cmd curl jq awk
 # status/models вызываются трей-иконкой каждые несколько секунд — их не логируем.
 case "${CMD}" in

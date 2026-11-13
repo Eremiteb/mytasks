@@ -10,38 +10,103 @@ set -uo pipefail
 SCRIPT_NAME="$(basename -- "$0")"
 SCRIPT_BASE="${SCRIPT_NAME%.*}"
 SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)
-CONF_FILE="${SCRIPT_DIR}/conf/${SCRIPT_BASE}.conf"
-LOG_DIR="${MYTASKS_LOG_DIR:-${SCRIPT_DIR}/logs}"
-STATE_DIR="${SCRIPT_DIR}/state"
 TIMESTAMP="$(date '+%Y-%m-%d-%H-%M-%S')"
-LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}-${TIMESTAMP}.jsonl"
-LOG_TEMPLATE_FILE="${SCRIPT_DIR}/conf/log_template.conf"
-
-# Владелец создаваемых файлов (скрипт работает от root, см. fix_owner). Значение по
-# умолчанию — владелец:группа каталога скрипта; задаётся до конфига, конфиг переопределяет.
 # SYSTEM_MONITOR_EUID — только для тестов (подмена EUID).
 RUN_EUID="${SYSTEM_MONITOR_EUID:-${EUID}}"
-FILE_OWNER="$(stat -c '%U:%G' -- "${SCRIPT_DIR}" 2>/dev/null || true)"
-FILE_OWNER_DEFAULT="${FILE_OWNER}"
 
-mkdir -p "${LOG_DIR}"
+# Конфиг. По расписанию работает root-копия скрипта (check_mytasks.sh ставит
+# её root:root в /usr/local/lib/mytasks, рядом нет conf/): она читает только
+# root-конфиг (по умолчанию /etc/mytasks/system_monitor.conf, юнит передаёт
+# его через --config) и никогда не выполняет файлы пользователя. Запуск из
+# каталога mytasks: root-конфиг, если он есть, иначе conf/system_monitor.conf.
+ROOT_CONF_FILE="/etc/mytasks/${SCRIPT_BASE}.conf"
+# Чьим конфигам доверять под root (владелец root, без записи для группы и остальных)
+TRUSTED_UID=0
+# Подмена root-конфига — только для тестов и только не под настоящим root
+if [[ -n "${SYSTEM_MONITOR_TEST_ROOT_CONF:-}" && "${EUID}" -ne 0 ]]; then
+    ROOT_CONF_FILE="${SYSTEM_MONITOR_TEST_ROOT_CONF}"
+    TRUSTED_UID="${EUID}"
+fi
+USER_CONF_FILE="${SCRIPT_DIR}/conf/${SCRIPT_BASE}.conf"
+INSTALLED_COPY=0
+[[ -d "${SCRIPT_DIR}/conf" ]] || INSTALLED_COPY=1
+# --config ФАЙЛ разбирается до загрузки конфига (остальные ключи — в ARGS)
+CONF_ARG=""
+prev_arg=""
+for arg in "$@"; do
+    [[ "${prev_arg}" == "-c" || "${prev_arg}" == "--config" ]] && CONF_ARG="${arg}"
+    prev_arg="${arg}"
+done
+if [[ -n "${CONF_ARG}" ]]; then
+    CONF_FILE="${CONF_ARG}"
+elif ((INSTALLED_COPY)) || [[ -e "${ROOT_CONF_FILE}" || -L "${ROOT_CONF_FILE}" ]]; then
+    CONF_FILE="${ROOT_CONF_FILE}"
+else
+    CONF_FILE="${USER_CONF_FILE}"
+fi
 
-if [[ -r "${LOG_TEMPLATE_FILE}" ]]; then
+# Владелец uid и права файла: обычный файл, не симлинк, владелец TRUSTED_UID,
+# без записи для группы и остальных
+trusted_root_file() {
+    local st
+    [[ -f "$1" && ! -L "$1" ]] || return 1
+    st="$(stat -c '%u %a' -- "$1" 2>/dev/null)" || return 1
+    [[ "${st%% *}" == "${TRUSTED_UID}" ]] || return 1
+    (( (8#${st##* } & 8#022) == 0 ))
+}
+
+if ((INSTALLED_COPY)) || [[ "${CONF_FILE}" != "${USER_CONF_FILE}" && "${RUN_EUID}" -eq 0 ]]; then
+    # Root-копия и чужой конфиг под root: только доверенный файл, иначе отказ
+    if ! trusted_root_file "${CONF_FILE}"; then
+        echo "Ошибка: конфиг ${CONF_FILE} отсутствует или не доверенный (нужен обычный файл root:root без записи для группы и остальных); установите его: check_mytasks.sh" >&2
+        exit 2
+    fi
+elif ((RUN_EUID == 0)); then
+    # Осознанный ручной запуск от root из каталога пользователя (sudo ./system_monitor.sh)
+    script_owner="$(stat -c '%u' -- "${SCRIPT_DIR}/${SCRIPT_NAME}" 2>/dev/null)" || script_owner=""
+    conf_owner="0"
+    [[ -e "${CONF_FILE}" ]] && { conf_owner="$(stat -c '%u' -- "${CONF_FILE}" 2>/dev/null)" || conf_owner=""; }
+    if [[ "${script_owner}" != "0" || "${conf_owner}" != "0" ]]; then
+        echo "ВНИМАНИЕ: от root выполняются скрипт/конфиг пользователя (${SCRIPT_DIR}); по расписанию работает root-копия из /usr/local/lib/mytasks — ручной запуск от root только осознанно" >&2
+    fi
+fi
+
+# Значения из окружения не наследуются: только конфиг или умолчания ниже
+MYTASKS_DIR=""
+FILE_OWNER=""
+if [[ -r "${CONF_FILE}" ]]; then
+    # shellcheck source=/dev/null
+    source "${CONF_FILE}"
+fi
+
+# Каталог данных mytasks: у root-копии — только из конфига
+if [[ -z "${MYTASKS_DIR}" ]]; then
+    if ((INSTALLED_COPY)); then
+        echo "Ошибка: в ${CONF_FILE} не задан MYTASKS_DIR (каталог данных mytasks)" >&2
+        exit 2
+    fi
+    MYTASKS_DIR="${SCRIPT_DIR}"
+fi
+LOG_DIR="${MYTASKS_LOG_DIR:-${MYTASKS_DIR}/logs}"
+STATE_DIR="${MYTASKS_DIR}/state"
+LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}-${TIMESTAMP}.jsonl"
+LOG_TEMPLATE_FILE="${MYTASKS_DIR}/conf/log_template.conf"
+
+# Шаблон логов — файл пользователя: под root не выполняется (значения по умолчанию)
+if ((RUN_EUID != 0)) && [[ -r "${LOG_TEMPLATE_FILE}" ]]; then
     # shellcheck source=/dev/null
     source "${LOG_TEMPLATE_FILE}"
 fi
 LOG_SCHEMA_VERSION="${LOG_SCHEMA_VERSION:-1.0}"
 LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
 
-if [[ -r "${CONF_FILE}" ]]; then
-    # shellcheck source=/dev/null
-    source "${CONF_FILE}"
+# Владелец создаваемых файлов (скрипт работает от root, см. fix_owner); пустое
+# значение в конфиге = владелец и группа каталога mytasks
+if [[ -z "${FILE_OWNER}" ]]; then
+    FILE_OWNER="$(stat -c '%U:%G' -- "${MYTASKS_DIR}" 2>/dev/null)" || FILE_OWNER=""
 fi
-
-# Пустое значение в конфиге = владелец каталога скрипта
-FILE_OWNER="${FILE_OWNER:-${FILE_OWNER_DEFAULT}}"
 DB_FILE="${DB_FILE:-${STATE_DIR}/${SCRIPT_BASE}.db}"
-REPORT_DIR="${REPORT_DIR:-${SCRIPT_DIR}/system_reports}"
+REPORT_DIR="${REPORT_DIR:-${MYTASKS_DIR}/system_reports}"
 REPORT_KEEP="${REPORT_KEEP:-5}"
 KEEP_LOGS="${KEEP_LOGS:-10}"
 HISTORY_POINTS="${HISTORY_POINTS:-30}"
@@ -63,6 +128,42 @@ GPU_TEMP_CRIT_C="${GPU_TEMP_CRIT_C:-85}"
 APP_NAME="${APP_NAME:-SystemMonitor}"
 ICON_NAME="${ICON_NAME:-utilities-system-monitor}"
 URGENCY="${URGENCY:-critical}"
+
+# Есть ли в пути симлинк (сравнение пути с разыменованием и без него)
+path_has_symlink() {
+    local resolved literal
+    resolved="$(realpath -m -- "$1")" || return 0
+    literal="$(realpath -m -s -- "$1")" || return 0
+    [[ "${resolved}" != "${literal}" ]]
+}
+
+# Под root каталоги данных принадлежат пользователю: запись — без следования
+# симлинкам (иначе подменённая ссылка увела бы запись root в чужой файл)
+if ((RUN_EUID == 0)); then
+    db_dir="$(dirname -- "${DB_FILE}")"
+    for root_path in "${db_dir}" "${LOG_DIR}" "${REPORT_DIR}"; do
+        if path_has_symlink "${root_path}"; then
+            echo "Ошибка: путь ${root_path} содержит симлинк — запись от root отклонена" >&2
+            exit 2
+        fi
+    done
+    for root_path in "${DB_FILE}" "${DB_FILE}-wal" "${DB_FILE}-shm" "${DB_FILE}-journal"; do
+        if [[ -L "${root_path}" ]]; then
+            echo "Ошибка: ${root_path} — симлинк, база от root не открывается" >&2
+            exit 2
+        fi
+    done
+fi
+
+mkdir -p "${LOG_DIR}"
+# Лог под root создаётся эксклюзивно (noclobber: O_EXCL, симлинк не годится);
+# уже существующий обычный файл (повторный запуск в ту же секунду) допустим
+if ((RUN_EUID == 0)) && ! (set -C; : > "${LOG_FILE}") 2>/dev/null; then
+    if [[ -L "${LOG_FILE}" || ! -f "${LOG_FILE}" ]]; then
+        echo "Ошибка: не удалось безопасно создать лог ${LOG_FILE}" >&2
+        exit 2
+    fi
+fi
 
 ###############################################################################
 # HELPERS
@@ -255,7 +356,7 @@ require_cmd() {
 usage() {
     cat <<EOF
 Использование:
-  ${SCRIPT_NAME} [-r|--report] [-n|--dry-run] [-h|--help]
+  ${SCRIPT_NAME} [-r|--report] [-n|--dry-run] [-c|--config ФАЙЛ] [-h|--help]
 
 Без аргументов:
   Опрашивает диски (smartctl), CPU (lm_sensors, /proc) и GPU (nvidia-smi,
@@ -269,6 +370,12 @@ usage() {
   -n, --dry-run  Опросить систему и показать, что было бы записано в SQLite и
                  отчёт, не меняя БД, отчёты и не показывая уведомлений; печатает
                  план миграции схемы БД (только чтение).
+  -c, --config ФАЙЛ
+                 Конфиг явно (юнит system-monitor передаёт root-конфиг
+                 /etc/mytasks/system_monitor.conf). Без ключа: root-копия —
+                 только root-конфиг, запуск из mytasks — root-конфиг, если он
+                 есть, иначе conf/system_monitor.conf. Под root чужой конфиг
+                 должен принадлежать root и быть недоступен на запись другим.
   -h, --help     Показать эту справку и выйти.
 EOF
 }
@@ -287,6 +394,14 @@ while [[ $# -gt 0 ]]; do
         -r|--report)
             REPORT_ONLY=1
             shift
+            ;;
+        -c|--config)
+            # Уже учтён до загрузки конфига
+            if [[ $# -lt 2 || -z "$2" ]]; then
+                echo "Ключ $1 требует путь к конфигу" >&2
+                exit 1
+            fi
+            shift 2
             ;;
         -h|--help)
             usage
@@ -549,6 +664,13 @@ init_db() {
         return 1
     fi
     backup="$(db_backup_path "${version}")"
+    # sqlite3 .backup открывает файл по пути (с разыменованием): заранее
+    # подложенный файл или ссылка с тем же именем — отказ
+    if [[ -e "${backup}" || -L "${backup}" ]]; then
+        echo "Ошибка: файл резервной копии ${backup} уже существует" >&2
+        log_json "ERROR" "db_backup_exists" "Файл резервной копии уже существует" "${backup}"
+        return 1
+    fi
     if ! sqlite3 "${DB_FILE}" ".backup '${backup}'"; then
         echo "Ошибка: не удалось сделать резервную копию ${backup}" >&2
         log_json "ERROR" "db_backup_failed" "Не удалось сделать резервную копию БД" "${backup}"
@@ -1604,8 +1726,9 @@ ${sector_chart}
 </html>
 HTML
 
+    # Права — до переноса: chmod по готовому пути пошёл бы по подменённой ссылке
+    chmod 644 -- "${tmp_report}" || return 1
     mv -f -- "${tmp_report}" "${report_file}"
-    chmod 644 -- "${report_file}"
 }
 
 ###############################################################################
@@ -1680,8 +1803,18 @@ if ! generate_report "${REPORT_FILE}"; then
     cleanup_logs
     exit 2
 fi
-cp -f -- "${REPORT_FILE}" "${REPORT_DIR}/latest.html"
-chmod 644 -- "${REPORT_DIR}/latest.html"
+# latest.html — через временный файл рядом и rename: rename заменяет саму
+# ссылку, а не её цель, права ставятся до rename (chmod/cp идут по симлинку)
+if ! LATEST_TMP="$(mktemp -- "${REPORT_DIR}/.latest.html.XXXXXX")" \
+    || ! cp -- "${REPORT_FILE}" "${LATEST_TMP}" \
+    || ! chmod 644 -- "${LATEST_TMP}" \
+    || ! mv -f -- "${LATEST_TMP}" "${REPORT_DIR}/latest.html"; then
+    echo "Ошибка: не удалось обновить ${REPORT_DIR}/latest.html" >&2
+    log_json "ERROR" "latest_failed" "Не удалось обновить latest.html" "${REPORT_DIR}"
+    [[ -n "${LATEST_TMP:-}" ]] && rm -f -- "${LATEST_TMP}"
+    cleanup_logs
+    exit 2
+fi
 fix_owner "${REPORT_FILE}" "${REPORT_DIR}/latest.html" "${DB_FILE}" "${DB_FILE}-wal" "${DB_FILE}-shm"
 log_json "INFO" "report_generated" "Сформирован HTML-отчёт" "${REPORT_FILE}"
 
