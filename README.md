@@ -789,6 +789,10 @@ sudo ./hp_p1005_garuda.sh --all
 Codex и Gemini CLI (`~/.agents/skills`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md`). Источники — каталог
 `agent-skills/model-routing/` (`claude.SKILL.md`, `agents.SKILL.md`, `section.*.md`, `plan-guard.py`, `remind.py`), правятся только там.
 
+Ставятся и навыки `best-practices` (практики инженерии: best practices языка и экосистемы) и `infosec`
+(информационная безопасность: чек-лист ревью, `reference.md`) — в `~/.claude/skills` и `~/.agents/skills`
+на всех хостах из `HOSTS`. Источники — `agent-skills/best-practices/` и `agent-skills/infosec/`, правятся только там.
+
 Для Claude Code ставится и хук `~/.claude/hooks/model-routing-plan-guard.py` (PreToolUse на
 `mcp__ccd_turn__update_plan` в `~/.claude/settings.json`): план, у шага которого нет метки `[Haiku]`
 или `[Opus]`, отклоняется, и агент получает причину. Так выбор модели под шаг не держится на памяти

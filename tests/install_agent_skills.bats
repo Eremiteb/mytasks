@@ -75,6 +75,11 @@ EOF
   [ "$status" -eq 0 ]
   [ -f "$HOME/.claude/skills/model-routing/SKILL.md" ]
   [ -f "$HOME/.agents/skills/model-routing/SKILL.md" ]
+  for base in "$HOME/.claude/skills" "$HOME/.agents/skills"; do
+    cmp "$base/best-practices/SKILL.md" "$TMP_DIR/agent-skills/best-practices/SKILL.md"
+    cmp "$base/infosec/SKILL.md" "$TMP_DIR/agent-skills/infosec/SKILL.md"
+    cmp "$base/infosec/reference.md" "$TMP_DIR/agent-skills/infosec/reference.md"
+  done
   grep -q 'model-routing:begin' "$HOME/.claude/CLAUDE.md"
   grep -q 'model-routing:begin' "$HOME/.codex/AGENTS.md"
   [ ! -e "$HOME/.gemini" ]

@@ -93,7 +93,7 @@ Usage:
   ${SCRIPT_NAME} --dry-run [HOST...]
   ${SCRIPT_NAME} --apply   [HOST...]
 
-Ставит навык model-routing и раздел «Выбор модели под шаг» для Claude Code,
+Ставит навыки model-routing, best-practices и infosec и раздел «Выбор модели под шаг» для Claude Code,
 Codex и Gemini CLI на этом устройстве (local) и на удалённых хостах по ssh.
 Для Claude Code ещё подключает хуки в ~/.claude/settings.json: PreToolUse update_plan
 (~/.claude/hooks/model-routing-plan-guard.py — план без меток [Haiku]/[Opus] у шагов не
@@ -110,7 +110,7 @@ USAGE
 
 # Файл источника в base64 одной строкой.
 encode_file() {
-  local file="${SKILLS_SRC_DIR}/model-routing/$1"
+  local file="${SKILLS_SRC_DIR}/$1"
   [[ -r "${file}" ]] || { echo "Error: нет файла ${file}" >&2; exit 1; }
   base64 -w0 < "${file}"
 }
@@ -118,14 +118,19 @@ encode_file() {
 # Сценарий, который выполняется на целевом устройстве (stdin у bash -s).
 build_payload() {
   local dry="$1" claude_skill agents_skill claude_section agents_section plan_guard remind
-  claude_skill="$(encode_file claude.SKILL.md)"
-  agents_skill="$(encode_file agents.SKILL.md)"
-  claude_section="$(encode_file section.claude.md)"
-  agents_section="$(encode_file section.agents.md)"
-  plan_guard="$(encode_file plan-guard.py)"
-  remind="$(encode_file remind.py)"
-  printf 'DRY=%s\nCLAUDE_SKILL=%s\nAGENTS_SKILL=%s\nCLAUDE_SECTION=%s\nAGENTS_SECTION=%s\nPLAN_GUARD=%s\nREMIND=%s\n' \
-    "${dry}" "${claude_skill}" "${agents_skill}" "${claude_section}" "${agents_section}" "${plan_guard}" "${remind}"
+  local bp_skill infosec_skill infosec_ref
+  claude_skill="$(encode_file model-routing/claude.SKILL.md)"
+  agents_skill="$(encode_file model-routing/agents.SKILL.md)"
+  claude_section="$(encode_file model-routing/section.claude.md)"
+  agents_section="$(encode_file model-routing/section.agents.md)"
+  plan_guard="$(encode_file model-routing/plan-guard.py)"
+  remind="$(encode_file model-routing/remind.py)"
+  bp_skill="$(encode_file best-practices/SKILL.md)"
+  infosec_skill="$(encode_file infosec/SKILL.md)"
+  infosec_ref="$(encode_file infosec/reference.md)"
+  printf 'DRY=%s\nCLAUDE_SKILL=%s\nAGENTS_SKILL=%s\nCLAUDE_SECTION=%s\nAGENTS_SECTION=%s\nPLAN_GUARD=%s\nREMIND=%s\nBP_SKILL=%s\nINFOSEC_SKILL=%s\nINFOSEC_REF=%s\n' \
+    "${dry}" "${claude_skill}" "${agents_skill}" "${claude_section}" "${agents_section}" "${plan_guard}" "${remind}" \
+    "${bp_skill}" "${infosec_skill}" "${infosec_ref}"
   cat <<'PAYLOAD'
 put() {
   local dest="$1" b64="$2"
@@ -215,11 +220,19 @@ os.replace(tmp, path)
 print(f"[готово] подключён хук {event}: {path}")
 PY
 }
+# Навыки best-practices и infosec — одинаковые для Claude Code и для ~/.agents (Codex, Gemini)
+skills_common() {
+  local base="$1"
+  put "${base}/best-practices/SKILL.md" "$BP_SKILL"
+  put "${base}/infosec/SKILL.md" "$INFOSEC_SKILL"
+  put "${base}/infosec/reference.md" "$INFOSEC_REF"
+}
 found=0
 if [ -d "$HOME/.claude" ]; then
   found=1
   put "$HOME/.claude/skills/model-routing/SKILL.md" "$CLAUDE_SKILL"
   put "$HOME/.claude/skills/model-routing/remind.py" "$REMIND"
+  skills_common "$HOME/.claude/skills"
   section "$HOME/.claude/CLAUDE.md" "$CLAUDE_SECTION"
   put "$HOME/.claude/hooks/model-routing-plan-guard.py" "$PLAN_GUARD"
   hook "$HOME/.claude/settings.json" PreToolUse mcp__ccd_turn__update_plan \
@@ -231,6 +244,7 @@ fi
 if [ -d "$HOME/.codex" ] || [ -d "$HOME/.gemini" ] || [ -d "$HOME/.agents" ]; then
   found=1
   put "$HOME/.agents/skills/model-routing/SKILL.md" "$AGENTS_SKILL"
+  skills_common "$HOME/.agents/skills"
 fi
 if [ -d "$HOME/.codex" ]; then section "$HOME/.codex/AGENTS.md" "$AGENTS_SECTION"; fi
 if [ -d "$HOME/.gemini" ]; then section "$HOME/.gemini/GEMINI.md" "$AGENTS_SECTION"; fi
