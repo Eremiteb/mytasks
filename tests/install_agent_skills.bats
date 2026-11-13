@@ -30,12 +30,13 @@ teardown() {
   [[ "$output" == *"[dry-run] будет: записать"* ]]
   [ ! -e "$HOME/.claude/skills" ]
   [ ! -e "$HOME/.claude/CLAUDE.md" ]
-  [[ "$output" == *"[dry-run] будет: подключить хук плана"* ]]
+  [[ "$output" == *"[dry-run] будет: подключить хук PreToolUse"* ]]
+  [[ "$output" == *"[dry-run] будет: подключить хук UserPromptSubmit"* ]]
   [ ! -e "$HOME/.claude/settings.json" ]
   [ ! -e "$HOME/.claude/hooks" ]
 }
 
-@test "--apply подключает хук плана, не трогая прочие настройки и хуки, без дублей" {
+@test "--apply подключает хуки плана и напоминания, не трогая прочие настройки и хуки, без дублей" {
   cat > "$HOME/.claude/settings.json" <<'EOF'
 {
   "theme": "dark",
@@ -44,15 +45,18 @@ teardown() {
 EOF
   run "$TMP_DIR/install_agent_skills.sh" --apply local
   [ "$status" -eq 0 ]
-  [[ "$output" == *"[готово] подключён хук плана"* ]]
+  [[ "$output" == *"[готово] подключён хук PreToolUse"* ]]
+  [[ "$output" == *"[готово] подключён хук UserPromptSubmit"* ]]
   [ -f "$HOME/.claude/hooks/model-routing-plan-guard.py" ]
+  [ -f "$HOME/.claude/skills/model-routing/remind.py" ]
   [ -f "$HOME/.claude/settings.json.bak-model-routing" ]
   run python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); p=d["hooks"]["PreToolUse"]; print(d["theme"], len(p), p[0]["matcher"], p[1]["matcher"], p[1]["hooks"][0]["command"])' "$HOME/.claude/settings.json"
   [ "$output" = "dark 2 Bash mcp__ccd_turn__update_plan python3 -I $HOME/.claude/hooks/model-routing-plan-guard.py" ]
   run "$TMP_DIR/install_agent_skills.sh" --apply local
-  [[ "$output" == *"[ok] хук плана подключён"* ]]
-  run python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["hooks"]["PreToolUse"]))' "$HOME/.claude/settings.json"
-  [ "$output" = "2" ]
+  [[ "$output" == *"[ok] хук PreToolUse подключён"* ]]
+  [[ "$output" == *"[ok] хук UserPromptSubmit подключён"* ]]
+  run python3 -c 'import json,sys; h=json.load(open(sys.argv[1]))["hooks"]; u=h["UserPromptSubmit"]; print(len(h["PreToolUse"]), len(u), u[0]["hooks"][0]["command"])' "$HOME/.claude/settings.json"
+  [ "$output" = "2 1 python3 -I ~/.claude/skills/model-routing/remind.py" ]
 }
 
 @test "хук плана: шаг без метки модели отклоняется, с метками и advance — пропускаются" {
