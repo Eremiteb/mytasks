@@ -18,6 +18,7 @@
   music_tags_clean.py --restore state/music-tags-backup-… # откат
 """
 import argparse
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -216,32 +217,36 @@ def main():
     saved = 0
     t0 = time.time()
     current_work = None
-    report = open(report_path, "a", encoding="utf-8") if args.apply or args.limit == 0 else None
-    for index, (root, path) in enumerate(find_mp3(roots), 1):
-        if args.limit and index > args.limit:
-            break
-        work_dir = args.work_dir or os.path.join(os.path.dirname(root.rstrip("/")), ".tagclean-work")
-        if current_work != work_dir:
-            os.makedirs(work_dir, exist_ok=True)
-            current_work = work_dir
-        try:
-            status, before, after = clean_one(engine, path, work_dir, args.backup_dir, root, args.apply)
-        except Exception as error:
-            status, before, after = f"error:{error!r}", 0, 0
-        key = status.split(":", 1)[0]
-        stats[key] = stats.get(key, 0) + 1
-        saved += before - after
-        if status.startswith("would_clean") and index <= 20:
-            print(f"[dry-run] будет: очистить теги {path} ({before} → {after} байт)")
-        if status.startswith("error"):
-            print(f"ОШИБКА {path}: {status}", flush=True)
-        if report and status != "clean":
-            report.write(json.dumps({"path": path, "status": status, "before": before, "after": after},
-                                    ensure_ascii=False) + "\n")
-        if index % 500 == 0 or index == total:
-            spent = time.time() - t0
-            print(f"ПРОГРЕСС {index}/{total} ({index * 100 // total}%), {index / spent:.1f} файл/с, "
-                  f"осталось ~{spent / index * (total - index) / 60:.0f} мин; {stats}", flush=True)
+    # Отчёт — в with: закрывается и при сбое посреди обработки
+    write_report = args.apply or args.limit == 0
+    with (
+        open(report_path, "a", encoding="utf-8") if write_report else contextlib.nullcontext()
+    ) as report:
+        for index, (root, path) in enumerate(find_mp3(roots), 1):
+            if args.limit and index > args.limit:
+                break
+            work_dir = args.work_dir or os.path.join(os.path.dirname(root.rstrip("/")), ".tagclean-work")
+            if current_work != work_dir:
+                os.makedirs(work_dir, exist_ok=True)
+                current_work = work_dir
+            try:
+                status, before, after = clean_one(engine, path, work_dir, args.backup_dir, root, args.apply)
+            except Exception as error:
+                status, before, after = f"error:{error!r}", 0, 0
+            key = status.split(":", 1)[0]
+            stats[key] = stats.get(key, 0) + 1
+            saved += before - after
+            if status.startswith("would_clean") and index <= 20:
+                print(f"[dry-run] будет: очистить теги {path} ({before} → {after} байт)")
+            if status.startswith("error"):
+                print(f"ОШИБКА {path}: {status}", flush=True)
+            if report and status != "clean":
+                report.write(json.dumps({"path": path, "status": status, "before": before, "after": after},
+                                        ensure_ascii=False) + "\n")
+            if index % 500 == 0 or index == total:
+                spent = time.time() - t0
+                print(f"ПРОГРЕСС {index}/{total} ({index * 100 // total}%), {index / spent:.1f} файл/с, "
+                      f"осталось ~{spent / index * (total - index) / 60:.0f} мин; {stats}", flush=True)
     if current_work and os.path.isdir(current_work) and not os.listdir(current_work):
         os.rmdir(current_work)
     print(f"ИТОГ {mode}: {stats}, высвобождено {saved} байт, за {(time.time() - t0) / 60:.1f} мин", flush=True)
