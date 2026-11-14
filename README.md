@@ -766,11 +766,31 @@ llamactl                         # интерактивное меню
 llamactl status
 llamactl load qwen3.6-35b-a3b
 llamactl free-vram
-llamactl -n preset set qwen3.5-9b ctx-size 49152   # сначала план
-llamactl preset set qwen3.5-9b ctx-size 49152
+llamactl -n preset set deepseek-v4-pro-qwen3.5-9b ctx-size 49152   # сначала план
+llamactl preset set deepseek-v4-pro-qwen3.5-9b ctx-size 49152
 llamactl add unsloth/Qwen3.5-4B-GGUF Qwen3.5-4B-Q4_K_M.gguf --mmproj mmproj-F16.gguf
 llamactl -n update --bench && llamactl update --bench
 ```
+
+#### Модель `auto`: выбор модели по языку (`llama_lang_router.py`)
+
+Роутер llama.cpp сам не выбирает модель по языку, поэтому перед ним работает
+прокси `llamactl/llama_lang_router.py` (только stdlib) — пользовательская служба
+`llama-lang-router.service` (ставит `check_mytasks.sh`) на `http://127.0.0.1:8081`.
+Через него доступны тот же веб-интерфейс и OpenAI-совместимый API, а в списке
+моделей появляется `auto`:
+
+- запрос с моделью `auto` (или без `model`) уходит в `qwen3.5-9b-kazakh`, если
+  последнее сообщение пользователя написано по-казахски (казахских букв
+  ә ғ қ ң ө ұ ү һ і не меньше 3 % кириллицы), иначе — в `qwen3.6-35b-a3b`;
+- явно выбранная модель не меняется, прочие запросы передаются как есть;
+  `auto` в других запросах (`?model=auto`, загрузка модели) означает модель по умолчанию.
+
+Модели и порты меняются переменными `LANG_ROUTER_LISTEN`, `LANG_ROUTER_UPSTREAM`,
+`LANG_ROUTER_KK_MODEL`, `LANG_ROUTER_DEFAULT_MODEL`
+(`systemctl --user edit llama-lang-router.service`, раздел `[Service]`, строки
+`Environment=…`). Журнал маршрутизации:
+`journalctl --user -u llama-lang-router -f`.
 
 ---
 

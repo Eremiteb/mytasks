@@ -132,6 +132,7 @@ JOBS=(
     "link|llamactl|llamactl/llamactl.sh|path:@LLAMA_PREFIX@|Команда llamactl в ~/.local/bin: управление локальным llama.cpp (модели, VRAM, сервисы, пресеты, обновление)."
     "link|llamactl-tray|llamactl/llamactl_tray.py|path:@LLAMA_PREFIX@|Команда llamactl-tray в ~/.local/bin: значок llama.cpp в трее."
     "autostart|llamactl-tray.desktop||path:@LLAMA_PREFIX@|Автозапуск значка llama.cpp в трее при входе в графический сеанс."
+    "user-unit|llama-lang-router.service||path:@LLAMA_PREFIX@|Прокси llama.cpp на 127.0.0.1:8081 с моделью auto: казахский текст → qwen3.5-9b-kazakh, остальное → qwen3.6-35b-a3b; явно выбранная модель не меняется. Скрипт llamactl/llama_lang_router.py."
     "system-ext|llama-server.service||path:@LLAMA_PREFIX@|Роутер llama.cpp на 127.0.0.1:8080: веб-интерфейс и OpenAI-совместимый API. Юнит ставится вне mytasks."
     "system-ext|llama-fim.service||path:@LLAMA_PREFIX@|FIM-автодополнение llama.cpp на 127.0.0.1:8012 для VS Code и Zed. Юнит ставится вне mytasks."
 )

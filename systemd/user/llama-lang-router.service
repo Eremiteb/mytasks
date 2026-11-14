@@ -1,0 +1,15 @@
+[Unit]
+Description=Прокси llama.cpp :8081 с моделью auto (казахский → казахская модель, остальное → модель по умолчанию)
+Documentation=file://@MYTASKS_DIR@/README.md
+After=network.target
+
+[Service]
+Type=simple
+# Модели и порты — переменные LANG_ROUTER_* (см. начало llama_lang_router.py);
+# переопределять через systemctl --user edit llama-lang-router.service
+ExecStart=/usr/bin/env python3 -I @MYTASKS_DIR@/llamactl/llama_lang_router.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

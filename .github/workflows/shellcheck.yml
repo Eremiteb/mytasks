@@ -89,4 +89,8 @@ jobs:
       # Трей и статус llamactl — Ruff с длиной строки 130 (у music_downloader
       # свой .ruff.toml и свой workflow). pipx есть в образе ubuntu-latest.
       - name: Ruff (llamactl)
-        run: pipx run --spec "ruff==0.17.0" ruff check --line-length 130 llamactl/llamactl_tray.py llamactl/llamactl_status.py
+        run: pipx run --spec "ruff==0.17.0" ruff check --line-length 130 llamactl/llamactl_tray.py llamactl/llamactl_status.py llamactl/llama_lang_router.py tests/test_llama_lang_router.py
+
+      # Прокси llama_lang_router: только stdlib, тесты на unittest
+      - name: Tests (llama_lang_router)
+        run: python3 -m unittest tests/test_llama_lang_router.py -v
