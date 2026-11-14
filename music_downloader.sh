@@ -149,7 +149,16 @@ else
     fi
 fi
 
-if [[ ${PYTHON_EXIT_CODE} -eq 0 ]]; then
+# Код 2 — загрузчик остановился штатно: кончилось место в папке download_paths
+# (или ошибка настроек, она уже записана в лог движка). Уже скачанное всё равно
+# раскладываем, иначе файлы копятся в _cloud до первого запуска с кодом 0.
+if [[ ${PYTHON_EXIT_CODE} -eq 2 ]]; then
+    log_json "WARN" "downloader_stopped" "Загрузчик остановлен (лимит места или ошибка настроек, см. лог движка)" "rc=${PYTHON_EXIT_CODE}"
+elif [[ ${PYTHON_EXIT_CODE} -ne 0 ]]; then
+    log_json "ERROR" "downloader_failed" "Загрузчик завершился с ошибкой" "rc=${PYTHON_EXIT_CODE}"
+fi
+
+if [[ ${PYTHON_EXIT_CODE} -eq 0 || ${PYTHON_EXIT_CODE} -eq 2 ]]; then
     SPLIT_SCRIPT="${SCRIPT_DIR}/split_by_dash.sh"
     if [[ -f "${SPLIT_SCRIPT}" ]]; then
         log_json "INFO" "split_start" "Запуск сортировщика" "${SPLIT_SCRIPT}"
@@ -162,8 +171,6 @@ if [[ ${PYTHON_EXIT_CODE} -eq 0 ]]; then
     else
         log_json "ERROR" "split_missing" "Сортировщик не найден" "${SPLIT_SCRIPT}"
     fi
-else
-    log_json "ERROR" "downloader_failed" "Загрузчик завершился с ошибкой" "rc=${PYTHON_EXIT_CODE}"
 fi
 
 log_json "INFO" "done" "Завершение работы" "rc=${PYTHON_EXIT_CODE}"

@@ -45,6 +45,19 @@ EOF
   [ ! -e "$TMP_DIR/split_called" ]
 }
 
+@test "exit code 2 (limit stop) still runs split_by_dash.sh and is a warning" {
+  cat > "$TMP_DIR/music_downloader/music_downloader.py" <<'EOF'
+import sys
+sys.exit(2)
+EOF
+
+  rm -f "$TMP_DIR/split_called"
+  run bash "$TMP_DIR/music_downloader.sh"
+
+  [ "$status" -eq 2 ]
+  [ -e "$TMP_DIR/split_called" ]
+}
+
 @test "dry-run does not start downloader and runs sorter with --dry-run" {
   cat > "$TMP_DIR/music_downloader/music_downloader.py" <<'EOF2'
 import pathlib

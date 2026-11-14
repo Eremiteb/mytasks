@@ -920,7 +920,7 @@ python3 mht_to_fb2.py /архивы --dry-run
 **Порядок работы:**
 1. Активирует виртуальное окружение (`venv`) в папке `music_downloader/`, если оно существует.
 2. Запускает `music_downloader.py` и сохраняет его код выхода.
-3. Деактивирует venv; при коде выхода загрузчика `0` запускает `split_by_dash.sh`, если он найден.
+3. Деактивирует venv; при коде выхода загрузчика `0` запускает `split_by_dash.sh`, если он найден; при коде 2 (остановка по лимиту места или ошибка настроек) сортировщик тоже запускается, в лог — WARN `downloader_stopped`.
 4. Логирует результат и возвращает код выхода загрузчика.
 
 **Настройки обёртки (conf/music_downloader.conf, образец `conf/music_downloader.conf.example`):** `PYTHON_BIN` (python3), `VENV_PATH` (по умолчанию `music_downloader/venv`), `CRON_LOG` (по умолчанию `logs/cron_execution.log`). Настройки самого загрузчика — `music_downloader/music_downloader.json`.
