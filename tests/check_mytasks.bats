@@ -758,7 +758,7 @@ EOT2
 
 @test "db: команда не найдена — ВНИМАНИЕ без сбоя" {
   write_conf '"db|missing.db|bin/нет-такой --migrate-db||Демо-база без команды"' ""
-  run "$WORK/check_mytasks.sh" --status
+  run "$WORK/check_mytasks.sh" --no-create
   [ "$status" -eq 1 ]
   [[ "$output" == *"нет bin/нет-такой"* ]]
   [[ "$output" == *"ВНИМАНИЕ"* ]]
@@ -769,7 +769,7 @@ EOT2
   printf '#!/usr/bin/env bash\nexit 3\n' > "$WORK/bin/demo-db"
   chmod +x "$WORK/bin/demo-db"
   write_conf '"db|demo.db|bin/demo-db --migrate-db||Демо-база"' ""
-  run "$WORK/check_mytasks.sh" --status
+  run "$WORK/check_mytasks.sh" --no-create
   [ "$status" -eq 1 ]
   [[ "$output" == *"кодом 3"* ]]
   [[ "$output" == *"ВНИМАНИЕ"* ]]
