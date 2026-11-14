@@ -39,6 +39,8 @@ SCRIPT_NAME = os.path.splitext(os.path.basename(__file__))[0]
 LOG_NAME = f"{SCRIPT_NAME}_engine"
 CONFIG_PATH = os.path.join(BASE_DIR, f"{SCRIPT_NAME}.json")
 DB_PATH = os.path.join(BASE_DIR, f"{SCRIPT_NAME}.db")
+# Драйверы загружаются только из этого каталога (тесты подменяют его своим временным)
+DRIVERS_DIR = os.path.join(BASE_DIR, "drivers")
 
 def get_log_dir(config=None):
     # Переопределение каталога логов (используется тестами, чтобы не засорять logs/)
@@ -607,8 +609,8 @@ def require_http_url(url):
 
 
 def resolve_driver_path(path):
-    """Путь драйвера после realpath: только `*.py` внутри BASE_DIR/drivers; иначе ValueError."""
-    drivers_dir = os.path.realpath(os.path.join(BASE_DIR, "drivers"))
+    """Путь драйвера после realpath: только `*.py` внутри DRIVERS_DIR; иначе ValueError."""
+    drivers_dir = os.path.realpath(DRIVERS_DIR)
     full_path = os.path.realpath(os.path.join(BASE_DIR, path))
     if not full_path.endswith(".py") or os.path.commonpath([drivers_dir, full_path]) != drivers_dir:
         raise ValueError(f"Драйвер должен быть файлом .py внутри {drivers_dir}: {path}")

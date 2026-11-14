@@ -107,8 +107,8 @@ def test_choose_take_finds_common_part_and_best_take(tmp_path):
 
 def _fake_tools(monkeypatch, fingerprints, errors=None):
     by_path = {}
-    monkeypatch.setattr(recorder, "fingerprint", lambda path: by_path[path])
-    monkeypatch.setattr(recorder, "decode_errors", lambda path: (errors or {}).get(Path(path).name, 0))
+    monkeypatch.setattr(recorder, "fingerprint", lambda path, *_args: by_path[path])
+    monkeypatch.setattr(recorder, "decode_errors", lambda path, *_args: (errors or {}).get(Path(path).name, 0))
     return by_path
 
 
@@ -222,7 +222,7 @@ def test_dry_run_changes_nothing(tmp_path, monkeypatch, capsys):
     response.headers = {"Content-Type": "audio/mpeg"}
     response.read.return_value = FRAME * 20
     monkeypatch.setattr(recorder.urllib.request, "urlopen", lambda *args, **kwargs: response)
-    monkeypatch.setattr(recorder, "read_now_playing", lambda url: (("Duman", "Бiр, eкі, үш"), None))
+    monkeypatch.setattr(recorder, "read_now_playing", lambda url, *_args: (("Duman", "Бiр, eкі, үш"), None))
     monkeypatch.setattr(recorder, "in_library", lambda artist, title: False)
     monkeypatch.setattr(recorder.shutil, "which", lambda name: f"/usr/bin/{name}")
     assert recorder.dry_run(cfg) == 0

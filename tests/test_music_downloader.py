@@ -172,7 +172,7 @@ class TestMusicDownloader(unittest.TestCase):
             scraper = MagicMock()
             scraper.get.return_value.__enter__.side_effect = responses
             with (
-                patch.multiple(music_downloader, CONFIG_PATH=str(config_path), DB_PATH=str(root / "db.sqlite")),
+                patch.multiple(music_downloader, DRIVERS_DIR=str(root), CONFIG_PATH=str(config_path), DB_PATH=str(root / "db.sqlite")),
                 patch.object(music_downloader, "setup_logging"),
                 patch.object(music_downloader, "cleanup_old_logs"),
                 patch.object(music_downloader.time, "sleep"),
@@ -242,7 +242,7 @@ class TestMusicDownloader(unittest.TestCase):
 
             scraper.get.side_effect = get
             with (
-                patch.multiple(music_downloader, CONFIG_PATH=str(config_path), DB_PATH=str(root / "db.sqlite")),
+                patch.multiple(music_downloader, DRIVERS_DIR=str(root), CONFIG_PATH=str(config_path), DB_PATH=str(root / "db.sqlite")),
                 patch.object(music_downloader, "setup_logging"),
                 patch.object(music_downloader, "cleanup_old_logs"),
                 patch.object(music_downloader.time, "sleep"),
@@ -294,7 +294,7 @@ class TestMusicDownloader(unittest.TestCase):
             scraper.resolve_track.return_value = resolved
             scraper.get.return_value.__enter__.return_value = response
             with (
-                patch.multiple(music_downloader, CONFIG_PATH=str(config_path), DB_PATH=str(db_path)),
+                patch.multiple(music_downloader, DRIVERS_DIR=str(root), CONFIG_PATH=str(config_path), DB_PATH=str(db_path)),
                 patch.object(music_downloader, "setup_logging"),
                 patch.object(music_downloader, "cleanup_old_logs"),
                 patch.object(music_downloader.time, "sleep"),
@@ -351,7 +351,7 @@ class TestMusicDownloader(unittest.TestCase):
                 "src": "https://music.youtube.com/watch?v=x", "fetch": fetch,
             }
             with (
-                patch.multiple(music_downloader, CONFIG_PATH=str(config_path), DB_PATH=str(root / "db.sqlite")),
+                patch.multiple(music_downloader, DRIVERS_DIR=str(root), CONFIG_PATH=str(config_path), DB_PATH=str(root / "db.sqlite")),
                 patch.object(music_downloader, "setup_logging"),
                 patch.object(music_downloader, "cleanup_old_logs"),
                 patch.object(music_downloader.time, "sleep"),
@@ -395,7 +395,7 @@ class TestMusicDownloader(unittest.TestCase):
                 scraper.resolve_track.side_effect = [outcome, resolved]
                 scraper.get.return_value.__enter__.return_value = response
                 with (
-                    patch.multiple(music_downloader, CONFIG_PATH=str(config_path), DB_PATH=str(root / "db.sqlite")),
+                    patch.multiple(music_downloader, DRIVERS_DIR=str(root), CONFIG_PATH=str(config_path), DB_PATH=str(root / "db.sqlite")),
                     patch.object(music_downloader, "setup_logging"),
                     patch.object(music_downloader, "cleanup_old_logs"),
                     patch.object(music_downloader.time, "sleep"),
@@ -450,7 +450,7 @@ class TestMusicDownloader(unittest.TestCase):
             scraper = MagicMock()
             scraper.get.return_value.__enter__.return_value = response
             with (
-                patch.multiple(music_downloader, CONFIG_PATH=str(config_path), DB_PATH=str(root / "db.sqlite")),
+                patch.multiple(music_downloader, DRIVERS_DIR=str(root), CONFIG_PATH=str(config_path), DB_PATH=str(root / "db.sqlite")),
                 patch.object(music_downloader, "setup_logging"),
                 patch.object(music_downloader, "cleanup_old_logs"),
                 patch.object(music_downloader.time, "sleep"),
@@ -771,7 +771,7 @@ class TestMusicDownloader(unittest.TestCase):
             scraper = MagicMock()
             scraper.get.return_value.__enter__.return_value = response
             with (
-                patch.multiple(music_downloader, CONFIG_PATH=str(config_path), DB_PATH=str(root / "db.sqlite")),
+                patch.multiple(music_downloader, DRIVERS_DIR=str(root), CONFIG_PATH=str(config_path), DB_PATH=str(root / "db.sqlite")),
                 patch.object(music_downloader, "setup_logging"),
                 patch.object(music_downloader, "cleanup_old_logs"),
                 patch.object(music_downloader.time, "sleep"),
@@ -830,7 +830,7 @@ class TestMusicDownloader(unittest.TestCase):
             scraper = MagicMock()
             scraper.get.side_effect = get
             with (
-                patch.multiple(music_downloader, CONFIG_PATH=str(config_path), DB_PATH=str(root / "db.sqlite")),
+                patch.multiple(music_downloader, DRIVERS_DIR=str(root), CONFIG_PATH=str(config_path), DB_PATH=str(root / "db.sqlite")),
                 patch.object(music_downloader, "setup_logging"),
                 patch.object(music_downloader, "cleanup_old_logs"),
                 patch.object(music_downloader.time, "sleep"),
@@ -878,7 +878,7 @@ class TestMusicDownloader(unittest.TestCase):
             scraper = MagicMock()
             scraper.get.return_value.__enter__.return_value = response
             with (
-                patch.multiple(music_downloader, CONFIG_PATH=str(config_path), DB_PATH=str(root / "db.sqlite")),
+                patch.multiple(music_downloader, DRIVERS_DIR=str(root), CONFIG_PATH=str(config_path), DB_PATH=str(root / "db.sqlite")),
                 patch.object(music_downloader, "setup_logging"),
                 patch.object(music_downloader, "cleanup_old_logs"),
                 patch.object(music_downloader.time, "sleep"),
@@ -901,7 +901,7 @@ class TestMusicDownloader(unittest.TestCase):
                 config_path.write_text(json.dumps({"download_paths": [{"path": str(destination)}], "sites": [], **bad}),
                                        encoding="utf-8")
                 with (
-                    patch.multiple(music_downloader, CONFIG_PATH=str(config_path), DB_PATH=str(root / "db.sqlite")),
+                    patch.multiple(music_downloader, DRIVERS_DIR=str(root), CONFIG_PATH=str(config_path), DB_PATH=str(root / "db.sqlite")),
                     patch.object(music_downloader, "setup_logging"),
                     patch.object(music_downloader.cloudscraper, "create_scraper") as create_scraper,
                     self.assertRaises(SystemExit) as error,
