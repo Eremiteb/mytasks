@@ -33,6 +33,8 @@ MOUNT_PROBE_TIMEOUT_SECS="${MOUNT_PROBE_TIMEOUT_SECS:-5}"
 MOUNT_POLL_SECS="${MOUNT_POLL_SECS:-3}"
 # Точки монтирования из /etc/fstab, которые не проверяются (расширенное регулярное выражение)
 MOUNT_IGNORE_REGEX="${MOUNT_IGNORE_REGEX:-^/(proc|sys|dev|run|tmp|boot)}"
+# Таблица точек монтирования (для проверки на другой машине или в тестах — свой файл)
+FSTAB_FILE="${FSTAB_FILE:-/etc/fstab}"
 
 if [[ -r "${CONFIG_FILE}" ]]; then
     # shellcheck source=/dev/null
@@ -119,7 +121,12 @@ for arg in "$@"; do
 done
 
 FAILED_MOUNTS=()
-log_json "INFO" "start" "Проверка точек монтирования" "/etc/fstab"
+log_json "INFO" "start" "Проверка точек монтирования" "${FSTAB_FILE}"
+if [[ ! -r "${FSTAB_FILE}" ]]; then
+    echo "Ошибка: не читается ${FSTAB_FILE}" >&2
+    log_json "ERROR" "fstab_unreadable" "Не читается таблица монтирования" "${FSTAB_FILE}"
+    exit 2
+fi
 
 while read -r device mount_point type _options _dump _pass; do
     [[ "${device}" =~ ^(#|$) ]] && continue
@@ -143,7 +150,7 @@ while read -r device mount_point type _options _dump _pass; do
         FAILED_MOUNTS+=("${MP_CLEAN}")
         log_json "WARN" "mount_missing" "Точка не смонтирована" "${MP_CLEAN}"
     fi
-done < /etc/fstab
+done < "${FSTAB_FILE}"
 
 if [[ ${#FAILED_MOUNTS[@]} -gt 0 ]]; then
     FAILED_STR=$(IFS=', '; echo "${FAILED_MOUNTS[*]}")

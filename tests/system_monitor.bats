@@ -144,7 +144,7 @@ db_query() {
   cp "$STUB_DIR/notify-send" "$iso/notify-send"
   for _cmd in bash env date mkdir ls rm sed grep tr awk mktemp basename dirname cat printf cp find sort sqlite3 jq; do
     _bin="$(command -v "$_cmd" 2>/dev/null)"
-    [ -n "$_bin" ] && ln -sf "$_bin" "$iso/$_cmd" || true
+    if [ -n "$_bin" ]; then ln -sf "$_bin" "$iso/$_cmd"; fi
   done
 
   run env PATH="$iso" bash "$TMP_DIR/system_monitor.sh"
@@ -301,7 +301,7 @@ iso_path_without() {
   cp "$STUB_DIR/notify-send" "$iso/notify-send"
   for _cmd in bash env date mkdir ls rm mv chmod sed grep tr awk sleep mktemp basename dirname cat printf cp find sort sqlite3 jq; do
     _bin="$(command -v "$_cmd" 2>/dev/null)"
-    [ -n "$_bin" ] && ln -sf "$_bin" "$iso/$_cmd" || true
+    if [ -n "$_bin" ]; then ln -sf "$_bin" "$iso/$_cmd"; fi
   done
 }
 
@@ -457,7 +457,7 @@ EOF
   cp "$STUB_DIR/notify-send" "$iso/notify-send"
   for _cmd in bash env date mkdir ls rm mv chmod sed grep tr awk mktemp basename dirname cat printf cp find sort sqlite3 jq; do
     _bin="$(command -v "$_cmd" 2>/dev/null)"
-    [ -n "$_bin" ] && ln -sf "$_bin" "$iso/$_cmd" || true
+    if [ -n "$_bin" ]; then ln -sf "$_bin" "$iso/$_cmd"; fi
   done
 
   run env PATH="$iso" bash "$TMP_DIR/system_monitor.sh" -r
@@ -574,64 +574,8 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# Версионированные миграции схемы БД (PRAGMA user_version)
+# Версия схемы БД (PRAGMA user_version)
 # ---------------------------------------------------------------------------
-
-make_old_db() {
-  # Старая схема: device_alias/mountpoints/size_bytes в конце; счётчик AUTOINCREMENT = 4
-  # при MAX(id) = 3 (четвёртая строка была удалена)
-  sqlite3 "$TMP_DIR/state/system_monitor.db" <<'SQL'
-CREATE TABLE disk_stats (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, device TEXT NOT NULL, model TEXT, serial TEXT,
-    health TEXT NOT NULL, temperature_c INTEGER, power_on_hours INTEGER, reallocated_sectors INTEGER,
-    pending_sectors INTEGER, uncorrectable_errors INTEGER, device_alias TEXT, mountpoints TEXT, size_bytes INTEGER
-);
-INSERT INTO disk_stats (ts, device, model, serial, health, temperature_c, power_on_hours, reallocated_sectors, pending_sectors, uncorrectable_errors, device_alias, mountpoints, size_bytes)
-VALUES ('2026-01-01T00:00:00+0000', '/dev/sda', 'M1', 'S1', 'PASSED', 30, 100, 0, 0, 0, 'a1', '/', 111),
-       ('2026-01-01T00:00:00+0000', '/dev/sdb', 'M2', 'S2', 'PASSED', 31, 200, 0, 0, 0, 'a2', '/home', 222),
-       ('2026-01-02T00:00:00+0000', '/dev/sda', 'M1', 'S1', 'PASSED', 32, 101, 0, 0, 0, 'a1', '/', 111),
-       ('2026-01-03T00:00:00+0000', '/dev/sda', 'M1', 'S1', 'PASSED', 33, 102, 0, 0, 0, 'a1', '/', 111);
-DELETE FROM disk_stats WHERE id = 4;
-SQL
-}
-
-@test "миграция: старая БД пересобирается в канонический порядок, данные и id на месте, есть копия" {
-  make_old_db
-
-  run_monitor --report
-  [ "$status" -eq 0 ]
-
-  run db_query "SELECT group_concat(name, ',') FROM pragma_table_info('disk_stats');"
-  [ "$output" = "id,ts,device,device_alias,mountpoints,model,serial,size_bytes,health,temperature_c,power_on_hours,reallocated_sectors,pending_sectors,uncorrectable_errors" ]
-  run db_query "PRAGMA user_version;"
-  [ "$output" = "1" ]
-  run db_query "SELECT id, device, device_alias, mountpoints, size_bytes, temperature_c FROM disk_stats ORDER BY id;"
-  [ "$output" = $'1|/dev/sda|a1|/|111|30\n2|/dev/sdb|a2|/home|222|31\n3|/dev/sda|a1|/|111|32' ]
-  # счётчик AUTOINCREMENT сохранён (не меньше прежнего 4), индекс пересоздан
-  run db_query "SELECT seq FROM sqlite_sequence WHERE name='disk_stats';"
-  [ "$output" = "4" ]
-  run db_query "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_disk_stats_device_ts';"
-  [ "$output" = "1" ]
-  # недостающие таблицы созданы
-  run db_query "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('cpu_stats','gpu_stats');"
-  [ "$output" = "2" ]
-  compgen -G "$TMP_DIR/state/system_monitor.db.bak-v0-*" > /dev/null
-  run sqlite3 -noheader "$(compgen -G "$TMP_DIR/state/system_monitor.db.bak-v0-*" | head -1)" "SELECT COUNT(*) FROM disk_stats; PRAGMA user_version;"
-  [ "$output" = $'3\n0' ]
-}
-
-@test "миграция: повторный запуск ничего не меняет и не делает копий" {
-  make_old_db
-  run_monitor --report
-  [ "$status" -eq 0 ]
-  before="$(ls "$TMP_DIR/state" | wc -l)"
-
-  run_monitor --report
-  [ "$status" -eq 0 ]
-  [ "$(ls "$TMP_DIR/state" | wc -l)" = "$before" ]
-  run db_query "PRAGMA user_version;"
-  [ "$output" = "1" ]
-}
 
 @test "новая БД получает user_version = 1 без резервной копии" {
   run_monitor
@@ -643,28 +587,60 @@ SQL
   [ "$status" -ne 0 ]
 }
 
-@test "миграция: --dry-run не меняет старую БД и печатает план" {
-  make_old_db
-  before="$(sha256sum "$TMP_DIR/state/system_monitor.db")"
-
-  run_monitor --dry-run
-  [ "$status" -eq 0 ]
-  plan="$output"
-
-  [ "$(sha256sum "$TMP_DIR/state/system_monitor.db")" = "$before" ]
-  run compgen -G "$TMP_DIR/state/system_monitor.db.bak-*"
-  [ "$status" -ne 0 ]
-  [[ "$plan" == *"[dry-run] будет: миграция БД v0 → v1"* ]]
-  [[ "$plan" == *"будет: резервная копия"*".bak-v0-"* ]]
-  [[ "$plan" == *"таблица disk_stats: 3 строк"* ]]
-  [[ "$plan" == *"таблица cpu_stats: нет, будет создана"* ]]
-}
-
-@test "миграция: --dry-run без базы сообщает о создании новой базы" {
+@test "--dry-run без базы сообщает о создании новой базы" {
   run_monitor --dry-run
   [ "$status" -eq 0 ]
   [[ "$output" == *"[dry-run] будет: создана новая база v1"* ]]
   [ ! -e "$TMP_DIR/state/system_monitor.db" ]
+}
+
+@test "--migrate-db создаёт базу v1 без опроса дисков" {
+  run_monitor --migrate-db
+  [ "$status" -eq 0 ]
+  [ -f "$TMP_DIR/state/system_monitor.db" ]
+
+  run db_query "PRAGMA user_version;"
+  [ "$output" = "1" ]
+  # Опроса не было: ни строк дисков в БД, ни HTML-отчёта
+  run db_query "SELECT COUNT(*) FROM disk_stats;"
+  [ "$output" = "0" ]
+  run compgen -G "$TMP_DIR/system_reports/*.html"
+  [ "$status" -ne 0 ]
+}
+
+@test "--migrate-db --dry-run: план без создания базы" {
+  run_monitor --migrate-db --dry-run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"[dry-run] будет: создана новая база"* ]]
+  [ ! -e "$TMP_DIR/state/system_monitor.db" ]
+}
+
+@test "--migrate-db --dry-run на актуальной базе — без строк «будет:»" {
+  run_monitor --migrate-db
+  [ "$status" -eq 0 ]
+
+  run_monitor --migrate-db --dry-run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"схема БД уже v1"* ]]
+  [[ "$output" != *"[dry-run] будет:"* ]]
+}
+
+@test "--migrate-db и --report несовместимы" {
+  run_monitor --migrate-db --report
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Ключи --migrate-db и --report несовместимы"* ]]
+}
+
+@test "база со схемой старше v1 — отказ без изменений, --dry-run предупреждает" {
+  mkdir -p "$TMP_DIR/state"
+  sqlite3 "$TMP_DIR/state/system_monitor.db" "CREATE TABLE disk_stats (id INTEGER PRIMARY KEY, ts TEXT); PRAGMA user_version = 0;"
+  cp "$TMP_DIR/state/system_monitor.db" "$TMP_DIR/before.db"
+  run_monitor --dry-run
+  [[ "$output" == *"старше поддерживаемой"* ]]
+  run_monitor
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"старше поддерживаемой"* ]]
+  cmp "$TMP_DIR/state/system_monitor.db" "$TMP_DIR/before.db"
 }
 
 # ---------------------------------------------------------------------------
@@ -684,8 +660,7 @@ EOF
 
 seed_own_files() {
   mkdir -p "$TMP_DIR/system_reports"
-  touch "$TMP_DIR/state/system_monitor.db.bak-v0-20200101-000000" \
-    "$TMP_DIR/logs/system_monitor-2020-01-01-00-00-00.jsonl" \
+  touch "$TMP_DIR/logs/system_monitor-2020-01-01-00-00-00.jsonl" \
     "$TMP_DIR/logs/other-2020-01-01-00-00-00.jsonl" \
     "$TMP_DIR/system_reports/system_monitor-2020-01-01-00-00-00.html" \
     "$TMP_DIR/system_reports/foreign.html"
@@ -702,7 +677,7 @@ seed_own_files() {
   [ ! -s "$CHOWN_LOG" ]
 }
 
-@test "FILE_OWNER: от root владелец меняется у БД, логов, отчётов и копий, чужие файлы не трогаются" {
+@test "FILE_OWNER: от root владелец меняется у БД, логов и отчётов, чужие файлы не трогаются" {
   make_chown_stub
   seed_own_files
   printf 'FILE_OWNER="nobodyx:nogroupx"\n' > "$TMP_DIR/conf/system_monitor.conf"
@@ -711,7 +686,6 @@ seed_own_files() {
 
   [ "$status" -eq 0 ]
   grep -q -- "nobodyx:nogroupx .*state/system_monitor.db$" "$CHOWN_LOG"
-  grep -q -- "state/system_monitor.db.bak-v0-" "$CHOWN_LOG"
   grep -q -- "logs/system_monitor-2020-01-01" "$CHOWN_LOG"
   grep -q -- "system_reports/system_monitor-2020-01-01" "$CHOWN_LOG"
   grep -q -- "system_reports/latest.html" "$CHOWN_LOG"

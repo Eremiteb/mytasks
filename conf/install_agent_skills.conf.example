@@ -1,8 +1,8 @@
-# Устройства, на которые install_agent_skills.sh ставит навык model-routing.
+# Устройства, на которые install_agent_skills.sh доставляет AI.md, навыки и хуки.
 # local — это устройство; остальное — имена из ~/.ssh/config или адреса (вход по ключу).
 HOSTS=(local hoster)
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10)
 KEEP_LOGS=10
-# Каталог с источниками навыка и разделов (SKILL.md, section.*.md, хук).
+# Каталог с источниками навыков и хуков; AI.md берётся из ai-md/ рядом со скриптом.
 # @MYTASKS_DIR@ — каталог проекта mytasks
 SKILLS_SRC_DIR="@MYTASKS_DIR@/agent-skills"

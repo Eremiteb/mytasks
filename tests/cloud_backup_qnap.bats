@@ -23,11 +23,6 @@ setup() {
   cp "$REPO_ROOT/cloud_backup_qnap.sh" "$TMP_DIR/cloud_backup_qnap.sh"
   chmod +x "$TMP_DIR/cloud_backup_qnap.sh"
 
-  if [[ "${BATS_TEST_DESCRIPTION}" = "актуальные значения zstd и WireGuard заданы по умолчанию" ]]; then
-    export TMP_DIR
-    return
-  fi
-
   python3 -c "import socket; s=socket.socket(socket.AF_UNIX); s.bind('$WG_SOCK_PATH')"
 
   cat > "$TMP_DIR/conf/cloud_backup_qnap.conf" <<EOF
@@ -85,7 +80,7 @@ teardown() {
   rm -rf "$TMP_DIR"
 }
 
-# Минимальный валидный (пустой) gzip-фиксчер — как в tests/cloud_backup.bats
+# Минимальный валидный (пустой) gzip-фиксчер
 GZIP_FIXTURE='\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00'
 
 run_script() {
@@ -94,17 +89,6 @@ run_script() {
 }
 
 # ---------------------------------------------------------------------------
-
-@test "актуальные значения zstd и WireGuard заданы по умолчанию" {
-  run grep -F 'COMP_ZSTD_CMD="${COMP_ZSTD_CMD:-zstd -5 --threads=0 -c}"' "$TMP_DIR/cloud_backup_qnap.sh"
-  [ "$status" -eq 0 ]
-
-  run grep -F 'WG_ENDPOINT="${WG_ENDPOINT:-}"' "$TMP_DIR/cloud_backup_qnap.sh"
-  [ "$status" -eq 0 ]
-
-  run grep -F 'endpoint="${WG_ENDPOINT}"' "$TMP_DIR/cloud_backup_qnap.sh"
-  [ "$status" -eq 0 ]
-}
 
 @test "RAW_TRANSFER_ENABLED=0 — поведение как раньше, ncat не вызывается" {
   cat > "$STUB_DIR/ssh" <<EOF

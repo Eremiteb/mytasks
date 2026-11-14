@@ -82,6 +82,10 @@ URGENCY="normal"
 #        проверка и включение); link — ссылка в BIN_DIR (параметр — цель в mytasks);
 #        autostart — файл из systemd/autostart/ в AUTOSTART_DIR; conf — конфиг
 #        (параметр — пример); venv — окружение Python (параметр — модули);
+#        db — база SQLite (параметр — команда относительно mytasks с аргументами
+#        через пробел, без eval): проверка — «команда --dry-run» (строка
+#        «[dry-run] будет: …» — база создастся или мигрирует), исправление —
+#        сама команда;
 #        linger — loginctl enable-linger для пользователя: его user-службы
 #        (beufm-recorder.service) работают и без входа в сеанс, с загрузки;
 #        health — служба действительно работает (имя — user-служба без
@@ -102,6 +106,7 @@ URGENCY="normal"
 JOBS=(
     "root-file|system_monitor.sh|system_monitor.sh:lib:0755||Root-копия system_monitor.sh (root:root) в ROOT_LIB_DIR: её запускает системный таймер system-monitor от root, поэтому код вне домашнего каталога и процессы пользователя не могут его подменить. После правки system_monitor.sh в mytasks — «отличается», обновление с подтверждением."
     "root-file|system_monitor.conf|conf/system_monitor.conf,conf/system_monitor.conf.example:conf:0644||Root-копия настроек system_monitor в ROOT_CONF_DIR (из conf/system_monitor.conf, без него — из примера): root-копия скрипта читает только её. Правки conf/system_monitor.conf действуют после обновления копии (с подтверждением)."
+    "db|state/system_monitor.db|system_monitor.sh --migrate-db||База истории опросов system_monitor (SQLite): при развёртывании с нуля создаётся сразу в текущей схеме, существующая приводится к ней. При переносе на новую машину сначала скопируйте прежнюю базу (sqlite3 .backup), иначе история опросов начнётся заново."
     "system-unit|system-monitor.timer|||Опрос SMART дисков, CPU и GPU каждые 6 ч (00, 06, 12, 18 ч; пропущенный запуск догоняется после загрузки), запись в SQLite и HTML-отчёт system_reports/latest.html. Запускается root-копия system_monitor.sh из ROOT_LIB_DIR в песочнице systemd."
     "user-unit|check-backups.timer|||Ежедневная проверка каталогов с архивами резервных копий (наличие, возраст, размер, целостность) с уведомлением в трее. Скрипт check_backups.sh, настройки — conf/check_backups.conf."
     "user-unit|beufm-recorder.service|||Постоянная запись эфира Beu FM: каждый выход песни сохраняется дублем, из трёх дублей собирается лучшая запись (общий участок по отпечаткам fpcalc). Загрузчик берёт её, только если песни нет в источниках MP3. Скрипт music_downloader/beufm_recorder.py, настройки — блок recorder сайта beufm_kz в music_downloader/music_downloader.json."
@@ -113,14 +118,16 @@ JOBS=(
     "user-unit|btrfs-monitor.timer||fs:/=btrfs|Каждые 6 ч (00, 06, 12, 18 ч; пропущенный запуск — после загрузки): проверка счётчиков ошибок Btrfs корневого раздела, уведомление при их росте. Скрипт btrfs_monitor.sh."
     "user-unit|getip.timer|||Через 2 мин после загрузки и каждые 30 мин: проверка внешнего IP-адреса, история изменений. Скрипт getip.sh."
     "no-cron|crontab|music_downloader.sh,sources.sh,btrfs_monitor.sh,getip.sh,utility_bills.sh|cmd:crontab|Скрипты mytasks запускают таймеры systemd, а не cron: оставшаяся от прежней установки строка crontab дала бы второй, параллельный запуск."
-    "user-unit|agent-skills-sync.timer|||Раз в сутки ставит навыки model-routing, best-practices и infosec и раздел «Выбор модели под шаг» для Claude Code, Codex и Gemini на этом устройстве и на удалённых хостах из conf/install_agent_skills.conf (недоступные пропускает до следующего запуска). Скрипт install_agent_skills.sh."
+    "user-unit|agent-skills-sync.timer|||Раз в сутки доставляет AI.md, навыки model-routing, best-practices, infosec и хуки без изменения файлов агентов для Claude Code, Codex и Gemini на этом устройстве и на удалённых хостах из conf/install_agent_skills.conf (недоступные пропускает до следующего запуска). Скрипт install_agent_skills.sh."
     "user-unit|check-store-mount.service|||При входе в графический сеанс проверяет, смонтированы ли точки из /etc/fstab, и показывает уведомление о несмонтированных. Скрипт check-store-mount.sh."
     "conf|conf/check_backups.conf|conf/check_backups.conf.example||Настройки check_backups.sh: каталоги с архивами (BACKUP_DIRS), допустимый возраст и размер архивов."
     "conf|conf/sources.conf|conf/sources.conf.example||Список каталогов для sources.sh: строки «источник, назначение, опции rsync» либо «7z, каталог, каталог архивов, сколько хранить, опции 7z» через вертикальную черту."
     "conf|music_downloader/music_downloader.json|music_downloader/music_downloader.json.example||Настройки загрузчика музыки: сайты, общий список каталогов download_paths, лимит размера."
     "venv|music_downloader/venv|requests,bs4,cloudscraper,mutagen||Виртуальное окружение Python загрузчика музыки: music_downloader/setup_venv.sh ставит зависимости из requirements.txt."
+    "db|music_downloader/music_downloader.db|music_downloader/venv/bin/python music_downloader/music_downloader.py --migrate-db||База загрузчика музыки (SQLite): список скачанного, по которому не качаются повторы. Создаётся в текущей схеме; при переносе сначала скопируйте прежнюю базу (sqlite3 .backup)."
     "conf|utility_bills/utility_bills.json|utility_bills/utility_bills.json.example||Настройки квитанций ЖКУ: почтовый ящик (IMAP), папка, отправители (search.from), каталог PDF, база SQLite, OCR и ступени тарифа электроэнергии. Пароль — в файле или переменной UTILITY_BILLS_IMAP_PASSWORD."
     "venv|utility_bills/venv|numpy,PIL||Виртуальное окружение Python квитанций ЖКУ: utility_bills/setup_venv.sh ставит зависимости из requirements.txt."
+    "db|utility_bills/utility_bills.db|utility_bills.sh --migrate-db||База квитанций ЖКУ (SQLite, права 600): платежи и тарифы. Создаётся в текущей схеме; при переносе сначала скопируйте прежнюю базу (sqlite3 .backup)."
     "root-file|llamactl-root|llamactl/llamactl-root.sh:lib:0755|path:@LLAMA_PREFIX@|Root-хелпер llamactl (root:root) в ROOT_LIB_DIR: через sudo -A llamactl запускает только его — установка models.ini и замена сборки llama.cpp без исполнения кода из домашнего каталога от root."
     "link|llamactl|llamactl/llamactl.sh|path:@LLAMA_PREFIX@|Команда llamactl в ~/.local/bin: управление локальным llama.cpp (модели, VRAM, сервисы, пресеты, обновление)."
     "link|llamactl-tray|llamactl/llamactl_tray.py|path:@LLAMA_PREFIX@|Команда llamactl-tray в ~/.local/bin: значок llama.cpp в трее."
@@ -150,7 +157,7 @@ DEPS=(
     "flock|util-linux;gentoo=sys-apps/util-linux||llamactl.sh: блокировка записи пресетов models.ini"
     "rsync|rsync||sources.sh: синхронизация каталогов"
     "7z|7zip||sources.sh: архивы 7z (строки «7z» в conf/sources.conf)"
-    "zstd|zstd||check_backups.sh (проверка .tar.zst), cloud_backup.sh"
+    "zstd|zstd||check_backups.sh (проверка .tar.zst)"
     "unzip|unzip||unpack-fb2zip.sh, check_backups.sh (проверка .zip)"
     "file|file||cp1251_to_utf8.sh: определение кодировки файлов"
     "gnu:find|findutils||GNU find (-printf): ротация логов во всех скриптах; в busybox (Alpine) его нет"
@@ -164,8 +171,6 @@ DEPS=(
     "yt-dlp|yt-dlp;gentoo=net-misc/yt-dlp|opt|music_downloader: последний источник MP3 — песни YouTube Music"
     "fpcalc|chromaprint;debian=libchromaprint-tools;redhat=chromaprint-tools;suse=chromaprint-fpcalc;gentoo=media-libs/chromaprint|opt|beufm_recorder.py: сравнение дублей эфира по акустическим отпечаткам"
     "pandoc|pandoc;arch=pandoc-cli;alpine=pandoc-cli;gentoo=app-text/pandoc-bin|opt|doc2fb2.sh, mht_to_fb2.py: преобразование документов"
-    "sshpass|sshpass|opt|cloud_backup.sh: вход на сервер по паролю"
-    "wg-quick|wireguard-tools|opt|cloud_backup.sh: туннель WireGuard"
     "py:PyQt6|python3-pyqt6;arch=python-pyqt6;suse=python3-PyQt6;alpine=py3-pyqt6;void=python3-PyQt6;gentoo=dev-python/pyqt6|path:@LLAMA_PREFIX@|llamactl_tray.py: значок в трее (PyQt6 в системном Python)"
 )
 
@@ -1071,6 +1076,7 @@ kind_label() {
         autostart) printf 'автозапуск' ;;
         conf) printf 'конфиг' ;;
         venv) printf 'venv' ;;
+        db) printf 'база данных' ;;
         linger) printf 'linger' ;;
         health) printf 'работа службы' ;;
         root-file) printf 'файл (root)' ;;
@@ -1367,6 +1373,42 @@ eval_venv() {
     fi
 }
 
+# Команда задания db (путь и аргументы через пробел) — в массив DB_ARGV, без eval
+parse_db_cmd() {
+    DB_ARGV=()
+    read -r -a DB_ARGV <<<"$1"
+}
+
+# Проверка базы: «команда --dry-run». Строка «[dry-run] будет: …» — база будет
+# создана или мигрирована; иначе версия из «уже v<N>» и состояние OK
+eval_db() {
+    local i="$1" cmd="$2"
+    local exe out rc=0 state
+    local re_ver='уже v([0-9]+)'
+    parse_db_cmd "${cmd}"
+    exe="${MYTASKS_DIR}/${DB_ARGV[0]:-}"
+    # Нет исполняемого файла: на чистой машине venv создаётся в том же прогоне раньше
+    # (задания venv стоят выше), поэтому исправление остаётся — fix_db проверит команду заново
+    if [[ ! -f "${exe}" || ! -x "${exe}" ]]; then
+        set_row "${i}" "нет" "—" "нет команды" "ВНИМАНИЕ" "нет ${DB_ARGV[0]:-} (сначала окружение/скрипт)" "db" "создать базу после окружения: ${cmd}"
+        return 0
+    fi
+    out="$(timeout 120 "${exe}" "${DB_ARGV[@]:1}" --dry-run 2>&1 </dev/null)" || rc=$?
+    if [[ "${rc}" -ne 0 ]]; then
+        set_row "${i}" "—" "—" "проверка не удалась" "ВНИМАНИЕ" "проверка базы завершилась с кодом ${rc}" "none" ""
+        return 0
+    fi
+    if grep -q '^\[dry-run\] будет:' <<<"${out}"; then
+        set_row "${i}" "нет" "—" "создать/обновить" "ВНИМАНИЕ" "база отсутствует или схема устарела" "db" "создать или обновить базу: ${cmd}"
+        return 0
+    fi
+    state="актуальна"
+    if [[ "${out}" =~ ${re_ver} ]]; then
+        state="схема v${BASH_REMATCH[1]}"
+    fi
+    set_row "${i}" "есть" "—" "${state}" "OK" "" "none" ""
+}
+
 # Каталог назначения root-file по ключу lib|conf
 root_file_dir() {
     if [[ "$1" == "lib" ]]; then
@@ -1428,6 +1470,7 @@ eval_job() {
         autostart) eval_autostart "${i}" "${name}" ;;
         conf) eval_conf "${i}" "${name}" "${arg}" ;;
         venv) eval_venv "${i}" "${name}" "${arg}" ;;
+        db) eval_db "${i}" "${arg}" ;;
         linger) eval_linger "${i}" ;;
         health) eval_health "${i}" "${name}" "${arg}" ;;
         root-file) eval_root_file "${i}" "${name}" "${arg}" ;;
@@ -1584,6 +1627,23 @@ fix_venv() {
     bash "${setup}"
 }
 
+# Создание или обновление базы: та же команда, без --dry-run (от текущего пользователя)
+fix_db() {
+    local i="$1" cmd
+    IFS='|' read -r _ _ cmd _ <<<"${ALL_JOBS[${i}]}"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        say "[dry-run] будет: ${R_ACTION[${i}]}"
+        return 0
+    fi
+    parse_db_cmd "${cmd}"
+    if [[ ! -f "${MYTASKS_DIR}/${DB_ARGV[0]}" || ! -x "${MYTASKS_DIR}/${DB_ARGV[0]}" ]]; then
+        say "База ${R_NAME[${i}]} не создана: нет ${DB_ARGV[0]} (создайте окружение или скрипт и повторите)"
+        return 1
+    fi
+    say "Создаётся или обновляется база ${R_NAME[${i}]}…"
+    "${MYTASKS_DIR}/${DB_ARGV[0]}" "${DB_ARGV[@]:1}"
+}
+
 # Перезапуск зависшей или не писавшей в лог user-службы (вид health)
 fix_health() {
     local i="$1"
@@ -1637,6 +1697,7 @@ fix_job() {
         link) fix_link "${i}" ;;
         autostart) fix_autostart "${i}" ;;
         venv) fix_venv "${i}" ;;
+        db) fix_db "${i}" ;;
         linger) fix_linger "${i}" ;;
         restart) fix_health "${i}" ;;
         root-file) fix_root_file "${i}" ;;

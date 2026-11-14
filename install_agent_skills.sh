@@ -93,12 +93,12 @@ Usage:
   ${SCRIPT_NAME} --dry-run [HOST...]
   ${SCRIPT_NAME} --apply   [HOST...]
 
-Ставит навыки model-routing, best-practices и infosec и раздел «Выбор модели под шаг» для Claude Code,
+Доставляет AI.md и навыки model-routing, best-practices и infosec для Claude Code,
 Codex и Gemini CLI на этом устройстве (local) и на удалённых хостах по ssh.
-Для Claude Code ещё подключает хуки в ~/.claude/settings.json: PreToolUse update_plan
-(~/.claude/hooks/model-routing-plan-guard.py — план без меток [Haiku]/[Opus] у шагов не
-принимается) и UserPromptSubmit (~/.claude/skills/model-routing/remind.py — напоминание
-о навыке на моделях старше Haiku).
+Подключает нативные хуки проверки плана и напоминания: Claude Code
+(PreToolUse/UserPromptSubmit), Codex (PreToolUse/UserPromptSubmit) и Gemini CLI
+(BeforeTool/BeforeAgent). Файлы AGENTS.md, CLAUDE.md и GEMINI.md не меняет.
+Для Codex новый хук требует просмотра и доверия в интерфейсе /hooks.
 Хосты — из HOSTS в conf/${SCRIPT_BASE}.conf либо аргументами.
 
 Options:
@@ -117,68 +117,49 @@ encode_file() {
 
 # Сценарий, который выполняется на целевом устройстве (stdin у bash -s).
 build_payload() {
-  local dry="$1" claude_skill agents_skill claude_section agents_section plan_guard remind
+  local dry="$1" ai_doc claude_skill agents_skill plan_guard remind
   local bp_skill infosec_skill infosec_ref
+  [[ -r "${SCRIPT_DIR}/ai-md/AI.md" ]] || { echo "Error: нет файла ${SCRIPT_DIR}/ai-md/AI.md" >&2; exit 1; }
+  ai_doc="$(base64 -w0 < "${SCRIPT_DIR}/ai-md/AI.md")"
   claude_skill="$(encode_file model-routing/claude.SKILL.md)"
   agents_skill="$(encode_file model-routing/agents.SKILL.md)"
-  claude_section="$(encode_file model-routing/section.claude.md)"
-  agents_section="$(encode_file model-routing/section.agents.md)"
   plan_guard="$(encode_file model-routing/plan-guard.py)"
   remind="$(encode_file model-routing/remind.py)"
   bp_skill="$(encode_file best-practices/SKILL.md)"
   infosec_skill="$(encode_file infosec/SKILL.md)"
   infosec_ref="$(encode_file infosec/reference.md)"
-  printf 'DRY=%s\nCLAUDE_SKILL=%s\nAGENTS_SKILL=%s\nCLAUDE_SECTION=%s\nAGENTS_SECTION=%s\nPLAN_GUARD=%s\nREMIND=%s\nBP_SKILL=%s\nINFOSEC_SKILL=%s\nINFOSEC_REF=%s\n' \
-    "${dry}" "${claude_skill}" "${agents_skill}" "${claude_section}" "${agents_section}" "${plan_guard}" "${remind}" \
+  printf 'DRY=%s\nAI_DOC=%s\nCLAUDE_SKILL=%s\nAGENTS_SKILL=%s\nPLAN_GUARD=%s\nREMIND=%s\nBP_SKILL=%s\nINFOSEC_SKILL=%s\nINFOSEC_REF=%s\n' \
+    "${dry}" "${ai_doc}" "${claude_skill}" "${agents_skill}" "${plan_guard}" "${remind}" \
     "${bp_skill}" "${infosec_skill}" "${infosec_ref}"
   cat <<'PAYLOAD'
+set -euo pipefail
 put() {
-  local dest="$1" b64="$2"
+  local dest="$1" b64="$2" tmp parent
   if [ -f "${dest}" ] && printf '%s' "${b64}" | base64 -d | cmp -s - "${dest}"; then
     echo "[ok] актуален: ${dest}"; return 0
   fi
   if [ "$DRY" -eq 1 ]; then echo "[dry-run] будет: записать ${dest}"; return 0; fi
-  mkdir -p "$(dirname "${dest}")"
-  printf '%s' "${b64}" | base64 -d > "${dest}"
+  parent="$(dirname "${dest}")" || return 1
+  mkdir -p "${parent}" || return 1
+  tmp="$(mktemp "${dest}.tmp.XXXXXX")" || return 1
+  if ! printf '%s' "${b64}" | base64 -d > "${tmp}" || ! mv -f -- "${tmp}" "${dest}"; then
+    rm -f -- "${tmp}"
+    echo "[ошибка] не удалось записать ${dest}" >&2
+    return 1
+  fi
   echo "[готово] записан: ${dest}"
 }
-section() {
-  local file="$1" b64="$2" tmp
-  if [ -f "${file}" ] && grep -q '^## Выбор модели под шаг' "${file}" && ! grep -q 'model-routing:begin' "${file}"; then
-    echo "[ok] раздел уже есть (без маркеров): ${file}"; return 0
-  fi
-  tmp="$(mktemp)"
-  {
-    if [ -f "${file}" ]; then
-      sed '/<!-- model-routing:begin -->/,/<!-- model-routing:end -->/d' "${file}" \
-        | awk '{l[NR]=$0} END{n=NR; while(n>0 && l[n]=="") n--; for(i=1;i<=n;i++) print l[i]}'
-    fi
-    printf '\n<!-- model-routing:begin -->\n'
-    printf '%s' "${b64}" | base64 -d
-    printf '<!-- model-routing:end -->\n'
-  } > "${tmp}"
-  if [ -f "${file}" ] && cmp -s "${tmp}" "${file}"; then
-    echo "[ok] актуален: ${file}"
-  elif [ "$DRY" -eq 1 ]; then
-    echo "[dry-run] будет: обновить раздел в ${file}"
-  else
-    mkdir -p "$(dirname "${file}")"
-    cat "${tmp}" > "${file}"
-    echo "[готово] обновлён раздел: ${file}"
-  fi
-  rm -f "${tmp}"
-}
-# Хук Claude Code в ~/.claude/settings.json: одна запись на событие, без дублей (поиск по
-# метке marker в command), остальные настройки и хуки не трогаются; перед записью —
-# копия settings.json.bak-model-routing. Аргументы: файл, событие, matcher ("" — без него),
-# команда, метка, тайм-аут, statusMessage ("" — без него).
+# JSON-хук платформы: одна запись на событие, без дублей (метка в command).
+# Другие настройки не трогаются, перед записью создаётся .bak-model-routing.
+# Тайм-аут — в единицах платформы: секунды Claude/Codex, миллисекунды Gemini.
+# Аргументы: файл, событие, matcher, команда, метка, тайм-аут, statusMessage.
 hook() {
   local settings="$1" event="$2" matcher="$3" command="$4" marker="$5" timeout="$6" status="$7"
   if ! command -v python3 >/dev/null 2>&1; then
-    echo "[пропуск] нет python3: хуки не подключены"; return 0
+    echo "[ошибка] нет python3: хуки не подключены" >&2; return 1
   fi
   python3 -I - "$settings" "$event" "$matcher" "$command" "$marker" "$timeout" "$status" "$DRY" <<'PY'
-import json, os, shutil, sys
+import json, os, shutil, sys, tempfile
 
 path, event, matcher, command, marker, timeout, status, dry = sys.argv[1:9]
 dry = dry == "1"
@@ -194,8 +175,8 @@ try:
 except FileNotFoundError:
     data = {}
 except ValueError:
-    print(f"[ошибка] {path}: неверный JSON, хук {event} не подключён")
-    sys.exit(0)
+    print(f"[ошибка] {path}: неверный JSON, хук {event} не подключён", file=sys.stderr)
+    sys.exit(1)
 pre = data.setdefault("hooks", {}).setdefault(event, [])
 idx = [i for i, e in enumerate(pre)
        if any(marker in str(h.get("command", "")) for h in e.get("hooks", []))]
@@ -212,11 +193,15 @@ pre.insert(pos, want)
 if os.path.exists(path):
     shutil.copy2(path, path + ".bak-model-routing")
 os.makedirs(os.path.dirname(path), exist_ok=True)
-tmp = path + ".tmp-model-routing"
-with open(tmp, "w", encoding="utf-8") as f:
-    json.dump(data, f, ensure_ascii=False, indent=2)
-    f.write("\n")
-os.replace(tmp, path)
+fd, tmp = tempfile.mkstemp(prefix=".model-routing-", dir=os.path.dirname(path))
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+finally:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
 print(f"[готово] подключён хук {event}: {path}")
 PY
 }
@@ -233,7 +218,6 @@ if [ -d "$HOME/.claude" ]; then
   put "$HOME/.claude/skills/model-routing/SKILL.md" "$CLAUDE_SKILL"
   put "$HOME/.claude/skills/model-routing/remind.py" "$REMIND"
   skills_common "$HOME/.claude/skills"
-  section "$HOME/.claude/CLAUDE.md" "$CLAUDE_SECTION"
   put "$HOME/.claude/hooks/model-routing-plan-guard.py" "$PLAN_GUARD"
   hook "$HOME/.claude/settings.json" PreToolUse mcp__ccd_turn__update_plan \
     "python3 -I ${HOME}/.claude/hooks/model-routing-plan-guard.py" model-routing-plan-guard 10 \
@@ -246,8 +230,24 @@ if [ -d "$HOME/.codex" ] || [ -d "$HOME/.gemini" ] || [ -d "$HOME/.agents" ]; th
   put "$HOME/.agents/skills/model-routing/SKILL.md" "$AGENTS_SKILL"
   skills_common "$HOME/.agents/skills"
 fi
-if [ -d "$HOME/.codex" ]; then section "$HOME/.codex/AGENTS.md" "$AGENTS_SECTION"; fi
-if [ -d "$HOME/.gemini" ]; then section "$HOME/.gemini/GEMINI.md" "$AGENTS_SECTION"; fi
+if [ -d "$HOME/.codex" ]; then
+  put "$HOME/.codex/hooks/model-routing-plan-guard.py" "$PLAN_GUARD"
+  put "$HOME/.codex/hooks/model-routing-remind.py" "$REMIND"
+  hook "$HOME/.codex/hooks.json" PreToolUse update_plan \
+    "python3 -I ${HOME}/.codex/hooks/model-routing-plan-guard.py" model-routing-plan-guard 10 \
+    "Проверка меток модели в плане"
+  hook "$HOME/.codex/hooks.json" UserPromptSubmit "" \
+    "python3 -I ${HOME}/.codex/hooks/model-routing-remind.py" model-routing-remind 5 ""
+fi
+if [ -d "$HOME/.gemini" ]; then
+  put "$HOME/.gemini/hooks/model-routing-plan-guard.py" "$PLAN_GUARD"
+  put "$HOME/.gemini/hooks/model-routing-remind.py" "$REMIND"
+  hook "$HOME/.gemini/settings.json" BeforeTool write_todos \
+    "python3 -I ${HOME}/.gemini/hooks/model-routing-plan-guard.py" model-routing-plan-guard 10000 ""
+  hook "$HOME/.gemini/settings.json" BeforeAgent "" \
+    "python3 -I ${HOME}/.gemini/hooks/model-routing-remind.py" model-routing-remind 5000 ""
+fi
+if [ "$found" -eq 1 ]; then put "$HOME/.config/ai-context/AI.md" "$AI_DOC"; fi
 if [ "$found" -eq 0 ]; then echo "[пропуск] нет ~/.claude, ~/.codex, ~/.gemini, ~/.agents"; fi
 PAYLOAD
 }

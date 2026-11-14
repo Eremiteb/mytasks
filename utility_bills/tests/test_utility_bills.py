@@ -161,6 +161,16 @@ def test_migrate_dry_run_creates_nothing(tmp_path):
     assert lines and lines[0].startswith("[dry-run] будет:")
 
 
+def test_migrate_dry_run_on_current_schema_reports_no_changes(tmp_path):
+    path = tmp_path / "bills.db"
+    ub.migrate_database(path, out=noop)
+    lines = []
+    ub.migrate_database(path, dry_run=True, out=lines.append)
+    assert len(lines) == 1
+    assert lines[0].startswith(f"[dry-run] схема БД уже v{ub.DB_LATEST}")
+    assert "будет:" not in lines[0]
+
+
 def test_save_bill_replaces_same_period(tmp_path):
     path = tmp_path / "bills.db"
     ub.migrate_database(path, out=noop)

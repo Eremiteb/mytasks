@@ -74,7 +74,7 @@ last_log() {
   cp "$STUB_DIR/notify-send" "$iso/notify-send"
   for _cmd in bash env date mkdir ls tail rm sed grep tr awk mktemp basename dirname cat printf cp; do
     _bin="$(command -v "$_cmd" 2>/dev/null)"
-    [ -n "$_bin" ] && ln -sf "$_bin" "$iso/$_cmd" || true
+    if [ -n "$_bin" ]; then ln -sf "$_bin" "$iso/$_cmd"; fi
   done
 
   run env PATH="$iso" bash "$TMP_DIR/btrfs_monitor.sh"

@@ -15,6 +15,9 @@ MOUNT_POLL_SECS=3
 # Точки из /etc/fstab, которые не проверяются (расширенное регулярное выражение по пути точки)
 MOUNT_IGNORE_REGEX='^/(proc|sys|dev|run|tmp|boot)'
 
+# Таблица точек монтирования (по умолчанию /etc/fstab)
+# FSTAB_FILE=/etc/fstab
+
 # Сколько последних JSONL-логов хранить (по умолчанию — общее значение из conf/log_template.conf, 10)
 # KEEP_LOGS=10
 

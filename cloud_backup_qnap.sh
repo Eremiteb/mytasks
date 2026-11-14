@@ -1,19 +1,18 @@
 #!/opt/bin/bash
 ###############################################################################
-# QNAP-версия cloud_backup.sh
+# cloud_backup_qnap.sh — резервное копирование /opt/esimych-cloud с удалённого
+# сервера через WireGuard VPN, запускаемое НА САМОМ QNAP NAS (Task Scheduler /
+# Entware cron).
 #
-# Резервное копирование /opt/esimych-cloud с удалённого сервера через
-# WireGuard VPN, запускаемая НА САМОМ QNAP NAS (Task Scheduler / Entware cron).
-#
-# Отличия от десктопной версии (cloud_backup.sh):
+# Особенности:
 #   - shebang указывает на Entware bash (/opt/bin/bash) напрямую — обычный
 #     на QNAP #!/bin/sh/#!/bin/ash не поддерживает массивы/local/${!var},
 #     которые использует скрипт. Если Entware ставит bash по другому пути,
 #     поправьте shebang или создайте симлинк: ln -s <путь> /opt/bin/bash;
 #   - PATH дополнен /opt/sbin:/opt/bin (Entware), т.к. QTS сам по себе не
 #     содержит wg-quick, wg, zstd и т.п.;
-#   - убран весь sudo-код: Task Scheduler и Entware cron на QNAP и так
-#     выполняют скрипт от root, sudo не требуется и обычно не установлен;
+#   - sudo не используется: Task Scheduler и Entware cron на QNAP и так
+#     выполняют скрипт от root; sudo обычно не установлен;
 #   - подсказки по установке недостающих утилит даются через opkg, а не pacman.
 #
 # ПРЕДВАРИТЕЛЬНАЯ НАСТРОЙКА НА QNAP (сделать один раз вручную):

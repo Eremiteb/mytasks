@@ -1,5 +1,5 @@
 [Unit]
-Description=Установка навыка model-routing для Claude Code, Codex и Gemini на всех устройствах
+Description=Доставка AI.md, навыков и хуков для Claude Code, Codex и Gemini на всех устройствах
 Documentation=file://@MYTASKS_DIR@/README.md
 
 [Service]

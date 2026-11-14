@@ -857,6 +857,8 @@ def migrate_database(path: Path | str, dry_run: bool = False, out: Callable[[str
             version = conn.execute("PRAGMA user_version").fetchone()[0]
             if version < DB_LATEST:
                 out(f"[dry-run] будет: миграция БД v{version} → v{DB_LATEST} с резервной копией {_backup_path(path, version)}")
+            else:
+                out(f"[dry-run] схема БД уже v{version} (последняя v{DB_LATEST}), изменений нет")
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():

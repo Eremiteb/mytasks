@@ -1,44 +1,44 @@
 #!/usr/bin/env python3
-"""Хук PreToolUse для update_plan: каждый шаг плана должен иметь метку класса модели.
-
-Правило «Выбор модели под шаг» (навык model-routing) требует при составлении плана
-отнести каждый шаг к классу. Хук отклоняет план (код 2, причина — агенту в stderr),
-если у пункта нет префикса [Haiku] или [Opus]. Вызовы без списка шагов
-(advance/done/start) пропускаются. Любая собственная ошибка хука — код 0: сломанный
-хук не должен блокировать работу.
-
-Ставится install_agent_skills.sh в ~/.claude/hooks/model-routing-plan-guard.py.
-"""
+"""Отклоняет план без меток модели; ошибки самого хука не блокируют агента."""
 
 import json
 import re
 import sys
 
-TAG_RE = re.compile(r"^\[(Haiku|Opus)\]\s+\S")
-
-REASON = (
-    "План не принят: у каждого шага update_plan должна быть метка класса модели в начале — "
-    "[Haiku] вся рутина: механика и типовая разработка по плану (документация, граф, коммит/пуш, чтение, правки), "
-    "[Opus] решения, сложная диагностика и необратимое (службы, удаление, миграции, боевые запуски). "
-    "Таблица и способы переключения — навык model-routing (~/.claude/skills/model-routing/SKILL.md). "
-    "Повтори update_plan с метками; самодостаточные шаги [Haiku] отдай подагенту Agent с model haiku по точному плану (Sonnet не использовать), "
-    "для серии таких шагов в основной сессии один раз предложи пользователю /model."
-)
+CLAUDE_TAG = re.compile(r"^\[(?:Haiku|Opus)\]\s+\S")
+MODEL_TAG = re.compile(r"^\[[A-Za-z][A-Za-z0-9._/-]+\]\s+\S")
+REASON = ("План не принят: каждый шаг должен начинаться меткой модели. "
+          "Claude: [Haiku] или [Opus]; Codex и Gemini: точный идентификатор "
+          "доступной модели в квадратных скобках. Сверь каталог и повтори план.")
 
 
 def main() -> int:
     try:
         data = json.load(sys.stdin)
-        items = (data.get("tool_input") or {}).get("items")
-    except (ValueError, AttributeError):
+        tool_input = data.get("tool_input") if isinstance(data, dict) else None
+    except (OSError, ValueError):
         return 0
-    if not isinstance(items, list):
+    if not isinstance(tool_input, dict):
         return 0
-    bad = [str(it.get("content", "")) for it in items
-           if isinstance(it, dict) and not TAG_RE.match(str(it.get("content", "")))]
+    if isinstance(tool_input.get("items"), list):
+        steps, fields, tag = tool_input["items"], ("content",), CLAUDE_TAG
+    elif isinstance(tool_input.get("plan"), list):
+        steps, fields, tag = tool_input["plan"], ("step",), MODEL_TAG
+    elif isinstance(tool_input.get("todos"), list):
+        steps, fields, tag = tool_input["todos"], ("description", "content", "task"), MODEL_TAG
+    else:
+        return 0
+    bad = []
+    for item in steps:
+        if not isinstance(item, dict):
+            continue
+        content = next((str(item[field]) for field in fields if field in item), "")
+        if not tag.match(content):
+            bad.append(content)
     if not bad:
         return 0
-    print(REASON + " Шаги без метки: " + "; ".join(f"«{c[:60]}»" for c in bad[:6]), file=sys.stderr)
+    print(REASON + " Шаги без метки: " + "; ".join(f"«{step[:60]}»" for step in bad[:6]),
+          file=sys.stderr)
     return 2
 
 

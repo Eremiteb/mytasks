@@ -238,8 +238,9 @@ trim() {
   printf '%s' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
 }
 
-# Переносит содержимое каталога src в каталог dst (при конфликте имён добавляет
-# числовой суффикс, как и при раскладке файлов); пустой src затем удаляется.
+# Переносит содержимое каталога src в каталог dst (при конфликте имён файлов остаётся
+# больший, при равном размере — уже лежащий; для папок — числовой суффикс); пустой src
+# затем удаляется.
 merge_dir_into() {
   src="$1"
   dst="$2"
@@ -249,8 +250,15 @@ merge_dir_into() {
     item_name=$(basename -- "${item}")
     item_safe=$(win_safe_name "${item_name}")
     [ -n "${item_safe}" ] || item_safe="${item_name}"
-    item_free=$(free_name "${dst}" "${item_safe}")
-    item_dst="${dst}/${item_free}"
+    item_dst="${dst}/${item_safe}"
+    if [ -f "${item}" ] && [ -f "${item_dst}" ]; then
+      # Одноимённые файлы при слиянии папок: остаётся больший (без суффикса .N)
+      resolve_name_conflict "${item}" "${item_dst}"
+      [ "${CONFLICT_MOVE_SRC}" -eq 1 ] || continue
+    elif [ -e "${item_dst}" ]; then
+      item_free=$(free_name "${dst}" "${item_safe}")
+      item_dst="${dst}/${item_free}"
+    fi
     if [ "${DRY_RUN}" -eq 1 ] || mv -f -- "${item}" "${item_dst}"; then
       log_action "INFO" "moved_item" "Файл перемещен при объединении папок" "${item} -> ${item_dst}"
     fi
@@ -774,7 +782,8 @@ do_rmdir() {
 
 # Переименовывает запись path в допустимое для Windows имя. Папка, у которой имя
 # после исправления совпадает (без учёта регистра) с существующей папкой,
-# объединяется с ней; файл при конфликте получает суффикс .N.
+# объединяется с ней; файл при конфликте с одноимённым файлом — остаётся больший
+# (resolve_name_conflict), иначе суффикс .N.
 rename_safe() {
   path="$1"
   dir=$(dirname -- "${path}")
@@ -790,8 +799,14 @@ rename_safe() {
     log_action "INFO" "renamed_safe" "Папка с недопустимым для Windows именем объединена с существующей" "${path} -> ${dir}/${existing}"
     return 0
   fi
-  new_free=$(free_name "${dir}" "${new}")
-  target="${dir}/${new_free}"
+  target="${dir}/${new}"
+  if [ -f "${path}" ] && [ -f "${target}" ]; then
+    resolve_name_conflict "${path}" "${target}"
+    [ "${CONFLICT_MOVE_SRC}" -eq 1 ] || return 0
+  elif [ -e "${target}" ]; then
+    new_free=$(free_name "${dir}" "${new}")
+    target="${dir}/${new_free}"
+  fi
   if [ "${DRY_RUN}" -eq 1 ] || mv -f -- "${path}" "${target}"; then
     log_action "INFO" "renamed_safe" "Имя приведено к допустимому для Windows" "${path} -> ${target}"
   fi
@@ -821,6 +836,25 @@ resolve_case_files() {
       log_action "INFO" "${dup_event}" "Удалён файл меньшего размера, ${dup_reason} (${candidate_size} Б, оставлен ${keep_size} Б)" "${candidate} (оставлен ${keep})"
     fi
   done < "${group_file}"
+}
+
+# Конфликт имён файлов: src переносится на место dst, а dst уже есть. Остаётся
+# больший, при равном размере — dst (уже лежащий); меньший удаляется через
+# resolve_case_files (в dry-run — только план). Результат — в CONFLICT_MOVE_SRC:
+# 1 — src нужно переместить на место dst (dst уже удалён), 0 — src удалён.
+# Необязательные event и reason передаются в resolve_case_files.
+resolve_name_conflict() {
+  _rc_src_size=$(stat -c %s -- "$1")
+  _rc_dst_size=$(stat -c %s -- "$2")
+  _rc_group="$(mktemp)"
+  printf '%s\n%s\n' "$2" "$1" > "${_rc_group}"
+  resolve_case_files "${_rc_group}" "${3:-name_dup_removed}" "${4:-одноимённый с оставленным}"
+  rm -f -- "${_rc_group}"
+  CONFLICT_MOVE_SRC=0
+  if [ "${_rc_src_size}" -gt "${_rc_dst_size}" ]; then
+    CONFLICT_MOVE_SRC=1
+  fi
+  return 0
 }
 
 # Приводит к допустимым в Windows имена всех записей внутри каталога parent на любой
@@ -1041,14 +1075,9 @@ process_directory() {
         fi
       done
       if [ -n "${tag_other}" ]; then
-        tag_src_size=$(stat -c %s -- "${file}")
-        tag_other_size=$(stat -c %s -- "${tag_other}")
-        tag_group="$(mktemp)"
-        printf '%s\n%s\n' "${tag_other}" "${file}" > "${tag_group}"
-        resolve_case_files "${tag_group}" "tag_dup_removed" "одноимённый по тегам с оставленным"
-        rm -f -- "${tag_group}"
+        resolve_name_conflict "${file}" "${tag_other}" "tag_dup_removed" "одноимённый по тегам с оставленным"
         # Исходник не больше уже лежащего — он удалён (в dry-run — по плану)
-        [ "${tag_src_size}" -gt "${tag_other_size}" ] || continue
+        [ "${CONFLICT_MOVE_SRC}" -eq 1 ] || continue
       fi
       tag_free="${tag_name}"
       # В dry-run файл не трогаем: дальше план строится для нового имени
@@ -1083,8 +1112,15 @@ process_directory() {
     do_mkdir "${target_dir}"
     echo "${target_dir}" >> "${CREATED_DIRS_FILE}"
 
-    free=$(free_name "${target_dir}" "${new_name}")
-    dst="${target_dir}/${free}"
+    dst="${target_dir}/${new_name}"
+    # Одноимённый файл уже в папке исполнителя: остаётся больший (без суффикса .N)
+    if [ -f "${dst}" ]; then
+      resolve_name_conflict "${file}" "${dst}"
+      [ "${CONFLICT_MOVE_SRC}" -eq 1 ] || continue
+    elif [ -e "${dst}" ]; then
+      free=$(free_name "${target_dir}" "${new_name}")
+      dst="${target_dir}/${free}"
+    fi
 
     if [ "${DRY_RUN}" -eq 1 ] || mv -f -- "${file}" "${dst}"; then
       log_action "INFO" "moved" "Файл перемещен" "${name} -> ${dst}"

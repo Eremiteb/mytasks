@@ -230,7 +230,7 @@ def migrate_database(path, dry_run=False, out=None):
             if not _user_tables(conn):
                 out(f"[dry-run] будет: создана новая база v{DB_LATEST}: {path}")
             elif version >= DB_LATEST:
-                out(f"[dry-run] будет: ничего, схема БД уже v{version} (последняя v{DB_LATEST})")
+                out(f"[dry-run] схема БД уже v{version} (последняя v{DB_LATEST}), изменений нет")
             else:
                 for line in _plan_lines(conn, path, version):
                     out(f"[dry-run] будет: {line}")

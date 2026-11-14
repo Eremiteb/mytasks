@@ -24,16 +24,30 @@ teardown() {
   [ -f "$TMP_DIR/music/Artist/Artist - Song.mp3" ]
 }
 
-@test "adds numeric suffix on name conflict" {
+@test "name conflict keeps the larger file" {
   mkdir -p "$TMP_DIR/music/Artist"
-  touch "$TMP_DIR/music/Artist/Artist - Song.mp3"
-  touch "$TMP_DIR/music/Artist - Song.mp3"
+  printf 'small' > "$TMP_DIR/music/Artist/Artist - Song.mp3"
+  printf 'bigger-file' > "$TMP_DIR/music/Artist - Song.mp3"
 
   run bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
 
   [ "$status" -eq 0 ]
-  [ -f "$TMP_DIR/music/Artist/Artist - Song.mp3" ]
-  [ -f "$TMP_DIR/music/Artist/Artist - Song.mp3.1" ]
+  [ "$(cat "$TMP_DIR/music/Artist/Artist - Song.mp3")" = "bigger-file" ]
+  [ ! -e "$TMP_DIR/music/Artist/Artist - Song.mp3.1" ]
+  [ ! -e "$TMP_DIR/music/Artist - Song.mp3" ]
+}
+
+@test "name conflict with equal size removes the new file" {
+  mkdir -p "$TMP_DIR/music/Artist"
+  printf 'old1' > "$TMP_DIR/music/Artist/Artist - Song.mp3"
+  printf 'new2' > "$TMP_DIR/music/Artist - Song.mp3"
+
+  run bash "$TMP_DIR/split_by_dash.sh" "$TMP_DIR/music"
+
+  [ "$status" -eq 0 ]
+  [ "$(cat "$TMP_DIR/music/Artist/Artist - Song.mp3")" = "old1" ]
+  [ ! -e "$TMP_DIR/music/Artist/Artist - Song.mp3.1" ]
+  [ ! -e "$TMP_DIR/music/Artist - Song.mp3" ]
 }
 
 @test "merges case-variant folders into the one matching the artist case" {

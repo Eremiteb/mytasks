@@ -463,7 +463,10 @@ health_log() {  # $1 — время последней записи (date -d), $
   for pair in 'opensuse-tumbleweed:zypper --non-interactive dup' 'void:xbps-install -Syu' 'gentoo:emerge --update --deep --newuse --ask=n @world' 'solus:eopkg upgrade -y' 'opensuse-microos:transactional-update --non-interactive dup'; do
     printf 'ID=%s\nPRETTY_NAME="T"\n' "${pair%%:*}" > "$STATE/os-release"
     : > "$CALLS"
-    "$WORK/check_mytasks.sh" --yes --no-gui >/dev/null 2>&1 || true
+    rc=0
+    "$WORK/check_mytasks.sh" --yes --no-gui >/dev/null 2>&1 || rc=$?
+    # 0 — всё на месте, 1 — остались проблемы; 2 и выше — ошибка аргументов или сбой
+    [ "$rc" -le 1 ] || { echo "код ${rc} для ${pair%%:*}"; return 1; }
     grep -qF -- "${pair#*:}" "$CALLS" || { echo "нет «${pair#*:}» для ${pair%%:*}"; cat "$CALLS"; return 1; }
   done
 }
@@ -713,4 +716,68 @@ health_log() {  # $1 — время последней записи (date -d), $
   run "$WORK/check_mytasks.sh" __root-install-units "$SYS_UNITS" "$ROOT_LIB" "$ROOT_CONFD" "$WORK" sysdemo.timer
   [ "$status" -eq 0 ]
   [ -f "$SYS_UNITS/sysdemo.timer" ]
+}
+
+# Стаб базы: с --dry-run печатает план, пока нет $DEMO_DB; без --dry-run создаёт её
+db_stub() {
+  mkdir -p "$WORK/bin"
+  export DEMO_DB="$WORK/demo.db"
+  cat > "$WORK/bin/demo-db" <<'EOT2'
+#!/usr/bin/env bash
+dry=0
+for a in "$@"; do [[ "$a" == "--dry-run" ]] && dry=1; done
+if [[ "${dry}" -eq 1 ]]; then
+  if [[ -f "${DEMO_DB}" ]]; then
+    echo "[dry-run] схема БД уже v1 (последняя v1), изменений нет"
+  else
+    echo "[dry-run] будет: создана новая база v1: x"
+  fi
+  exit 0
+fi
+touch "${DEMO_DB}"
+echo "создана"
+EOT2
+  chmod +x "$WORK/bin/demo-db"
+}
+
+@test "db: нет базы — ВНИМАНИЕ, --dry-run только план, --yes создаёт, затем OK" {
+  db_stub
+  write_conf '"db|demo.db|bin/demo-db --migrate-db||Демо-база"' ""
+  run "$WORK/check_mytasks.sh" --status
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"ВНИМАНИЕ"* ]]
+  [[ "$output" == *"база данных"* ]]
+  run "$WORK/check_mytasks.sh" --dry-run --no-gui
+  [[ "$output" == *"[dry-run] будет: создать или обновить базу"* ]]
+  [ ! -e "$WORK/demo.db" ]
+  run "$WORK/check_mytasks.sh" --yes --no-gui
+  [ -e "$WORK/demo.db" ]
+  run "$WORK/check_mytasks.sh" --status
+  [[ "$output" == *"demo.db"*"схема v1"*"OK"* ]]
+}
+
+@test "db: команда не найдена — ВНИМАНИЕ без сбоя" {
+  write_conf '"db|missing.db|bin/нет-такой --migrate-db||Демо-база без команды"' ""
+  run "$WORK/check_mytasks.sh" --status
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"нет bin/нет-такой"* ]]
+  [[ "$output" == *"ВНИМАНИЕ"* ]]
+}
+
+@test "db: проверка с ошибкой — ВНИМАНИЕ" {
+  mkdir -p "$WORK/bin"
+  printf '#!/usr/bin/env bash\nexit 3\n' > "$WORK/bin/demo-db"
+  chmod +x "$WORK/bin/demo-db"
+  write_conf '"db|demo.db|bin/demo-db --migrate-db||Демо-база"' ""
+  run "$WORK/check_mytasks.sh" --status
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"кодом 3"* ]]
+  [[ "$output" == *"ВНИМАНИЕ"* ]]
+}
+
+@test "db: --yes без команды — сообщение, база не создана" {
+  write_conf '"db|demo.db|bin/нет-такой --migrate-db||Демо-база"' ""
+  run "$WORK/check_mytasks.sh" --yes --no-gui
+  [[ "$output" == *"не создана: нет bin/нет-такой"* ]]
+  [ ! -e "$WORK/demo.db" ]
 }

@@ -60,13 +60,17 @@ teardown() {
   printf '#!/usr/bin/env bash\nexit 1\n' > "$STUB_DIR/mountpoint"
   chmod +x "$STUB_DIR/mountpoint"
 
-  run env PATH="$STUB_DIR:$PATH" MOUNT_WAIT_SECS=0 MOUNT_IGNORE_REGEX='^/(proc|sys|dev|run|tmp)' bash "$REPO_ROOT/check-store-mount.sh"
+  printf 'server:/share /mnt/fake-store nfs defaults 0 0\n' > "$TMP_DIR/fstab"
+  run env PATH="$STUB_DIR:$PATH" MOUNT_WAIT_SECS=0 MOUNT_IGNORE_REGEX='^/(proc|sys|dev|run|tmp)' FSTAB_FILE="$TMP_DIR/fstab" bash "$REPO_ROOT/check-store-mount.sh"
 
-  # В /etc/fstab этой машины есть точки вне исключений; при отсутствии таких записей тест неинформативен
-  if grep -qE '^[^#[:space:]]+[[:space:]]+/' /etc/fstab; then
-    [ "$status" -eq 1 ]
-    [[ "$output" == *"Ошибка: не смонтированы"* ]]
-  fi
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"Ошибка: не смонтированы"* ]]
+}
+
+@test "нечитаемый FSTAB_FILE — код 2 и сообщение" {
+  run env PATH="$STUB_DIR:$PATH" FSTAB_FILE="$TMP_DIR/нет-такого" bash "$REPO_ROOT/check-store-mount.sh"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"не читается"* ]]
 }
 
 @test "KEEP_LOGS: лишние JSONL-логи удаляются по заданному числу" {
