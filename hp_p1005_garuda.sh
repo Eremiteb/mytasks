@@ -155,7 +155,7 @@ warn() {
 }
 
 need_cmd() {
-  command -v "${1}" >/dev/null 2>&1 || die "Command not found: ${1}"
+  command -v "${1}" >/dev/null 2>&1 || die "Не найдена команда: ${1}"
 }
 
 # -------------------------
@@ -304,7 +304,7 @@ main() {
     run_gui
     print_test
   else
-    die "Only --all is supported in this version"
+    die "Неизвестный аргумент: допустимы --all и -n/--dry-run"
   fi
 
   # Итоговое сообщение — до log_close: после закрытия дескриптора запись в лог

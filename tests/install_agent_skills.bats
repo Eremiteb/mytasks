@@ -118,6 +118,7 @@ EOF
     cmp "$base/best-practices/SKILL.md" "$TMP_DIR/agent-skills/best-practices/SKILL.md"
     cmp "$base/infosec/SKILL.md" "$TMP_DIR/agent-skills/infosec/SKILL.md"
     cmp "$base/infosec/reference.md" "$TMP_DIR/agent-skills/infosec/reference.md"
+    cmp "$base/music-library-merge/SKILL.md" "$TMP_DIR/agent-skills/music-library-merge/SKILL.md"
   done
   cmp "$HOME/.config/ai-context/AI.md" "$TMP_DIR/ai-md/AI.md"
   [ ! -e "$HOME/.claude/CLAUDE.md" ]

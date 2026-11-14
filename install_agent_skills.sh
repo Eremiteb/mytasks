@@ -93,7 +93,7 @@ Usage:
   ${SCRIPT_NAME} --dry-run [HOST...]
   ${SCRIPT_NAME} --apply   [HOST...]
 
-Доставляет AI.md и навыки model-routing, best-practices и infosec для Claude Code,
+Доставляет AI.md и навыки model-routing, best-practices, infosec и music-library-merge для Claude Code,
 Codex и Gemini CLI на этом устройстве (local) и на удалённых хостах по ssh.
 Подключает нативные хуки проверки плана и напоминания: Claude Code
 (PreToolUse/UserPromptSubmit), Codex (PreToolUse/UserPromptSubmit) и Gemini CLI
@@ -118,7 +118,7 @@ encode_file() {
 # Сценарий, который выполняется на целевом устройстве (stdin у bash -s).
 build_payload() {
   local dry="$1" ai_doc claude_skill agents_skill plan_guard remind
-  local bp_skill infosec_skill infosec_ref
+  local bp_skill infosec_skill infosec_ref mlm_skill
   [[ -r "${SCRIPT_DIR}/ai-md/AI.md" ]] || { echo "Error: нет файла ${SCRIPT_DIR}/ai-md/AI.md" >&2; exit 1; }
   ai_doc="$(base64 -w0 < "${SCRIPT_DIR}/ai-md/AI.md")"
   claude_skill="$(encode_file model-routing/claude.SKILL.md)"
@@ -128,9 +128,10 @@ build_payload() {
   bp_skill="$(encode_file best-practices/SKILL.md)"
   infosec_skill="$(encode_file infosec/SKILL.md)"
   infosec_ref="$(encode_file infosec/reference.md)"
-  printf 'DRY=%s\nAI_DOC=%s\nCLAUDE_SKILL=%s\nAGENTS_SKILL=%s\nPLAN_GUARD=%s\nREMIND=%s\nBP_SKILL=%s\nINFOSEC_SKILL=%s\nINFOSEC_REF=%s\n' \
+  mlm_skill="$(encode_file music-library-merge/SKILL.md)"
+  printf 'DRY=%s\nAI_DOC=%s\nCLAUDE_SKILL=%s\nAGENTS_SKILL=%s\nPLAN_GUARD=%s\nREMIND=%s\nBP_SKILL=%s\nINFOSEC_SKILL=%s\nINFOSEC_REF=%s\nMLM_SKILL=%s\n' \
     "${dry}" "${ai_doc}" "${claude_skill}" "${agents_skill}" "${plan_guard}" "${remind}" \
-    "${bp_skill}" "${infosec_skill}" "${infosec_ref}"
+    "${bp_skill}" "${infosec_skill}" "${infosec_ref}" "${mlm_skill}"
   cat <<'PAYLOAD'
 set -euo pipefail
 put() {
@@ -205,12 +206,13 @@ finally:
 print(f"[готово] подключён хук {event}: {path}")
 PY
 }
-# Навыки best-practices и infosec — одинаковые для Claude Code и для ~/.agents (Codex, Gemini)
+# Навыки best-practices, infosec и music-library-merge — одинаковые для Claude Code и для ~/.agents (Codex, Gemini)
 skills_common() {
   local base="$1"
   put "${base}/best-practices/SKILL.md" "$BP_SKILL"
   put "${base}/infosec/SKILL.md" "$INFOSEC_SKILL"
   put "${base}/infosec/reference.md" "$INFOSEC_REF"
+  put "${base}/music-library-merge/SKILL.md" "$MLM_SKILL"
 }
 found=0
 if [ -d "$HOME/.claude" ]; then

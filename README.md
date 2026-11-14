@@ -704,11 +704,11 @@ sudo ./hp_p1005_garuda.sh --all
 
 ### `install_agent_skills.sh`
 
-Копирует единый источник требований `ai-md/AI.md` в `~/.config/ai-context/AI.md` на выбранных хостах и устанавливает навыки `model-routing`, `best-practices`, `infosec` для Claude Code, Codex и Gemini CLI. Глобальные и проектные `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` остаются короткими ссылками на `AI.md`; установщик их не меняет.
+Копирует единый источник требований `ai-md/AI.md` в `~/.config/ai-context/AI.md` на выбранных хостах и устанавливает навыки `model-routing`, `best-practices`, `infosec`, `music-library-merge` для Claude Code, Codex и Gemini CLI. Глобальные и проектные `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` остаются короткими ссылками на `AI.md`; установщик их не меняет.
 
-Источники навыков и хуков — `agent-skills/model-routing/`, `agent-skills/best-practices/` и `agent-skills/infosec/`. Новые запрошенные навыки и хуки сначала регистрируются в `ai-md/AI.md`, для навыков проекта затем добавляются в установщик и тесты, для внешних пакетов — ставятся штатно без копирования в Git.
+Источники навыков и хуков — `agent-skills/model-routing/`, `agent-skills/best-practices/`, `agent-skills/infosec/` и `agent-skills/music-library-merge/`. Новые запрошенные навыки и хуки сначала регистрируются в `ai-md/AI.md`, для навыков проекта затем добавляются в установщик и тесты, для внешних пакетов — ставятся штатно без копирования в Git.
 
-Остальные пользовательские навыки (`graphify`, `music-library-merge`, `perplexity-web-research`, `ponytail`, `security-best-practices`) ставятся нативно в пользовательские каталоги каждой платформы из доверенного источника; содержимое внешних пакетов в публичный репозиторий не копируется. Их назначение и порядок распространения описаны в `ai-md/AI.md`.
+Остальные пользовательские навыки (`graphify`, `perplexity-web-research`, `ponytail`, `security-best-practices`) ставятся нативно в пользовательские каталоги каждой платформы из доверенного источника; содержимое внешних пакетов в публичный репозиторий не копируется. Их назначение и порядок распространения описаны в `ai-md/AI.md`.
 
 Два поведения хуков ставятся всем доступным агентам: проверка меток модели у шагов плана и напоминание о `model-routing` перед каждым запросом. Claude Code использует `PreToolUse` (`mcp__ccd_turn__update_plan`, метки `[Haiku]`/`[Opus]`) и `UserPromptSubmit` в `~/.claude/settings.json`. Codex использует `PreToolUse` (`update_plan`) и `UserPromptSubmit` в `~/.codex/hooks.json`; после установки новые хуки нужно просмотреть и доверить им через `/hooks` или Settings → Hooks. Gemini CLI использует `BeforeTool` (`write_todos`) и `BeforeAgent` в `~/.gemini/settings.json`; эти хуки начнут работать после установки CLI.
 
@@ -923,6 +923,8 @@ journalctl --user -u sources.service
 
 ### `split_by_dash.sh`
 
+Анализ библиотеки перед слиянием папок (только чтение, статистика и кандидаты по паттернам): `python3 split_by_dash_analyze_music.py [N]` — первый шаг навыка `music-library-merge`.
+
 Раскладывает файлы по папкам-исполнителям по шаблону `Исполнитель - Название`.
 
 **Алгоритм:**
@@ -1084,7 +1086,7 @@ SQLite `utility_bills/utility_bills.db` с представлениями для
 pytest загрузчика на Python 3.14), `.github/workflows/utility-bills.yml` (Ruff и pytest `utility_bills/`) и `.github/workflows/security-scan.yml`
 (Semgrep, Trivy, OSV-Scanner, Gitleaks, CodeQL; еженедельно и на push/PR).
 
-Версии инструментов CI закреплены: `shellcheck-py==0.11.0.1` из PyPI (ставится через `pipx`), `semgrep==1.95.0`,
+Версии инструментов CI закреплены: `shellcheck-py==0.11.0.1` из PyPI (ставится через `pipx`), `semgrep==1.183.0`,
 bats-core — тег `v1.11.1`; ruff в `shellcheck.yml` (для `llamactl`) — `ruff==0.17.0`, в `requirements-ci.txt`
 загрузчика — `ruff>=0.17.0`, у `utility_bills` — `>=0.17.0,<0.18`. У всех workflows на верхнем уровне
 `permissions: contents: read`. Workflow `music-downloader.yml` запускает и `tests/test_mht_to_fb2.py`.

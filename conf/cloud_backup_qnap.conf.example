@@ -47,6 +47,9 @@ REMOTE_PATH="/opt/esimych-cloud"
 # /Public/backups обычно тоже работает как симлинк на тот же путь)
 BACKUP_DIR="/share/Public/backups"
 
+# Постоянный каталог Entware на диске NAS; скрипт подключает его в /opt, если bind-mount слетел после перезагрузки
+# ENTWARE_DATA_DIR=/share/Public/entware
+
 # Оставить WireGuard активным после завершения скрипта: 1 — да, 0 — нет (по умолчанию)
 WG_KEEP_UP="0"
 
