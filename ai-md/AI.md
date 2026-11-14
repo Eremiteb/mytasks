@@ -49,6 +49,7 @@
 ## Область работы
 
 - Сессии и чаты этого проекта работают только с `/home/esimych/esimych-docs/mytasks`.
+- Группа (сессии) `tasks` — проект на QNAP: рабочий каталог `/mnt/store/tasks` (NFS-вид `/share/Public/tasks` на QNAP) с боевой копией `cloud_backup_qnap.sh`, `conf/`, `logs/` (JSONL запусков), `state/`. Исходник и git — `mytasks`: правки вносить там, затем копировать скрипт в `/mnt/store/tasks/cloud_backup_qnap.sh`; рабочий `conf/cloud_backup_qnap.conf` лежит только на QNAP и в git не входит. `/mnt/store/tasks` — не git-репозиторий.
 - К esimych-cloud (`root@10.66.66.1:/opt/esimych-cloud`) обращаться только по прямому указанию пользователя в текущем запросе: не подключаться к серверу ради сверки состояния, диагностики или открытых вопросов из передачи контекста. Скрипты mytasks, которые сами работают с сервером (`cloud_backup_qnap.sh`), правятся здесь как обычно.
 
 ## Язык
