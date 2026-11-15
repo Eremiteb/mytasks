@@ -87,7 +87,7 @@ if [[ ! -f "${REQ_FILE}" || -L "${REQ_FILE}" ]]; then
     printf '%s: нет файла требований %s (обычный файл, не ссылка)\n' "${SCRIPT_NAME}" "${REQ_FILE}" >&2
     exit 2
 fi
-# shellcheck source=conf/check_mytasks.requirements
+# shellcheck source=/dev/null
 source "${REQ_FILE}"
 
 # Примеры, по которым при первом запуске проходит мастер конфигов
