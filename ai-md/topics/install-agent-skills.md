@@ -1,0 +1,12 @@
+# `install_agent_skills.sh`: распространение AI.md, навыков и хуков
+
+Справка проекта mytasks по теме. Общие правила — [AI.md](../AI.md), правила проекта — [mytasks.md](../mytasks.md).
+
+## `install_agent_skills.sh`: распространение AI.md, навыков и хуков
+
+- `ai-md/AI.md` — источник общих требований; установщик доставляет его копию в `~/.config/ai-context/AI.md` на выбранные устройства вместе с навыками и хуками. Глобальные и проектные `AGENTS.md`/`CLAUDE.md`/`GEMINI.md` после однократной очистки остаются указателями, установщик их больше не изменяет. Источники навыков и хуков — `agent-skills/`; сначала `./install_agent_skills.sh --dry-run`, затем `--apply` по правилу подтверждения боевого запуска.
+- Устройства — `HOSTS` в `conf/install_agent_skills.conf` (`local` + имена из `~/.ssh/config`); ставится в `~/.claude`, `~/.codex`, `~/.gemini`, `~/.agents` там, где каталог есть. Постоянно — `agent-skills-sync.timer` (задание `check_mytasks.sh`). Новое устройство добавлять в `HOSTS`, не копировать файлы вручную.
+- `plan-guard.py` ставится в каталог хуков каждой доступной платформы: Claude проверяет метки `[Haiku]`/`[Opus]`, Codex и Gemini — метку с актуальным идентификатором модели у каждого шага. Для Claude это `PreToolUse` на `update_plan`, для Codex — `PreToolUse` на `update_plan`, для Gemini — `BeforeTool` на `write_todos`. Ошибка самого хука не блокирует работу; отсутствие метки возвращает код 2 и причину агенту.
+- `remind.py` напоминает применять `model-routing` в начале каждого запроса: Claude и Codex — `UserPromptSubmit`, Gemini — `BeforeAgent`. Для Gemini сценарий выдаёт JSON `additionalContext`; для остальных — текст. Напоминание не заменяет самостоятельную проверку агентом.
+- Codex загружает `~/.codex/hooks.json` только после просмотра и доверия к новым хукам в `/hooks` или Settings → Hooks; установщик не обходит этот шаг. Gemini использует `~/.gemini/settings.json` и сможет исполнить хуки, когда CLI установлен. Для Gemini тайм-ауты задаются в миллисекундах, для Claude/Codex — в секундах.
+- Навыки `best-practices` (практики инженерии), `infosec` (ИБ, чек-лист ревью, `reference.md`) и `music-library-merge` (процедура слияния папок `/mnt/copy/Music`) ставятся тем же сценарием в `~/.claude/skills` и `~/.agents/skills` на всех хостах из `HOSTS`. Источники — `agent-skills/best-practices/`, `agent-skills/infosec/`, `agent-skills/music-library-merge/`, правятся только там.

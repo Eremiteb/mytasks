@@ -704,7 +704,7 @@ sudo ./hp_p1005_garuda.sh --all
 
 ### `install_agent_skills.sh`
 
-Копирует единый источник требований `ai-md/AI.md` в `~/.config/ai-context/AI.md` на выбранных хостах и устанавливает навыки `model-routing`, `best-practices`, `infosec`, `music-library-merge` для Claude Code, Codex и Gemini CLI. Глобальные и проектные `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` остаются короткими ссылками на `AI.md`; установщик их не меняет.
+Копирует единый источник требований `ai-md/AI.md` в `~/.config/ai-context/AI.md` на выбранных хостах и устанавливает навыки `model-routing`, `best-practices`, `infosec`, `music-library-merge` для Claude Code, Codex и Gemini CLI. Глобальные и проектные `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` остаются короткими ссылками на `AI.md`; установщик их не меняет. Доставляется только `AI.md` с общими правилами; правила проекта (`ai-md/mytasks.md`) и справки по темам (`ai-md/topics/*.md`) нужны только внутри mytasks и читаются из репозитория.
 
 Источники навыков и хуков — `agent-skills/model-routing/`, `agent-skills/best-practices/`, `agent-skills/infosec/` и `agent-skills/music-library-merge/`. Новые запрошенные навыки и хуки сначала регистрируются в `ai-md/AI.md`, для навыков проекта затем добавляются в установщик и тесты, для внешних пакетов — ставятся штатно без копирования в Git.
 
@@ -1091,7 +1091,7 @@ SQLite `utility_bills/utility_bills.db` с представлениями для
 
 Тесты и проверки кода локально не запускаются — только в CI GitHub Actions
 после пуша; состав проверок и порядок чтения результата — в разделе
-«Валидация» [`ai-md/AI.md`](ai-md/AI.md), не дублируются здесь. Инструменты
+«Валидация» [`ai-md/mytasks.md`](ai-md/mytasks.md), не дублируются здесь. Инструменты
 проверки на рабочую машину не ставятся: `pytest` и `ruff` для загрузчика —
 в `music_downloader/requirements-ci.txt` и `utility_bills/requirements-ci.txt`, которые использует только CI.
 
