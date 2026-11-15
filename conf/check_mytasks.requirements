@@ -1,0 +1,139 @@
+# shellcheck shell=bash
+# Требования стека mytasks к машине — единый источник для check_mytasks.sh.
+# Здесь перечислено всё, что нужно стеку: задания (JOBS) и зависимости (DEPS).
+# При изменении стека (новый скрипт, юнит, зависимость, системная настройка)
+# правится только этот файл. Машинные дополнения (пути, имена устройств,
+# личные настройки ОС) — в conf/check_mytasks.conf (не в Git) через JOBS+=(…).
+# Файл подключается как код Bash (source), в том числе в root-шагах: он
+# проверяет аргументы root-шагов, поэтому правится так же осторожно, как скрипт.
+# shellcheck disable=SC2034
+
+# Задания: «вид|имя|параметр|условие|описание».
+#   вид: user-unit / system-unit — юнит из шаблонов systemd/user/ или systemd/
+#        (ставятся все файлы с тем же базовым именем: .service и .timer);
+#        user-ext / system-ext — юнит, который ставится вне mytasks (только
+#        проверка и включение); link — ссылка в BIN_DIR (параметр — цель в mytasks);
+#        autostart — файл из systemd/autostart/ в AUTOSTART_DIR; conf — конфиг
+#        (параметр — пример); venv — окружение Python (параметр — модули);
+#        db — база SQLite (параметр — команда относительно mytasks с аргументами
+#        через пробел, без eval): проверка — «команда --dry-run» (строка
+#        «[dry-run] будет: …» — база создастся или мигрирует), исправление —
+#        сама команда;
+#        linger — loginctl enable-linger для пользователя: его user-службы
+#        (beufm-recorder.service) работают и без входа в сеанс, с загрузки;
+#        health — служба действительно работает (имя — user-служба без
+#        .service, параметр МАСКА_ЛОГА:МИНУТЫ): последняя запись самого свежего
+#        лога в LOG_DIR не старше МИНУТ и без ERROR в последних 200 строках;
+#        исправление — systemctl --user restart;
+#        no-cron — в crontab не должно быть строк с этими скриптами (параметр —
+#        имена через запятую): их запускают таймеры systemd, а старая строка
+#        cron дала бы второй запуск; исправление — удалить строки;
+#        root-file — root-копия файла mytasks вне домашнего каталога (имя —
+#        имя файла назначения, параметр ИСТОЧНИКИ:КАТАЛОГ:РЕЖИМ: исходники
+#        через запятую относительно mytasks, берётся первый существующий,
+#        *.example — с подстановкой; КАТАЛОГ lib = ROOT_LIB_DIR, conf =
+#        ROOT_CONF_DIR, в конфиг дописывается MYTASKS_DIR; РЕЖИМ 0755/0644);
+#        ставится root:root, отличие от исходника — предложение обновить;
+#        КАТАЛОГ abs — системный файл ОС: имя — полный путь (/etc/…), шаблон —
+#        в etc/ репозитория по тому же пути, прежний файл сохраняется как
+#        ИМЯ.bak-ГГГГММДД-ЧЧММСС, в */systemd/* затем systemctl daemon-reload;
+#        system-off — системный юнит должен быть выключен (не установлен — OK),
+#        исправление — systemctl disable --now;
+#        sys-key — строка «КЛЮЧ = значение» в системном файле (имя — путь,
+#        параметр — строка; пробелы и кавычки при сравнении не важны):
+#        исправление заменяет действующую или закомментированную строку ключа
+#        (копия ФАЙЛ.bak-…), ключа нет совсем — только предупреждение;
+#        sys-check — только проверка условия ОС (параметр — признаки, как в
+#        поле условия), исправление — вручную или другими заданиями.
+#   условие: пусто — всегда; path:ПУТЬ, nopath:ПУТЬ (пути нет), cmd:КОМАНДА,
+#        fs:ТОЧКА=ТИП, link:ССЫЛКА=ЦЕЛЬ, swap:zram (активна подкачка zram),
+#        family:СЕМЕЙСТВО через запятую; при невыполненном — «не требуется».
+#        opt — рекомендуемое: проблема — «рекомендуется», на код возврата не
+#        влияет и с --yes не исправляется (только по вопросу).
+#   Root-шаги принимают только задания этого файла: машинные дополнения
+#   из conf/check_mytasks.conf под root не читаются (их root-исправления
+#   отклоняются) — для них подходят проверки без root (sys-check и т.п.).
+JOBS=(
+    "root-file|system_monitor.sh|system_monitor.sh:lib:0755||Root-копия system_monitor.sh (root:root) в ROOT_LIB_DIR: её запускает системный таймер system-monitor от root, поэтому код вне домашнего каталога и процессы пользователя не могут его подменить. После правки system_monitor.sh в mytasks — «отличается», обновление с подтверждением."
+    "root-file|system_monitor.conf|conf/system_monitor.conf,conf/system_monitor.conf.example:conf:0644||Root-копия настроек system_monitor в ROOT_CONF_DIR (из conf/system_monitor.conf, без него — из примера): root-копия скрипта читает только её. Правки conf/system_monitor.conf действуют после обновления копии (с подтверждением)."
+    "db|state/system_monitor.db|system_monitor.sh --migrate-db||База истории опросов system_monitor (SQLite): при развёртывании с нуля создаётся сразу в текущей схеме, существующая приводится к ней. При переносе на новую машину сначала скопируйте прежнюю базу (sqlite3 .backup), иначе история опросов начнётся заново."
+    "system-unit|system-monitor.timer|||Опрос SMART дисков, CPU и GPU каждые 6 ч (00, 06, 12, 18 ч; пропущенный запуск догоняется после загрузки), запись в SQLite и HTML-отчёт system_reports/latest.html. Запускается root-копия system_monitor.sh из ROOT_LIB_DIR в песочнице systemd."
+    "user-unit|check-backups.timer|||Ежедневная проверка каталогов с архивами резервных копий (наличие, возраст, размер, целостность) с уведомлением в трее. Скрипт check_backups.sh, настройки — conf/check_backups.conf."
+    "user-unit|beufm-recorder.service|||Постоянная запись эфира Beu FM: каждый выход песни сохраняется дублем, из трёх дублей собирается лучшая запись (общий участок по отпечаткам fpcalc). Загрузчик берёт её, только если песни нет в источниках MP3. Скрипт music_downloader/beufm_recorder.py, настройки — блок recorder сайта beufm_kz в music_downloader/music_downloader.json."
+    "health|beufm-recorder|beufm_recorder-*.jsonl:20|cmd:systemctl|Запись эфира Beu FM действительно идёт: служба пишет в лог logs/beufm_recorder-*.jsonl хотя бы раз в 20 мин (смена трека в эфире) и без ошибок. Иначе — перезапуск службы."
+    "linger|enable-linger||cmd:loginctl|Пользовательские службы без входа в сеанс (loginctl enable-linger): запись эфира beufm-recorder.service работает с загрузки системы, а не только пока вы в сеансе."
+    "user-unit|sources.timer|||Ежедневно в 21:30 (пропущенный при выключенном компьютере запуск выполняется после загрузки): синхронизация каталогов через rsync и архивы 7z по списку conf/sources.conf. Ждёт окончания скачивания музыки и блокирует выключение до конца копирования. Скрипт sources.sh."
+    "user-unit|music-downloader.timer|||Ежедневно в 21:00 (пропущенный при выключенном компьютере запуск выполняется после загрузки): скачивание новой музыки с сайтов из music_downloader/music_downloader.json и раскладка по папкам исполнителей (split_by_dash.sh). Скрипт music_downloader.sh."
+    "user-unit|utility-bills.timer|||20-го числа каждого месяца в 10:00 (пропущенный при выключенном компьютере запуск выполняется после загрузки): письма с квитанциями ЖКУ из почтового ящика, разбор PDF (OCR) и запись платежей в SQLite для отчётов. Обработанные письма пропускаются. Скрипт utility_bills.sh, настройки — utility_bills/utility_bills.json."
+    "user-unit|btrfs-monitor.timer||fs:/=btrfs|Каждые 6 ч (00, 06, 12, 18 ч; пропущенный запуск — после загрузки): проверка счётчиков ошибок Btrfs корневого раздела, уведомление при их росте. Скрипт btrfs_monitor.sh."
+    "user-unit|getip.timer|||Через 2 мин после загрузки и каждые 30 мин: проверка внешнего IP-адреса, история изменений. Скрипт getip.sh."
+    "no-cron|crontab|music_downloader.sh,sources.sh,btrfs_monitor.sh,getip.sh,utility_bills.sh|cmd:crontab|Скрипты mytasks запускают таймеры systemd, а не cron: оставшаяся от прежней установки строка crontab дала бы второй, параллельный запуск."
+    "user-unit|agent-skills-sync.timer|||Раз в сутки доставляет AI.md, навыки model-routing, best-practices, infosec и хуки без изменения файлов агентов для Claude Code, Codex и Gemini на этом устройстве и на удалённых хостах из conf/install_agent_skills.conf (недоступные пропускает до следующего запуска). Скрипт install_agent_skills.sh."
+    "user-unit|check-store-mount.service|||При входе в графический сеанс проверяет, смонтированы ли точки из /etc/fstab, и показывает уведомление о несмонтированных. Скрипт check-store-mount.sh."
+    "conf|conf/check_backups.conf|conf/check_backups.conf.example||Настройки check_backups.sh: каталоги с архивами (BACKUP_DIRS), допустимый возраст и размер архивов."
+    "conf|conf/sources.conf|conf/sources.conf.example||Список каталогов для sources.sh: строки «источник, назначение, опции rsync» либо «7z, каталог, каталог архивов, сколько хранить, опции 7z» через вертикальную черту."
+    "conf|music_downloader/music_downloader.json|music_downloader/music_downloader.json.example||Настройки загрузчика музыки: сайты, общий список каталогов download_paths, лимит размера."
+    "venv|music_downloader/venv|requests,bs4,cloudscraper,mutagen||Виртуальное окружение Python загрузчика музыки: music_downloader/setup_venv.sh ставит зависимости из requirements.txt."
+    "db|music_downloader/music_downloader.db|music_downloader/venv/bin/python music_downloader/music_downloader.py --migrate-db||База загрузчика музыки (SQLite): список скачанного, по которому не качаются повторы. Создаётся в текущей схеме; при переносе сначала скопируйте прежнюю базу (sqlite3 .backup)."
+    "conf|utility_bills/utility_bills.json|utility_bills/utility_bills.json.example||Настройки квитанций ЖКУ: почтовый ящик (IMAP), папка, отправители (search.from), каталог PDF, база SQLite, OCR и ступени тарифа электроэнергии. Пароль — в файле или переменной UTILITY_BILLS_IMAP_PASSWORD."
+    "venv|utility_bills/venv|numpy,PIL||Виртуальное окружение Python квитанций ЖКУ: utility_bills/setup_venv.sh ставит зависимости из requirements.txt."
+    "db|utility_bills/utility_bills.db|utility_bills.sh --migrate-db||База квитанций ЖКУ (SQLite, права 600): платежи и тарифы. Создаётся в текущей схеме; при переносе сначала скопируйте прежнюю базу (sqlite3 .backup)."
+    "root-file|llamactl-root|llamactl/llamactl-root.sh:lib:0755|path:@LLAMA_PREFIX@|Root-хелпер llamactl (root:root) в ROOT_LIB_DIR: через sudo -A llamactl запускает только его — установка models.ini и замена сборки llama.cpp без исполнения кода из домашнего каталога от root."
+    "link|llamactl|llamactl/llamactl.sh|path:@LLAMA_PREFIX@|Команда llamactl в ~/.local/bin: управление локальным llama.cpp (модели, VRAM, сервисы, пресеты, обновление)."
+    "link|llamactl-tray|llamactl/llamactl_tray.py|path:@LLAMA_PREFIX@|Команда llamactl-tray в ~/.local/bin: значок llama.cpp в трее."
+    "autostart|llamactl-tray.desktop||path:@LLAMA_PREFIX@|Автозапуск значка llama.cpp в трее при входе в графический сеанс."
+    "user-unit|llama-lang-router.service||path:@LLAMA_PREFIX@|Прокси llama.cpp на 127.0.0.1:8081 с моделью auto: казахский текст → qwen3.5-9b-kazakh, остальное → qwen3.6-35b-a3b; явно выбранная модель не меняется. Скрипт llamactl/llama_lang_router.py."
+    "system-ext|llama-server.service||path:@LLAMA_PREFIX@|Роутер llama.cpp на 127.0.0.1:8080: веб-интерфейс и OpenAI-совместимый API. Юнит ставится вне mytasks."
+    "system-ext|llama-fim.service||path:@LLAMA_PREFIX@|FIM-автодополнение llama.cpp на 127.0.0.1:8012 для VS Code и Zed. Юнит ставится вне mytasks."
+    # Условия ОС для стека (обязательные): работа круглосуточно и запас памяти
+    "root-file|/etc/systemd/sleep.conf.d/no-sleep.conf|etc/systemd/sleep.conf.d/no-sleep.conf:abs:0644|cmd:systemctl|Сон и гибернация запрещены: запись эфира beufm-recorder, ночные таймеры (music-downloader, sources, check-backups, бэкап сервера на QNAP) и llama-server работают круглосуточно, а сон обрывает их. Откат — удалить файл."
+    "sys-check|zram|swap:zram|cmd:systemctl|Подкачка в сжатой памяти (zram) активна: llama.cpp, OCR квитанций и ночные задания переживают пики памяти без OOM-killer. Если нет — ставятся пакет zram-generator и /etc/systemd/zram-generator.conf (если у дистрибутива нет своей настройки); zram включается после перезагрузки или systemctl start systemd-zram-setup@zram0.service."
+    "root-file|/etc/systemd/zram-generator.conf|etc/systemd/zram-generator.conf:abs:0644|cmd:systemctl,nopath:/usr/lib/systemd/zram-generator.conf|Настройка zram для стека (размер = RAM, сжатие zstd), если у дистрибутива своей нет (у Garuda и Fedora — /usr/lib/systemd/zram-generator.conf). Действует после перезагрузки или systemctl start systemd-zram-setup@zram0.service."
+    # Обслуживание ОС (рекомендуемые)
+    "system-ext|fstrim.timer||cmd:fstrim,opt|Еженедельный TRIM всех смонтированных ФС (btrfs, ext4, XFS): SSD не теряют скорость записи под базами, логами и моделями llama.cpp."
+    "system-off|btrfs-trim.timer||fs:/=btrfs,opt|Отдельный TRIM btrfs не нужен: fstrim.timer обрабатывает все ФС, второй проход лишь нагружает диск."
+    "system-off|cronie.service||cmd:crond,opt|Демон cron не нужен: все расписания mytasks — таймеры systemd с догоном (задание crontab удаляет и старые строки)."
+    "system-ext|paccache.timer||family:arch,cmd:paccache,opt|Еженедельная чистка кэша пакетов pacman (pacman-contrib): кэш не занимает место на корневом разделе."
+    "root-file|/etc/systemd/system/paccache.service.d/override.conf|etc/systemd/system/paccache.service.d/override.conf:abs:0644|family:arch,cmd:paccache,opt|paccache хранит одну версию каждого пакета (-k 1) и удаляет кэш удалённых пакетов (-uk0); по умолчанию — три версии."
+    "sys-key|/etc/pacman.conf|ParallelDownloads = 10|family:arch,opt|Параллельная загрузка пакетов pacman: обязательное обновление системы в начале check_mytasks.sh идёт быстрее."
+)
+
+# Зависимости: «команда|пакеты|условие|описание».
+#   команда: имя в PATH, несколько вариантов через запятую (достаточно одного),
+#        py:МОДУЛЬ — модуль системного Python (SYSTEM_PYTHON) или gnu:КОМАНДА —
+#        GNU-версия утилиты (не busybox);
+#   пакеты: имя пакета по умолчанию и отличия через «;» в виде
+#        семейство=пакет (arch, debian, redhat, suse, alpine, void, gentoo,
+#        solus), «-» — нет в репозиториях, ставить вручную;
+#   условие: как у заданий, плюс opt — необязательная зависимость (не
+#        считается проблемой, с --yes не ставится, но предлагается).
+DEPS=(
+    "python3|python3;arch=python;gentoo=dev-lang/python||Python 3: music_downloader, mht_to_fb2.py, llamactl status (llamactl_status.py) и трей"
+    "py:ensurepip|python3;arch=python;debian=python3-venv;gentoo=dev-lang/python||Модуль venv/ensurepip: виртуальное окружение music_downloader"
+    "notify-send|libnotify;debian=libnotify-bin;suse=libnotify-tools||Уведомления в трее: check_backups, check-store-mount, system_monitor, btrfs_monitor, этот скрипт"
+    "gawk|gawk||split_by_dash.sh: имена файлов и папок, допустимые в Windows"
+    "jq|jq||system_monitor.sh, llamactl.sh"
+    "sqlite3|sqlite3;arch=sqlite;redhat=sqlite;alpine=sqlite;void=sqlite;gentoo=dev-db/sqlite||system_monitor.sh: база истории опросов"
+    "smartctl|smartmontools||system_monitor.sh: SMART-атрибуты дисков"
+    "curl|curl||getip.sh, llamactl.sh"
+    "flock|util-linux;gentoo=sys-apps/util-linux||llamactl.sh: блокировка записи пресетов models.ini"
+    "rsync|rsync||sources.sh: синхронизация каталогов"
+    "7z|7zip||sources.sh: архивы 7z (строки «7z» в conf/sources.conf)"
+    "zstd|zstd||check_backups.sh (проверка .tar.zst)"
+    "unzip|unzip||unpack-fb2zip.sh, check_backups.sh (проверка .zip)"
+    "file|file||cp1251_to_utf8.sh: определение кодировки файлов"
+    "gnu:find|findutils||GNU find (-printf): ротация логов во всех скриптах; в busybox (Alpine) его нет"
+    "gnu:stat|coreutils||GNU coreutils (stat -c, date -d, sort -V, readlink -f, install -t); в busybox (Alpine) их нет"
+    "btrfs|btrfs-progs|fs:/=btrfs|btrfs_monitor.sh: счётчики ошибок Btrfs"
+    "tesseract|tesseract;debian=tesseract-ocr;suse=tesseract-ocr;alpine=tesseract-ocr;gentoo=app-text/tesseract||utility_bills: распознавание квитанций (нужны языки rus, kaz, eng: Arch — tesseract-data-rus/-kaz/-eng, Debian — tesseract-ocr-rus/-kaz/-eng; проверка — utility_bills.sh --check)"
+    "pdfimages|poppler;debian=poppler-utils;redhat=poppler-utils;suse=poppler-tools;alpine=poppler-utils;gentoo=app-text/poppler||utility_bills: извлечение изображения страницы из PDF-квитанции"
+    "zenity,kdialog|zenity|opt|Окна вопросов этого скрипта (кнопка «Стоп» во всех окнах — только у zenity) и графический askpass для sudo"
+    "sensors|lm_sensors;debian=lm-sensors;suse=sensors;alpine=lm-sensors;gentoo=sys-apps/lm-sensors|opt|system_monitor.sh: температура CPU"
+    "ffmpeg|ffmpeg;redhat=ffmpeg-free|opt|all_to_mp3.sh, music_downloader (YouTube Music): перекодирование в MP3; beufm_recorder.py: проверка дублей"
+    "yt-dlp|yt-dlp;gentoo=net-misc/yt-dlp|opt|music_downloader: последний источник MP3 — песни YouTube Music"
+    "fpcalc|chromaprint;debian=libchromaprint-tools;redhat=chromaprint-tools;suse=chromaprint-fpcalc;gentoo=media-libs/chromaprint|opt|beufm_recorder.py: сравнение дублей эфира по акустическим отпечаткам"
+    "pandoc|pandoc;arch=pandoc-cli;alpine=pandoc-cli;gentoo=app-text/pandoc-bin|opt|doc2fb2.sh, mht_to_fb2.py: преобразование документов"
+    "py:PyQt6|python3-pyqt6;arch=python-pyqt6;suse=python3-PyQt6;alpine=py3-pyqt6;void=python3-PyQt6;gentoo=dev-python/pyqt6|path:@LLAMA_PREFIX@|llamactl_tray.py: значок в трее (PyQt6 в системном Python)"
+    "file:/usr/lib/systemd/system-generators/zram-generator|zram-generator;debian=systemd-zram-generator;alpine=-;void=-;gentoo=-;solus=-;nixos=-|cmd:systemctl|Генератор подкачки zram для systemd: создаёт /dev/zram0 по zram-generator.conf (задание zram)"
+    "paccache|pacman-contrib|family:arch,opt|paccache: чистка кэша пакетов pacman (paccache.timer)"
+)

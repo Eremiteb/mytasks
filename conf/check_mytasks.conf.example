@@ -78,3 +78,12 @@ URGENCY="normal"
 
 # Список заданий и зависимостей можно переопределить массивами JOBS и DEPS
 # (формат и значения по умолчанию — в начале check_mytasks.sh).
+
+# Машинные дополнения к требованиям стека (conf/check_mytasks.requirements):
+# личные настройки ОС этой машины, которые не нужны стеку и не публикуются в Git
+# (имена устройств, интерфейсов, личные службы). Root-шаги этот файл не читают,
+# поэтому здесь — проверки без root (sys-check) или рекомендуемые (opt).
+# JOBS+=(
+#     "sys-check|resolv-stub|link:/etc/resolv.conf=../run/systemd/resolve/stub-resolv.conf|opt|DNS через systemd-resolved"
+#     "sys-check|data-xfs|fs:/data=xfs|opt|Большие каталоги на отдельном XFS-диске /data"
+# )

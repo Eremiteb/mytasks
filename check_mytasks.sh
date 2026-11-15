@@ -12,7 +12,9 @@
 #   3) проверяет зависимости и ставит пакеты менеджером своего семейства ОС:
 #      arch — pacman, debian — apt-get, redhat — dnf;
 #   4) создаёт юниты systemd, ссылки и автозапуск из шаблонов
-#      каталога systemd/ с подстановкой @MYTASKS_DIR@.
+#      каталога systemd/ с подстановкой @MYTASKS_DIR@, приводит системные
+#      условия ОС (сон, zram, обслуживание) к требованиям стека.
+# Требования стека — conf/check_mytasks.requirements (единый источник).
 # Для каждого отсутствующего или неработающего задания выводится
 # предупреждение с описанием и вопрос «создать?»: «да» — создаётся, «нет» —
 # ничего не меняется. Таблица состояния выводится всегда (только таблица —
@@ -75,105 +77,18 @@ APP_NAME="MytasksCheck"
 ICON_NAME="dialog-warning"
 URGENCY="normal"
 
-# Задания: «вид|имя|параметр|условие|описание».
-#   вид: user-unit / system-unit — юнит из шаблонов systemd/user/ или systemd/
-#        (ставятся все файлы с тем же базовым именем: .service и .timer);
-#        user-ext / system-ext — юнит, который ставится вне mytasks (только
-#        проверка и включение); link — ссылка в BIN_DIR (параметр — цель в mytasks);
-#        autostart — файл из systemd/autostart/ в AUTOSTART_DIR; conf — конфиг
-#        (параметр — пример); venv — окружение Python (параметр — модули);
-#        db — база SQLite (параметр — команда относительно mytasks с аргументами
-#        через пробел, без eval): проверка — «команда --dry-run» (строка
-#        «[dry-run] будет: …» — база создастся или мигрирует), исправление —
-#        сама команда;
-#        linger — loginctl enable-linger для пользователя: его user-службы
-#        (beufm-recorder.service) работают и без входа в сеанс, с загрузки;
-#        health — служба действительно работает (имя — user-служба без
-#        .service, параметр МАСКА_ЛОГА:МИНУТЫ): последняя запись самого свежего
-#        лога в LOG_DIR не старше МИНУТ и без ERROR в последних 200 строках;
-#        исправление — systemctl --user restart;
-#        no-cron — в crontab не должно быть строк с этими скриптами (параметр —
-#        имена через запятую): их запускают таймеры systemd, а старая строка
-#        cron дала бы второй запуск; исправление — удалить строки;
-#        root-file — root-копия файла mytasks вне домашнего каталога (имя —
-#        имя файла назначения, параметр ИСТОЧНИКИ:КАТАЛОГ:РЕЖИМ: исходники
-#        через запятую относительно mytasks, берётся первый существующий,
-#        *.example — с подстановкой; КАТАЛОГ lib = ROOT_LIB_DIR, conf =
-#        ROOT_CONF_DIR, в конфиг дописывается MYTASKS_DIR; РЕЖИМ 0755/0644);
-#        ставится root:root, отличие от исходника — предложение обновить.
-#   условие: пусто — всегда; path:ПУТЬ, cmd:КОМАНДА, fs:ТОЧКА=ТИП,
-#        family:СЕМЕЙСТВО через запятую; при невыполненном — «не требуется».
-JOBS=(
-    "root-file|system_monitor.sh|system_monitor.sh:lib:0755||Root-копия system_monitor.sh (root:root) в ROOT_LIB_DIR: её запускает системный таймер system-monitor от root, поэтому код вне домашнего каталога и процессы пользователя не могут его подменить. После правки system_monitor.sh в mytasks — «отличается», обновление с подтверждением."
-    "root-file|system_monitor.conf|conf/system_monitor.conf,conf/system_monitor.conf.example:conf:0644||Root-копия настроек system_monitor в ROOT_CONF_DIR (из conf/system_monitor.conf, без него — из примера): root-копия скрипта читает только её. Правки conf/system_monitor.conf действуют после обновления копии (с подтверждением)."
-    "db|state/system_monitor.db|system_monitor.sh --migrate-db||База истории опросов system_monitor (SQLite): при развёртывании с нуля создаётся сразу в текущей схеме, существующая приводится к ней. При переносе на новую машину сначала скопируйте прежнюю базу (sqlite3 .backup), иначе история опросов начнётся заново."
-    "system-unit|system-monitor.timer|||Опрос SMART дисков, CPU и GPU каждые 6 ч (00, 06, 12, 18 ч; пропущенный запуск догоняется после загрузки), запись в SQLite и HTML-отчёт system_reports/latest.html. Запускается root-копия system_monitor.sh из ROOT_LIB_DIR в песочнице systemd."
-    "user-unit|check-backups.timer|||Ежедневная проверка каталогов с архивами резервных копий (наличие, возраст, размер, целостность) с уведомлением в трее. Скрипт check_backups.sh, настройки — conf/check_backups.conf."
-    "user-unit|beufm-recorder.service|||Постоянная запись эфира Beu FM: каждый выход песни сохраняется дублем, из трёх дублей собирается лучшая запись (общий участок по отпечаткам fpcalc). Загрузчик берёт её, только если песни нет в источниках MP3. Скрипт music_downloader/beufm_recorder.py, настройки — блок recorder сайта beufm_kz в music_downloader/music_downloader.json."
-    "health|beufm-recorder|beufm_recorder-*.jsonl:20|cmd:systemctl|Запись эфира Beu FM действительно идёт: служба пишет в лог logs/beufm_recorder-*.jsonl хотя бы раз в 20 мин (смена трека в эфире) и без ошибок. Иначе — перезапуск службы."
-    "linger|enable-linger||cmd:loginctl|Пользовательские службы без входа в сеанс (loginctl enable-linger): запись эфира beufm-recorder.service работает с загрузки системы, а не только пока вы в сеансе."
-    "user-unit|sources.timer|||Ежедневно в 21:30 (пропущенный при выключенном компьютере запуск выполняется после загрузки): синхронизация каталогов через rsync и архивы 7z по списку conf/sources.conf. Ждёт окончания скачивания музыки и блокирует выключение до конца копирования. Скрипт sources.sh."
-    "user-unit|music-downloader.timer|||Ежедневно в 21:00 (пропущенный при выключенном компьютере запуск выполняется после загрузки): скачивание новой музыки с сайтов из music_downloader/music_downloader.json и раскладка по папкам исполнителей (split_by_dash.sh). Скрипт music_downloader.sh."
-    "user-unit|utility-bills.timer|||20-го числа каждого месяца в 10:00 (пропущенный при выключенном компьютере запуск выполняется после загрузки): письма с квитанциями ЖКУ из почтового ящика, разбор PDF (OCR) и запись платежей в SQLite для отчётов. Обработанные письма пропускаются. Скрипт utility_bills.sh, настройки — utility_bills/utility_bills.json."
-    "user-unit|btrfs-monitor.timer||fs:/=btrfs|Каждые 6 ч (00, 06, 12, 18 ч; пропущенный запуск — после загрузки): проверка счётчиков ошибок Btrfs корневого раздела, уведомление при их росте. Скрипт btrfs_monitor.sh."
-    "user-unit|getip.timer|||Через 2 мин после загрузки и каждые 30 мин: проверка внешнего IP-адреса, история изменений. Скрипт getip.sh."
-    "no-cron|crontab|music_downloader.sh,sources.sh,btrfs_monitor.sh,getip.sh,utility_bills.sh|cmd:crontab|Скрипты mytasks запускают таймеры systemd, а не cron: оставшаяся от прежней установки строка crontab дала бы второй, параллельный запуск."
-    "user-unit|agent-skills-sync.timer|||Раз в сутки доставляет AI.md, навыки model-routing, best-practices, infosec и хуки без изменения файлов агентов для Claude Code, Codex и Gemini на этом устройстве и на удалённых хостах из conf/install_agent_skills.conf (недоступные пропускает до следующего запуска). Скрипт install_agent_skills.sh."
-    "user-unit|check-store-mount.service|||При входе в графический сеанс проверяет, смонтированы ли точки из /etc/fstab, и показывает уведомление о несмонтированных. Скрипт check-store-mount.sh."
-    "conf|conf/check_backups.conf|conf/check_backups.conf.example||Настройки check_backups.sh: каталоги с архивами (BACKUP_DIRS), допустимый возраст и размер архивов."
-    "conf|conf/sources.conf|conf/sources.conf.example||Список каталогов для sources.sh: строки «источник, назначение, опции rsync» либо «7z, каталог, каталог архивов, сколько хранить, опции 7z» через вертикальную черту."
-    "conf|music_downloader/music_downloader.json|music_downloader/music_downloader.json.example||Настройки загрузчика музыки: сайты, общий список каталогов download_paths, лимит размера."
-    "venv|music_downloader/venv|requests,bs4,cloudscraper,mutagen||Виртуальное окружение Python загрузчика музыки: music_downloader/setup_venv.sh ставит зависимости из requirements.txt."
-    "db|music_downloader/music_downloader.db|music_downloader/venv/bin/python music_downloader/music_downloader.py --migrate-db||База загрузчика музыки (SQLite): список скачанного, по которому не качаются повторы. Создаётся в текущей схеме; при переносе сначала скопируйте прежнюю базу (sqlite3 .backup)."
-    "conf|utility_bills/utility_bills.json|utility_bills/utility_bills.json.example||Настройки квитанций ЖКУ: почтовый ящик (IMAP), папка, отправители (search.from), каталог PDF, база SQLite, OCR и ступени тарифа электроэнергии. Пароль — в файле или переменной UTILITY_BILLS_IMAP_PASSWORD."
-    "venv|utility_bills/venv|numpy,PIL||Виртуальное окружение Python квитанций ЖКУ: utility_bills/setup_venv.sh ставит зависимости из requirements.txt."
-    "db|utility_bills/utility_bills.db|utility_bills.sh --migrate-db||База квитанций ЖКУ (SQLite, права 600): платежи и тарифы. Создаётся в текущей схеме; при переносе сначала скопируйте прежнюю базу (sqlite3 .backup)."
-    "root-file|llamactl-root|llamactl/llamactl-root.sh:lib:0755|path:@LLAMA_PREFIX@|Root-хелпер llamactl (root:root) в ROOT_LIB_DIR: через sudo -A llamactl запускает только его — установка models.ini и замена сборки llama.cpp без исполнения кода из домашнего каталога от root."
-    "link|llamactl|llamactl/llamactl.sh|path:@LLAMA_PREFIX@|Команда llamactl в ~/.local/bin: управление локальным llama.cpp (модели, VRAM, сервисы, пресеты, обновление)."
-    "link|llamactl-tray|llamactl/llamactl_tray.py|path:@LLAMA_PREFIX@|Команда llamactl-tray в ~/.local/bin: значок llama.cpp в трее."
-    "autostart|llamactl-tray.desktop||path:@LLAMA_PREFIX@|Автозапуск значка llama.cpp в трее при входе в графический сеанс."
-    "user-unit|llama-lang-router.service||path:@LLAMA_PREFIX@|Прокси llama.cpp на 127.0.0.1:8081 с моделью auto: казахский текст → qwen3.5-9b-kazakh, остальное → qwen3.6-35b-a3b; явно выбранная модель не меняется. Скрипт llamactl/llama_lang_router.py."
-    "system-ext|llama-server.service||path:@LLAMA_PREFIX@|Роутер llama.cpp на 127.0.0.1:8080: веб-интерфейс и OpenAI-совместимый API. Юнит ставится вне mytasks."
-    "system-ext|llama-fim.service||path:@LLAMA_PREFIX@|FIM-автодополнение llama.cpp на 127.0.0.1:8012 для VS Code и Zed. Юнит ставится вне mytasks."
-)
-
-# Зависимости: «команда|пакеты|условие|описание».
-#   команда: имя в PATH, несколько вариантов через запятую (достаточно одного),
-#        py:МОДУЛЬ — модуль системного Python (SYSTEM_PYTHON) или gnu:КОМАНДА —
-#        GNU-версия утилиты (не busybox);
-#   пакеты: имя пакета по умолчанию и отличия через «;» в виде
-#        семейство=пакет (arch, debian, redhat, suse, alpine, void, gentoo,
-#        solus), «-» — нет в репозиториях, ставить вручную;
-#   условие: как у заданий, плюс opt — необязательная зависимость (не
-#        считается проблемой, с --yes не ставится, но предлагается).
-DEPS=(
-    "python3|python3;arch=python;gentoo=dev-lang/python||Python 3: music_downloader, mht_to_fb2.py, llamactl status (llamactl_status.py) и трей"
-    "py:ensurepip|python3;arch=python;debian=python3-venv;gentoo=dev-lang/python||Модуль venv/ensurepip: виртуальное окружение music_downloader"
-    "notify-send|libnotify;debian=libnotify-bin;suse=libnotify-tools||Уведомления в трее: check_backups, check-store-mount, system_monitor, btrfs_monitor, этот скрипт"
-    "gawk|gawk||split_by_dash.sh: имена файлов и папок, допустимые в Windows"
-    "jq|jq||system_monitor.sh, llamactl.sh"
-    "sqlite3|sqlite3;arch=sqlite;redhat=sqlite;alpine=sqlite;void=sqlite;gentoo=dev-db/sqlite||system_monitor.sh: база истории опросов"
-    "smartctl|smartmontools||system_monitor.sh: SMART-атрибуты дисков"
-    "curl|curl||getip.sh, llamactl.sh"
-    "flock|util-linux;gentoo=sys-apps/util-linux||llamactl.sh: блокировка записи пресетов models.ini"
-    "rsync|rsync||sources.sh: синхронизация каталогов"
-    "7z|7zip||sources.sh: архивы 7z (строки «7z» в conf/sources.conf)"
-    "zstd|zstd||check_backups.sh (проверка .tar.zst)"
-    "unzip|unzip||unpack-fb2zip.sh, check_backups.sh (проверка .zip)"
-    "file|file||cp1251_to_utf8.sh: определение кодировки файлов"
-    "gnu:find|findutils||GNU find (-printf): ротация логов во всех скриптах; в busybox (Alpine) его нет"
-    "gnu:stat|coreutils||GNU coreutils (stat -c, date -d, sort -V, readlink -f, install -t); в busybox (Alpine) их нет"
-    "btrfs|btrfs-progs|fs:/=btrfs|btrfs_monitor.sh: счётчики ошибок Btrfs"
-    "tesseract|tesseract;debian=tesseract-ocr;suse=tesseract-ocr;alpine=tesseract-ocr;gentoo=app-text/tesseract||utility_bills: распознавание квитанций (нужны языки rus, kaz, eng: Arch — tesseract-data-rus/-kaz/-eng, Debian — tesseract-ocr-rus/-kaz/-eng; проверка — utility_bills.sh --check)"
-    "pdfimages|poppler;debian=poppler-utils;redhat=poppler-utils;suse=poppler-tools;alpine=poppler-utils;gentoo=app-text/poppler||utility_bills: извлечение изображения страницы из PDF-квитанции"
-    "zenity,kdialog|zenity|opt|Окна вопросов этого скрипта (кнопка «Стоп» во всех окнах — только у zenity) и графический askpass для sudo"
-    "sensors|lm_sensors;debian=lm-sensors;suse=sensors;alpine=lm-sensors;gentoo=sys-apps/lm-sensors|opt|system_monitor.sh: температура CPU"
-    "ffmpeg|ffmpeg;redhat=ffmpeg-free|opt|all_to_mp3.sh, music_downloader (YouTube Music): перекодирование в MP3; beufm_recorder.py: проверка дублей"
-    "yt-dlp|yt-dlp;gentoo=net-misc/yt-dlp|opt|music_downloader: последний источник MP3 — песни YouTube Music"
-    "fpcalc|chromaprint;debian=libchromaprint-tools;redhat=chromaprint-tools;suse=chromaprint-fpcalc;gentoo=media-libs/chromaprint|opt|beufm_recorder.py: сравнение дублей эфира по акустическим отпечаткам"
-    "pandoc|pandoc;arch=pandoc-cli;alpine=pandoc-cli;gentoo=app-text/pandoc-bin|opt|doc2fb2.sh, mht_to_fb2.py: преобразование документов"
-    "py:PyQt6|python3-pyqt6;arch=python-pyqt6;suse=python3-PyQt6;alpine=py3-pyqt6;void=python3-PyQt6;gentoo=dev-python/pyqt6|path:@LLAMA_PREFIX@|llamactl_tray.py: значок в трее (PyQt6 в системном Python)"
-)
+# Требования стека (задания JOBS и зависимости DEPS) — в отслеживаемом
+# conf/check_mytasks.requirements: единый источник, правится при изменении
+# стека. Формат и виды заданий описаны в самом файле.
+REQ_FILE="${CONF_DIR}/${SCRIPT_BASE}.requirements"
+JOBS=()
+DEPS=()
+if [[ ! -f "${REQ_FILE}" || -L "${REQ_FILE}" ]]; then
+    printf '%s: нет файла требований %s (обычный файл, не ссылка)\n' "${SCRIPT_NAME}" "${REQ_FILE}" >&2
+    exit 2
+fi
+# shellcheck source=conf/check_mytasks.requirements
+source "${REQ_FILE}"
 
 # Примеры, по которым при первом запуске проходит мастер конфигов
 # (пусто — все conf/*.conf.example, music_downloader/*.json.example и utility_bills/*.json.example)
@@ -306,11 +221,15 @@ usage() {
 Без опций: таблица состояния, обязательное полное обновление системы
 штатным средством её семейства, затем для каждого отсутствующего задания —
 предупреждение с описанием и вопрос «создать?», в конце итоговая таблица.
+Что нужно стеку (задания, системные условия ОС, зависимости), перечислено
+в conf/check_mytasks.requirements; рекомендуемое (opt) отмечается
+«рекомендуется», на код возврата не влияет и с --yes не выполняется.
 
   -s, --status      только таблица состояния (задания и все зависимости)
   -n, --dry-run     план без изменений: «[dry-run] будет: …»
   -y, --yes         создавать всё отсутствующее без вопросов (конфиги — со
-                    значениями по умолчанию, только обязательные пакеты)
+                    значениями по умолчанию, только обязательные пакеты
+                    и задания)
       --no-create   без вопросов и изменений: таблица и предупреждения
       --notify      уведомление в трее, если остались проблемы
   -c, --configure   мастер для всех отсутствующих конфигов (как при первом
@@ -319,7 +238,8 @@ usage() {
       --no-gui      не использовать окна kdialog/zenity
   -h, --help        эта справка
 
-Коды возврата: 0 — всё на месте, 1 — есть проблемы, 2 — ошибка аргументов.
+Коды возврата: 0 — всё на месте, 1 — есть проблемы, 2 — ошибка аргументов
+или нет файла требований.
 EOF
 }
 
@@ -720,9 +640,16 @@ has_systemd() {
 }
 
 # Проверка условия «path:…,cmd:…,fs:ТОЧКА=ТИП,family:…» (opt пропускается)
+# Активна ли подкачка на zram (/dev/zram*)
+swap_has_zram() {
+    local out
+    out="$(swapon --show=NAME --noheadings 2>/dev/null)" || return 1
+    [[ $'\n'"${out}" == *$'\n'/dev/zram* ]]
+}
+
 check_when() {
     local when="$1"
-    local token mnt want fstype path_value
+    local token mnt want fstype path_value link_target
     local tokens=()
 
     [[ -z "${when}" ]] && return 0
@@ -735,7 +662,15 @@ check_when() {
                 path_value="${path_value//@LLAMA_PREFIX@/${LLAMA_PREFIX}}"
                 [[ -e "${path_value}" ]] || return 1
                 ;;
+            nopath:*) [[ -e "${token#nopath:}" || -L "${token#nopath:}" ]] && return 1 ;;
             cmd:*) command -v "${token#cmd:}" >/dev/null 2>&1 || return 1 ;;
+            link:*)
+                path_value="${token#link:}"
+                [[ -L "${path_value%%=*}" ]] || return 1
+                link_target="$(readlink -- "${path_value%%=*}")" || return 1
+                [[ "${link_target}" == "${path_value#*=}" ]] || return 1
+                ;;
+            swap:zram) swap_has_zram || return 1 ;;
             family:*) [[ "${OS_FAMILY}" == "${token#family:}" ]] || return 1 ;;
             fs:*)
                 mnt="${token#fs:}"
@@ -786,9 +721,9 @@ unit_enable_args() {
 }
 
 # Аргументы root-шагов проверяются: под root пользовательский конфиг не
-# читается, поэтому имена юнитов, файлов и пакетов сверяются со встроенными
-# JOBS/DEPS (не под root — с JOBS/DEPS конфига: там граница прав не
-# пересекается), пути назначения — только каталоги, принадлежащие root,
+# читается, поэтому имена юнитов, файлов и пакетов сверяются с JOBS/DEPS из
+# conf/check_mytasks.requirements (не под root — с JOBS/DEPS конфига: там граница
+# прав не пересекается), пути назначения — только каталоги, принадлежащие root,
 # исходники — только файлы внутри каталога скрипта.
 root_refuse() {
     printf '%s: root-шаг отклонён: %s\n' "${SCRIPT_NAME}" "$1" >&2
@@ -848,10 +783,14 @@ root_check_mytasks_dir() {
     [[ "$1" == "${SCRIPT_DIR}" ]] || root_refuse "MYTASKS_DIR «$1» не совпадает с каталогом скрипта ${SCRIPT_DIR}"
 }
 
-# Разбор параметра root-file: RF_SOURCES, RF_DIRKEY (lib|conf), RF_MODE
+# Разбор параметра root-file: RF_SOURCES, RF_DIRKEY (lib|conf|abs), RF_MODE.
+# abs — системный файл ОС: имя задания — полный путь назначения (/etc/…)
 parse_root_file_spec() {
     IFS=':' read -r RF_SOURCES RF_DIRKEY RF_MODE <<<"$1"
-    [[ "${RF_DIRKEY}" == "lib" || "${RF_DIRKEY}" == "conf" ]] || return 1
+    case "${RF_DIRKEY}" in
+        lib|conf|abs) ;;
+        *) return 1 ;;
+    esac
     [[ "${RF_MODE}" == "0755" || "${RF_MODE}" == "0644" ]] || return 1
     [[ -n "${RF_SOURCES}" ]]
 }
@@ -922,18 +861,28 @@ root_install_units() {
 }
 
 # __root-install-file ИМЯ КАТАЛОГ MYTASKS_DIR: root-копия задания root-file
-# (временный файл в каталоге назначения и rename: без следования симлинкам)
+# (временный файл в каталоге назначения и rename: без следования симлинкам).
+# Системный файл ОС (abs): каталог — только родитель пути из JOBS, прежний
+# файл сохраняется рядом как ИМЯ.bak-ГГГГММДД-ЧЧММСС (не *.conf — systemd его
+# не читает); юниты и drop-in в */systemd/* применяются daemon-reload
 root_install_file() {
-    local name="${1:-}" dir="${2:-}" spec tmp
+    local name="${1:-}" dir="${2:-}" spec tmp base stamp
     [[ $# -eq 3 ]] || { root_refuse "ожидалось 3 аргумента"; return; }
-    [[ "${name}" =~ ^[A-Za-z0-9._-]+$ ]] || { root_refuse "недопустимое имя «${name}»"; return; }
+    [[ "${name}" =~ ^[A-Za-z0-9._-]+$ || "${name}" =~ ^/[A-Za-z0-9._+/-]+$ ]] || { root_refuse "недопустимое имя «${name}»"; return; }
     spec="$(job_param root-file "${name}")" || { root_refuse "файла «${name}» нет в JOBS"; return; }
     parse_root_file_spec "${spec}" || { root_refuse "некорректное задание ${name}"; return; }
+    base="${name##*/}"
+    if [[ "${RF_DIRKEY}" == "abs" ]]; then
+        [[ "${name}" == /* && "${dir}" == "${name%/*}" ]] || { root_refuse "каталог «${dir}» не совпадает с путём ${name}"; return; }
+        [[ -n "${base}" && "${base}" != "." && "${base}" != ".." ]] || { root_refuse "недопустимое имя файла в ${name}"; return; }
+    else
+        [[ "${name}" != */* ]] || { root_refuse "имя копии в ${RF_DIRKEY} — без каталога, а не «${name}»"; return; }
+    fi
     valid_dest_dir "${dir}" || { root_refuse "каталог «${dir}» недопустим"; return; }
     root_check_mytasks_dir "$3" || return
     MYTASKS_DIR="$3"
     install -d -m 0755 -- "${dir}" || return 1
-    tmp="$(mktemp -- "${dir}/.${name}.XXXXXX")" || return 1
+    tmp="$(mktemp -- "${dir}/.${base}.XXXXXX")" || return 1
     if ! render_root_file "${spec}" "${tmp}"; then
         rm -f -- "${tmp}"
         root_refuse "нет исходника ${RF_SOURCES} (обычный файл в ${SCRIPT_DIR})"
@@ -943,7 +892,17 @@ root_install_file() {
         rm -f -- "${tmp}"
         return 1
     fi
-    mv -f -- "${tmp}" "${dir}/${name}"
+    if [[ "${RF_DIRKEY}" == "abs" && ( -e "${dir}/${base}" || -L "${dir}/${base}" ) ]]; then
+        stamp="$(date '+%Y%m%d-%H%M%S')"
+        if ! cp -a -- "${dir}/${base}" "${dir}/${base}.bak-${stamp}"; then
+            rm -f -- "${tmp}"
+            return 1
+        fi
+    fi
+    mv -f -- "${tmp}" "${dir}/${base}" || return 1
+    if [[ "${RF_DIRKEY}" == "abs" && "${dir}/" == */systemd/* ]]; then
+        systemctl daemon-reload
+    fi
 }
 
 # Юнит — только system-unit/system-ext из JOBS (или .service/.timer пары system-unit)
@@ -960,6 +919,55 @@ root_enable() {
         esac
     done
     root_refuse "юнита «${unit}» нет в JOBS"
+}
+
+# Выключение — только юнит вида system-off из JOBS
+root_disable() {
+    local unit="${1:-}"
+    [[ $# -eq 1 ]] || { root_refuse "ожидался 1 аргумент"; return; }
+    job_param system-off "${unit}" >/dev/null || { root_refuse "юнита «${unit}» нет среди system-off в JOBS"; return; }
+    systemctl disable --now -- "${unit}"
+}
+
+# __root-set-key ФАЙЛ КЛЮЧ: строка «КЛЮЧ = значение» берётся из задания sys-key
+# в JOBS (значение аргументом не передать). Действующие строки ключа заменяются, при
+# их отсутствии — первая закомментированная; права и владелец сохраняются,
+# прежний файл — ФАЙЛ.bak-ГГГГММДД-ЧЧММСС, замена — rename временного файла
+root_set_key() {
+    local file="${1:-}" line cur dir tmp stamp re_act re_com replaced=0 have_act=0
+    [[ $# -eq 2 && "${file}" =~ ^/[A-Za-z0-9._+/-]+$ && "$2" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { root_refuse "недопустимые аргументы: ожидались ФАЙЛ КЛЮЧ"; return; }
+    line="$(sys_key_job_line "${file}" "$2")" || { root_refuse "ключа «$2» файла «${file}» нет среди sys-key в JOBS"; return; }
+    parse_sys_key "${line}" || { root_refuse "некорректная строка задания ${file}"; return; }
+    dir="${file%/*}"
+    valid_dest_dir "${dir}" || { root_refuse "каталог «${dir}» недопустим"; return; }
+    [[ -f "${file}" && ! -L "${file}" ]] || { root_refuse "${file} — не обычный файл"; return; }
+    sys_key_scan "${file}"
+    [[ "${SK_STATE}" == "ok" ]] && return 0
+    [[ "${SK_STATE}" == "set" ]] || { root_refuse "в ${file} нет ключа ${SK_KEY}"; return; }
+    re_act="^[[:space:]]*${SK_KEY}[[:space:]]*="
+    re_com="^[[:space:]]*#[[:space:]]*${SK_KEY}[[:space:]]*="
+    grep -Eq -- "${re_act}" "${file}" && have_act=1
+    tmp="$(mktemp -- "${dir}/.${file##*/}.XXXXXX")" || return 1
+    while IFS= read -r cur || [[ -n "${cur}" ]]; do
+        if [[ "${cur}" =~ ${re_act} ]]; then
+            printf '%s\n' "${SK_LINE}"
+        elif [[ "${have_act}" -eq 0 && "${replaced}" -eq 0 && "${cur}" =~ ${re_com} ]]; then
+            printf '%s\n' "${SK_LINE}"
+            replaced=1
+        else
+            printf '%s\n' "${cur}"
+        fi
+    done < "${file}" > "${tmp}" || { rm -f -- "${tmp}"; return 1; }
+    if ! chmod --reference="${file}" -- "${tmp}" || ! chown --reference="${file}" -- "${tmp}"; then
+        rm -f -- "${tmp}"
+        return 1
+    fi
+    stamp="$(date '+%Y%m%d-%H%M%S')"
+    if ! cp -a -- "${file}" "${file}.bak-${stamp}"; then
+        rm -f -- "${tmp}"
+        return 1
+    fi
+    mv -f -- "${tmp}" "${file}"
 }
 
 # Linger — только для пользователя, вызвавшего sudo/pkexec (не под root — себя)
@@ -1081,6 +1089,9 @@ kind_label() {
         linger) printf 'linger' ;;
         health) printf 'работа службы' ;;
         root-file) printf 'файл (root)' ;;
+        system-off) printf 'выключено (система)' ;;
+        sys-key) printf 'настройка ОС' ;;
+        sys-check) printf 'проверка ОС' ;;
         *) printf '%s' "$1" ;;
     esac
 }
@@ -1412,12 +1423,108 @@ eval_db() {
     set_row "${i}" "есть" "—" "${state}" "OK" "" "none" ""
 }
 
-# Каталог назначения root-file по ключу lib|conf
+# Каталог назначения root-file по ключу lib|conf|abs и имени задания
+# (у abs имя — полный путь файла, каталог — его родитель)
 root_file_dir() {
-    if [[ "$1" == "lib" ]]; then
-        printf '%s' "${ROOT_LIB_DIR}"
+    case "$1" in
+        lib) printf '%s' "${ROOT_LIB_DIR}" ;;
+        abs) printf '%s' "${2%/*}" ;;
+        *) printf '%s' "${ROOT_CONF_DIR}" ;;
+    esac
+}
+
+# Юнит ОС, который стеку мешает или не нужен (вид system-off): выключен или
+# не установлен — OK; включён или работает — выключить и остановить
+eval_unit_off() {
+    local i="$1" name="$2" on="нет"
+    if ! has_systemd; then
+        set_row "${i}" "—" "—" "нет systemd" "OK" "" "none" ""
+        return 0
+    fi
+    unit_props system "${name}" || P_LOAD="not-found"
+    if [[ "${P_LOAD}" != "loaded" ]]; then
+        set_row "${i}" "нет" "—" "не установлен" "OK" "" "none" ""
+        return 0
+    fi
+    case "${P_FILE}" in
+        enabled|enabled-runtime|linked|linked-runtime) on="да" ;;
+        *) ;;
+    esac
+    if [[ "${on}" == "да" || "${P_ACTIVE}" == "active" || "${P_ACTIVE}" == "activating" ]]; then
+        set_row "${i}" "есть" "${on}" "${P_ACTIVE:-?}" "ВНИМАНИЕ" "${name} должен быть выключен" "disable" "выключить и остановить ${name} (systemctl disable --now)"
     else
-        printf '%s' "${ROOT_CONF_DIR}"
+        set_row "${i}" "есть" "нет" "выключен" "OK" "" "none" ""
+    fi
+}
+
+# Строка «КЛЮЧ = значение» задания sys-key: SK_KEY, SK_LINE; код 1 — недопустимая
+# (ключ — имя переменной, значение — без кавычек-экранирования и спецсимволов shell)
+parse_sys_key() {
+    local re_line='^[A-Za-z0-9_ ="./:+-]+$'
+    SK_LINE="$1"
+    SK_KEY="${SK_LINE%%=*}"
+    SK_KEY="${SK_KEY//[[:space:]]/}"
+    [[ "${SK_LINE}" == *=* && "${SK_KEY}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+    [[ "${SK_LINE}" =~ ${re_line} ]]
+}
+
+# Без пробелов и кавычек: «A = "x"» и «A="x"» считаются одной настройкой
+sys_key_norm() {
+    local v="${1//[[:space:]]/}" dq='"' sq="'"
+    v="${v//${dq}/}"
+    printf '%s' "${v//${sq}/}"
+}
+
+# Разбор файла по ключу SK_KEY: SK_STATE — ok (действующая строка совпадает),
+# set (есть действующая или закомментированная строка ключа — правится на месте),
+# missing (ключа нет: место в файле, например секцию, выбирает человек)
+sys_key_scan() {
+    local file="$1" line want norm got=0 comment=0 re_act re_com
+    want="$(sys_key_norm "${SK_LINE}")"
+    re_act="^[[:space:]]*${SK_KEY}[[:space:]]*="
+    re_com="^[[:space:]]*#[[:space:]]*${SK_KEY}[[:space:]]*="
+    SK_STATE="missing"
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        if [[ "${line}" =~ ${re_act} ]]; then
+            got=1
+            norm="$(sys_key_norm "${line}")"
+            [[ "${norm}" == "${want}" ]] && { SK_STATE="ok"; return 0; }
+        elif [[ "${line}" =~ ${re_com} ]]; then
+            comment=1
+        fi
+    done < "${file}"
+    [[ "${got}" -eq 1 || "${comment}" -eq 1 ]] && SK_STATE="set"
+    return 0
+}
+
+# Настройка «КЛЮЧ = значение» в системном файле (вид sys-key)
+eval_sys_key() {
+    local i="$1" file="$2" line="$3"
+    if ! parse_sys_key "${line}"; then
+        set_row "${i}" "—" "—" "—" "ВНИМАНИЕ" "некорректная строка задания «${line}»" "none" ""
+        return 0
+    fi
+    if [[ ! -f "${file}" || ! -r "${file}" ]]; then
+        set_row "${i}" "нет" "—" "нет файла" "ВНИМАНИЕ" "нет файла ${file}" "none" ""
+        return 0
+    fi
+    sys_key_scan "${file}"
+    case "${SK_STATE}" in
+        ok) set_row "${i}" "есть" "—" "${SK_LINE}" "OK" "" "none" "" ;;
+        set) set_row "${i}" "отличается" "—" "—" "ВНИМАНИЕ" "в ${file} нет «${SK_LINE}»" "sys-key" "установить «${SK_LINE}» в ${file} (прежний — ${file##*/}.bak-<дата>)" ;;
+        *) set_row "${i}" "нет" "—" "нет ключа" "ВНИМАНИЕ" "в ${file} нет ключа ${SK_KEY}: добавьте «${SK_LINE}» вручную в нужное место файла" "none" "" ;;
+    esac
+}
+
+# Условие ОС, которое выполняется вручную или другими заданиями (вид sys-check):
+# параметр — признаки как в поле условия (swap:zram, link:…, fs:…, path:…)
+eval_sys_check() {
+    local i="$1" spec="$2" label
+    if check_when "${spec}"; then
+        set_row "${i}" "есть" "—" "выполнено" "OK" "" "none" ""
+    else
+        label="$(when_label "${spec}")"
+        set_row "${i}" "нет" "—" "не выполнено" "ВНИМАНИЕ" "не выполнено: ${label}" "none" ""
     fi
 }
 
@@ -1428,8 +1535,8 @@ eval_root_file() {
         set_row "${i}" "—" "—" "—" "ВНИМАНИЕ" "некорректный параметр задания «${spec}»" "none" ""
         return 0
     fi
-    dir="$(root_file_dir "${RF_DIRKEY}")"
-    dest="${dir}/${name}"
+    dir="$(root_file_dir "${RF_DIRKEY}" "${name}")"
+    dest="${dir}/${name##*/}"
     tmp="$(mktemp)"
     if ! render_root_file "${spec}" "${tmp}"; then
         rm -f -- "${tmp}"
@@ -1477,8 +1584,16 @@ eval_job() {
         linger) eval_linger "${i}" ;;
         health) eval_health "${i}" "${name}" "${arg}" ;;
         root-file) eval_root_file "${i}" "${name}" "${arg}" ;;
+        system-off) eval_unit_off "${i}" "${name}" ;;
+        sys-key) eval_sys_key "${i}" "${name}" "${arg}" ;;
+        sys-check) eval_sys_check "${i}" "${arg}" ;;
         *) set_row "${i}" "—" "—" "—" "ВНИМАНИЕ" "неизвестный вид задания «${kind}»" "none" "" ;;
     esac
+    # Рекомендуемое (opt в условии): проблема показывается, но не влияет на код
+    # возврата и с --yes не исправляется — только по вопросу
+    if [[ "${R_RESULT[${i}]}" == "ВНИМАНИЕ" && ",${when}," == *",opt,"* ]]; then
+        R_RESULT[i]="рекомендуется"
+    fi
 }
 
 eval_all() {
@@ -1556,8 +1671,46 @@ fix_root_file() {
         return 0
     fi
     parse_root_file_spec "${spec}" || return 1
-    dir="$(root_file_dir "${RF_DIRKEY}")"
+    dir="$(root_file_dir "${RF_DIRKEY}" "${name}")"
     as_root __root-install-file "${name}" "${dir}" "${MYTASKS_DIR}"
+}
+
+# Выключение юнита ОС (вид system-off) — root-шаг проверяет имя по JOBS
+fix_unit_off() {
+    local i="$1"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        say "[dry-run] будет: ${R_ACTION[${i}]} (с повышением прав)"
+        return 0
+    fi
+    as_root __root-disable "${R_NAME[${i}]}"
+}
+
+# Настройка в системном файле (вид sys-key) — root-шаг берёт строку из JOBS
+fix_sys_key() {
+    local i="$1" line
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+        say "[dry-run] будет: ${R_ACTION[${i}]} (с повышением прав)"
+        return 0
+    fi
+    IFS='|' read -r _ _ line _ <<<"${ALL_JOBS[${i}]}"
+    parse_sys_key "${line}" || return 1
+    as_root __root-set-key "${R_NAME[${i}]}" "${SK_KEY}"
+}
+
+# Строка задания sys-key для пары ФАЙЛ + КЛЮЧ (в одном файле может быть
+# несколько ключей); код 1 — такого задания нет
+sys_key_job_line() {
+    local want_file="$1" want_key="$2" entry kind name arg
+    for entry in "${JOBS[@]}"; do
+        IFS='|' read -r kind name arg _ <<<"${entry}"
+        [[ "${kind}" == "sys-key" && "${name}" == "${want_file}" ]] || continue
+        parse_sys_key "${arg}" || continue
+        if [[ "${SK_KEY}" == "${want_key}" ]]; then
+            printf '%s' "${arg}"
+            return 0
+        fi
+    done
+    return 1
 }
 
 fix_cron() {
@@ -1704,6 +1857,8 @@ fix_job() {
         linger) fix_linger "${i}" ;;
         restart) fix_health "${i}" ;;
         root-file) fix_root_file "${i}" ;;
+        disable) fix_unit_off "${i}" ;;
+        sys-key) fix_sys_key "${i}" ;;
         conf-dir) fix_conf_dir ;;
         conf)
             IFS='|' read -r _ name arg _ <<<"${ALL_JOBS[${i}]}"
@@ -1735,19 +1890,30 @@ handle_job() {
     local i="$1"
     local name="${R_NAME[${i}]}" label text rc
     [[ "${STOP}" -eq 1 ]] && return 0
-    [[ "${R_RESULT[${i}]}" == "ВНИМАНИЕ" ]] || return 0
+    [[ "${R_RESULT[${i}]}" == "ВНИМАНИЕ" || "${R_RESULT[${i}]}" == "рекомендуется" ]] || return 0
     # Задание уже обработано в этом запуске (исправлено, отклонено или не
     # исправляется) — второй раз не предупреждать и не спрашивать
     [[ " ${HANDLED} " == *" ${name} "* ]] && return 0
     HANDLED+=" ${name}"
     label="$(kind_label "${R_KIND[${i}]}")"
 
-    warn "${label} ${name}: ${R_PROBLEM[${i}]}"
-    say "   ${R_DESC[${i}]}"
-    log_json "WARN" "job_problem" "${label} ${name}: ${R_PROBLEM[${i}]}" "${R_DESC[${i}]}"
+    if [[ "${R_RESULT[${i}]}" == "рекомендуется" ]]; then
+        say "· Рекомендуется — ${label} ${name}: ${R_PROBLEM[${i}]}"
+        say "   ${R_DESC[${i}]}"
+        log_json "INFO" "job_recommended" "${label} ${name}: ${R_PROBLEM[${i}]}" "${R_DESC[${i}]}"
+    else
+        warn "${label} ${name}: ${R_PROBLEM[${i}]}"
+        say "   ${R_DESC[${i}]}"
+        log_json "WARN" "job_problem" "${label} ${name}: ${R_PROBLEM[${i}]}" "${R_DESC[${i}]}"
+    fi
 
     if [[ "${R_FIX[${i}]}" == "none" ]]; then
         say "   Автоматически не исправляется."
+        return 0
+    fi
+    # Рекомендуемое не входит в «всё обязательное» --yes: только по вопросу
+    if [[ "${R_RESULT[${i}]}" == "рекомендуется" && "${ASSUME_YES}" -eq 1 && "${DRY_RUN}" -eq 0 ]]; then
+        say "   Рекомендуемое: с --yes не выполняется (запустите без --yes и ответьте «да»)."
         return 0
     fi
     if [[ "${R_FIX[${i}]}" == "conf" ]]; then
@@ -1843,6 +2009,11 @@ dep_present() {
         # GNU-версия утилиты (в busybox нет find -printf, stat -c, date -d и т.п.)
         ver="$("${cmd#gnu:}" --version 2>/dev/null)" || return 1
         [[ "${ver}" == *GNU* ]]
+        return
+    fi
+    if [[ "${cmd}" == file:* ]]; then
+        # Файл, а не команда в PATH (генераторы systemd и т.п.)
+        [[ -e "${cmd#file:}" ]]
         return
     fi
     if [[ "${cmd}" == py:* ]]; then
@@ -2317,6 +2488,7 @@ print_table() {
                 case "${cell}" in
                     OK|есть) color=$'\033[32m' ;;
                     ВНИМАНИЕ|нет) color=$'\033[31m' ;;
+                    рекомендуется) color=$'\033[33m' ;;
                     *) color=$'\033[2m' ;;
                 esac
             fi
@@ -2398,9 +2570,9 @@ notify_alert() {
 # ARGS
 ###############################################################################
 # Внутренние root-шаги (этот же скрипт через sudo/pkexec) — до загрузки
-# пользовательского конфига: под root он не выполняется, значения — встроенные
-# JOBS/DEPS и проверенные аргументы. Не под root (SUDO_CMD="", тесты) граница
-# прав не пересекается, и JOBS/DEPS берутся из конфига, как у основного запуска.
+# пользовательского конфига: под root он не выполняется, значения — JOBS/DEPS из
+# conf/check_mytasks.requirements и проверенные аргументы. Не под root (SUDO_CMD="",
+# тесты) граница прав не пересекается, и JOBS/DEPS берутся из конфига, как у основного запуска.
 case "${1:-}" in
     __root-*)
         [[ "${EUID}" -eq 0 ]] || load_user_conf
@@ -2410,6 +2582,8 @@ case "${1:-}" in
             __root-install-units) root_install_units "$@" ;;
             __root-install-file) root_install_file "$@" ;;
             __root-enable) root_enable "$@" ;;
+            __root-disable) root_disable "$@" ;;
+            __root-set-key) root_set_key "$@" ;;
             __root-linger) root_linger "$@" ;;
             __root-pkg) root_pkg "$@" ;;
             __root-update) root_update "$@" ;;

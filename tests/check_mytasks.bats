@@ -29,6 +29,7 @@ setup() {
   cp "$REPO_ROOT/check_mytasks.sh" "$WORK/"
   cp "$REPO_ROOT/systemd/user/check-mytasks.service" "$WORK/systemd/user/"
   cp "$REPO_ROOT/conf/check_mytasks.conf.example" "$WORK/conf/"
+  cp "$REPO_ROOT/conf/check_mytasks.requirements" "$WORK/conf/"
   chmod +x "$WORK/check_mytasks.sh"
   printf '#!/bin/sh\necho demo\n' > "$WORK/demo.sh"
   chmod +x "$WORK/demo.sh"
@@ -94,6 +95,9 @@ case "${args[0]}" in
     ;;
   enable)
     for u in "${args[@]:1}"; do [[ "$u" == --now ]] || touch "$STATE/enabled/$u"; done
+    ;;
+  disable)
+    for u in "${args[@]:1}"; do [[ "$u" == --now ]] || rm -f "$STATE/enabled/$u"; done
     ;;
   *) ;;
 esac
@@ -803,4 +807,153 @@ EOT2
   run "$WORK/check_mytasks.sh" --yes --no-gui
   [[ "$output" == *"не создана: нет bin/нет-такой"* ]]
   [ ! -e "$WORK/demo.db" ]
+}
+
+@test "system-off: включён — ВНИМАНИЕ, --dry-run план, --yes выключает; не установлен — OK" {
+  touch "$STATE/ext/offdemo.service" "$STATE/enabled/offdemo.service"
+  write_conf '"system-off|offdemo.service|||Демо-выключение"' ""
+  run "$WORK/check_mytasks.sh" --status
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"выключено (система)"* ]]
+  [[ "$output" == *"ВНИМАНИЕ"* ]]
+
+  run "$WORK/check_mytasks.sh" --dry-run --no-gui
+  [[ "$output" == *"[dry-run] будет: выключить и остановить offdemo.service"* ]]
+  [ -e "$STATE/enabled/offdemo.service" ]
+
+  run "$WORK/check_mytasks.sh" --yes --no-gui
+  grep -qx -- "systemctl disable --now -- offdemo.service" "$CALLS"
+  [ ! -e "$STATE/enabled/offdemo.service" ]
+
+  run "$WORK/check_mytasks.sh" --status
+  [[ "$output" == *"offdemo.service"*"выключен"*"OK"* ]]
+
+  rm "$STATE/ext/offdemo.service"
+  run "$WORK/check_mytasks.sh" --status
+  [[ "$output" == *"не установлен"* ]]
+}
+
+@test "system-off: root-шаг отклоняет юнит не из JOBS" {
+  touch "$STATE/ext/offdemo.service" "$STATE/enabled/offdemo.service"
+  write_conf '"system-off|offdemo.service|||Демо-выключение"' ""
+  run "$WORK/check_mytasks.sh" __root-disable sshd.service
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"нет среди system-off"* ]]
+  run grep -q -- "disable --now -- sshd.service" "$CALLS"
+  [ "$status" -ne 0 ]
+  [ -e "$STATE/enabled/offdemo.service" ]
+}
+
+@test "root-file abs: системный файл — отличие, обновление с резервной копией; чужой каталог отклоняется" {
+  ABS="$(cd "$TMP_DIR" && pwd -P)"
+  mkdir -p "$WORK/etc" "$ABS/sysetc/demo.d"
+  printf 'new\n' > "$WORK/etc/abs.conf"
+  printf 'old\n' > "$ABS/sysetc/demo.d/abs.conf"
+  chmod 0644 "$ABS/sysetc/demo.d/abs.conf"
+  write_conf "\"root-file|$ABS/sysetc/demo.d/abs.conf|etc/abs.conf:abs:0644||Демо системный файл\"" ""
+
+  run "$WORK/check_mytasks.sh" --status
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"отличается"* ]]
+  [[ "$output" == *"ВНИМАНИЕ"* ]]
+
+  run "$WORK/check_mytasks.sh" --yes --no-gui
+  cmp "$WORK/etc/abs.conf" "$ABS/sysetc/demo.d/abs.conf"
+  bak=( "$ABS/sysetc/demo.d/abs.conf.bak-"* )
+  [ "${#bak[@]}" -eq 1 ]
+  [ "$(cat "${bak[0]}")" = "old" ]
+
+  run "$WORK/check_mytasks.sh" --status
+  [[ "$output" == *"abs.conf"*"OK"* ]]
+
+  run "$WORK/check_mytasks.sh" __root-install-file "$ABS/sysetc/demo.d/abs.conf" "$ABS/sysetc" "$WORK"
+  [ "$status" -eq 2 ]
+}
+
+@test "sys-key: закомментированный ключ заменяется с копией; ключа нет — только предупреждение" {
+  ABS="$(cd "$TMP_DIR" && pwd -P)"
+  printf '[options]\n#Parallel = 5\nOther = 1\n' > "$ABS/keys.conf"
+  printf 'Other = 1\n' > "$ABS/nokey.conf"
+  write_conf "\"sys-key|$ABS/keys.conf|Parallel = 10||Демо ключ\"
+\"sys-key|$ABS/nokey.conf|Absent = 1||Демо нет ключа\"" ""
+
+  run "$WORK/check_mytasks.sh" --status
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"настройка ОС"* ]]
+  [[ "$output" == *"ВНИМАНИЕ"* ]]
+
+  run "$WORK/check_mytasks.sh" --yes --no-gui
+  [[ "$output" == *"вручную"* ]]
+  grep -qx 'Parallel = 10' "$ABS/keys.conf"
+  grep -qx 'Other = 1' "$ABS/keys.conf"
+  run grep -q '#Parallel' "$ABS/keys.conf"
+  [ "$status" -ne 0 ]
+  ls "$ABS"/keys.conf.bak-* >/dev/null
+  [ "$(cat "$ABS/nokey.conf")" = "Other = 1" ]
+
+  run "$WORK/check_mytasks.sh" --status
+  [[ "$output" == *"keys.conf"*"OK"* ]]
+
+  run "$WORK/check_mytasks.sh" __root-set-key "$ABS/keys.conf" Other
+  [ "$status" -eq 2 ]
+}
+
+@test "sys-key: пробелы и кавычки не важны" {
+  ABS="$(cd "$TMP_DIR" && pwd -P)"
+  printf 'Key="v"\n' > "$ABS/q.conf"
+  write_conf "\"sys-key|$ABS/q.conf|Key = v||Демо\"" ""
+  run "$WORK/check_mytasks.sh" --status
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"q.conf"*"OK"* ]]
+}
+
+@test "sys-check: ссылка совпадает — OK, иначе ВНИМАНИЕ без исправления" {
+  ABS="$(cd "$TMP_DIR" && pwd -P)"
+  ln -s target "$ABS/lnk"
+  write_conf "\"sys-check|demo-link|link:$ABS/lnk=target||Демо проверка\"" ""
+  run "$WORK/check_mytasks.sh" --status
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"проверка ОС"* ]]
+  [[ "$output" == *"выполнено"* ]]
+
+  write_conf "\"sys-check|demo-link|link:$ABS/lnk=other||Демо проверка\"" ""
+  run "$WORK/check_mytasks.sh" --status
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"ВНИМАНИЕ"* ]]
+
+  run "$WORK/check_mytasks.sh" --no-create --no-gui
+  [[ "$output" == *"не выполнено"* ]]
+  [[ "$output" == *"Автоматически не исправляется."* ]]
+}
+
+@test "opt: рекомендуемое не влияет на код возврата и не исправляется с --yes" {
+  touch "$STATE/ext/optoff.service" "$STATE/enabled/optoff.service"
+  write_conf "\"system-off|optoff.service||opt|Демо рекомендуемое\"
+\"sys-check|opt-check|nopath:$WORK|opt|Демо рекомендуемая проверка\"" ""
+
+  run "$WORK/check_mytasks.sh" --status
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"рекомендуется"* ]]
+
+  run "$WORK/check_mytasks.sh" --yes --no-gui
+  [[ "$output" == *"с --yes не выполняется"* ]]
+  run grep -q -- "disable --now -- optoff.service" "$CALLS"
+  [ "$status" -ne 0 ]
+  [ -e "$STATE/enabled/optoff.service" ]
+
+  run "$WORK/check_mytasks.sh" --dry-run --no-gui
+  [[ "$output" == *"[dry-run] будет: выключить и остановить optoff.service"* ]]
+}
+
+@test "DEPS file: — есть, если файл существует" {
+  ABS="$(cd "$TMP_DIR" && pwd -P)"
+  write_conf "" "\"file:$ABS/gen|demo-gen||Демо файл-зависимость\""
+  run "$WORK/check_mytasks.sh" --status
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"file:$ABS/gen"* ]]
+  [[ "$output" == *"нет"* ]]
+
+  touch "$ABS/gen"
+  run "$WORK/check_mytasks.sh" --status
+  [ "$status" -eq 0 ]
 }

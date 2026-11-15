@@ -53,6 +53,7 @@ reports/
 conf/*
 !conf/.gitkeep
 !conf/*.conf.example
+!conf/check_mytasks.requirements
 
 # Local project directories (exclude from GitHub)
 /music_downloader-dev/
