@@ -10,6 +10,15 @@ MODEL_TAG = re.compile(r"^\[[A-Za-z][A-Za-z0-9._/-]+\]\s+\S")
 REASON = ("План не принят: каждый шаг должен начинаться меткой модели. "
           "Claude: [Haiku] или [Opus]; Codex и Gemini: точный идентификатор "
           "доступной модели в квадратных скобках. Сверь каталог и повтори план.")
+# План Claude из стольких и более шагов, где все шаги [Opus], без причины — отклоняется.
+ALL_SENIOR_MIN_STEPS = 3
+SENIOR_ONLY_TAG = re.compile(r"^\[Opus\]")
+SENIOR_REASON = re.compile(r"\(Opus:\s*\S")
+REASON_ALL_SENIOR = ("План не принят: все шаги помечены [Opus]. Рутину (сбор данных, проверки, "
+                     "правки по готовому плану, документацию, коммит) пометь [Haiku] и отдай "
+                     "подагенту Agent с model: haiku. Если каждый шаг действительно требует Opus "
+                     "(анализ, диагностика, необратимое), добавь причину хотя бы в один шаг: "
+                     "«[Opus] Шаг (Opus: причина)».")
 
 
 def main() -> int:
@@ -29,13 +38,20 @@ def main() -> int:
     else:
         return 0
     bad = []
+    contents = []
     for item in steps:
         if not isinstance(item, dict):
             continue
         content = next((str(item[field]) for field in fields if field in item), "")
+        contents.append(content)
         if not tag.match(content):
             bad.append(content)
     if not bad:
+        if tag is CLAUDE_TAG and len(contents) >= ALL_SENIOR_MIN_STEPS \
+                and all(SENIOR_ONLY_TAG.match(c) for c in contents) \
+                and not any(SENIOR_REASON.search(c) for c in contents):
+            print(REASON_ALL_SENIOR, file=sys.stderr)
+            return 2
         return 0
     print(REASON + " Шаги без метки: " + "; ".join(f"«{step[:60]}»" for step in bad[:6]),
           file=sys.stderr)

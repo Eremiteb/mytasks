@@ -89,6 +89,23 @@ EOF
   [ "$status" -eq 0 ]
 }
 
+@test "хук плана: план Claude только из [Opus] без причины отклоняется" {
+  guard="$TMP_DIR/agent-skills/model-routing/plan-guard.py"
+  all_opus='[{"content":"[Opus] Собрать данные"},{"content":"[Opus] Правка"},{"content":"[Opus] Проверка"}]'
+  run bash -c "printf '{\"tool_input\":{\"items\":%s}}' '$all_opus' | python3 -I '$guard'"
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"все шаги помечены [Opus]"* ]]
+  with_reason='[{"content":"[Opus] Миграция (Opus: необратимое)"},{"content":"[Opus] Правка"},{"content":"[Opus] Проверка"}]'
+  run bash -c "printf '{\"tool_input\":{\"items\":%s}}' '$with_reason' | python3 -I '$guard'"
+  [ "$status" -eq 0 ]
+  mixed='[{"content":"[Opus] Анализ"},{"content":"[Haiku] Правка"},{"content":"[Haiku] Проверка"}]'
+  run bash -c "printf '{\"tool_input\":{\"items\":%s}}' '$mixed' | python3 -I '$guard'"
+  [ "$status" -eq 0 ]
+  two_opus='[{"content":"[Opus] Анализ"},{"content":"[Opus] Ответ"}]'
+  run bash -c "printf '{\"tool_input\":{\"items\":%s}}' '$two_opus' | python3 -I '$guard'"
+  [ "$status" -eq 0 ]
+}
+
 @test "хук плана принимает метки Codex и Gemini и отклоняет шаг без метки" {
   guard="$TMP_DIR/agent-skills/model-routing/plan-guard.py"
   run bash -c "printf '%s' '{\"tool_input\":{\"plan\":[{\"step\":\"Собрать данные\"}]}}' | python3 -I '$guard'"
