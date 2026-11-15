@@ -756,6 +756,29 @@ EOT2
   [[ "$output" == *"demo.db"*"схема v1"*"OK"* ]]
 }
 
+@test "db: относительный путь в аргументах команды — проверка и создание из другого каталога" {
+  db_stub
+  # Как у music_downloader: «venv/bin/python music_downloader/music_downloader.py» —
+  # второй путь относителен MYTASKS_DIR; служба входа в сеанс работает из $HOME
+  cat > "$WORK/bin/demo-wrap" <<'EOT2'
+#!/usr/bin/env bash
+[[ -f "$1" ]] || { echo "can't open file '$1'"; exit 2; }
+script="$1"; shift
+exec "${script}" "$@"
+EOT2
+  chmod +x "$WORK/bin/demo-wrap"
+  write_conf '"db|demo.db|bin/demo-wrap bin/demo-db --migrate-db||Демо-база"' ""
+  mkdir -p "$TMP_DIR/elsewhere"
+  cd "$TMP_DIR/elsewhere"
+  run "$WORK/check_mytasks.sh" --no-create
+  [[ "$output" != *"завершилась с кодом"* ]]
+  [[ "$output" == *"база отсутствует или схема устарела"* ]]
+  run "$WORK/check_mytasks.sh" --yes --no-gui
+  [ -e "$WORK/demo.db" ]
+  run "$WORK/check_mytasks.sh" --status
+  [[ "$output" == *"demo.db"*"схема v1"*"OK"* ]]
+}
+
 @test "db: команда не найдена — ВНИМАНИЕ без сбоя" {
   write_conf '"db|missing.db|bin/нет-такой --migrate-db||Демо-база без команды"' ""
   run "$WORK/check_mytasks.sh" --no-create
