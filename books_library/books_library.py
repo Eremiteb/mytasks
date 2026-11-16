@@ -1485,6 +1485,106 @@ def relink(db_path: str, pairs: list[tuple[str, str]]) -> int:
     return len(pairs)
 
 
+DUP_STATUS_NAMES = {"similar": "Похожие (ручное решение)", "auto": "Удалены автоматически", "resolved": "Решённые"}
+DUP_PAGE_SIZE = 50
+
+
+def dup_groups_page(conn: sqlite3.Connection, status: str, page: int, size: int) -> tuple[int, list[dict[str, Any]]]:
+    """Группы дублей одного статуса с участниками (веб и API). Путь карантина наружу не отдаётся вызывающими."""
+    total = conn.execute("SELECT count(*) FROM dup_groups WHERE status=?", (status,)).fetchone()[0]
+    groups: list[dict[str, Any]] = []
+    for group in conn.execute("SELECT id, key, status, created FROM dup_groups WHERE status=? ORDER BY id LIMIT ? OFFSET ?",
+                              (status, size, (page - 1) * size)).fetchall():
+        members = []
+        for member in conn.execute("SELECT path, fmt, size, words, coverage, role, quarantine FROM dup_members "
+                                   "WHERE group_id=? ORDER BY role DESC, path", (group["id"],)).fetchall():
+            book = conn.execute("SELECT id FROM books WHERE path=?", (member["path"],)).fetchone()
+            members.append({**dict(member), "book_id": book[0] if book else None})
+        groups.append({**dict(group), "members": members})
+    return total, groups
+
+
+def dup_group_json(group: dict[str, Any]) -> dict[str, Any]:
+    return {"id": group["id"], "key": group["key"], "status": group["status"], "created": group["created"],
+            "members": [{"path": display_path(m["path"], m["fmt"]), "key_path": m["path"], "fmt": m["fmt"], "size": m["size"],
+                         "words": m["words"], "coverage": m["coverage"], "role": m["role"], "book_id": m["book_id"],
+                         "in_quarantine": bool(m["quarantine"])} for m in group["members"]]}
+
+
+def dup_action(cfg: dict[str, Any], group_id: int, action: str, path: str = "") -> str:
+    """Решение по группе дублей: общая логика веба и API. Возвращает сообщение; ошибки для пользователя — ValueError."""
+    root = Path(cfg["books_dir"]).resolve()
+    if action == "keep-both":
+        with closing(connect(cfg["db_path"])) as conn, conn:
+            if conn.execute("UPDATE dup_groups SET status='resolved' WHERE id=?", (group_id,)).rowcount == 0:
+                raise ValueError("группа дублей не найдена")
+        say(f"группа {group_id}: оставлены все файлы", "dup_action", detail=f"keep-both group={group_id}")
+        return "Все файлы группы оставлены, группа помечена решённой."
+    if action == "quarantine":
+        with closing(connect(cfg["db_path"])) as conn:
+            kept = [r[0] for r in conn.execute("SELECT path FROM dup_members WHERE group_id=? AND role='kept' ORDER BY path",
+                                               (group_id,))]
+        if path not in kept:
+            raise ValueError("файл не является оставленным участником этой группы")
+        others = [p for p in kept if p != path]
+        if not others:
+            raise ValueError("единственную оставленную книгу группы нельзя отправить в карантин")
+        keeper = others[0]
+        with scan_lock():
+            full = (root / path).resolve()
+            if not full.is_relative_to(root) or not full.is_file():
+                raise ValueError("файл не найден в каталоге книг")
+            dest = Path(cfg["quarantine_dir"]) / "duplicate" / path
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                if dest.exists():
+                    dest = unique_path(dest.parent, dest.name, set())
+                shutil.move(full, dest)
+            except OSError as error:
+                raise ValueError(f"не удалось переместить файл в карантин: {error.strerror}") from error
+            with closing(connect(cfg["db_path"])) as conn, conn:
+                conn.execute("UPDATE dup_members SET role='duplicate', quarantine=?, keeper=? WHERE group_id=? AND path=?",
+                             (str(dest), keeper, group_id, path))
+                conn.execute("DELETE FROM books_fts WHERE rowid IN (SELECT id FROM books WHERE path=?)", (path,))
+                conn.execute("DELETE FROM books WHERE path=?", (path,))
+            relink(cfg["db_path"], [(path, keeper)])
+        say(f"группа {group_id}: в карантин {path}", "dup_action", detail=f"quarantine group={group_id} keeper={keeper}")
+        return f"«{path}» перенесён в карантин, оставлен «{keeper}»."
+    if action == "restore":
+        with closing(connect(cfg["db_path"])) as conn:
+            row = conn.execute("SELECT quarantine FROM dup_members WHERE group_id=? AND path=? AND role='duplicate' "
+                               "AND quarantine<>''", (group_id, path)).fetchone()
+        if row is None:
+            raise ValueError("файл не числится в карантине этой группы")
+        with scan_lock():
+            source = Path(row[0]).resolve()
+            if not source.is_relative_to(Path(cfg["quarantine_dir"]).resolve()) or not source.is_file():
+                raise ValueError("файл в карантине не найден")
+            target = (root / path).resolve()
+            if not target.is_relative_to(root):
+                raise ValueError("путь вне каталога книг")
+            if target.exists():
+                raise ValueError("на месте уже есть файл, восстановление отменено")
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(source, target)
+            except OSError as error:
+                raise ValueError(f"не удалось восстановить файл: {error.strerror}") from error
+            stat = target.stat()
+            meta = read_book_meta(root, path)
+            with closing(connect(cfg["db_path"])) as conn, conn:
+                conn.execute("UPDATE dup_members SET role='kept', quarantine='', keeper='' WHERE group_id=? AND path=?",
+                             (group_id, path))
+                kept_count = conn.execute("SELECT count(*) FROM dup_members WHERE group_id=? AND role='kept'",
+                                          (group_id,)).fetchone()[0]
+                if kept_count > 1:
+                    conn.execute("UPDATE dup_groups SET status='similar' WHERE id=?", (group_id,))
+                upsert_book(conn, path, stat.st_size, stat.st_mtime, meta)
+        say(f"группа {group_id}: восстановлен {path}", "dup_action", detail=f"restore group={group_id}")
+        return f"«{path}» восстановлен в каталог."
+    raise ValueError("неизвестное действие")
+
+
 def zip_date(mtime: float) -> tuple[int, int, int, int, int, int]:
     return max(datetime.fromtimestamp(mtime).timetuple()[:6], (1980, 1, 1, 0, 0, 0))
 
@@ -2566,7 +2666,7 @@ body:'id='+id+'&ch='+ch+'&p='+v.toFixed(4)})},800)})})();
 """
 
 NAV = [("/", "Поиск"), ("/sections", "Разделы"), ("/authors", "Авторы"), ("/series", "Серии"), ("/genres", "Жанры"), ("/browse", "Папки"),
-       ("/shelves", "Полки"), ("/recent", "Недавние"), ("/stats", "Статистика")]
+       ("/shelves", "Полки"), ("/recent", "Недавние"), ("/dups", "Дубликаты"), ("/stats", "Статистика")]
 
 
 def e(value: Any) -> str:
@@ -2651,6 +2751,9 @@ API_HELP = {
                       "confirm: <id успешного dry-run> — обязателен для боевого fix-encoding/unpack-fb2zip/convert, "
                       "параметры режима: path, only, max_mb, to, overwrite, skip_newer, exclude, author, title_mode, toc, "
                       "toc_depth, delete_source}",
+    "GET /api/dups": "группы дублей: status=similar|auto|resolved (по умолчанию similar), page (по 50); "
+                     "в members путь для показа — path, для действий — key_path",
+    "POST /api/dups/<id>": "{action: keep-both|quarantine|restore, path: key_path участника} — решение по группе",
     "POST /api/progress": "позиция чтения (форма id, ch, p) — используется читалкой",
 }
 
@@ -2799,7 +2902,7 @@ class Handler(BaseHTTPRequestHandler):
         handlers: dict[tuple[str, str], Callable[[list[str]], None]] = {
             ("GET", ""): self.view_search, ("GET", "book"): self.view_book, ("GET", "read"): self.view_read,
             ("GET", "file"): self.view_file, ("GET", "cover"): self.view_cover, ("GET", "res"): self.view_res, ("GET", "page"): self.view_djvu_page,
-            ("GET", "zip"): self.view_zip,
+            ("GET", "zip"): self.view_zip, ("GET", "dups"): self.view_dups, ("POST", "dups"): self.post_dups,
             ("GET", "authors"): self.view_authors, ("GET", "sections"): self.view_sections, ("GET", "series"): self.view_series, ("GET", "genres"): self.view_genres,
             ("GET", "browse"): self.view_browse, ("GET", "shelves"): self.view_shelves, ("GET", "recent"): self.view_recent,
             ("GET", "stats"): self.view_stats, ("GET", "opds"): self.view_opds, ("GET", "app.js"): self.view_js,
@@ -3132,6 +3235,75 @@ class Handler(BaseHTTPRequestHandler):
                            f'<form class="s" method="post" action="/shelves"><input name="name" placeholder="Новая полка" '
                            f'required maxlength="100"><button>Создать</button></form><p class="mut">Удаление полки не трогает книги.</p>')
 
+    def view_dups(self, _parts: list[str]) -> None:
+        status = self.query.get("status", "similar")
+        if status not in DUP_STATUS_NAMES:
+            status = "similar"
+        page = max(int(self.query["page"]), 1) if self.query.get("page", "").isdigit() else 1
+        with closing(self.db()) as conn:
+            counts = dict(conn.execute("SELECT status, count(*) FROM dup_groups GROUP BY status").fetchall())
+            total, groups = dup_groups_page(conn, status, page, DUP_PAGE_SIZE)
+        tabs = []
+        for key, label in DUP_STATUS_NAMES.items():
+            text = f"{label}: {counts.get(key, 0)}"
+            tabs.append(f"<b>{e(text)}</b>" if key == status else f'<a href="/dups?status={key}">{e(text)}</a>')
+
+        def button(gid: int, action: str, path: str, label: str) -> str:
+            return (f'<form class="s" method="post" action="/dups/{gid}"><input type="hidden" name="action" value="{action}">'
+                    f'<input type="hidden" name="path" value="{e(path)}"><input type="hidden" name="back_status" '
+                    f'value="{e(status)}"><button>{e(label)}</button></form>')
+
+        blocks = []
+        for group in groups:
+            gid = group["id"]
+            kept_count = sum(m["role"] == "kept" for m in group["members"])
+            rows = []
+            for m in group["members"]:
+                shown = display_path(m["path"], m["fmt"])
+                kept = m["role"] == "kept"
+                role = "оставлена" if kept else ("в карантине" if m["quarantine"] else "дубль")
+                coverage = "—" if m["coverage"] is None else f"{m['coverage'] * 100:.1f} %"
+                if m["book_id"]:
+                    book_id = m["book_id"]
+                    links = f'<a href="/book/{book_id}">книга</a> · <a href="/read/{book_id}">читать</a>'
+                else:
+                    links = "<span class='mut'>нет в каталоге</span>"
+                actions = ""
+                if kept and kept_count > 1:
+                    actions = button(gid, "quarantine", m["path"], "В карантин")
+                elif m["role"] == "duplicate" and m["quarantine"]:
+                    actions = button(gid, "restore", m["path"], "Восстановить")
+                rows.append(f'<tr><td><span title="{e(shown)}">{e(PurePosixPath(shown).name)}</span></td>'
+                            f'<td>{e(m["fmt"])}</td><td>{human_size(m["size"])}</td><td>{m["words"]}</td>'
+                            f'<td>{coverage}</td><td>{role}</td><td>{links}</td><td>{actions}</td></tr>')
+            head = button(gid, "keep-both", "", "Оставить все") if group["status"] == "similar" else ""
+            blocks.append(f'<section class="dup"><h3>{e(group["key"])} <span class="tag">'
+                          f'{e(DUP_STATUS_NAMES.get(group["status"], group["status"]))}</span></h3>{head}'
+                          f'<table><tr><th>Файл</th><th>Формат</th><th>Размер</th><th>Слов</th><th>Покрытие</th>'
+                          f'<th>Роль</th><th>Ссылки</th><th>Действия</th></tr>{"".join(rows)}</table></section>')
+        listing = "".join(blocks) or "<p>Групп нет. Дубликаты ищет режим dedup (ночная обработка).</p>"
+        params = {"status": status}
+        self.page("Дубликаты", f"<h2>Дубликаты</h2><p>{' · '.join(tabs)}</p>{listing}"
+                               f"{self.pager(total, page, DUP_PAGE_SIZE, params)}")
+
+    def post_dups(self, parts: list[str]) -> None:
+        if len(parts) != 1 or not parts[0].isdigit():
+            self.error_page(HTTPStatus.NOT_FOUND, "Страница не найдена")
+            return
+        form = {k: v[-1] for k, v in self.form.items()}
+        back = form.get("back_status", "similar")
+        if back not in DUP_STATUS_NAMES:
+            back = "similar"
+        try:
+            dup_action(self.cfg, int(parts[0]), form.get("action", ""), form.get("path", ""))
+        except ValueError as error:
+            self.error_page(HTTPStatus.BAD_REQUEST, str(error))
+            return
+        except ScanBusyError:
+            self.error_page(HTTPStatus.CONFLICT, "Идёт обработка библиотеки, повторите позже")
+            return
+        self.redirect(f"/dups?status={back}")
+
     def post_shelves(self, _parts: list[str]) -> None:
         form = {k: v[-1] for k, v in self.form.items()}
         with closing(self.db()) as conn, conn:
@@ -3237,6 +3409,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"books": total[0], "bytes": total[1], "last_scan": last[0] if last else None,
                                 "formats": {r[0]: {"books": r[1], "bytes": r[2]} for r in fmts},
                                 "statuses": {r[0]: r[1] for r in statuses}, "scan": SCAN_STATE})
+            elif name == "dups":
+                status = self.query.get("status", "similar")
+                if status not in DUP_STATUS_NAMES:
+                    self.send_json({"error": "status: similar, auto или resolved"}, HTTPStatus.BAD_REQUEST)
+                    return
+                page = max(int(self.query["page"]), 1) if self.query.get("page", "").isdigit() else 1
+                total, groups = dup_groups_page(conn, status, page, DUP_PAGE_SIZE)
+                self.send_json({"total": total, "page": page, "items": [dup_group_json(g) for g in groups]})
             else:
                 self.send_json({"error": "неизвестный ресурс", "endpoints": API_HELP}, HTTPStatus.NOT_FOUND)
 
@@ -3247,6 +3427,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         body = self.json_body
         try:
+            if name == "dups" and len(parts) == 2 and parts[1].isdigit():
+                action, path = body.get("action", ""), body.get("path", "")
+                if not isinstance(action, str) or not isinstance(path, str):
+                    raise ValueError("action и path — строки")
+                if len(path) > 4096 or "\x00" in path:
+                    raise ValueError("path: строка до 4096 символов без NUL")
+                message = dup_action(self.cfg, int(parts[1]), action, path)
+                self.send_json({"ok": True, "message": message})
+                return
             if name == "jobs" and len(parts) == 1:
                 command = body.get("command", "")
                 dry_run = body.get("dry_run", True)
@@ -3291,6 +3480,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
         except ConfirmRequiredError as error:
             self.send_json({"error": str(error)}, HTTPStatus.CONFLICT)
+        except ScanBusyError:
+            self.send_json({"error": "Идёт обработка библиотеки, повторите позже"}, HTTPStatus.CONFLICT)
 
     # ---- файлы, обложки, чтение -----------------------------------
     def view_file(self, parts: list[str], raw: bool = False) -> None:
