@@ -44,7 +44,7 @@ import time
 import unicodedata
 import zipfile
 import zlib
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import ExitStack, closing, contextmanager
 from datetime import UTC, datetime
@@ -1924,6 +1924,150 @@ def edit_book(cfg: dict[str, Any], book_id: int, raw: dict[str, Any], rename: bo
     return f"Метаданные {where}." + (f" Файл переименован: «{new_rel}»." if renamed else "")
 
 
+# ======================================================================
+# Проверка метаданных и переименование автора
+# ======================================================================
+
+FIX_REASON_TEXT = {
+    "semi": "искажённые заглавные (полу-cp866)",
+    "garbage": "мусорные символы",
+    "title": "пустое или числовое название",
+    "author": "нет автора",
+}
+FIX_COLUMNS = "id, path, fmt, title, authors, series, series_no, genres, year, lang, annotation"
+FIX_SQL = f"SELECT {FIX_COLUMNS} FROM books ORDER BY id"
+FIX_PAGE_SIZE = 100
+RENAME_LIMIT = 2000
+CONTROL_CHARS = re.compile(r"[\x00-\x1f]")
+CYRILLIC = re.compile("[а-яёА-ЯЁ]")
+LETTER = re.compile(r"[^\W\d_]")
+# Символы cp1252 с кодами 0x80–0x9F (€ ‚ „ … ‘ ’ “ ” и др.): продолжение UTF-8 при чтении как cp1252.
+CP1252_HIGH = "".join(ch for ch in (bytes([b]).decode("cp1252", errors="replace") for b in range(0x80, 0xA0))
+                      if ch != "\ufffd")
+# Кириллица в UTF-8 — два байта: лидирующий 0xD0 или 0xD1 (Ð, Ñ) и продолжение 0x80–0xBF. При чтении как cp1252
+# или latin-1 продолжение — это U+0080–U+00BF либо символ из CP1252_HIGH.
+MOJIBAKE = re.compile(f"[ÐÑ][\x80-\xbf{re.escape(CP1252_HIGH)}]")
+
+
+def _book_fields(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Поля книги в виде аргумента edit_book — значения из БД как есть."""
+    return {
+        "title": row["title"] or "",
+        "authors": [name for name in str(row["authors"] or "").split("; ") if name],
+        "series": row["series"] or "",
+        "series_no": row["series_no"],
+        "genres": [genre for genre in str(row["genres"] or "").split("; ") if genre],
+        "year": row["year"] or "",
+        "lang": row["lang"] or "",
+        "annotation": row["annotation"] or "",
+    }
+
+
+def _is_garbage(value: str) -> bool:
+    return "\ufffd" in value or CONTROL_CHARS.search(value) is not None or MOJIBAKE.search(value) is not None
+
+
+def _repair_mojibake(value: str) -> str | None:
+    """UTF-8, прочитанный как cp1252 (или latin-1), — обратно в кириллицу. Принимается, если нет символа U+FFFD, управляющих
+    символов и есть кириллица; иначе None."""
+    for codec in ("cp1252", "latin-1"):
+        try:
+            fixed = value.encode(codec).decode("utf-8")
+        except UnicodeError:
+            continue
+        if "\ufffd" not in fixed and CONTROL_CHARS.search(fixed) is None and CYRILLIC.search(fixed):
+            return fixed
+    return None
+
+
+def suspicious_fields(row: Mapping[str, Any]) -> tuple[list[str], dict[str, Any]]:
+    """Причины проверки метаданных книги и поля для edit_book. Пустой словарь — предложения нет."""
+    base = _book_fields(row)
+    reasons: list[str] = []
+    title, title_hits = fix_semi_cp866(base["title"], field=True)
+    authors_fixed = [fix_semi_cp866(name, field=True) for name in base["authors"]]
+    authors = [name for name, _ in authors_fixed]
+    if title_hits or any(hits for _, hits in authors_fixed):
+        reasons.append(FIX_REASON_TEXT["semi"])
+    candidate_title, candidate_authors = title, authors
+    garbage = [value for value in (title, *authors) if _is_garbage(value)]
+    if garbage:
+        reasons.append(FIX_REASON_TEXT["garbage"])
+        repaired = {value: fixed for value in garbage if (fixed := _repair_mojibake(value)) is not None}
+        if all(value in repaired for value in garbage):
+            candidate_title = repaired.get(title, title)
+            candidate_authors = [repaired.get(name, name) for name in authors]
+    stripped = title.strip()
+    if not stripped or LETTER.search(stripped) is None or stripped.casefold() in PLACEHOLDERS:
+        reasons.append(FIX_REASON_TEXT["title"])
+    if not authors:
+        reasons.append(FIX_REASON_TEXT["author"])
+    suggestion: dict[str, Any] = {}
+    if candidate_title != base["title"] or candidate_authors != base["authors"]:
+        suggestion = {**base, "title": candidate_title, "authors": candidate_authors}
+        try:
+            validate_edit(suggestion)  # предложение должно проходить ту же проверку, что и правка
+        except ValueError:
+            suggestion = {}
+    return reasons, suggestion
+
+
+def fix_scan(conn: sqlite3.Connection, reason: str, page: int, size: int
+             ) -> tuple[dict[str, int], int, list[tuple[sqlite3.Row, list[str], dict[str, Any]]]]:
+    """Один проход по книгам курсором: счётчики причин (ключ «all» — все проблемные), число книг под фильтром
+    и книги нужной страницы."""
+    counts = {"all": 0, **{code: 0 for code in FIX_REASON_TEXT}}
+    total = 0
+    first = (page - 1) * size
+    items: list[tuple[sqlite3.Row, list[str], dict[str, Any]]] = []
+    for row in conn.execute(FIX_SQL):
+        reasons, suggestion = suspicious_fields(row)
+        if not reasons:
+            continue
+        codes = [code for code, text in FIX_REASON_TEXT.items() if text in reasons]
+        counts["all"] += 1
+        for code in codes:
+            counts[code] += 1
+        if reason and reason not in codes:
+            continue
+        if first <= total < first + size:
+            items.append((row, reasons, suggestion))
+        total += 1
+    return counts, total, items
+
+
+def rename_author(cfg: dict[str, Any], old: str, new: str) -> str:
+    """Переименование автора (слияние с уже существующим) во всех его книгах через edit_book.
+
+    Ошибки отдельных книг собираются; ScanBusyError прерывает весь проход. Сам scan_lock здесь не берётся:
+    его берёт edit_book для каждой книги, иначе была бы взаимоблокировка."""
+    old, new = old.strip(), new.strip()
+    for field, value in (("old", old), ("new", new)):
+        if not 1 <= len(value) <= 200 or CONTROL_CHARS.search(value):
+            raise ValueError(f"{field}: от 1 до 200 символов без управляющих")
+    if old == new:
+        raise ValueError("новое имя совпадает со старым")
+    with closing(connect(cfg["db_path"])) as conn:
+        ids = [r[0] for r in conn.execute(
+            "SELECT DISTINCT b.id FROM books b JOIN book_authors a ON a.book_id=b.id WHERE a.name=? LIMIT ?",
+            (old, RENAME_LIMIT + 1)).fetchall()]
+        if len(ids) > RENAME_LIMIT:
+            raise ValueError(f"у автора больше {RENAME_LIMIT} книг: переименование не выполнено")
+        rows = [conn.execute(f"SELECT {FIX_COLUMNS} FROM books WHERE id=?", (book_id,)).fetchone() for book_id in ids]
+    done, errors = 0, []
+    for row in rows:
+        if row is None:
+            continue
+        authors = list(dict.fromkeys(new if name == old else name for name in _book_fields(row)["authors"]))
+        try:
+            edit_book(cfg, row["id"], {**_book_fields(row), "authors": authors}, rename=False)
+        except ValueError as error:
+            errors.append(f"книга {row['id']}: {error}")
+        else:
+            done += 1
+    return f"переименовано {done}, ошибок {len(errors)}" + (f": {'; '.join(errors[:5])}" if errors else "")
+
+
 def zip_date(mtime: float) -> tuple[int, int, int, int, int, int]:
     return max(datetime.fromtimestamp(mtime).timetuple()[:6], (1980, 1, 1, 0, 0, 0))
 
@@ -3005,7 +3149,7 @@ body:'id='+id+'&ch='+ch+'&p='+v.toFixed(4)})},800)})})();
 """
 
 NAV = [("/", "Поиск"), ("/sections", "Разделы"), ("/authors", "Авторы"), ("/series", "Серии"), ("/genres", "Жанры"), ("/browse", "Папки"),
-       ("/shelves", "Полки"), ("/recent", "Недавние"), ("/dups", "Дубликаты"), ("/stats", "Статистика")]
+       ("/shelves", "Полки"), ("/recent", "Недавние"), ("/fix", "Проверка"), ("/dups", "Дубликаты"), ("/stats", "Статистика")]
 
 
 def e(value: Any) -> str:
@@ -3086,9 +3230,11 @@ API_HELP = {
     "POST /api/shelves": "{name} — создать полку",
     "POST /api/shelves/<id>/delete": "удалить полку (книги не трогаются)",
     "GET /api/jobs, GET /api/jobs/<id>": "фоновые задания: состояние, вывод плана, результат",
-    "POST /api/jobs": "{command: scan|migrate|fix-encoding|unpack-fb2zip|convert, dry_run: true (по умолчанию), "
-                      "confirm: <id успешного dry-run> — обязателен для боевого fix-encoding/unpack-fb2zip/convert, "
-                      "параметры режима: path, only, max_mb, to, overwrite, skip_newer, exclude, author, title_mode, toc, "
+    "POST /api/jobs": "{command: scan|migrate|fix-encoding|unpack-fb2zip|convert|dedup|zip-books, dry_run: true (по умолчанию), "
+                      "confirm: <id успешного dry-run с теми же параметрами> — обязателен для боевого запуска fix-encoding/unpack-fb2zip/"
+                      "convert/dedup/zip-books, "
+                      "параметры режима: path, only (для convert — fb2 и источники), workers, max_mb, to, overwrite, skip_newer, exclude, "
+                      "author, title_mode, toc, "
                       "toc_depth, delete_source}",
     "GET /api/dups": "группы дублей: status=similar|auto|resolved (по умолчанию similar), page (по 50); "
                      "в members путь для показа — path, для действий — key_path",
@@ -3097,6 +3243,9 @@ API_HELP = {
     "POST /api/books/<id>/edit": "{title, authors[], series, series_no, genres[], year, lang, annotation, rename?: bool} — "
                                  "правка метаданных; epub/fb2 переписываются в файле (прежняя версия в карантине edited/), "
                                  "остальные форматы — только в каталоге",
+    "GET /api/fix": "проблемные метаданные: reason=semi|garbage|title|author, page (по 100); в items: id, path, title, "
+                    "authors, reasons, suggestion {title, authors} | null",
+    "POST /api/authors/rename": "{old, new} — переименовать автора во всех его книгах (слияние с существующим)",
 }
 
 
@@ -3245,6 +3394,7 @@ class Handler(BaseHTTPRequestHandler):
             ("GET", ""): self.view_search, ("GET", "book"): self.view_book, ("GET", "read"): self.view_read,
             ("GET", "file"): self.view_file, ("GET", "cover"): self.view_cover, ("GET", "res"): self.view_res, ("GET", "page"): self.view_djvu_page,
             ("GET", "zip"): self.view_zip, ("GET", "dups"): self.view_dups, ("POST", "dups"): self.post_dups,
+            ("GET", "fix"): self.view_fix, ("POST", "fix"): self.post_fix, ("POST", "authors"): self.post_authors,
             ("GET", "authors"): self.view_authors, ("GET", "sections"): self.view_sections, ("GET", "series"): self.view_series, ("GET", "genres"): self.view_genres,
             ("GET", "browse"): self.view_browse, ("GET", "shelves"): self.view_shelves, ("GET", "recent"): self.view_recent,
             ("GET", "stats"): self.view_stats, ("GET", "opds"): self.view_opds, ("GET", "app.js"): self.view_js,
@@ -3355,7 +3505,12 @@ class Handler(BaseHTTPRequestHandler):
                           for k, v in params.items() if k in {"author", "series", "genre", "dir", "lang", "collection"})
         if active:
             active += ' <a href="/">сбросить</a>'
-        self.page(params.get("q") or "Поиск", form + active + self.pager(total, page, size, params) + self.book_list(rows)
+        rename = ""
+        if params.get("author"):
+            rename = (f'<form class="s" method="post" action="/authors/rename"><input type="hidden" name="old" '
+                      f'value="{e(params["author"])}"><input name="new" value="{e(params["author"])}" maxlength="200" '
+                      f'required size="40"><button>Переименовать / слить автора во всех книгах</button></form>')
+        self.page(params.get("q") or "Поиск", form + active + rename + self.pager(total, page, size, params) + self.book_list(rows)
                   + self.pager(total, page, size, params))
 
     def grouped(self, title: str, sql: str, link: Callable[[str], str], label: Callable[[str], str] = str) -> None:
@@ -3639,6 +3794,84 @@ class Handler(BaseHTTPRequestHandler):
                            f'<form class="s" method="post" action="/shelves"><input name="name" placeholder="Новая полка" '
                            f'required maxlength="100"><button>Создать</button></form><p class="mut">Удаление полки не трогает книги.</p>')
 
+    def view_fix(self, _parts: list[str]) -> None:
+        reason = self.query.get("reason", "")
+        reason = reason if reason in FIX_REASON_TEXT else ""
+        page = max(int(self.query["page"]), 1) if self.query.get("page", "").isdigit() else 1
+        with closing(self.db()) as conn:
+            counts, total, items = fix_scan(conn, reason, page, FIX_PAGE_SIZE)
+        tabs = []
+        for code, label in [("", "все проблемные"), *FIX_REASON_TEXT.items()]:
+            text = f"{label}: {counts['all'] if not code else counts[code]}"
+            if code == reason:
+                tabs.append(f"<b>{e(text)}</b>")
+            else:
+                href = f"/fix?reason={code}" if code else "/fix"
+                tabs.append(f'<a href="{href}">{e(text)}</a>')
+        blocks = []
+        for row, reasons, suggestion in items:
+            book_id = row["id"]
+            authors_now = ", ".join(name for name in str(row["authors"]).split("; ") if name)
+            proposal = ""
+            if suggestion:
+                proposal = (f'<p>Предложение: <b>{e(suggestion["title"])}</b> — {e(", ".join(suggestion["authors"]))}</p>'
+                            f'<form class="s" method="post" action="/fix/{book_id}">'
+                            f'<input type="hidden" name="reason" value="{e(reason)}"><button>Применить</button></form>')
+            blocks.append(f'<li><div><a href="/book/{book_id}"><b>{e(row["title"])}</b></a> '
+                          f'<span class="mut">{e(display_path(row["path"], row["fmt"]))}</span><br>'
+                          f'<span class="tag">{e("; ".join(reasons))}</span>'
+                          f'<p class="mut">Сейчас: {e(authors_now) or "—"}</p>{proposal}'
+                          f'<a href="/edit/{book_id}">Редактировать</a></div></li>')
+        listing = f'<ul class="list">{"".join(blocks)}</ul>' if blocks else "<p>Проблем не найдено.</p>"
+        params = {"reason": reason} if reason else {}
+        pager = self.pager(total, page, FIX_PAGE_SIZE, params)
+        self.page("Проверка метаданных", f"<h2>Проверка метаданных</h2><p>{' · '.join(tabs)}</p>"
+                  f"{pager}{listing}{pager}")
+
+    def post_fix(self, parts: list[str]) -> None:
+        if len(parts) != 1 or not parts[0].isdigit():
+            self.error_page(HTTPStatus.NOT_FOUND, "Страница не найдена")
+            return
+        form = {k: v[-1] for k, v in self.form.items()}
+        reason = form.get("reason", "")
+        reason = reason if reason in FIX_REASON_TEXT else ""
+        with closing(self.db()) as conn:
+            row = conn.execute(f"SELECT {FIX_COLUMNS} FROM books WHERE id=?", (int(parts[0]),)).fetchone()
+        if row is None:
+            self.error_page(HTTPStatus.NOT_FOUND, "Книга не найдена")
+            return
+        # Значения берутся из БД заново, а не из формы: форма передаёт только причину фильтра.
+        _, suggestion = suspicious_fields(row)
+        if not suggestion:
+            self.error_page(HTTPStatus.BAD_REQUEST, "Для этой книги нет автоматического исправления")
+            return
+        try:
+            edit_book(self.cfg, int(parts[0]), suggestion, rename=False)
+        except ValueError as error:
+            self.error_page(HTTPStatus.BAD_REQUEST, str(error))
+            return
+        except ScanBusyError:
+            self.error_page(HTTPStatus.CONFLICT, "Идёт обработка библиотеки, повторите позже")
+            return
+        self.redirect(f"/fix?reason={reason}" if reason else "/fix")
+
+    def post_authors(self, parts: list[str]) -> None:
+        if parts != ["rename"]:
+            self.error_page(HTTPStatus.NOT_FOUND, "Страница не найдена")
+            return
+        form = {k: v[-1] for k, v in self.form.items()}
+        try:
+            message = rename_author(self.cfg, form.get("old", ""), form.get("new", ""))
+        except ValueError as error:
+            self.error_page(HTTPStatus.BAD_REQUEST, str(error))
+            return
+        except ScanBusyError:
+            self.error_page(HTTPStatus.CONFLICT, "Идёт обработка библиотеки, повторите позже")
+            return
+        target = form.get("new", "").strip()
+        self.page("Автор переименован", f"<h2>Переименование автора</h2><p>{e(message)}</p>"
+                  f'<p><a href="/?author={quote(target)}">Открыть «{e(target)}»</a></p>')
+
     def view_dups(self, _parts: list[str]) -> None:
         status = self.query.get("status", "similar")
         if status not in DUP_STATUS_NAMES:
@@ -3813,6 +4046,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"books": total[0], "bytes": total[1], "last_scan": last[0] if last else None,
                                 "formats": {r[0]: {"books": r[1], "bytes": r[2]} for r in fmts},
                                 "statuses": {r[0]: r[1] for r in statuses}, "scan": SCAN_STATE})
+            elif name == "fix":
+                reason = self.query.get("reason", "")
+                if reason and reason not in FIX_REASON_TEXT:
+                    self.send_json({"error": "reason: semi, garbage, title или author"}, HTTPStatus.BAD_REQUEST)
+                    return
+                page = max(int(self.query["page"]), 1) if self.query.get("page", "").isdigit() else 1
+                _, total, items = fix_scan(conn, reason, page, FIX_PAGE_SIZE)
+                self.send_json({"total": total, "page": page, "items": [
+                    {"id": row["id"], "path": display_path(row["path"], row["fmt"]), "title": row["title"],
+                     "authors": [name for name in row["authors"].split("; ") if name], "reasons": reasons,
+                     "suggestion": {"title": s["title"], "authors": s["authors"]} if s else None}
+                    for row, reasons, s in items]})
             elif name == "dups":
                 status = self.query.get("status", "similar")
                 if status not in DUP_STATUS_NAMES:
@@ -3849,6 +4094,12 @@ class Handler(BaseHTTPRequestHandler):
                 with closing(self.db()) as conn:
                     row = conn.execute("SELECT * FROM books WHERE id=?", (int(parts[1]),)).fetchone()
                 self.send_json({"ok": True, "message": message, "book": book_json(row)})
+                return
+            if name == "authors" and len(parts) == 2 and parts[1] == "rename":
+                old, new = body.get("old", ""), body.get("new", "")
+                if not isinstance(old, str) or not isinstance(new, str):
+                    raise ValueError("old и new — строки")
+                self.send_json({"ok": True, "message": rename_author(self.cfg, old, new)})
                 return
             if name == "jobs" and len(parts) == 1:
                 command = body.get("command", "")
