@@ -1428,6 +1428,40 @@ def normalize_fb2(raw: bytes) -> tuple[bytes, list[str], int]:
     return raw, done, semi
 
 
+FB2_NS = b"http://www.gribuser.ru/xml/fictionbook/2.0"
+
+
+def ensure_fb2_namespace(raw: bytes) -> bytes:
+    """Без пространства имён FictionBook (и xlink у l:href) Calibre собирает почти пустой epub: добавить их в корень."""
+    match = re.search(rb"<FictionBook\b[^>]*>", raw[:8192])
+    if not match:
+        return raw
+    tag = match.group(0)
+    extra = b""
+    if not re.search(rb"\sxmlns\s*=", tag):
+        extra += b' xmlns="' + FB2_NS + b'"'
+    for prefix in set(re.findall(rb"<[^>]*\s(\w+):href\s*=", raw[:1024 * 1024])):
+        if not re.search(rb"\sxmlns:" + prefix + rb"\s*=", tag):
+            extra += b" xmlns:" + prefix + b'="http://www.w3.org/1999/xlink"'
+    return raw if not extra else raw[:match.start()] + tag[:12] + extra + tag[12:] + raw[match.end():]
+
+
+def count_words(text: str) -> int:
+    return len(re.findall(r"[^\W_]+", text))
+
+
+def epub_text_loss(fb2_raw: bytes, epub: Path) -> str | None:
+    """Проверка, что текст не потерян: в epub не меньше 80 % слов тела fb2 (без бинарных вложений)."""
+    text = decode_xml(fb2_raw)
+    start, end = text.find("<body"), text.find("<binary")
+    fb2_words = count_words(re.sub(r"<[^>]*>", " ", text[max(start, 0):end if end > start else None]))
+    with zipfile.ZipFile(epub) as archive:
+        epub_words = count_words(" ".join(re.sub(r"<[^>]*>", " ", decode_xml(zip_read(archive, p))) for p in Epub(archive).spine()))
+    if fb2_words >= 50 and epub_words < 0.8 * fb2_words:
+        return f"в epub {epub_words} слов из {fb2_words} в fb2"
+    return None
+
+
 def calibre_env(tmp: Path) -> dict[str, str]:
     """Окружение Calibre во временном каталоге: в песочнице службы домашний каталог только для чтения."""
     for sub in ("config", "cache", "temp", "xdg"):
@@ -1770,9 +1804,12 @@ def convert_fb2(cfg: dict[str, Any], dry_run: bool = False, path: str | None = N
             tmp = Path(tmp_name)
             staged, produced = tmp / "book.fb2", tmp / "book.epub"
             if data is None:
-                shutil.copyfile(src, staged)
-            else:
-                staged.write_bytes(data)
+                if src.stat().st_size > 256 * 1024 * 1024:
+                    run.record("skipped", src, reason="fb2 больше 256 МБ")
+                    return
+                data = src.read_bytes()
+            data = ensure_fb2_namespace(data)
+            staged.write_bytes(data)
             try:
                 done = subprocess.run(["ebook-convert", str(staged), str(produced)], capture_output=True, env=calibre_env(tmp),
                                       cwd=tmp, timeout=timeout, check=False, stdin=subprocess.DEVNULL)
@@ -1780,7 +1817,10 @@ def convert_fb2(cfg: dict[str, Any], dry_run: bool = False, path: str | None = N
                     f"ebook-convert: {done.stderr.decode('utf-8', errors='replace')[-300:] or done.returncode}"
             except subprocess.TimeoutExpired:
                 problem = f"ebook-convert: тайм-аут {timeout} с"
-            problem = problem or verify_book(produced, "epub")
+            try:
+                problem = problem or verify_book(produced, "epub") or epub_text_loss(data, produced)
+            except (OSError, ValueError, KeyError, zipfile.BadZipFile, EOFError) as error:
+                problem = f"проверка epub: {type(error).__name__}: {error}"
             if problem:
                 run.quarantine(src, "rejected-convert", reason=problem)
                 return
