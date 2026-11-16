@@ -1,0 +1,49 @@
+name: Books library
+
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "books_library/**"
+      - ".github/workflows/books-library.yml"
+  pull_request:
+    branches: ["**"]
+    paths:
+      - "books_library/**"
+      - ".github/workflows/books-library.yml"
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.1.0
+        with:
+          python-version: "3.14"
+          cache: "pip"
+          cache-dependency-path: |
+            books_library/requirements-ci.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r books_library/requirements-ci.txt
+
+      - name: Run static analysis (Ruff)
+        run: ruff check books_library/
+
+      - name: Validate config example
+        run: python -m json.tool books_library/books_library.json.example >/dev/null
+
+      - name: Run tests
+        run: python -m pytest books_library/tests -q

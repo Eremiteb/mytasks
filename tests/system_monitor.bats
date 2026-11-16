@@ -6,7 +6,7 @@
 # разбора JSON важна сама по себе). CPU опрашивается по-настоящему через
 # /proc/stat и /proc/loadavg (эти псевдофайлы есть на любом Linux, включая
 # CI-раннеры) — не стабится, т.к. это не внешняя команда, а чтение файла.
-# Скрипт копируется во временную папку, поэтому logs/, state/ и
+# Скрипт копируется во временную папку, поэтому logs/, system_monitor/ и
 # system_reports/ создаются в TMP_DIR, а не в репозитории.
 
 setup() {
@@ -20,7 +20,7 @@ setup() {
   # /etc/mytasks машины на тесты не влияет
   export SYSTEM_MONITOR_TEST_ROOT_CONF="$TMP_DIR/etc-mytasks/system_monitor.conf"
 
-  mkdir -p "$STUB_DIR" "$SMART_DIR" "$TMP_DIR/conf" "$TMP_DIR/logs" "$TMP_DIR/state"
+  mkdir -p "$STUB_DIR" "$SMART_DIR" "$TMP_DIR/conf" "$TMP_DIR/logs" "$TMP_DIR/system_monitor"
 
   cp "$REPO_ROOT/system_monitor.sh" "$TMP_DIR/system_monitor.sh"
   chmod +x "$TMP_DIR/system_monitor.sh"
@@ -129,7 +129,7 @@ last_log() {
 }
 
 db_query() {
-  sqlite3 -noheader -separator '|' "$TMP_DIR/state/system_monitor.db" "$1"
+  sqlite3 -noheader -separator '|' "$TMP_DIR/system_monitor/system_monitor.db" "$1"
 }
 
 # ---------------------------------------------------------------------------
@@ -176,7 +176,7 @@ EOF
   run_monitor
 
   [ "$status" -eq 0 ]
-  [ -f "$TMP_DIR/state/system_monitor.db" ]
+  [ -f "$TMP_DIR/system_monitor/system_monitor.db" ]
   [[ "$output" == *"Отчёт:"* ]]
 
   run db_query "SELECT COUNT(*) FROM disk_stats;"
@@ -547,7 +547,7 @@ EOF
   run env PATH="$STUB_DIR:$PATH" bash "$TMP_DIR/system_monitor.sh" --dry-run
 
   [ "$status" -eq 0 ]
-  [ ! -e "$TMP_DIR/state/system_monitor.db" ]
+  [ ! -e "$TMP_DIR/system_monitor/system_monitor.db" ]
   [ ! -e "$TMP_DIR/system_reports" ]
   [[ "$output" == *"[dry-run] будет: запись в"*"disk_stats"* ]]
   [[ "$output" == *"[dry-run] Изменения не выполнены."* ]]
@@ -583,7 +583,7 @@ EOF
 
   run db_query "PRAGMA user_version;"
   [ "$output" = "1" ]
-  run compgen -G "$TMP_DIR/state/system_monitor.db.bak-*"
+  run compgen -G "$TMP_DIR/system_monitor/system_monitor.db.bak-*"
   [ "$status" -ne 0 ]
 }
 
@@ -591,13 +591,13 @@ EOF
   run_monitor --dry-run
   [ "$status" -eq 0 ]
   [[ "$output" == *"[dry-run] будет: создана новая база v1"* ]]
-  [ ! -e "$TMP_DIR/state/system_monitor.db" ]
+  [ ! -e "$TMP_DIR/system_monitor/system_monitor.db" ]
 }
 
 @test "--migrate-db создаёт базу v1 без опроса дисков" {
   run_monitor --migrate-db
   [ "$status" -eq 0 ]
-  [ -f "$TMP_DIR/state/system_monitor.db" ]
+  [ -f "$TMP_DIR/system_monitor/system_monitor.db" ]
 
   run db_query "PRAGMA user_version;"
   [ "$output" = "1" ]
@@ -612,7 +612,7 @@ EOF
   run_monitor --migrate-db --dry-run
   [ "$status" -eq 0 ]
   [[ "$output" == *"[dry-run] будет: создана новая база"* ]]
-  [ ! -e "$TMP_DIR/state/system_monitor.db" ]
+  [ ! -e "$TMP_DIR/system_monitor/system_monitor.db" ]
 }
 
 @test "--migrate-db --dry-run на актуальной базе — без строк «будет:»" {
@@ -632,15 +632,15 @@ EOF
 }
 
 @test "база со схемой старше v1 — отказ без изменений, --dry-run предупреждает" {
-  mkdir -p "$TMP_DIR/state"
-  sqlite3 "$TMP_DIR/state/system_monitor.db" "CREATE TABLE disk_stats (id INTEGER PRIMARY KEY, ts TEXT); PRAGMA user_version = 0;"
-  cp "$TMP_DIR/state/system_monitor.db" "$TMP_DIR/before.db"
+  mkdir -p "$TMP_DIR/system_monitor"
+  sqlite3 "$TMP_DIR/system_monitor/system_monitor.db" "CREATE TABLE disk_stats (id INTEGER PRIMARY KEY, ts TEXT); PRAGMA user_version = 0;"
+  cp "$TMP_DIR/system_monitor/system_monitor.db" "$TMP_DIR/before.db"
   run_monitor --dry-run
   [[ "$output" == *"старше поддерживаемой"* ]]
   run_monitor
   [ "$status" -ne 0 ]
   [[ "$output" == *"старше поддерживаемой"* ]]
-  cmp "$TMP_DIR/state/system_monitor.db" "$TMP_DIR/before.db"
+  cmp "$TMP_DIR/system_monitor/system_monitor.db" "$TMP_DIR/before.db"
 }
 
 # ---------------------------------------------------------------------------
@@ -685,7 +685,7 @@ seed_own_files() {
   run env PATH="$STUB_DIR:$PATH" SYSTEM_MONITOR_EUID=0 bash "$TMP_DIR/system_monitor.sh"
 
   [ "$status" -eq 0 ]
-  grep -q -- "nobodyx:nogroupx .*state/system_monitor.db$" "$CHOWN_LOG"
+  grep -q -- "nobodyx:nogroupx .*system_monitor/system_monitor.db$" "$CHOWN_LOG"
   grep -q -- "logs/system_monitor-2020-01-01" "$CHOWN_LOG"
   grep -q -- "system_reports/system_monitor-2020-01-01" "$CHOWN_LOG"
   grep -q -- "system_reports/latest.html" "$CHOWN_LOG"
@@ -755,7 +755,8 @@ seed_own_files() {
 
 @test "root: база — симлинк: отказ, цель не меняется" {
   printf 'keep\n' > "$TMP_DIR/victim"
-  ln -s "$TMP_DIR/victim" "$TMP_DIR/state/system_monitor.db"
+  mkdir -p "$TMP_DIR/system_monitor"
+  ln -s "$TMP_DIR/victim" "$TMP_DIR/system_monitor/system_monitor.db"
 
   run env PATH="$STUB_DIR:$PATH" SYSTEM_MONITOR_EUID=0 bash "$TMP_DIR/system_monitor.sh"
 
@@ -778,9 +779,9 @@ seed_own_files() {
   [ ! -e "$TMP_DIR/pwned-conf" ]
   [ ! -e "$TMP_DIR/pwned-tpl" ]
   # Данные — в каталоге mytasks из root-конфига, а не рядом с копией скрипта
-  [ -f "$TMP_DIR/state/system_monitor.db" ]
+  [ -f "$TMP_DIR/system_monitor/system_monitor.db" ]
   [ -f "$TMP_DIR/system_reports/latest.html" ]
-  [ ! -e "$TMP_DIR/lib/state" ]
+  [ ! -e "$TMP_DIR/lib/system_monitor" ]
   ls "$TMP_DIR"/logs/system_monitor-*.jsonl >/dev/null
 }
 
@@ -803,7 +804,7 @@ seed_own_files() {
   run env PATH="$STUB_DIR:$PATH" SYSTEM_MONITOR_EUID=0 bash "$TMP_DIR/lib/system_monitor.sh"
   [ "$status" -eq 2 ]
   [[ "$output" == *"не доверенный"* ]]
-  [ ! -e "$TMP_DIR/state/system_monitor.db" ]
+  [ ! -e "$TMP_DIR/system_monitor/system_monitor.db" ]
 }
 
 @test "запуск из mytasks: при наличии root-конфига читается он, а не conf/" {

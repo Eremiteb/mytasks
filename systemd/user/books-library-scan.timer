@@ -1,0 +1,13 @@
+[Unit]
+Description=Библиотека книг: индексация каталога ежедневно в 04:30, пропущенный запуск — после загрузки
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+# Пропущенный запуск (компьютер был выключен) выполняется сразу после загрузки.
+Persistent=true
+# Случайная задержка до 10 мин: не запускать вместе с другими задачами.
+RandomizedDelaySec=10min
+Unit=books-library-scan.service
+
+[Install]
+WantedBy=timers.target

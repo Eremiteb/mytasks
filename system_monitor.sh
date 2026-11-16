@@ -88,7 +88,9 @@ if [[ -z "${MYTASKS_DIR}" ]]; then
     MYTASKS_DIR="${SCRIPT_DIR}"
 fi
 LOG_DIR="${MYTASKS_LOG_DIR:-${MYTASKS_DIR}/logs}"
-STATE_DIR="${MYTASKS_DIR}/state"
+# Каталог данных скрипта: база с историей опросов. Не state/ — там только
+# восстанавливаемое состояние (правило mytasks: ai-md/mytasks.md)
+DATA_DIR="${MYTASKS_DIR}/system_monitor"
 LOG_FILE="${LOG_DIR}/${SCRIPT_BASE}-${TIMESTAMP}.jsonl"
 LOG_TEMPLATE_FILE="${MYTASKS_DIR}/conf/log_template.conf"
 
@@ -105,7 +107,7 @@ LOG_COMPAT_TARGETS="${LOG_COMPAT_TARGETS:-elk,opensearch,loki,graylog,splunk}"
 if [[ -z "${FILE_OWNER}" ]]; then
     FILE_OWNER="$(stat -c '%U:%G' -- "${MYTASKS_DIR}" 2>/dev/null)" || FILE_OWNER=""
 fi
-DB_FILE="${DB_FILE:-${STATE_DIR}/${SCRIPT_BASE}.db}"
+DB_FILE="${DB_FILE:-${DATA_DIR}/${SCRIPT_BASE}.db}"
 REPORT_DIR="${REPORT_DIR:-${MYTASKS_DIR}/system_reports}"
 REPORT_KEEP="${REPORT_KEEP:-5}"
 KEEP_LOGS="${KEEP_LOGS:-10}"
@@ -720,7 +722,7 @@ discover_disks() {
 # из lsblk -J через jq; точки монтирования — из таблицы монтирования хоста
 # (findmnt --task 1, т.е. /proc/1/mountinfo), а не своей: служба работает в
 # песочнице systemd (ProtectSystem, ReadWritePaths, PrivateTmp), где lsblk
-# видит и служебные bind-монтирования вроде .../state или второго /var/tmp.
+# видит и служебные bind-монтирования вроде .../system_monitor или второго /var/tmp.
 # findmnt -S /dev/<раздел> на btrfs отдаёт все подтома раздела (/ и /var/log
 # с одного и того же раздела).
 disk_mountpoints() {

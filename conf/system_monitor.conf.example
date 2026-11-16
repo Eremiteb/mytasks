@@ -1,4 +1,4 @@
-# Каталог mytasks: в нём данные (state/, logs/, system_reports/). Обязателен
+# Каталог mytasks: в нём данные (system_monitor/, logs/, system_reports/). Обязателен
 # для root-копии скрипта (/usr/local/lib/mytasks/system_monitor.sh), которую
 # запускает таймер: она читает только root-копию этого конфига
 # /etc/mytasks/system_monitor.conf (её ставит и обновляет check_mytasks.sh).
@@ -10,7 +10,7 @@ MYTASKS_DIR="@MYTASKS_DIR@"
 DISKS=""
 
 # Путь к базе SQLite с историей опросов
-DB_FILE="@MYTASKS_DIR@/state/system_monitor.db"
+DB_FILE="@MYTASKS_DIR@/system_monitor/system_monitor.db"
 
 # Владелец создаваемых файлов (БД, копии, логи, отчёты): «пользователь» или
 # «пользователь:группа». Скрипт работает от root и после записи передаёт файлы
@@ -19,7 +19,7 @@ DB_FILE="@MYTASKS_DIR@/state/system_monitor.db"
 FILE_OWNER=""
 
 # Каталог для HTML-отчётов (по умолчанию MYTASKS_DIR/system_reports). Таймер
-# работает в песочнице systemd: запись разрешена только в state/, logs/ и
+# работает в песочнице systemd: запись разрешена только в system_monitor/, logs/ и
 # system_reports/ каталога mytasks — другие пути для DB_FILE/REPORT_DIR
 # потребуют правки ReadWritePaths в systemd/system-monitor.service
 REPORT_DIR="@MYTASKS_DIR@/system_reports"

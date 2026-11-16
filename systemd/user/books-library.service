@@ -1,0 +1,34 @@
+[Unit]
+Description=Библиотека книг: веб-интерфейс на 127.0.0.1:8090 (books_library.py serve)
+Documentation=file://@MYTASKS_DIR@/books_library/README.md
+# Повторы при сбое: не больше 4 запусков за 10 минут — иначе ошибка остаётся видна в systemctl.
+StartLimitIntervalSec=10min
+StartLimitBurst=4
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py serve
+# Сбой (1) — повтор через 10 с; ошибка конфигурации (2) повтором не лечится.
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=2
+# Задания API convert запускают LibreOffice и pandoc: запас памяти под них.
+MemoryMax=1G
+
+# Ограничения: запись — каталог подпроекта (БД, блокировка, reports/), логи и каталог книг. В каталог книг пишут
+# только задания API fix-encoding/unpack-fb2zip/convert, и боевой запуск принимается лишь после успешного dry-run.
+# Чтобы интерфейс никогда не менял книги, уберите /mnt/copy/Books (systemctl --user edit books-library.service).
+# Если books_dir в books_library.json другой — поправьте путь здесь («-» — не ошибка, если каталога нет).
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=@MYTASKS_DIR@/books_library @MYTASKS_DIR@/logs -/mnt/copy/Books
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=default.target

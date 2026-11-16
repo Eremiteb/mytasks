@@ -1,0 +1,16 @@
+{
+  "_comment": "Скопируйте в books_library.json (файл не попадает в Git). books_dir — каталог книг (только чтение, кроме служебных режимов fix-encoding, unpack-fb2zip и convert); db_path — база SQLite (относительный путь — от каталога books_library/); host/port — адрес веб-интерфейса (127.0.0.1 — только с этой машины; для доступа из сети задайте auth); scan_workers — потоков разбора при сканировании; reader_max_mb — предел размера книги для чтения в браузере и для fix-encoding; page_size — книг на странице; convert_timeout — тайм-аут одного запуска pandoc/LibreOffice при convert, с (10..3600). Пароль: auth.password или переменная из auth.password_env. Описание — README.md.",
+  "books_dir": "/mnt/copy/Books",
+  "db_path": "books_library.db",
+  "host": "127.0.0.1",
+  "port": 8090,
+  "scan_workers": 8,
+  "reader_max_mb": 64,
+  "page_size": 50,
+  "convert_timeout": 300,
+  "auth": {
+    "user": "",
+    "password": "",
+    "password_env": "BOOKS_LIBRARY_PASSWORD"
+  }
+}

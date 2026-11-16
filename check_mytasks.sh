@@ -91,7 +91,7 @@ fi
 source "${REQ_FILE}"
 
 # Примеры, по которым при первом запуске проходит мастер конфигов
-# (пусто — все conf/*.conf.example, music_downloader/*.json.example и utility_bills/*.json.example)
+# (пусто — все conf/*.conf.example, music_downloader/*.json.example, utility_bills/*.json.example и books_library/*.json.example)
 CONF_EXAMPLES=()
 # Конфиги, которые мастер не предлагает: cloud_backup_qnap.sh работает на
 # самом QNAP (Entware), а не на этой машине
@@ -2444,7 +2444,7 @@ configure_all() {
     if [[ ${#CONF_EXAMPLES[@]} -gt 0 ]]; then
         examples=("${CONF_EXAMPLES[@]}")
     else
-        for example in "${CONF_DIR}"/*.conf.example "${SCRIPT_DIR}"/music_downloader/*.json.example "${SCRIPT_DIR}"/utility_bills/*.json.example; do
+        for example in "${CONF_DIR}"/*.conf.example "${SCRIPT_DIR}"/music_downloader/*.json.example "${SCRIPT_DIR}"/utility_bills/*.json.example "${SCRIPT_DIR}"/books_library/*.json.example; do
             [[ -f "${example}" ]] && examples+=("${example#"${SCRIPT_DIR}"/}")
         done
     fi

@@ -18,7 +18,7 @@ Red Hat и др.), обязательно обновляет систему, п�
 mytasks не нужен; оставшиеся от прежней установки строки crontab удаляются).
 Таблица состояния — `check_mytasks.sh --status`.
 
-Базы SQLite (`state/system_monitor.db`, `music_downloader/music_downloader.db`, `utility_bills/utility_bills.db`) создаёт `check_mytasks.sh` — задания «база данных» после venv — сразу в текущей схеме. При переносе с другой машины сначала на старой машине скопируйте прежние базы командой `sqlite3 <база> ".backup '<копия>'"` и положите копии по тем же путям ДО первого запуска `check_mytasks.sh` и таймеров; иначе создадутся пустые базы и история (опросы, список скачанного, квитанции) начнётся заново. Существующую базу `check_mytasks.sh` приводит к текущей схеме теми же командами `--migrate-db`.
+Базы SQLite (`system_monitor/system_monitor.db`, `music_downloader/music_downloader.db`, `utility_bills/utility_bills.db`, `books_library/books_library.db`) создаёт `check_mytasks.sh` — задания «база данных» после venv — сразу в текущей схеме. При переносе с другой машины сначала на старой машине скопируйте прежние базы командой `sqlite3 <база> ".backup '<копия>'"` и положите копии по тем же путям ДО первого запуска `check_mytasks.sh` и таймеров; иначе создадутся пустые базы и история (опросы, список скачанного, квитанции) начнётся заново. Существующую базу `check_mytasks.sh` приводит к текущей схеме теми же командами `--migrate-db`.
 
 ## Лицензия
 
@@ -43,7 +43,6 @@ mytasks не нужен; оставшиеся от прежней установ
 - `check_backups.conf.example`;
 - `check_mytasks.conf.example`;
 - `cloud_backup_qnap.conf.example` (только для QNAP);
-- `doc2fb2.conf.example`;
 - `getip.conf.example`;
 - `llamactl.conf.example`;
 - `log_template.conf.example`;
@@ -386,7 +385,7 @@ journalctl --user -u check-backups.service -n 20
 2. **Обязательно обновляет систему** штатной командой своего семейства (столбец «Обновление системы»; одно повышение прав) — до любых изменений. Если обновление не удалось или для ОС не поддерживается, пакеты в этом запуске не ставятся (в rolling-дистрибутивах установка без обновления — неподдерживаемое частичное обновление), остальные проверки идут. После обновления ядра или при флаге `/run/reboot-required` скрипт напоминает о перезагрузке. В режимах `--status`, `--no-create` и без терминала/окон без `--yes` обновление не выполняется; `GARUDA_UPDATE="no"` — на Garuda чистый `pacman -Syu` вместо `garuda-update`.
 3. Затем прописывает себя в автозагрузку: user-юнит `check-mytasks.service` при входе в графический сеанс запускает `check_mytasks.sh --no-create --notify` (таблица в журнале и уведомление о проблемах).
 4. Записывает каталог mytasks — каталог, откуда запущен скрипт, — в `conf/check_mytasks.conf` (`MYTASKS_DIR`). Если репозиторий перенесён и каталог в конфиге другой, предупреждает и предлагает обновить его, а затем и все юниты.
-5. При первом запуске (нет `conf/check_mytasks.conf`) проводит мастер всех отсутствующих конфигов по `conf/*.conf.example`, `music_downloader/*.json.example` и `utility_bills/*.json.example` (кроме `cloud_backup_qnap.conf`): окна `zenity` (без него — `kdialog`), без графики — вопросы в терминале. Описание каждого значения берётся из комментариев примера, значения по умолчанию — из примера с подстановкой `@MYTASKS_DIR@`/`@HOME@`. Строки примера без изменений копируются как есть (`${HOME}` и т.п. сохраняются).
+5. При первом запуске (нет `conf/check_mytasks.conf`) проводит мастер всех отсутствующих конфигов по `conf/*.conf.example`, `music_downloader/*.json.example`, `utility_bills/*.json.example` и `books_library/*.json.example` (кроме `cloud_backup_qnap.conf`): окна `zenity` (без него — `kdialog`), без графики — вопросы в терминале. Описание каждого значения берётся из комментариев примера, значения по умолчанию — из примера с подстановкой `@MYTASKS_DIR@`/`@HOME@`. Строки примера без изменений копируются как есть (`${HOME}` и т.п. сохраняются).
 6. Проверяет зависимости (обязательные и необязательные) и ставит пакеты менеджером своего семейства одним запросом прав.
 7. Проверяет задания и для каждого отсутствующего или неработающего выводит предупреждение с описанием и вопрос «создать?»: «да» — создаёт, «нет» — ничего не меняет и в этом запуске больше не спрашивает.
 
@@ -410,12 +409,14 @@ journalctl --user -u check-backups.service -n 20
 | `beufm-recorder` | работа службы | запись эфира идёт: лог `logs/beufm_recorder-*.jsonl` обновлялся не позже 20 мин назад и без ошибок, иначе `systemctl --user restart` |
 | `music-downloader.timer` | user-юнит | `music_downloader.sh` ежедневно в 21:00, пропущенный запуск — после загрузки |
 | `utility-bills.timer` | user-юнит | `utility_bills.sh` 20-го числа в 10:00, пропущенный запуск — после загрузки: квитанции ЖКУ из почты в SQLite |
+| `books-library.service` | user-юнит | `books_library/books_library.py serve` постоянно: веб-интерфейс библиотеки книг на 127.0.0.1:8090 |
+| `books-library-scan.timer` | user-юнит | `books_library/books_library.py scan` ежедневно в 04:30, пропущенный запуск — после загрузки: индексация каталога книг |
 | `btrfs-monitor.timer` | user-юнит | `btrfs_monitor.sh` в 00/06/12/18 ч, пропущенный — после загрузки (только если `/` на Btrfs) |
 | `getip.timer` | user-юнит | `getip.sh` через 2 мин после загрузки и каждые 30 мин |
 | `crontab` | старый cron | в crontab нет строк `music_downloader.sh`, `sources.sh`, `btrfs_monitor.sh`, `getip.sh`, `utility_bills.sh` (иначе — второй, параллельный запуск); исправление — удаление строк вместе с комментарием `# mytasks:` |
-| `conf/check_backups.conf`, `conf/sources.conf`, `music_downloader/music_downloader.json`, `utility_bills/utility_bills.json` | конфиг | создаются мастером |
+| `conf/check_backups.conf`, `conf/sources.conf`, `music_downloader/music_downloader.json`, `utility_bills/utility_bills.json`, `books_library/books_library.json` | конфиг | создаются мастером |
 | `music_downloader/venv`, `utility_bills/venv` | venv | `music_downloader/setup_venv.sh`, `utility_bills/setup_venv.sh` |
-| `state/system_monitor.db`, `music_downloader/music_downloader.db`, `utility_bills/utility_bills.db` | база данных (`db`) | проверка — `<команда> --dry-run` (`system_monitor.sh --migrate-db`, `music_downloader.py --migrate-db`, `utility_bills.sh --migrate-db`): строка `[dry-run] будет:` — база отсутствует или устарела (ВНИМАНИЕ), иначе OK со «схема vN»; исправление — `<команда>` от пользователя; нет исполняемого файла — ВНИМАНИЕ, при исправлении «не создана: нет …» |
+| `system_monitor/system_monitor.db`, `music_downloader/music_downloader.db`, `utility_bills/utility_bills.db`, `books_library/books_library.db` | база данных (`db`) | проверка — `<команда> --dry-run` (`system_monitor.sh --migrate-db`, `music_downloader.py --migrate-db`, `utility_bills.sh --migrate-db`, `python3 books_library/books_library.py --migrate-db`): строка `[dry-run] будет:` — база отсутствует или устарела (ВНИМАНИЕ), иначе OK со «схема vN»; исправление — `<команда>` от пользователя; нет исполняемого файла — ВНИМАНИЕ, при исправлении «не создана: нет …» |
 | `llamactl`, `llamactl-tray`, `llamactl-tray.desktop`, `llama-server.service`, `llama-fim.service` | ссылки, автозапуск, сервисы | только если есть каталог `LLAMA_PREFIX` (из `conf/check_mytasks.conf`, иначе из `conf/llamactl.conf`, иначе `/opt/llama.cpp`) |
 
 Шаблоны юнитов и автозапуска лежат в `systemd/` (`systemd/*.service|timer` — системные, `systemd/user/` — пользовательские, `systemd/autostart/` — XDG autostart) и содержат плейсхолдер `@MYTASKS_DIR@`; установленный файл, отличающийся от отрисованного шаблона (старая версия или другой каталог), отмечается «отличается» и предлагается к обновлению. Порядок между заданиями задан `After=`: `sources.service` начинается после `music-downloader.service`, `check-backups.service` — после `sources.service` (действует и когда оба таймера догоняют пропуск сразу после загрузки). Таймеры включаются с `--now`, сервисы входа в сеанс — только `enable`.
@@ -522,7 +523,7 @@ GPU (NVIDIA):
 | Параметр        | По умолчанию                    | Описание |
 |-----------------|----------------------------------|----------|
 | `DISKS`         | *(пусто = автоопределение)*      | Список дисков через запятую (`sda,sdb`), пусто — автоопределение через `lsblk` |
-| `DB_FILE`       | `state/system_monitor.db`        | Путь к базе SQLite с историей опросов |
+| `DB_FILE`       | `system_monitor/system_monitor.db`        | Путь к базе SQLite с историей опросов |
 | `FILE_OWNER`    | владелец:группа каталога скрипта | Кому передаются файлы скрипта (БД, логи, отчёты, `latest.html`): `пользователь` или `пользователь:группа`. Скрипт работает от root; не от root ничего не меняется. Прежние файлы приводятся к этому владельцу при каждом запуске под root. Пусто = владелец каталога скрипта |
 | `REPORT_DIR`    | `system_reports/` рядом со скриптом | Каталог для HTML-отчётов |
 | `REPORT_KEEP`   | `5`                               | Сколько последних HTML-отчётов хранить |
@@ -564,7 +565,7 @@ sudo ./system_monitor.sh -c /etc/mytasks/system_monitor.conf
 и `systemd/system-monitor.timer` (плейсхолдер `@MYTASKS_DIR@`) устанавливает в
 `/etc/systemd/system` и включает `check_mytasks.sh`. Юнит запускает root-копию
 `/usr/local/lib/mytasks/system_monitor.sh --config /etc/mytasks/system_monitor.conf`
-в песочнице systemd (запись только в `state/`, `logs/`, `system_reports/` каталога
+в песочнице systemd (запись только в `system_monitor/`, `logs/`, `system_reports/` каталога
 mytasks); изменения скрипта и `conf/system_monitor.conf` действуют после «обновить»
 в `check_mytasks.sh`. Таймер срабатывает в 00/06/12/18 часов, а благодаря `Persistent=true` пропущенный слот (машина была
 выключена) выполняется при первой же загрузке — не более одного раза за интервал.
@@ -585,25 +586,6 @@ journalctl -u system-monitor.service -n 20
 
 ---
 
-### `cp1251_to_utf8.sh`
-
-Рекурсивная перекодировка текстовых файлов из Windows-1251 в UTF-8.
-
-**Возможности:**
-- Берёт только текстовые файлы, у которых `file --mime-encoding` даёт iso-8859-1, windows-1252 или unknown-8bit (так libmagic видит cp1251); UTF-8, ASCII, UTF-16/32 и бинарные пропускаются
-- Код возврата `iconv` проверяется; временный файл создаётся рядом с исходным
-- Атомарная замена через временный файл (`mktemp`)
-- Сохраняет права и владельца файла
-- Режим `--dry-run` — только показывает, что будет перекодировано
-
-**Использование:**
-```sh
-./cp1251_to_utf8.sh <каталог>
-./cp1251_to_utf8.sh <каталог> --dry-run
-./cp1251_to_utf8.sh -h
-```
-
----
 
 ### `delete_by_ext.sh`
 
@@ -629,42 +611,6 @@ journalctl -u system-monitor.service -n 20
 
 ---
 
-### `doc2fb2.sh`
-
-Рекурсивная конвертация DOC / DOCX / RTF / ODT → FB2.
-
-**Цепочки конвертации:**
-- `docx`, `odt` → pandoc → fb2
-- `doc`, `rtf` → LibreOffice → odt → pandoc → fb2
-- Fallback для `rtf`: pandoc напрямую, затем `unrtf` → txt → pandoc
-- Fallback для `doc`: `antiword` / `catdoc` / `wvText` → txt → pandoc
-
-**Ключевые опции:**
-
-| Опция               | Описание                                              |
-|---------------------|-------------------------------------------------------|
-| `-d, --dir DIR`     | Исходный каталог (обязательно)                        |
-| `-o, --out OUTDIR`  | Выходной каталог                                      |
-| `-n, --dry-run`     | Без изменений, только показать                        |
-| `--overwrite`       | Перезаписывать существующие FB2                       |
-| `--skip-newer`      | Пропускать, если FB2 новее источника                  |
-| `--exclude PATTERN` | Исключить файлы по маске (можно несколько раз)        |
-| `--only doc|docx|rtf|odt|all` | Обрабатывать только указанный формат      |
-| `--author NAME`     | Принудительно установить автора                       |
-| `--toc / --no-toc`  | Добавить/убрать оглавление                            |
-| `--log-level info|error` | Уровень детализации лога                        |
-
-**Использование:**
-```sh
-./doc2fb2.sh -d /книги --dry-run
-./doc2fb2.sh -d /книги -o /fb2 --overwrite --log-level error
-```
-
-**Настройки (conf/doc2fb2.conf):** значения по умолчанию — `TITLE_MODE` (`auto`: auto|filename|keep), `TOC` (1), `TOC_DEPTH` (3), `PANDOC_TIMEOUT` (300 с на запуск pandoc; pandoc всегда с `--sandbox`; автор не подставляется из `$USER`), `LOG_LEVEL` (`info`: info|error), `LOG_KEEP_DAYS` (10 дней хранения `doc2fb2_*.jsonl`). Ключи командной строки главнее конфига.
-
-Лог: JSONL-файл `doc2fb2_*.jsonl`. Логи старше `LOG_KEEP_DAYS` дней (по умолчанию 10) удаляются автоматически.
-
----
 
 ### `getip.sh`
 
@@ -829,33 +775,6 @@ llamactl -n update --bench && llamactl update --bench
 
 ---
 
-### `mht_to_fb2.py`
-
-Рекурсивно обрабатывает MHT/MHTML и CHM в указанном каталоге.
-
-**Возможности:**
-- Умная автодетекция кодировки: UTF-8, CP1251, KOI8-R, Latin-1
-- Извлекает текст и структуру из HTML-части архива
-- MHT/MHTML конвертирует через `pandoc` в FB2 рядом с исходником; после
-  успешной обычной конвертации удаляет исходный веб-архив
-- Для CHM не выполняет конвертацию, а удаляет одноимённый FB2, если он существует
-- `pandoc` запускается с `--sandbox` и тайм-аутом (`--timeout`, по умолчанию 300 с); результат пишется во временный `.part`, исходник удаляется только если FB2 создан и непуст
-- `--overwrite` разрешает перезаписать существующий FB2
-- `--dry-run` не удаляет исходный MHT/MHTML и только имитирует удаление FB2 для
-  CHM, но текущая реализация всё равно запускает `pandoc` и может записать FB2
-- JSONL-логирование в папку `logs/`
-
-**Требования:** Python 3, `pandoc`
-
-**Использование:**
-```sh
-python3 mht_to_fb2.py /архивы
-python3 mht_to_fb2.py /архивы --overwrite
-python3 mht_to_fb2.py /архивы --dry-run
-```
-
----
-
 ### `music_downloader.sh`
 
 Обёртка для запуска Python-проекта `music_downloader`.
@@ -891,29 +810,6 @@ Jamendo для категории `/` использует официальны�
 
 ---
 
-### `replace_encoding.sh`
-
-Заменяет фиксированную строку (без regexp и `&`) в текстовых файлах: поиск `grep -F`, замена во временный файл рядом и `mv`; `.bak` не создаётся.
-
-По умолчанию заменяет `windows-1251` → `utf-8` во всех текстовых файлах каталога.
-Если каталог не указан, используется текущий (`.`).
-
-**Опции:**
-
-| Опция                | Описание                                      |
-|----------------------|-----------------------------------------------|
-| `-d, --dry-run`      | Показать файлы без изменений                  |
-| `-n, --no-recursive` | Только текущий каталог (без подкаталогов)     |
-| `-h, --help`         | Справка                                       |
-
-**Использование:**
-```sh
-./replace_encoding.sh /path/to/dir
-./replace_encoding.sh /path/to/dir "старая строка" "новая строка"
-./replace_encoding.sh -d /path/to/dir
-```
-
----
 
 ### `sources.sh`
 
@@ -1016,32 +912,6 @@ journalctl --user -u sources.service
 
 ---
 
-### `unpack-fb2zip.sh`
-
-Распаковывает архивы `*.fb2.zip`, извлекая `.fb2`-файлы в тот же каталог.
-
-**Возможности:**
-- Рекурсивный поиск `*.fb2.zip`
-- Конфликты имён разрешаются суффиксами `_1`, `_2`…
-- Имя записи передаётся `unzip` без шаблонов; размер записи ограничен `--max-mb` (200 МБ, или `UNPACK_FB2ZIP_MAX_MB`)
-- Режим `--dry-run`
-- JSONL-логирование
-
-**Опции:**
-
-| Опция              | Описание                                          |
-|--------------------|---------------------------------------------------|
-| `-p, --path DIR`   | Корневая папка для поиска (обязательно)           |
-| `--dry-run`        | Только показать действия                          |
-| `--log FILE`       | Путь к JSONL-логу                                 |
-| `-h, --help`       | Справка                                           |
-
-**Использование:**
-```sh
-./unpack-fb2zip.sh -p /книги
-./unpack-fb2zip.sh -p /книги --dry-run
-```
-
 ### `utility_bills.sh`
 
 Квитанции ЖКУ: заходит в почтовый ящик (IMAP, только чтение), в указанной папке ищет письма с
@@ -1068,6 +938,34 @@ SQLite `utility_bills/utility_bills.db` с представлениями для
 план печатается в терминал. Подробно — [README проекта](utility_bills/README.md), CI —
 `.github/workflows/utility-bills.yml`.
 
+### `books_library`
+
+Домашняя библиотека книг `/mnt/copy/Books`: движок `books_library/books_library.py` (только
+стандартная библиотека Python, без venv и без обёртки). `scan` индексирует каталог в SQLite (FTS5)
+инкрементально, `serve` поднимает веб-интерфейс на `127.0.0.1:8090` (поиск, статусы чтения, читалка
+fb2/epub/txt, OPDS). Служебные режимы меняют файлы только с предварительным `-n` и JSON-отчётом в `books_library/reports/`:
+`fix-encoding` (кодировка fb2 и txt), `unpack-fb2zip` (распаковка fb2.zip), `convert` (DOC/DOCX/RTF/ODT и MHT/MHTML → EPUB;
+исходник удаляется только с `--delete-source` после проверки результата).
+
+```bash
+python3 books_library/books_library.py scan -n                       # план индексации; база не создаётся
+python3 books_library/books_library.py scan                          # индексация
+python3 books_library/books_library.py fix-encoding -n --only all    # план исправления кодировки
+python3 books_library/books_library.py unpack-fb2zip -n -p /книги    # план распаковки fb2.zip
+python3 books_library/books_library.py convert -n -p /книги          # план конвертации в EPUB
+python3 books_library/books_library.py serve                         # веб-интерфейс в переднем плане
+```
+
+**Замены прежних скриптов:** `unpack-fb2zip.sh` → `unpack-fb2zip`; `doc2fb2.sh` → `convert`;
+`cp1251_to_utf8.sh` и `replace_encoding.sh` → `fix-encoding` (с проверкой содержимого); `mht_to_fb2.py` → `convert` (MHT/MHTML, по умолчанию EPUB; CHM не поддерживается).
+
+**Настройки:** `books_library/books_library.json` (каталог книг, база, адрес и порт, авторизация,
+`convert_timeout`). **Расписание и сервис:** `systemd/user/books-library-scan.timer` — ежедневно в 04:30,
+`Persistent=true`; `systemd/user/books-library.service` — постоянный веб-сервер (ставит `check_mytasks.sh`).
+**JSON API** (`/api`): поиск, отметки, полки и фоновые задания; боевой запуск изменяющих режимов — только с `confirm` успешного dry-run (см. [README проекта](books_library/README.md#json-api)).
+**Логи:** `logs/books_library-*.jsonl`. Подробно — [README проекта](books_library/README.md), CI —
+`.github/workflows/books-library.yml`.
+
 ---
 
 ## Зависимости
@@ -1081,23 +979,19 @@ SQLite `utility_bills/utility_bills.db` с представлениями для
 | `check_backups.sh` | Bash, `find`, `sort`, `timeout`; опц.: `notify-send`, `zstd`/`gzip`/`unzip`/`7z`/`tar` (проверка целостности) |
 | `check_mytasks.sh` | Bash, `systemctl`, `crontab`, `findmnt`, `pgrep`; опц.: `zenity`/`kdialog` (окна вопросов), `sudo -A`/`pkexec`, `notify-send`; пакеты — `pacman`/`apt-get`/`dnf`/`yum`/`rpm-ostree`/`zypper`/`apk`/`xbps-install`/`emerge`/`eopkg` |
 | `cloud_backup_qnap.sh` | Entware Bash, `wireguard-go`, `ncat`, `xxd`, `ssh`; удалённо: `docker`, `tar`, `nc`, один из `zstd`/`pigz`/`gzip` |
-| `cp1251_to_utf8.sh` | `iconv`, `file`, `find` |
 | `delete_by_ext.sh` | `find` |
-| `doc2fb2.sh` | `pandoc`, `libreoffice`; опц.: `unrtf`, `antiword`, `catdoc`, `wvText` |
 | `getip.sh` | `curl` |
 | `hp_p1005_garuda.sh` | Arch/Garuda, `pacman`, `lsusb`, `systemctl`, CUPS (`lp`), `system-config-printer` |
 | `llamactl/llamactl.sh` | Bash, `python3` (статус через `llamactl_status.py`), `curl`, `jq`, `flock` (util-linux), `systemctl`, `journalctl`, `sudo -A` (askpass); опц.: `nvidia-smi`, `git`+`cmake`+CUDA (`update`), `sha256sum` (`add`) |
 | `llamactl/llamactl_status.py` | Python 3 (только стандартная библиотека), `systemctl`; опц.: драйвер NVIDIA (`libnvidia-ml.so.1`) или `nvidia-smi` |
 | `llamactl/llamactl_tray.py` | Python 3 + PyQt6, `llamactl_status.py`, `llamactl.sh`; опц.: `konsole`, `xdg-open` |
+| `books_library/books_library.py` | Python 3 (только стандартная библиотека, без venv); опц.: `pandoc` и LibreOffice (`convert`, в т. ч. MHT), `unrtf`, `antiword`, `catdoc`, `wvText` (запасные пути `convert`) |
 | `lowercase_ext.sh` | Bash, `find`, `mv` |
-| `mht_to_fb2.py` | Python 3, `pandoc` |
 | `music_downloader.sh` | Bash, Python 3, локальный проект `music_downloader/`; после успеха — `split_by_dash.sh` |
 | `utility_bills.sh` | Bash, Python 3 (venv: numpy, pillow), `tesseract` с языками rus/kaz/eng, `pdfimages` (poppler) |
-| `replace_encoding.sh` | Bash, `grep`, `sed` |
 | `sources.sh` | POSIX shell, `rsync`, `xargs`, `7z` (для строк `7z`) |
 | `split_by_dash.sh` | POSIX shell, `find`, `mv`, `sed`, `gawk` |
 | `system_monitor.sh` | Bash, `smartctl` (root), `jq`, `sqlite3`, `lsblk`, `findmnt`; опц.: `sensors`, `nvidia-smi`, `notify-send` |
-| `unpack-fb2zip.sh` | Bash, `find`, `unzip` |
 
 ---
 
@@ -1107,7 +1001,7 @@ SQLite `utility_bills/utility_bills.db` с представлениями для
 после пуша; состав проверок и порядок чтения результата — в разделе
 «Валидация» [`ai-md/mytasks.md`](ai-md/mytasks.md), не дублируются здесь. Инструменты
 проверки на рабочую машину не ставятся: `pytest` и `ruff` для загрузчика —
-в `music_downloader/requirements-ci.txt` и `utility_bills/requirements-ci.txt`, которые использует только CI.
+в `music_downloader/requirements-ci.txt`, `utility_bills/requirements-ci.txt` и `books_library/requirements-ci.txt`, которые использует только CI.
 
 Кратко: `tests/` — по Bats-файлу на актуальный корневой скрипт плюс общий
 `all_scripts_syntax.bats` (синтаксис каждого корневого `*.sh` и `llamactl/*.sh` по шебангу); внешние
@@ -1117,10 +1011,10 @@ SQLite `utility_bills/utility_bills.db` с представлениями для
 `.github/workflows/shellcheck.yml` (ShellCheck `error`+`style`+`-o all`, Ruff трея и статуса `llamactl`, синтаксис
 `bash -n`/`sh -n`, сканер небракетированных `$VAR`, `py_compile` (корневые `*.sh`/`*.py` и `llamactl/*.sh`/`llamactl/*.py`) — только
 при изменении `*.sh`/`*.py`), `.github/workflows/music-downloader.yml` (Ruff и
-pytest загрузчика на Python 3.14), `.github/workflows/utility-bills.yml` (Ruff и pytest `utility_bills/`) и `.github/workflows/security-scan.yml`
+pytest загрузчика на Python 3.14), `.github/workflows/utility-bills.yml` (Ruff и pytest `utility_bills/`), `.github/workflows/books-library.yml` (Ruff и pytest `books_library/`) и `.github/workflows/security-scan.yml`
 (Semgrep, Trivy, OSV-Scanner, Gitleaks, CodeQL; еженедельно и на push/PR).
 
 Версии инструментов CI закреплены: `shellcheck-py==0.11.0.1` из PyPI (ставится через `pipx`), `semgrep==1.183.0`,
 bats-core — тег `v1.11.1`; ruff в `shellcheck.yml` (для `llamactl`) — `ruff==0.17.0`, в `requirements-ci.txt`
 загрузчика — `ruff>=0.17.0`, у `utility_bills` — `>=0.17.0,<0.18`. У всех workflows на верхнем уровне
-`permissions: contents: read`. Workflow `music-downloader.yml` запускает и `tests/test_mht_to_fb2.py`.
+`permissions: contents: read`.

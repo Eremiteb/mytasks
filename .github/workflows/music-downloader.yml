@@ -6,16 +6,12 @@ on:
     paths:
       - "music_downloader/**"
       - "tests/test_music_downloader.py"
-      - "tests/test_mht_to_fb2.py"
-      - "mht_to_fb2.py"
       - ".github/workflows/music-downloader.yml"
   pull_request:
     branches: ["**"]
     paths:
       - "music_downloader/**"
       - "tests/test_music_downloader.py"
-      - "tests/test_mht_to_fb2.py"
-      - "mht_to_fb2.py"
       - ".github/workflows/music-downloader.yml"
 
 env:
@@ -87,7 +83,7 @@ jobs:
         run: python -m json.tool music_downloader/music_downloader.json.example >/dev/null
 
       - name: Run tests
-        run: python -m pytest music_downloader/tests tests/test_music_downloader.py tests/test_mht_to_fb2.py -q
+        run: python -m pytest music_downloader/tests tests/test_music_downloader.py -q
 
       - name: Fail build if Ruff found issues
         if: steps.ruff.outputs.ruff_exit != '0'

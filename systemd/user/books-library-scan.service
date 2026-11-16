@@ -1,0 +1,28 @@
+[Unit]
+Description=Библиотека книг: индексация каталога /mnt/copy/Books в SQLite (books_library.py scan)
+Documentation=file://@MYTASKS_DIR@/books_library/README.md
+# Одновременный запуск scan и кнопки «Пересканировать» исключён блокировкой движка (код 3 — не повторять).
+StartLimitIntervalSec=2h
+StartLimitBurst=4
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py scan
+# Конфигурация (2) и уже идущее сканирование (3) повтором не лечатся.
+RestartPreventExitStatus=2 3
+# Низкий приоритет CPU и дисковой очереди: сканирование не должно мешать остальным задачам.
+Nice=10
+IOSchedulingClass=idle
+MemoryMax=512M
+
+# Ограничения: файлы книг только читаются; запись — только в каталог библиотеки (БД) и логи.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=@MYTASKS_DIR@/books_library @MYTASKS_DIR@/logs
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native

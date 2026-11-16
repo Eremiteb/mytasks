@@ -1,0 +1,6 @@
+# Рабочие данные (машинно-зависимые): конфиг с возможным паролем и база с отметками чтения
+books_library.json
+books_library.db*
+.books_library.lock
+*.sync-conflict*
+reports/

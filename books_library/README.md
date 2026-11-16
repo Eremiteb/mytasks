@@ -1,0 +1,296 @@
+# books_library: домашняя библиотека книг
+
+Веб-библиотека для каталога книг `/mnt/copy/Books`: каталог индексируется в SQLite (FTS5), интерфейс
+открывается в браузере. Служебные режимы объединяют прежние скрипты для исправления кодировки, распаковки
+fb2.zip и конвертации DOC/DOCX/RTF/ODT/MHT в EPUB или FB2. Только стандартная библиотека Python 3, без
+зависимостей, venv и обёртки. Общие правила mytasks — [AI.md](../ai-md/AI.md), правила проекта —
+[mytasks.md](../ai-md/mytasks.md), справка по теме — [topics/books.md](../ai-md/topics/books.md).
+
+## Состав
+
+| Файл | Назначение |
+|---|---|
+| `books_library.py` | движок: сканирование, база, веб-сервер, OPDS, служебные режимы |
+| `books_library.json.example` | пример настроек (рабочий `books_library.json` не попадает в Git) |
+| `tests/test_books_library.py` | тесты pytest на синтетических данных во временных каталогах |
+| `../systemd/user/books-library.service` | постоянный веб-сервер |
+| `../systemd/user/books-library-scan.service`, `books-library-scan.timer` | ежедневное сканирование |
+
+Запуск — прямой вызов движка (файл исполняемый, интерпретатор — `python3`):
+
+```bash
+python3 books_library/books_library.py <режим> [ключи]
+```
+
+## Режимы
+
+| Режим | Что делает | Меняет файлы |
+|---|---|---|
+| `serve` | веб-интерфейс на `127.0.0.1:8090` в переднем плане (по умолчанию) | нет |
+| `scan` | инкрементальная индексация каталога (новые и изменённые по размеру и mtime, исчезнувшие удаляются из базы) | нет (только база) |
+| `fix-encoding` | кодировка fb2 (объявление) и txt (cp1251 → UTF-8) | да, с отчётом |
+| `unpack-fb2zip` | `.fb2` из `*.fb2.zip` рядом с архивом | да (добавляет файлы), архив остаётся |
+| `convert` | DOC/DOCX/RTF/ODT/MHT/MHTML → EPUB (по умолчанию) или FB2 | да (добавляет результат); исходник — только с `--delete-source` |
+| `--migrate-db` | только миграции схемы базы | база |
+
+Ключи:
+
+| Ключ | Действие |
+|---|---|
+| `-n`, `--dry-run` | ничего не менять; план строками `[dry-run] будет: …` |
+| `-p`, `--path DIR` | каталог для `fix-encoding`, `unpack-fb2zip`, `convert`: абсолютный путь или относительно `books_dir`; по умолчанию — каталог книг. Корень файловой системы и домашний каталог целиком отвергаются |
+| `--only` | `fix-encoding`: `all`, `fb2`, `txt`; `convert`: `all`, `doc`, `docx`, `rtf`, `odt`, `mht`, `mhtml` |
+| `--max-mb N` | `unpack-fb2zip`: предел размера одной распаковываемой книги, МБ (по умолчанию 200, допустимо 1..4096) |
+| `--to epub\|fb2` | `convert`: формат результата (по умолчанию EPUB — правило библиотеки) |
+| `--overwrite` | `convert`: перезаписывать существующий результат |
+| `--skip-newer` | `convert` с `--overwrite`: не трогать результат, который новее исходника |
+| `--exclude SUBSTR` | `convert`: пропускать имена, содержащие подстроку (можно повторять) |
+| `--author NAME` | `convert`: автор для всех документов (иначе — из метаданных DOCX или From у MHT, затем из имени папки) |
+| `--title-mode auto\|filename\|keep` | `convert`: откуда название (`auto` — метаданные, затем имя файла) |
+| `--no-toc`, `--toc-depth N` | `convert`: без оглавления / глубина оглавления (1..6, по умолчанию 3) |
+| `--delete-source` | `convert`: удалить исходник после проверки результата (с JSON-отчётом) |
+| `--config PATH` | другой файл настроек вместо `books_library/books_library.json` |
+
+Коды возврата: `0` — успех; `1` — ошибка выполнения (ввод-вывод, база); `2` — ошибка конфигурации или
+отсутствует нужная программа (например, pandoc для `convert`); `3` — уже выполняется другая операция.
+Блокировка `books_library/.books_library.lock` общая для `scan`, `fix-encoding`, `unpack-fb2zip`,
+`convert` и кнопки «Пересканировать» в интерфейсе: одновременно работает только одна операция.
+
+**Все изменяющие режимы — сначала с `-n`.** Порядок: `-n` → просмотр плана (количество, список, спорные
+случаи) → боевой запуск по прямому подтверждению. Перед изменением файлов режим пишет JSON-отчёт в
+`books_library/reports/` (`<вид>-<время>.json`) с путями, размерами и прежним состоянием.
+
+## Примеры
+
+```bash
+python3 books_library/books_library.py scan -n                        # план индексации; база не создаётся
+python3 books_library/books_library.py scan                           # индексация
+python3 books_library/books_library.py fix-encoding -n --only all     # план исправления кодировки
+python3 books_library/books_library.py fix-encoding --only all        # исправление (после -n)
+python3 books_library/books_library.py unpack-fb2zip -n -p /книги     # план распаковки
+python3 books_library/books_library.py unpack-fb2zip -p /книги        # распаковка (после -n)
+python3 books_library/books_library.py convert -n -p /книги --only doc   # план конвертации DOC
+python3 books_library/books_library.py convert -p /книги --only doc     # конвертация (после -n)
+python3 books_library/books_library.py serve                          # веб-интерфейс
+```
+
+## Сопоставление со старыми скриптами
+
+| Старый скрипт | Новый режим | Отличия |
+|---|---|---|
+| `unpack-fb2zip.sh -p DIR` | `unpack-fb2zip -p DIR` | предел размера `--max-mb` (по умолчанию 200 МБ); при конфликте имени — суффиксы `_1`, `_2`; архив не удаляется; `--log` не нужен (журнал общий) |
+| `doc2fb2.sh -d DIR` | `convert -p DIR` | по умолчанию EPUB (`--to fb2` — как раньше); тайм-аут — ключ `convert_timeout` в конфиге; `--overwrite`, `--toc-depth`, `--no-toc`, `--title-mode` сохранены; исходник удаляется только с `--delete-source` |
+| `cp1251_to_utf8.sh DIR` | `fix-encoding -p DIR --only txt` | содержимое проверяется (не UTF-8, cp1251 без ошибок, кириллица); угадывание по `file` не используется |
+| `replace_encoding.sh DIR` | `fix-encoding -p DIR --only fb2` | произвольная замена строк больше не поддерживается: режим лечит только кодировку |
+| `mht_to_fb2.py DIR` | `convert -p DIR --only mht` (или `mhtml`) | по умолчанию EPUB (`--to fb2` — как раньше); исходник удаляется только с `--delete-source` (старый удалял всегда); правило «удалить FB2 рядом с CHM» не перенесено — CHM в библиотеке нет |
+
+Запасные пути `convert` такие же, как у `doc2fb2.sh`: DOCX/ODT → pandoc; DOC/RTF → LibreOffice → DOCX →
+pandoc; при отсутствии LibreOffice — RTF напрямую через pandoc или `unrtf`, DOC — через `antiword`,
+`catdoc`, `wvText` с последующим pandoc из текста. MHT/MHTML: HTML из части `text/html` (иначе текст
+`text/plain` в `<pre>`), кодировка — заявленная, с запасными вариантами, название — `<title>` или Subject,
+автор — From.
+
+## Конвертация: безопасность и проверка
+
+- pandoc запускается в два шага. Первый — разбор недоверенного документа в JSON-AST с `--sandbox`
+  (без сети и чужих файлов), картинки извлекаются во временный каталог. Второй — запись EPUB/FB2 из AST;
+  картинки, которые ведут за пределы временного каталога, из AST удаляются.
+- Внешние программы запускаются без оболочки, с тайм-аутом `convert_timeout` (по умолчанию 300 с, допустимо 10..3600).
+- Результат проверяется: EPUB — ZIP/CRC, `mimetype`, `container.xml`, текст глав; FB2 — `FictionBook` с текстом.
+  Непроверенный результат не попадает в каталог.
+- Существующий результат не перезаписывается без `--overwrite`.
+- `--delete-source` удаляет исходник только после проверки результата и пишет отчёт
+  `books_library/reports/convert-<время>.json`. Без этого ключа исходники сохраняются.
+
+## Настройки
+
+Файл `books_library/books_library.json` создаёт мастер `check_mytasks.sh` из
+`books_library.json.example` (или вручную: `cp books_library.json.example books_library.json`).
+Неизвестный ключ, неверный тип или значение вне диапазона — ошибка конфигурации (код 2).
+Ключи, начинающиеся с `_`, игнорируются (для комментариев).
+
+| Ключ | По умолчанию | Значение |
+|---|---|---|
+| `books_dir` | `/mnt/copy/Books` | каталог книг (путь раскрывается `~`) |
+| `db_path` | `books_library.db` | база SQLite; относительный путь — от каталога `books_library/`. Вынос за пределы каталога требует правки `ReadWritePaths=` в юнитах |
+| `host` | `127.0.0.1` | адрес веб-интерфейса; при адресе не из localhost без пароля движок пишет предупреждение |
+| `port` | `8090` | порт, от 1 до 65535 |
+| `scan_workers` | `8` | потоков разбора книг при сканировании, от 1 до 64 |
+| `reader_max_mb` | `64` | предел размера книги для чтения в браузере и для `fix-encoding`, от 1 до 1024 МБ |
+| `page_size` | `50` | книг на странице списка, от 10 до 500 |
+| `convert_timeout` | `300` | тайм-аут одного запуска pandoc/LibreOffice при `convert`, с, от 10 до 3600 |
+| `auth.user` | пусто | имя для HTTP Basic-авторизации |
+| `auth.password` | пусто | пароль (лучше не хранить в файле) |
+| `auth.password_env` | `BOOKS_LIBRARY_PASSWORD` | имя переменной окружения с паролем, если `auth.password` пуст |
+
+Авторизация включается, когда задан пароль; `auth.password` без `auth.user` — ошибка конфигурации.
+
+## Журналы
+
+Движок пишет JSONL-журнал в `logs/books_library-<время>.jsonl` (каталог — `MYTASKS_LOG_DIR` или `logs/`
+репозитория; права 600; хранятся последние `KEEP_LOGS` из `conf/log_template.conf`). Вывод `serve` в
+терминале или в журнале systemd: `journalctl --user -u books-library.service`.
+
+## Юниты systemd (user)
+
+| Юнит | Что делает |
+|---|---|
+| `books-library.service` | постоянный `python3 -I books_library/books_library.py serve`; перезапуск при сбое через 10 с (код 2 не перезапускается); потолок памяти 1 ГБ; запись разрешена в `books_library/` (включая `reports/`), `logs/` и в каталог книг (для заданий API) |
+| `books-library-scan.service` | oneshot `… scan`; `Nice=10`, `IOSchedulingClass=idle`; коды 2 и 3 не перезапускаются |
+| `books-library-scan.timer` | ежедневно в 04:30, `Persistent=true` (пропущенный запуск — после загрузки), случайная задержка до 10 мин |
+
+Юниты ставит и включает `check_mytasks.sh` (задания `books-library.service` и `books-library-scan.timer`).
+Служебные режимы (`fix-encoding`, `unpack-fb2zip`, `convert`) юнитами не запускаются: их вызывают вручную
+после `-n` или через API (см. «JSON API»). Песочница юнитов: `NoNewPrivileges`, `ProtectSystem=strict`,
+`ProtectHome=read-only`, запись в `books_library/` (включая `reports/`), `logs/` и в каталог книг (`-/mnt/copy/Books`,
+дефис — не ошибка, если каталога нет), адресные семейства только `AF_UNIX`, `AF_INET`, `AF_INET6`.
+
+## Первый запуск
+
+1. `python3 books_library/books_library.py scan -n` — проверить план (количество книг и ошибки обхода).
+2. `python3 books_library/books_library.py scan` — создать базу и проиндексировать каталог.
+3. `systemctl --user enable --now books-library.service` — запустить веб-интерфейс.
+4. Открыть http://127.0.0.1:8090/ .
+
+## Возможности интерфейса
+
+- **Поиск** по названию, автору, серии, жанрам и аннотации: полнотекстовый (FTS5), регистр и `ё`/`е`
+  не различаются, каждое слово запроса — префикс, слова связаны по «И». Фильтры: формат, статус чтения,
+  полка, избранное, раздел, коллекция, автор, серия, жанр, язык. Сортировки: по релевантности, названию,
+  автору, серии, дате добавления, году, размеру, пути (`sort=path`, порядок выпусков журналов).
+- **Авторы и серии** — списки по буквам; **жанры** — по кодам fb2 с русскими названиями.
+- **Разделы** (`/sections`): папки каталога с подчёркиванием в начале (`_Сборники`, `_Журналы`,
+  `_Документация`, `_Разобрать`, `_Временное`, `_Религия`) и их подпапки-коллекции. Без такой папки книга
+  относится к разделу «Художественная литература»; в разделах автор и название берутся из имени файла
+  «Автор - Название», если в метаданных автора нет.
+- **Папки** (`/browse`) — навигация по каталогу книг, только чтение; путь проверяется внутри каталога.
+- **Страница книги** — обложка, аннотация, серия, жанры, другие книги серии, скачивание файла.
+- **Чтение в браузере** — fb2, fb2.zip, epub (по главам с оглавлением), txt. PDF — встроенным просмотрщиком
+  браузера. Остальные форматы (mobi, azw, djvu и др.) — только скачивание. Позиция чтения запоминается.
+- **Отметки** — статус (хочу / читаю / прочитано / брошено), оценка 0–5, избранное, заметки, полки.
+  Отметки привязаны к относительному пути книги и переживают пересканирование; если файл удалён из
+  каталога, его отметки остаются в базе.
+- **Недавние** и **статистика**. Кнопка «Пересканировать» запускает `scan` в фоне.
+
+## JSON API
+
+Эндпоинты под `/api`, ответы — JSON. `GET /api` выдаёт полный список эндпоинтов (тот же текст, что
+`API_HELP` в движке). API и CLI используют одну и ту же логику: проверка параметров (`command_params`),
+запуск режима (`run_command`) и вывод плана. Поэтому результат одинаков, и ошибки параметров одинаковы.
+
+| Метод и путь | Что делает |
+|---|---|
+| `GET /api/books` | поиск: `q`, `author`, `series`, `genre`, `section`, `collection`, `fmt`, `lang`, `status`, `shelf`, `fav=1`, `dir`, `sort`, `page`, `per_page` (до 500). Ответ: `total`, `page`, `per_page`, `items` |
+| `GET /api/books/<id>` | книга с отметкой (`mark`) и полками (`shelves`) |
+| `POST /api/books/<id>/mark` | `{status?, rating?, favorite?, note?}` — частичное обновление отметки |
+| `POST /api/books/<id>/shelves` | `{shelf_ids: [..]}` — заменить полки книги |
+| `GET /api/authors`, `GET /api/series` | `q` (подстрока) или `l` (первая буква); до 1000 строк |
+| `GET /api/genres`, `/api/sections`, `/api/shelves`, `/api/recent`, `/api/stats` | справочники и статистика |
+| `POST /api/shelves` | `{name}` — создать полку (ответ 201) |
+| `POST /api/shelves/<id>/delete` | удалить полку (книги не трогаются) |
+| `POST /api/jobs` | фоновое задание (ответ 202, см. ниже) |
+| `GET /api/jobs`, `GET /api/jobs/<id>` | список заданий и состояние одного: `state` (queued, running, done, failed), `output` (строки плана), `result`, `error` |
+| `POST /api/progress` | позиция чтения (форма `id`, `ch`, `p`) — используется читалкой |
+
+**Задания.** `POST /api/jobs` принимает `command` (`scan`, `migrate`, `fix-encoding`, `unpack-fb2zip`,
+`convert`), `dry_run` (по умолчанию `true`), `confirm` и параметры режима — те же, что ключи CLI, в виде
+полей JSON: `path` (`-p`), `only`, `max_mb`, `to`, `overwrite`, `skip_newer`, `exclude`, `author`,
+`title_mode`, `toc`, `toc_depth`, `delete_source`. Неизвестные параметры — 400. Задания хранятся в памяти
+сервера (последние ~100) и при перезапуске сервиса теряются; отчёты записываются в `books_library/reports/`.
+
+**Правило dry-run → боевой запуск.** Боевой запуск `fix-encoding`, `unpack-fb2zip` и `convert` требует
+`confirm` — id **завершённого успешного** dry-run того же режима с **теми же параметрами**. Иначе 409.
+`scan` и `migrate` боевые без `confirm`: меняют только базу.
+
+**Правила запросов.** GET — без изменений. POST принимается в двух случаях: с `Content-Type: application/json`
+(кросс-сайтовая страница без CORS такой запрос не отправит) или с той же страницы (`Origin`/`Referer`
+совпадает с `Host`). Иначе 403. Тело — не больше 100 КБ. Basic-авторизация — та же, что у интерфейса.
+Кириллица в сыром URL понимается (например, `curl` без процент-кодирования), но надёжнее кодировать
+параметры (`curl -G --data-urlencode`).
+
+Примеры (`BASE=http://127.0.0.1:8090`; при включённой авторизации добавьте `-u user:password`):
+
+```bash
+# Поиск
+curl -s -G "$BASE/api/books" --data-urlencode "q=тёмный"
+
+# Отметка: прочитано, оценка 5, избранное
+curl -s -X POST "$BASE/api/books/42/mark" -H 'Content-Type: application/json' \
+     -d '{"status":"done","rating":5,"favorite":true}'
+
+# Полка и назначение книге
+curl -s -X POST "$BASE/api/shelves" -H 'Content-Type: application/json' -d '{"name":"Любимые"}'
+curl -s -X POST "$BASE/api/books/42/shelves" -H 'Content-Type: application/json' -d '{"shelf_ids":[3]}'
+
+# 1. Dry-run задания (по умолчанию dry_run=true): вернёт id в поле id
+curl -s -X POST "$BASE/api/jobs" -H 'Content-Type: application/json' \
+     -d '{"command":"convert","path":"/mnt/copy/Books/Документы","only":"doc"}'
+
+# 2. Состояние и план (output) — повторять, пока state не станет done или failed
+curl -s "$BASE/api/jobs/<id>"
+
+# 3. Боевой запуск с confirm = id успешного dry-run и теми же параметрами
+curl -s -X POST "$BASE/api/jobs" -H 'Content-Type: application/json' \
+     -d '{"command":"convert","dry_run":false,"confirm":"<id>","path":"/mnt/copy/Books/Документы","only":"doc"}'
+```
+
+**Безопасность API.** Через API меняются отметки, полки и запускаются служебные режимы, поэтому по умолчанию
+сервер слушает только `127.0.0.1`. При доступе из сети обязательны `host` и `auth` с паролем. Защита от
+CSRF — два правила выше (JSON или тот же Origin). Боевой запуск без успешного dry-run с теми же параметрами
+невозможен. Юнит `books-library.service` разрешает запись в каталог книг (`-/mnt/copy/Books`) и в `books_library/` (отчёты — в `books_library/reports/`),
+потому что боевые задания API пишут туда; `MemoryMax` — 1 ГБ (конвертация pandoc требует памяти).
+
+Чтобы запретить запись в книги через сервис (тогда боевые `fix-encoding`, `unpack-fb2zip` и `convert` через API
+завершатся ошибкой, а `serve` и dry-run работают как прежде), переопределите юнит:
+
+```bash
+systemctl --user edit books-library.service
+```
+
+В открывшемся файле (подставьте свой путь вместо `/home/esimych/esimych-docs/mytasks`):
+
+```ini
+[Service]
+ReadWritePaths=
+ReadWritePaths=/home/esimych/esimych-docs/mytasks/books_library /home/esimych/esimych-docs/mytasks/logs
+```
+
+Затем `systemctl --user restart books-library.service`. Пустая строка `ReadWritePaths=` сбрасывает прежний
+список, следующая строка задаёт новый. Чтобы вернуть прежнее поведение, удалите override
+(`systemctl --user revert books-library.service`).
+
+## OPDS для читалок
+
+Каталог Atom/OPDS 1.2 — `/opds`: новые поступления; `/opds?q=запрос` — поиск (шаблон `searchTerms`
+объявлен в каталоге); ссылки на скачивание `/file/<id>` и обложки `/cover/<id>`. Адрес для читалки:
+`http://127.0.0.1:8090/opds`. При открытии в сеть добавляйте авторизацию: читалка передаёт её как Basic.
+
+## Безопасность
+
+- **Файлы книг меняют только служебные режимы** (в том числе задания API) и только после `-n` / dry-run с `confirm`. Веб-интерфейс и `scan` файлы только
+  читают. Пути из запросов не принимаются: книга выбирается по `id` из базы, путь проверяется внутри `books_dir`.
+- **Content-Security-Policy** для HTML-страниц: `default-src 'self'`, скрипты и картинки только со своего
+  адреса, `frame-ancestors 'none'`, `form-action 'self'`, `base-uri 'none'`; `X-Content-Type-Options: nosniff`,
+  `Cache-Control: no-store`.
+- **Очистка содержимого книг.** При чтении в браузере из fb2/epub/txt удаляются скрипты, стили, `iframe`,
+  `object` и все атрибуты, кроме картинок; картинки отдаются через сервер, только растровые типы (SVG нет).
+- **Проверка Origin/Referer для POST.** Отметки, полки, сканирование и позиция чтения принимаются только с
+  той же страницы (совпадение с `Host`), иначе 403. Размер тела POST — не более 100 КБ.
+- **Сеть.** По умолчанию сервер слушает только `127.0.0.1`. Для доступа из сети задайте `host` и
+  `auth.user` с паролем. Пароль — в переменной окружения (`auth.password_env`) или в файле с правами 600.
+- **Конвертация и распаковка.** Внешние программы без оболочки, pandoc с `--sandbox`, тайм-аут, проверка
+  результата, отчёты перед изменениями, удаление исходника только с `--delete-source`.
+- **Данные.** Книги и база не попадают в Git (`.gitignore` подпроекта): `books_library.json`,
+  `books_library.db*`, lock-файл.
+
+## Ограничения
+
+- Правка метаданных книг в интерфейсе не поддерживается. Отметки пользователя хранятся отдельно в базе.
+- Форматы mobi, azw, azw3, djvu, rtf, doc, docx, chm и др. в браузере не открываются; DOC/DOCX/RTF/ODT
+  и MHT/MHTML переводятся в EPUB через `convert`. CHM не конвертируется.
+- Обход каталога читает заголовки fb2 (первые 512 КБ) и содержимое zip/epub. Книги больше
+  `reader_max_mb` в браузере не открываются.
+- Если каталог книг временно недоступен, `scan` завершается ошибкой без изменения базы; интерфейс
+  показывает уже проиндексированное.
+- Тесты и статический анализ выполняются только в CI (`.github/workflows/books-library.yml`): Ruff по
+  `books_library/`, проверка `books_library.json.example`, pytest `books_library/tests`.

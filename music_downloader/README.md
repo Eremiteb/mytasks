@@ -263,7 +263,7 @@ sqlite3 music_downloader/music_downloader.db \
 (`.github/workflows/music-downloader.yml`) после пуша при изменениях загрузчика,
 общих тестов или workflow: зависимости из `requirements-ci.txt` (рабочие +
 `pytest`, `ruff`), Ruff `music_downloader/`, pytest
-`tests/test_music_downloader.py`, `tests/test_mht_to_fb2.py` и `music_downloader/tests` (временные каталоги,
+`tests/test_music_downloader.py` и `music_downloader/tests` (временные каталоги,
 подменённый HTTP, реальная музыка не скачивается), проверка
 `music_downloader.json.example` через `json.tool`. Bats-обёртка
 `tests/music_downloader_wrapper.bats` идёт в `bats-tests.yml`, синтаксис

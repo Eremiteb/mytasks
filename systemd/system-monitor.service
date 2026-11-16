@@ -24,7 +24,7 @@ PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
 # Запись — только данные mytasks (БД, логи, отчёты); «-» — нет каталога, не сбой запуска
-ReadWritePaths=-@MYTASKS_DIR@/state -@MYTASKS_DIR@/logs -@MYTASKS_DIR@/system_reports
+ReadWritePaths=-@MYTASKS_DIR@/system_monitor -@MYTASKS_DIR@/logs -@MYTASKS_DIR@/system_reports
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
