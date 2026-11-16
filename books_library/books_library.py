@@ -2030,7 +2030,7 @@ def dedup(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None, w
 
 def zip_books(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None, workers: int | None = None,
               out: Callable[[str], None] = print) -> dict[str, Any]:
-    """Упаковка: уже сжатые форматы — ZIP_STORED, прочие — deflate 6. Проверка: одна запись, размер и CRC как у
+    """Упаковка: уже сжатые форматы — ZIP_STORED, прочие — deflate 6; сначала пакуются прочие, затем сжатые. Проверка: одна запись, размер и CRC как у
     исходника, testzip; только после неё исходник удаляется (содержимое в zip побайтно — это не карантин).
     Многофайловые zip не трогаются; битые zip — в rejected-zip/, недопустимые для NTFS или длинные имена — в rejected-name/."""
     run = NightRun(cfg, "zip-books", dry_run, path, out)
@@ -2103,8 +2103,12 @@ def zip_books(cfg: dict[str, Any], dry_run: bool = False, path: str | None = Non
         run.record("zipped", src, to=str(dest), size=stat.st_size, zip_size=dest.stat().st_size)
         run.moved(src, dest)
 
+    def stored(item: tuple[Path, int]) -> bool:
+        return item[0].name.rpartition(".")[2].lower() in STORED_EXTENSIONS
+
     errors: list[str] = []
-    parallel(walk_files(run.target, suffixes, errors), one, workers or cfg["workers"], run)
+    for second in (False, True):  # сначала текстовые форматы, затем уже сжатые (pdf, djvu…)
+        parallel((i for i in walk_files(run.target, suffixes, errors) if stored(i) == second), one, workers or cfg["workers"], run)
     return run.finish({"walk_errors": errors[:200]})
 
 
