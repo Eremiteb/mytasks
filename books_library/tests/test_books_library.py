@@ -117,9 +117,15 @@ def books_dir(tmp_path: Path) -> Path:
 
 def make_cfg(tmp_path: Path, books: Path, port: int = 8090) -> dict[str, Any]:
     config = tmp_path / "books_library.json"
-    config.write_text(
-        json.dumps({"books_dir": str(books), "db_path": str(tmp_path / "lib.db"), "port": port}), encoding="utf-8"
-    )
+    # Карантин и число потоков — во временном каталоге: служебные режимы тестов не трогают /mnt/copy.
+    settings = {
+        "books_dir": str(books),
+        "db_path": str(tmp_path / "lib.db"),
+        "port": port,
+        "quarantine_dir": str(tmp_path / "quarantine"),
+        "workers": 2,
+    }
+    config.write_text(json.dumps(settings), encoding="utf-8")
     return bl.load_config(config)
 
 
@@ -1041,3 +1047,106 @@ def test_api_unknown_parameter_is_bad_request(web: str, api_env: None) -> None:
 def test_command_params_rejects_out_of_range_toc_depth() -> None:
     with pytest.raises(bl.ConfigError):
         bl.command_params("convert", {"toc_depth": 9})
+
+
+def test_command_params_accepts_workers_for_dedup_and_zip_books() -> None:
+    assert bl.command_params("dedup", {"workers": 4})["workers"] == 4
+    assert bl.command_params("zip-books", {})["workers"] is None
+
+
+def test_command_params_rejects_zero_workers() -> None:
+    with pytest.raises(bl.ConfigError):
+        bl.command_params("dedup", {"workers": 0})
+
+
+def test_load_config_rejects_quarantine_inside_books(tmp_path: Path) -> None:
+    books = tmp_path / "books"
+    config = tmp_path / "books_library.json"
+    config.write_text(json.dumps({"books_dir": str(books), "quarantine_dir": str(books / "removed")}), encoding="utf-8")
+    with pytest.raises(bl.ConfigError):
+        bl.load_config(config)
+
+
+# ---- однокнижные zip, пути и кодировки -----------------------------------------------------------
+
+LONG_RU = (
+    "Глава первая. Тихий лес окружал старый дом на опушке, и каждое утро туман медленно поднимался над рекой. "
+    "Иван Петрович вышел на крыльцо, посмотрел на далёкие холмы и подумал, что сегодня наконец закончит письмо брату. "
+    "Ветер шевелил листья берёз, а в траве звенели первые кузнечики. Никто в деревне не знал, что за рекой давно никто "
+    "не жил, и только Маша иногда слышала оттуда странные голоса по вечерам."
+)
+
+
+def test_split_name_understands_single_book_zip() -> None:
+    assert bl.split_name("a.fb2.zip") == ("a", "fb2")
+    assert bl.split_name("a.zip") == ("a", "zip")
+
+
+def test_display_path_hides_single_book_zip() -> None:
+    assert bl.display_path("x/a.fb2.zip", "fb2") == "x/a.fb2"
+    assert bl.display_path("x/b.zip", "pdf") == "x/b.pdf"
+    assert bl.display_path("x/m.zip", "zip") == "x/m.zip"
+
+
+@pytest.mark.parametrize("encoding", ["cp866", "koi8_r", "cp1251"])
+def test_detect_txt_recognizes_cyrillic_encodings(encoding: str) -> None:
+    text, found = bl.detect_txt(LONG_RU.encode(encoding))
+    assert text == LONG_RU
+    assert found == encoding
+
+
+def test_detect_txt_binary_is_not_text() -> None:
+    assert bl.detect_txt(b"\x00\x01abc") == (None, "binary")
+
+
+def test_normalize_txt_converts_line_endings_to_lf() -> None:
+    assert bl.normalize_txt(b"a\r\nb\rc")[0] == b"a\nb\nc"
+
+
+def test_fix_semi_cp866_restores_capitals_in_field() -> None:
+    assert bl.fix_semi_cp866("‘тейнбек „жон", field=True)[0] == "Стейнбек Джон"
+
+
+def test_norm_key_folds_yo_case_and_punctuation() -> None:
+    assert bl.norm_key("Ёлка_Два!") == "елка два"
+
+
+@pytest.fixture
+def night_cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    root = tmp_path / "night"
+    root.mkdir()
+    (root / "cp.txt").write_bytes(TXT_TEXT.encode("cp1251"))
+    (root / "bin.txt").write_bytes(b"\x00\x01abc")
+    # Журналы и отчёты пишутся в REPORTS_DIR: подменяем на временный каталог.
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    return make_cfg(tmp_path, root)
+
+
+def test_fix_encoding_moves_binary_txt_to_quarantine(night_cfg: dict[str, Any]) -> None:
+    root = Path(night_cfg["books_dir"])
+
+    stats = bl.fix_encoding(night_cfg, only="txt")
+
+    assert stats["fixed"] == 1
+    assert stats["rejected-encoding"] == 1
+    assert (root / "cp.txt").read_bytes() == TXT_TEXT.encode("utf-8")
+    assert not (root / "bin.txt").exists()
+    quarantined = Path(night_cfg["quarantine_dir"]) / "rejected-encoding" / "bin.txt"
+    assert quarantined.read_bytes() == b"\x00\x01abc"
+
+
+def test_zip_books_wraps_txt_and_removes_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "zip_src"
+    root.mkdir()
+    data = TXT_TEXT.encode("utf-8")
+    (root / "a.txt").write_bytes(data)
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    cfg = make_cfg(tmp_path, root)
+
+    stats = bl.zip_books(cfg)
+
+    assert stats["zipped"] == 1
+    assert not (root / "a.txt").exists()
+    with zipfile.ZipFile(root / "a.txt.zip") as archive:
+        assert archive.namelist() == ["a.txt"]
+        assert archive.read("a.txt") == data
