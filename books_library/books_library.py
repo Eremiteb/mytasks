@@ -674,7 +674,7 @@ def read_book_meta(root: Path, rel: str) -> dict[str, Any]:
     full = root / rel
     try:
         found: dict[str, Any] = {}
-        if meta["fmt"] == "fb2":
+        if meta["fmt"] == "fb2" and not rel.lower().endswith(".zip"):
             with full.open("rb") as handle:
                 found = fb2_meta(handle.read(FB2_HEAD_BYTES))
         elif meta["fmt"] == "epub" and not rel.lower().endswith(".zip"):
