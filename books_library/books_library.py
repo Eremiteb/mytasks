@@ -222,6 +222,12 @@ MIGRATIONS: list[str] = [
     ) WITHOUT ROWID;
     CREATE INDEX dup_members_path ON dup_members(path);
     """,
+    # v3: правки метаданных из веба и API: для форматов без записи в файл (pdf, djvu, txt…) — в БД;
+    # журнал правок с путём копии прежней версии файла в карантине.
+    """
+    CREATE TABLE meta_overrides(path TEXT PRIMARY KEY, title TEXT, authors TEXT, series TEXT, series_no INTEGER, genres TEXT, year TEXT, lang TEXT, annotation TEXT, updated REAL NOT NULL);
+    CREATE TABLE edit_log(id INTEGER PRIMARY KEY, path TEXT NOT NULL, new_path TEXT NOT NULL DEFAULT '', fields TEXT NOT NULL, backup TEXT NOT NULL DEFAULT '', created REAL NOT NULL);
+    """,
 ]
 DB_LATEST = len(MIGRATIONS)
 
@@ -758,6 +764,26 @@ def upsert_book(conn: sqlite3.Connection, rel: str, size: int, mtime: float, met
     conn.execute("INSERT INTO books_fts(rowid, doc) VALUES (?,?)", (book_id, fold(doc)))
 
 
+EDIT_KEYS = ("title", "authors", "series", "series_no", "genres", "year", "lang", "annotation")
+
+
+def load_overrides(db_path: str) -> dict[str, sqlite3.Row]:
+    """Правки метаданных из meta_overrides по пути книги; до схемы v3 таблицы нет — пусто."""
+    with closing(connect(db_path)) as conn:
+        if conn.execute("PRAGMA user_version").fetchone()[0] < 3:
+            return {}
+        return {row["path"]: row for row in conn.execute("SELECT * FROM meta_overrides")}
+
+
+def apply_override(meta: dict[str, Any], row: sqlite3.Row) -> None:
+    """Поверх разбора — непустые поля правки: метаданные книг без записи в файл живут в БД и не затираются сканом."""
+    for key in EDIT_KEYS:
+        value = row[key]
+        if value is None or value == "":
+            continue
+        meta[key] = [v for v in value.split("; ") if v] if key in ("authors", "genres") else value
+
+
 def scan(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str], None] = print) -> dict[str, int]:
     """Инкрементальное сканирование: новые и изменённые файлы разбираются, исчезнувшие удаляются из каталога."""
     root = Path(cfg["books_dir"])
@@ -797,6 +823,7 @@ def scan(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str], None] 
         return stats
 
     migrate_database(db_path, out=out)
+    overrides = load_overrides(db_path)
     started = last_report = time.monotonic()
     parse_errors = 0
     SCAN_STATE.update(stage="разбор книг", total=len(todo))
@@ -817,6 +844,8 @@ def scan(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str], None] 
                             parse_errors += 1
                             if parse_errors <= 50:
                                 say(f"метаданные по пути: {rel}", "parse_error", logging.WARNING, detail=meta["error"])
+                        if rel in overrides:
+                            apply_override(meta, overrides[rel])
                         upsert_book(conn, rel, size, mtime, meta)
                 done = start + len(batch)
                 SCAN_STATE["done"] = done
@@ -1583,6 +1612,316 @@ def dup_action(cfg: dict[str, Any], group_id: int, action: str, path: str = "") 
         say(f"группа {group_id}: восстановлен {path}", "dup_action", detail=f"restore group={group_id}")
         return f"«{path}» восстановлен в каталог."
     raise ValueError("неизвестное действие")
+
+
+# ----------------------------------------------------------------------
+# Правка метаданных: проверка полей, запись в файл (epub, fb2), каталог, переименование, журнал
+# ----------------------------------------------------------------------
+
+EDIT_LANG_RE = re.compile(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})?")
+EDIT_YEAR_RE = re.compile(r"[0-9]{4}")
+EDIT_BAD_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+EDIT_NAME_MAX = 240  # байт имени с расширением; запас до лимита файловой системы 255
+EDIT_MEMBER_MAX = 256 * 1024 * 1024
+OPF_METADATA_RE = re.compile(r"(<((?:[\w.-]+:)?)metadata(?=[\s>])[^>]*>)(.*?)(</\2metadata\s*>)", re.S)
+FB2_TITLE_INFO_RE = re.compile(r"(<((?:[\w.-]+:)?)title-info(?=[\s>])[^>]*>)(.*?)(</\2title-info\s*>)", re.S)
+
+
+def _edit_text(value: Any, field: str, low: int, high: int, multiline: bool = False) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field}: ожидается строка")
+    text = value.replace("\r\n", "\n").replace("\r", "\n") if multiline else value
+    text = text.strip()
+    if any(ord(ch) < 32 and not (multiline and ch == "\n") for ch in text):
+        raise ValueError(f"{field}: недопустимые управляющие символы")
+    if not low <= len(text) <= high:
+        raise ValueError(f"{field}: длина от {low} до {high} символов")
+    return text
+
+
+def _edit_names(value: Any, field: str, min_items: int, max_items: int, high: int) -> list[str]:
+    if not isinstance(value, list):
+        raise ValueError(f"{field}: ожидается список строк")
+    items = [_edit_text(item, field, 1, high) for item in value]
+    if not min_items <= len(items) <= max_items:
+        raise ValueError(f"{field}: от {min_items} до {max_items} значений")
+    return items
+
+
+def validate_edit(raw: dict[str, Any]) -> dict[str, Any]:
+    """Проверка полей правки метаданных; ошибки — ValueError с текстом для пользователя."""
+    unknown = sorted(set(raw) - set(EDIT_KEYS))
+    if unknown:
+        raise ValueError(f"неизвестные поля: {', '.join(unknown)}")
+    if "title" not in raw or "authors" not in raw:
+        raise ValueError("обязательны поля title и authors")
+    raw_no = raw.get("series_no")
+    if isinstance(raw_no, str):
+        raw_no = raw_no.strip()
+    if raw_no in (None, ""):
+        number = None
+    elif isinstance(raw_no, bool) or not (isinstance(raw_no, int) or (isinstance(raw_no, str) and raw_no.isascii() and raw_no.isdigit())):
+        raise ValueError("series_no: только цифры или пусто")
+    else:
+        number = int(raw_no)
+        if not 0 <= number <= 100000:
+            raise ValueError("series_no: от 0 до 100000")
+    year = _edit_text(raw.get("year", ""), "year", 0, 4)
+    if year and not EDIT_YEAR_RE.fullmatch(year):
+        raise ValueError("year: пусто или четыре цифры")
+    lang = _edit_text(raw.get("lang", ""), "lang", 0, 20)
+    if lang and not EDIT_LANG_RE.fullmatch(lang):
+        raise ValueError("lang: код языка вида ru или en-US")
+    return {
+        "title": _edit_text(raw["title"], "title", 1, 500),
+        "authors": _edit_names(raw["authors"], "authors", 1, 20, 200),
+        "series": _edit_text(raw.get("series", ""), "series", 0, 300),
+        "series_no": number,
+        "genres": _edit_names(raw.get("genres", []), "genres", 0, 20, 100),
+        "year": year,
+        "lang": lang,
+        "annotation": _edit_text(raw.get("annotation", ""), "annotation", 0, 20000, multiline=True),
+    }
+
+
+def _xml_text(value: str) -> str:
+    return html.escape(value, quote=True)
+
+
+def _drop_element(block: str, name: str, prefix: str = "") -> str:
+    """Удаляет элемент name (префикс — регулярка) вместе с содержимым либо самозакрывающийся."""
+    tag = rf"{prefix}{re.escape(name)}"
+    return re.sub(rf"<{tag}(?=[\s/>])[^>]*?(?:/>|>.*?</{tag}\s*>)", "", block, flags=re.S)
+
+
+def opf_with_meta(opf: str, fields: dict[str, Any]) -> str:
+    """OPF с новыми dc-полями и серией calibre; прежние dc:title/creator/subject/date/language/description заменяются."""
+    match = OPF_METADATA_RE.search(opf)
+    if not match:
+        raise ValueError("в OPF нет блока metadata")
+    inner = match.group(3)
+    for name in ("title", "creator", "subject", "date", "language", "description"):
+        inner = _drop_element(inner, name, "dc:")
+    inner = re.sub(r'<(?:[\w.-]+:)?meta\b[^>]*?\bname\s*=\s*["\']calibre:series(?:_index)?["\'][^>]*>', "", inner)
+    role = ' opf:role="aut"' if re.search(r"xmlns:opf\s*=", opf) else ""  # атрибут только при объявленном префиксе
+    lines = [f"<dc:title>{_xml_text(fields['title'])}</dc:title>"]
+    lines += [f"<dc:creator{role}>{_xml_text(author)}</dc:creator>" for author in fields["authors"]]
+    lines += [f"<dc:subject>{_xml_text(genre)}</dc:subject>" for genre in fields["genres"]]
+    if fields["year"]:
+        lines.append(f"<dc:date>{_xml_text(fields['year'])}</dc:date>")
+    if fields["lang"]:
+        lines.append(f"<dc:language>{_xml_text(fields['lang'])}</dc:language>")
+    if fields["annotation"]:
+        lines.append(f"<dc:description>{_xml_text(fields['annotation'])}</dc:description>")
+    if fields["series"]:
+        lines.append(f'<meta name="calibre:series" content="{_xml_text(fields["series"])}"/>')
+        if fields["series_no"] is not None:
+            lines.append(f'<meta name="calibre:series_index" content="{fields["series_no"]}"/>')
+    new_inner = inner.rstrip() + "".join(f"\n    {line}" for line in lines) + "\n  "
+    return opf[:match.start(3)] + new_inner + opf[match.end(3):]
+
+
+def epub_with_meta(data: bytes, fields: dict[str, Any]) -> bytes:
+    """EPUB с обновлённым OPF: mimetype первым без сжатия, остальные записи переносятся как были."""
+    with zipfile.ZipFile(io.BytesIO(data)) as source:
+        epub = Epub(source)
+        new_opf = opf_with_meta(epub.opf, fields).encode("utf-8")
+        infos = sorted(source.infolist(), key=lambda item: item.filename != "mimetype")
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w") as target:
+            for info in infos:
+                payload = new_opf if info.filename == epub.opf_path else read_member(source, info, EDIT_MEMBER_MAX)
+                entry = zipfile.ZipInfo(info.filename, date_time=info.date_time)
+                entry.compress_type = zipfile.ZIP_STORED if info.filename == "mimetype" else info.compress_type
+                entry.external_attr = info.external_attr
+                target.writestr(entry, payload)
+    return out.getvalue()
+
+
+def _fb2_author(name: str) -> str:
+    """«Фамилия Имя Отчество» → <author>: первое слово — фамилия, второе — имя, остальное — отчество."""
+    parts = name.split()
+    tags = (("last-name", parts[0]), ("first-name", parts[1] if len(parts) > 1 else ""),
+            ("middle-name", " ".join(parts[2:])))
+    return "<author>" + "".join(f"<{tag}>{_xml_text(value)}</{tag}>" for tag, value in tags if value) + "</author>"
+
+
+def fb2_with_meta(raw: bytes, fields: dict[str, Any]) -> bytes:
+    """FB2 с новым title-info; кодировка объявления и остальной текст сохраняются."""
+    match = DECL_RE.search(raw[:300])
+    encoding = match.group(2).decode("ascii") if match else "utf-8"
+    try:
+        codecs.lookup(encoding)
+    except LookupError:
+        encoding = "utf-8"
+    try:
+        text = raw.decode(encoding)
+    except UnicodeDecodeError as error:
+        raise ValueError("fb2 с битыми байтами — правка только в БД невозможна, исправьте кодировку") from error
+    found = FB2_TITLE_INFO_RE.search(text)
+    if not found:
+        raise ValueError("в fb2 нет title-info")
+    body = found.group(3)
+    for name in ("genre", "author", "book-title", "annotation", "date", "lang", "sequence"):
+        body = _drop_element(body, name, r"(?:[\w.-]+:)?")
+    head = [f"<genre>{_xml_text(genre)}</genre>" for genre in fields["genres"]]
+    head += [_fb2_author(author) for author in fields["authors"]]
+    head.append(f"<book-title>{_xml_text(fields['title'])}</book-title>")
+    if fields["annotation"]:
+        paragraphs = "".join(f"<p>{_xml_text(line)}</p>" for line in fields["annotation"].split("\n") if line.strip())
+        head.append(f"<annotation>{paragraphs}</annotation>")
+    tail = []
+    if fields["year"]:
+        tail.append(f"<date>{_xml_text(fields['year'])}</date>")
+    if fields["lang"]:
+        tail.append(f"<lang>{_xml_text(fields['lang'])}</lang>")
+    if fields["series"]:
+        number = f' number="{fields["series_no"]}"' if fields["series_no"] is not None else ""
+        tail.append(f'<sequence name="{_xml_text(fields["series"])}"{number}/>')
+    new_text = (text[:found.start()] + found.group(1) + "".join(head) + body + "".join(tail)
+                + found.group(4) + text[found.end():])
+    try:
+        return new_text.encode(encoding)
+    except UnicodeEncodeError:  # символы не входят в объявленную кодировку — сохраняем в UTF-8 с новым объявлением
+        converted = new_text.encode("utf-8")
+        return DECL_RE.sub(lambda m: m.group(1) + b"utf-8" + m.group(3), converted, count=1)
+
+
+def edited_name(fields: dict[str, Any], ext: str) -> str:
+    """«Автор - Название» + исходное расширение; запрещённые в Windows символы заменяются, название обрезается."""
+    authors = EDIT_BAD_CHARS.sub("_", ", ".join(fields["authors"]))
+    title = EDIT_BAD_CHARS.sub("_", fields["title"])
+    while title and len(f"{authors} - {title}{ext}".encode("utf-8")) > EDIT_NAME_MAX:
+        title = title[:-1]
+    base = f"{authors} - {title}" if title else authors
+    return base.strip(" .") + ext
+
+
+def edited_target(root: Path, full: Path, old_rel: str, fields: dict[str, Any], ext: str) -> Path:
+    """Новое место файла: в разделе («_…») — та же папка, иначе — папка первого автора."""
+    if PurePosixPath(old_rel).parts[0].startswith("_"):
+        folder = PurePosixPath(old_rel).parent
+    else:
+        name = EDIT_BAD_CHARS.sub("_", fields["authors"][0]).strip(" ._")
+        if not name:
+            raise ValueError("по имени автора нельзя составить имя папки")
+        folder = PurePosixPath(name)
+    target = (root / folder / edited_name(fields, ext)).resolve()
+    if not target.is_relative_to(root) or not all(name_ok(part) for part in target.relative_to(root).parts):
+        raise ValueError("новое имя недопустимо для Windows или слишком длинное")
+    if target != full and target.exists():
+        raise ValueError("файл с таким именем уже есть")
+    return target
+
+
+def _rewrite_book_file(cfg: dict[str, Any], full: Path, old_rel: str, fmt: str, wrapped: bool,
+                       fields: dict[str, Any]) -> str:
+    """Записывает метаданные в epub или fb2: проверка новой версии, копия прежней в карантин edited/, атомарная замена."""
+    limit = cfg["reader_max_mb"] * 1024 * 1024
+    member = ""
+    try:
+        if wrapped:
+            with zipfile.ZipFile(full) as archive:
+                inner = single_member(archive)
+                if inner is None or member_ext(inner) != fmt:
+                    raise ValueError("однокнижный архив не похож на книгу этого формата")
+                member = inner.filename
+                data = read_member(archive, inner, limit)
+        else:
+            if full.stat().st_size > limit:
+                raise ValueError(f"файл больше предела reader_max_mb ({cfg['reader_max_mb']} МБ)")
+            data = full.read_bytes()
+        new = epub_with_meta(data, fields) if fmt == "epub" else fb2_with_meta(data, fields)
+    except (OSError, KeyError, zipfile.BadZipFile, EOFError) as error:
+        raise ValueError(f"не удалось прочитать книгу для правки: {error}") from error
+    if fmt == "epub":
+        with tempfile.TemporaryDirectory(prefix="books-edit-") as tmp_dir:
+            probe = Path(tmp_dir) / "check.epub"
+            probe.write_bytes(new)
+            problem = verify_book(probe, "epub")
+    else:
+        problem = None if fb2_meta(new).get("title") == " ".join(fields["title"].split()) else "название в файле не совпало"
+    if problem:
+        raise ValueError(f"проверка не прошла: {problem}")
+    dest = Path(cfg["quarantine_dir"]) / "edited" / old_rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        dest = unique_path(dest.parent, dest.name, set())
+    shutil.copy2(full, dest)
+    if wrapped:
+        fd, tmp_name = tempfile.mkstemp(prefix=".edit.", suffix=".tmp", dir=full.parent)
+        os.close(fd)
+        tmp = Path(tmp_name)
+        try:
+            crc = write_zip(tmp, member, full.stat().st_mtime, io.BytesIO(new), len(new), fmt)
+            problem = verify_zip(tmp, member, len(new), crc)
+            if problem:
+                raise ValueError(f"перепаковка не прошла проверку: {problem}")
+            os.chmod(tmp, full.stat().st_mode & 0o666)
+            os.replace(tmp, full)
+        finally:
+            tmp.unlink(missing_ok=True)
+    else:
+        atomic_write(full, new, "edit")
+    return str(dest)
+
+
+def edit_book(cfg: dict[str, Any], book_id: int, raw: dict[str, Any], rename: bool = False) -> str:
+    """Правка метаданных книги: общая логика веба и API.
+
+    epub и fb2 переписываются в файле (прежняя версия — в карантин edited/); остальные форматы сохраняют правку
+    в БД (meta_overrides). rename переименовывает файл в «Автор - Название». Ошибки для пользователя — ValueError.
+    """
+    fields = validate_edit(raw)
+    root = Path(cfg["books_dir"]).resolve()
+    with scan_lock():
+        migrate_database(cfg["db_path"])
+        with closing(connect(cfg["db_path"])) as conn:
+            book = conn.execute("SELECT * FROM books WHERE id=?", (book_id,)).fetchone()
+        if book is None:
+            raise ValueError("книга не найдена")
+        old_rel, fmt = book["path"], book["fmt"]
+        full = (root / old_rel).resolve()
+        if not full.is_relative_to(root) or not full.is_file():
+            raise ValueError("файл книги не найден в каталоге книг")
+        wrapped = is_wrapped(old_rel, fmt)
+        original = PurePosixPath(old_rel).name
+        ext = original[-(len(fmt) + 5):] if wrapped else "." + original.rpartition(".")[2]
+        target = edited_target(root, full, old_rel, fields, ext) if rename else full
+        rewrite = fmt in ("epub", "fb2")
+        backup = _rewrite_book_file(cfg, full, old_rel, fmt, wrapped, fields) if rewrite else ""
+        if target != full:
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                os.rename(full, target)
+            except OSError as error:
+                raise ValueError(f"не удалось переименовать файл: {error.strerror}") from error
+        new_rel = target.relative_to(root).as_posix()
+        with closing(connect(cfg["db_path"])) as conn, conn:
+            if new_rel != old_rel:
+                conn.execute("UPDATE books SET path=? WHERE id=?", (new_rel, book_id))
+                conn.execute("UPDATE meta_overrides SET path=? WHERE path=?", (new_rel, old_rel))
+            if not rewrite:
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta_overrides(path, title, authors, series, series_no, genres, year, lang,"
+                    " annotation, updated) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (new_rel, fields["title"], "; ".join(fields["authors"]), fields["series"], fields["series_no"],
+                     "; ".join(fields["genres"]), fields["year"], fields["lang"], fields["annotation"], time.time()))
+            stat = target.stat()
+            meta = read_book_meta(root, new_rel)
+            meta.update({key: fields[key] for key in EDIT_KEYS})
+            upsert_book(conn, new_rel, stat.st_size, stat.st_mtime, meta)
+            conn.execute("INSERT INTO edit_log(path, new_path, fields, backup, created) VALUES (?,?,?,?,?)",
+                         (old_rel, new_rel if new_rel != old_rel else "", json.dumps(fields, ensure_ascii=False), backup,
+                          time.time()))
+        if new_rel != old_rel:
+            relink(cfg["db_path"], [(old_rel, new_rel)])
+    renamed = new_rel != old_rel
+    say(f"книга {book_id}: правка метаданных", "book_edit", detail=json.dumps(
+        {"book_id": book_id, "path": new_rel, "renamed": renamed, "backup": backup, "fields": fields}, ensure_ascii=False))
+    where = "записаны в файл (прежняя версия — в карантине edited/)" if rewrite else \
+        "сохранены в каталоге (формат не поддерживает запись в файл)"
+    return f"Метаданные {where}." + (f" Файл переименован: «{new_rel}»." if renamed else "")
 
 
 def zip_date(mtime: float) -> tuple[int, int, int, int, int, int]:
@@ -2755,6 +3094,9 @@ API_HELP = {
                      "в members путь для показа — path, для действий — key_path",
     "POST /api/dups/<id>": "{action: keep-both|quarantine|restore, path: key_path участника} — решение по группе",
     "POST /api/progress": "позиция чтения (форма id, ch, p) — используется читалкой",
+    "POST /api/books/<id>/edit": "{title, authors[], series, series_no, genres[], year, lang, annotation, rename?: bool} — "
+                                 "правка метаданных; epub/fb2 переписываются в файле (прежняя версия в карантине edited/), "
+                                 "остальные форматы — только в каталоге",
 }
 
 
@@ -2907,6 +3249,7 @@ class Handler(BaseHTTPRequestHandler):
             ("GET", "browse"): self.view_browse, ("GET", "shelves"): self.view_shelves, ("GET", "recent"): self.view_recent,
             ("GET", "stats"): self.view_stats, ("GET", "opds"): self.view_opds, ("GET", "app.js"): self.view_js,
             ("POST", "book"): self.post_book, ("POST", "shelves"): self.post_shelves, ("POST", "scan"): self.post_scan,
+            ("GET", "edit"): self.view_edit, ("POST", "edit"): self.post_edit,
             ("GET", "api"): self.api_get, ("POST", "api"): self.api_post,
         }
         handler = handlers.get(route)
@@ -3170,6 +3513,7 @@ class Handler(BaseHTTPRequestHandler):
         actions.append(f'<a href="/file/{bid}">Скачать ({human_size(book["size"])})</a>')
         folder = str(PurePosixPath(book["path"]).parent)
         actions.append(f'<a href="/browse?dir={quote(folder if folder != "." else "")}">Папка</a>')
+        actions.append(f'<a href="/edit/{bid}">Редактировать</a>')
         status = mark["status"] if mark else ""
         rating = mark["rating"] if mark else 0
         status_opts = "".join(f'<option value="{k}"{" selected" if k == status else ""}>{v}</option>' for k, v in STATUSES.items())
@@ -3222,6 +3566,66 @@ class Handler(BaseHTTPRequestHandler):
                     shelf_ids.append(create_shelf(conn, new_shelf))
                 set_shelves(conn, book["path"], shelf_ids)
         self.redirect(f"/book/{book['id']}")
+
+    def view_edit(self, parts: list[str]) -> None:
+        with closing(self.db()) as conn:
+            book = self.book_or_404(conn, parts[0] if len(parts) == 1 else "")
+            if not book:
+                self.error_page(HTTPStatus.NOT_FOUND, "Книга не найдена")
+                return
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            override = (conn.execute("SELECT * FROM meta_overrides WHERE path=?", (book["path"],)).fetchone()
+                        if version >= 3 else None)
+        values = {key: book[key] for key in EDIT_KEYS}
+        if override is not None:
+            values.update({key: override[key] for key in EDIT_KEYS if override[key] not in (None, "")})
+        bid = book["id"]
+        authors = "\n".join(a for a in str(values["authors"]).split("; ") if a)
+        genres = ", ".join(g for g in str(values["genres"]).split("; ") if g)
+        note = ("Изменения запишутся в файл книги (прежняя версия — в карантин edited/)" if book["fmt"] in ("epub", "fb2")
+                else "Формат не поддерживает запись метаданных: изменения сохраняются только в каталоге")
+        body = (f'<h2>Редактирование</h2><form method="post" action="/edit/{bid}">'
+                f'<p><label>Название<br><input name="title" value="{e(values["title"])}" maxlength="500" size="60" required>'
+                f'</label></p>'
+                f'<p><label>Авторы (по одному в строке)<br><textarea name="authors" rows="3" cols="50">{e(authors)}</textarea>'
+                f'</label></p>'
+                f'<p><label>Серия<br><input name="series" value="{e(values["series"])}" maxlength="300" size="50"></label> '
+                f'<label>№ <input name="series_no" value="{e(values["series_no"])}" size="6" maxlength="6"></label></p>'
+                f'<p><label>Жанры (через запятую, коды fb2)<br><input name="genres" value="{e(genres)}" size="60"></label></p>'
+                f'<p><label>Год <input name="year" value="{e(values["year"])}" size="6" maxlength="4"></label> '
+                f'<label>Язык <input name="lang" value="{e(values["lang"])}" size="6" maxlength="20"></label></p>'
+                f'<p><label>Аннотация<br><textarea name="annotation" rows="8" cols="60">{e(values["annotation"])}</textarea>'
+                f'</label></p>'
+                f'<p><label><input type="checkbox" name="rename" value="1"> '
+                f'Переименовать файл по метаданным (Автор - Название)</label></p>'
+                f'<p class="mut">{note}</p>'
+                f'<p><button>Сохранить</button> <a href="/book/{bid}">Отмена</a></p></form>')
+        self.page(f"Редактирование: {book['title']}", body)
+
+    def post_edit(self, parts: list[str]) -> None:
+        if len(parts) != 1 or not parts[0].isdigit():
+            self.error_page(HTTPStatus.NOT_FOUND, "Страница не найдена")
+            return
+        form = {k: v[-1] for k, v in self.form.items()}
+        raw: dict[str, Any] = {
+            "title": form.get("title", ""),
+            "authors": [line.strip() for line in form.get("authors", "").splitlines() if line.strip()],
+            "series": form.get("series", ""),
+            "series_no": form.get("series_no", ""),
+            "genres": [g.strip() for g in form.get("genres", "").split(",") if g.strip()],
+            "year": form.get("year", ""),
+            "lang": form.get("lang", ""),
+            "annotation": form.get("annotation", ""),
+        }
+        try:
+            edit_book(self.cfg, int(parts[0]), raw, rename=form.get("rename") == "1")
+        except ValueError as error:
+            self.error_page(HTTPStatus.BAD_REQUEST, str(error))
+            return
+        except ScanBusyError:
+            self.error_page(HTTPStatus.CONFLICT, "Идёт обработка библиотеки, повторите позже")
+            return
+        self.redirect(f"/book/{parts[0]}")
 
     def view_shelves(self, _parts: list[str]) -> None:
         with closing(self.db()) as conn:
@@ -3435,6 +3839,16 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("path: строка до 4096 символов без NUL")
                 message = dup_action(self.cfg, int(parts[1]), action, path)
                 self.send_json({"ok": True, "message": message})
+                return
+            if name == "books" and len(parts) == 3 and parts[1].isdigit() and parts[2] == "edit":
+                rename = body.get("rename", False)
+                if not isinstance(rename, bool):
+                    raise ValueError("rename: true или false")
+                fields = {k: v for k, v in body.items() if k != "rename"}
+                message = edit_book(self.cfg, int(parts[1]), fields, rename=rename)
+                with closing(self.db()) as conn:
+                    row = conn.execute("SELECT * FROM books WHERE id=?", (int(parts[1]),)).fetchone()
+                self.send_json({"ok": True, "message": message, "book": book_json(row)})
                 return
             if name == "jobs" and len(parts) == 1:
                 command = body.get("command", "")
