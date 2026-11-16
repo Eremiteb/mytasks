@@ -1099,6 +1099,13 @@ def test_detect_txt_binary_is_not_text() -> None:
     assert bl.detect_txt(b"\x00\x01abc") == (None, "binary")
 
 
+def test_detect_txt_drops_isolated_nul() -> None:
+    text, encoding = bl.detect_txt("Привет мир\r\n".encode() * 50 + b"\x00")
+    assert text == "Привет мир\r\n" * 50
+    assert "\x00" not in text
+    assert encoding == "utf-8"
+
+
 def test_normalize_txt_converts_line_endings_to_lf() -> None:
     assert bl.normalize_txt(b"a\r\nb\rc")[0] == b"a\nb\nc"
 

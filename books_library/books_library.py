@@ -1385,16 +1385,23 @@ def fix_fb2_text(text: str) -> tuple[str, int]:
     return (text[:match.start()] + description + text[match.end():], total) if total else (text, 0)
 
 
+# управляющие байты, недопустимые в тексте (кроме \t \n \f \r)
+TXT_CONTROL = bytes(b for b in range(32) if b not in (9, 10, 12, 13))
+
+
 def detect_txt(raw: bytes) -> tuple[str | None, str]:
     """Текст и кодировка TXT: UTF-8/UTF-16 с BOM, UTF-8, затем cp1251/KOI8-R/cp866 по доле строчных среди кириллических
-    букв (≥ 0,8 — у верной кодировки ~0,95, у неверной заглавные и строчные перепутаны), затем cp1252. None — не распознан."""
+    букв (≥ 0,8 — у верной кодировки ~0,95, у неверной заглавные и строчные перепутаны), затем cp1252. None — не распознан.
+    Бинарным считается файл, где управляющих байт больше 1 %; одиночные управляющие байты выбрасываются перед декодированием."""
     if raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
         try:
             return raw.decode("utf-16"), "utf-16"
         except UnicodeDecodeError:
             return None, "utf-16?"
-    if b"\x00" in raw:
+    controls = len(raw) - len(raw.translate(None, TXT_CONTROL))
+    if controls > len(raw) * 0.01:
         return None, "binary"
+    raw = raw.translate(None, TXT_CONTROL)
     try:
         return raw.decode("utf-8-sig"), "utf-8"
     except UnicodeDecodeError:
