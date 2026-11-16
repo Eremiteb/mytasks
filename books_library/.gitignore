@@ -4,3 +4,4 @@ books_library.db*
 .books_library.lock
 *.sync-conflict*
 reports/
+cache/

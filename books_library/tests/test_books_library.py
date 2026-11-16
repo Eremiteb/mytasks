@@ -5,12 +5,16 @@ from __future__ import annotations
 import base64
 import importlib
 import json
+import os
+import sqlite3
+import struct
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
 import zipfile
+import zlib
 from collections.abc import Iterator
 from contextlib import closing
 from pathlib import Path
@@ -31,6 +35,11 @@ FB2_REL = "Иванов Иван/Тёмный лес.fb2"
 ZIP_REL = "Иванов Иван/Архив.fb2.zip"
 EPUB_REL = "Сидоров Сергей/Электронная.epub"
 TXT_REL = "Иванов Иван/Заметки о лесе.txt"
+# Прочие форматы для просмотра в браузере (синтетические файлы; DjVu и Calibre подменяются в тестах).
+VIEW_ZIP_REL = "Иванов Иван/Коллекция.zip"
+DJVU_REL = "Иванов Иван/Скан.djvu"
+MOBI_REL = "Иванов Иван/Электронная.mobi"
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
 def make_fb2(title: str, first: str, last: str, *, body: str | None = None, cover: bool = False) -> bytes:
@@ -296,9 +305,9 @@ def fetch(url: str, *, data: bytes | None = None, headers: dict[str, str] | None
         return error.code, error.headers, error.read()
 
 
-@pytest.fixture
-def web(scanned: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
-    monkeypatch.setattr(bl.Handler, "cfg", scanned)
+def _serving(cfg: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
+    """Веб-сервер на свободном порту с заданной конфигурацией; останавливается после теста."""
+    monkeypatch.setattr(bl.Handler, "cfg", cfg)
     httpd = bl.ThreadingHTTPServer(("127.0.0.1", 0), bl.Handler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
@@ -308,6 +317,11 @@ def web(scanned: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> Iterator[st
         httpd.shutdown()
         httpd.server_close()
         thread.join(timeout=5)
+
+
+@pytest.fixture
+def web(scanned: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
+    yield from _serving(scanned, monkeypatch)
 
 
 def test_index_page_lists_book(web: str) -> None:
@@ -661,6 +675,220 @@ def test_mht_without_text_raises(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError):
         bl.mht_html(path, MHT_LIMIT)
+
+
+# ---- просмотр прочих форматов: PNM → PNG, кэш ----------------------------------------------------
+
+def read_png(png: bytes) -> tuple[int, int, int, int, bytes]:
+    """Разбор PNG: сигнатура, CRC каждого фрагмента, IEND; возвращает ширину, высоту, глубину, тип цвета и IDAT."""
+    assert png[:8] == PNG_SIGNATURE
+    pos = 8
+    chunks: dict[bytes, bytes] = {}
+    while pos < len(png):
+        length = int.from_bytes(png[pos:pos + 4], "big")
+        kind = png[pos + 4:pos + 8]
+        body = png[pos + 8:pos + 8 + length]
+        assert zlib.crc32(kind + body) == int.from_bytes(png[pos + 8 + length:pos + 12 + length], "big")
+        chunks[kind] = body
+        pos += 12 + length
+    assert b"IEND" in chunks
+    width, height, depth, color, _compression, _filter, _interlace = struct.unpack(">IIBBBBB", chunks[b"IHDR"])
+    return width, height, depth, color, zlib.decompress(chunks[b"IDAT"])
+
+
+def test_pnm_p6_becomes_rgb_png() -> None:
+    pixels = bytes(range(12))  # 2x2, по 3 байта на пиксель
+
+    width, height, depth, color, raw = read_png(bl.pnm_to_png(b"P6\n2 2\n255\n" + pixels))
+
+    assert (width, height, depth, color) == (2, 2, 8, 2)
+    assert raw == b"\x00" + pixels[0:6] + b"\x00" + pixels[6:12]
+    assert len(raw) == (1 + 6) * 2
+
+
+def test_pnm_p5_becomes_gray_png() -> None:
+    width, height, depth, color, raw = read_png(bl.pnm_to_png(b"P5\n3 1\n255\n\x10\x20\x30"))
+
+    assert (width, height, depth, color) == (3, 1, 8, 0)
+    assert raw == b"\x00\x10\x20\x30"
+    assert len(raw) == (1 + 3) * 1
+
+
+def test_pnm_p4_bits_are_inverted() -> None:
+    # 9 пикселей — строка из 2 байт. Бит 1 в PNM — чёрный, в PNG 1 — белый, поэтому биты инвертируются.
+    width, height, depth, color, raw = read_png(bl.pnm_to_png(b"P4\n9 2\n\xff\x80\x00\x01"))
+
+    assert (width, height, depth, color) == (9, 2, 1, 0)
+    assert raw == b"\x00\x00\x7f" + b"\x00\xff\xfe"
+    assert len(raw) == (1 + 2) * 2
+
+
+@pytest.mark.parametrize("data", [b"P3\n1 1\n255\n0 0 0\n", b"P7\n1 1\n255\n\x00"])
+def test_pnm_unsupported_magic_is_value_error(data: bytes) -> None:
+    with pytest.raises(ValueError):
+        bl.pnm_to_png(data)
+
+
+@pytest.mark.parametrize("data", [b"P6\n2 2\n255\n" + bytes(5), b"P4\n9 2\n\xff"])
+def test_pnm_truncated_data_is_value_error(data: bytes) -> None:
+    with pytest.raises(ValueError):
+        bl.pnm_to_png(data)
+
+
+def test_cache_prune_removes_oldest_file_first(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bl, "CACHE_DIR", tmp_path)
+    mib = 1024 * 1024
+    for name, atime in (("old.png", 1_000), ("mid.png", 2_000), ("new.png", 3_000)):
+        path = tmp_path / name
+        path.write_bytes(b"x" * mib)
+        os.utime(path, (atime, atime))
+
+    bl.cache_prune(2)  # 3 МБ при пределе 2 МБ: достаточно удалить один самый давно использованный файл
+
+    assert sorted(item.name for item in tmp_path.iterdir()) == ["mid.png", "new.png"]
+
+
+def cache_row(file_id: int, size: int, mtime: float) -> sqlite3.Row:
+    with closing(sqlite3.connect(":memory:")) as conn:
+        conn.row_factory = sqlite3.Row
+        return conn.execute("SELECT ? AS id, ? AS size, ? AS mtime", (file_id, size, mtime)).fetchone()
+
+
+def test_cache_key_changes_with_size_and_mtime() -> None:
+    base = bl.cache_key(cache_row(7, 100, 1_700_000_000.5))
+
+    assert base == "7-100-1700000000"
+    assert bl.cache_key(cache_row(7, 101, 1_700_000_000.5)) != base
+    assert bl.cache_key(cache_row(7, 100, 1_700_000_001.5)) != base
+
+
+# ---- просмотр прочих форматов в веб-интерфейсе ---------------------------------------------------
+
+@pytest.fixture
+def view_cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Каталог с ZIP, DjVu и MOBI; ddjvu/djvused/djvutxt и ebook-convert подменены, реальные программы не вызываются."""
+    root = tmp_path / "view_books"
+    (root / "Иванов Иван").mkdir(parents=True)
+    with zipfile.ZipFile(root / VIEW_ZIP_REL, "w") as archive:
+        archive.writestr("a.txt", "Привет, тихий лес.\n".encode("cp1251"))
+        archive.writestr("img.png", PNG_BYTES)
+        archive.writestr("b.bin", b"\x00\x01\x02binary")
+        archive.writestr("doc.html", "<html><body><p>Текст документа</p><script>alert(1)</script></body></html>")
+    (root / DJVU_REL).write_bytes(b"AT&TFORM synthetic djvu bytes")
+    (root / MOBI_REL).write_bytes(b"synthetic mobi bytes")
+    converted = tmp_path / "converted.epub"
+    make_epub(converted)
+    cfg = make_cfg(tmp_path, root)
+    bl.scan(cfg)
+    monkeypatch.setattr(bl, "djvu_page_count", lambda path, timeout: 3)
+    monkeypatch.setattr(bl, "djvu_page_text", lambda path, page, timeout: "текст")
+    monkeypatch.setattr(bl, "djvu_page_png", lambda cfg_, book, path, page: bl.pnm_to_png(b"P5\n1 1\n255\n\x00"))
+    monkeypatch.setattr(bl, "calibre_epub", lambda cfg_, book, path, create=True: converted)
+    return cfg
+
+
+@pytest.fixture
+def view_web(view_cfg: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
+    yield from _serving(view_cfg, monkeypatch)
+
+
+def test_zip_read_redirects_to_listing(view_web: str, view_cfg: dict[str, Any]) -> None:
+    bid = book_id(view_cfg, VIEW_ZIP_REL)
+
+    status, headers, _body = fetch(f"{view_web}/read/{bid}")
+
+    assert status == 303
+    assert headers.get("Location") == f"/zip/{bid}"
+
+
+def test_zip_listing_shows_file_names(view_web: str, view_cfg: dict[str, Any]) -> None:
+    status, _headers, body = fetch(f"{view_web}/zip/{book_id(view_cfg, VIEW_ZIP_REL)}")
+    text = body.decode("utf-8")
+
+    assert status == 200
+    for name in ("a.txt", "img.png", "b.bin", "doc.html"):
+        assert name in text
+
+
+def test_zip_text_entry_is_decoded_from_cp1251(view_web: str, view_cfg: dict[str, Any]) -> None:
+    bid = book_id(view_cfg, VIEW_ZIP_REL)
+
+    status, _headers, body = fetch(f"{view_web}/zip/{bid}?e=a.txt")
+
+    assert status == 200
+    assert "Привет, тихий лес." in body.decode("utf-8")
+
+
+def test_zip_image_entry_is_png(view_web: str, view_cfg: dict[str, Any]) -> None:
+    bid = book_id(view_cfg, VIEW_ZIP_REL)
+
+    status, headers, body = fetch(f"{view_web}/zip/{bid}?e=img.png")
+
+    assert status == 200
+    assert headers.get("Content-Type") == "image/png"
+    assert body == PNG_BYTES
+
+
+def test_zip_binary_entry_is_download(view_web: str, view_cfg: dict[str, Any]) -> None:
+    bid = book_id(view_cfg, VIEW_ZIP_REL)
+
+    status, headers, _body = fetch(f"{view_web}/zip/{bid}?e=b.bin")
+
+    assert status == 200
+    assert str(headers.get("Content-Disposition", "")).startswith("attachment")
+
+
+def test_zip_html_entry_drops_script(view_web: str, view_cfg: dict[str, Any]) -> None:
+    bid = book_id(view_cfg, VIEW_ZIP_REL)
+
+    status, _headers, body = fetch(f"{view_web}/zip/{bid}?e=doc.html")
+    text = body.decode("utf-8")
+
+    assert status == 200
+    assert "Текст документа" in text
+    assert "<script>" not in text
+    assert "alert(1)" not in text
+
+
+def test_zip_entry_outside_archive_is_404(view_web: str, view_cfg: dict[str, Any]) -> None:
+    bid = book_id(view_cfg, VIEW_ZIP_REL)
+
+    status, _headers, _body = fetch(f"{view_web}/zip/{bid}?e={quote('../../etc/passwd', safe='')}")
+
+    assert status == 404
+
+
+def test_djvu_read_shows_page_and_position(view_web: str, view_cfg: dict[str, Any]) -> None:
+    bid = book_id(view_cfg, DJVU_REL)
+
+    status, _headers, body = fetch(f"{view_web}/read/{bid}?page=2")
+    text = body.decode("utf-8")
+
+    assert status == 200
+    assert f"/page/{bid}/2" in text
+    assert "2/3" in text
+    assert "текст" in text
+
+
+def test_djvu_page_is_png(view_web: str, view_cfg: dict[str, Any]) -> None:
+    status, headers, body = fetch(f"{view_web}/page/{book_id(view_cfg, DJVU_REL)}/1")
+
+    assert status == 200
+    assert headers.get("Content-Type") == "image/png"
+    assert body.startswith(PNG_SIGNATURE)
+
+
+def test_djvu_page_zero_is_404(view_web: str, view_cfg: dict[str, Any]) -> None:
+    status, _headers, _body = fetch(f"{view_web}/page/{book_id(view_cfg, DJVU_REL)}/0")
+
+    assert status == 404
+
+
+def test_mobi_read_shows_converted_chapter(view_web: str, view_cfg: dict[str, Any]) -> None:
+    status, _headers, body = fetch(f"{view_web}/read/{book_id(view_cfg, MOBI_REL)}")
+
+    assert status == 200
+    assert "Глава первая" in body.decode("utf-8")
 
 
 # ---- JSON API -----------------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 [Unit]
-Description=Библиотека книг: индексация каталога /mnt/copy/Books в SQLite (books_library.py scan)
+Description=Библиотека книг: ночная обработка и индексация /mnt/copy/Books (books_library.py scan, fix-encoding, convert, dedup, zip-books, scan)
 Documentation=file://@MYTASKS_DIR@/books_library/README.md
 # Одновременный запуск scan и кнопки «Пересканировать» исключён блокировкой движка (код 3 — не повторять).
 StartLimitIntervalSec=2h
@@ -7,20 +7,31 @@ StartLimitBurst=4
 
 [Service]
 Type=oneshot
+# Обработка может идти часами (Calibre, сверка дубликатов): не обрывать по умолчанию-тайм-ауту systemd.
+TimeoutStartSec=infinity
+# Порядок конвейера: сначала scan (новые книги попадают в индекс), затем служебные режимы и итоговый scan.
+# «-» — сбой режима не мешает итоговому scan; отдельные файлы режимы и так не останавливают.
+ExecStart=/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py scan
+ExecStart=-/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py fix-encoding
+ExecStart=-/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py convert --only fb2
+ExecStart=-/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py dedup
+ExecStart=-/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py zip-books
 ExecStart=/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py scan
 # Конфигурация (2) и уже идущее сканирование (3) повтором не лечатся.
 RestartPreventExitStatus=2 3
-# Низкий приоритет CPU и дисковой очереди: сканирование не должно мешать остальным задачам.
+# Низкий приоритет CPU и дисковой очереди: обработка не должна мешать остальным задачам.
 Nice=10
 IOSchedulingClass=idle
-MemoryMax=512M
+MemoryMax=8G
 
-# Ограничения: файлы книг только читаются; запись — только в каталог библиотеки (БД) и логи.
+# Ограничения: файлы книг меняют только служебные режимы (fix-encoding, convert, dedup, zip-books); удаляемое и
+# заменяемое уходит в карантин /mnt/copy/Books-removed, а не удаляется. Запись — в каталог библиотеки (БД), логи,
+# каталог книг и карантин.
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=@MYTASKS_DIR@/books_library @MYTASKS_DIR@/logs
+ReadWritePaths=@MYTASKS_DIR@/books_library @MYTASKS_DIR@/logs -/mnt/copy/Books -/mnt/copy/Books-removed
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=yes
 RestrictRealtime=yes

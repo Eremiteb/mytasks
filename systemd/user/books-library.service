@@ -12,18 +12,20 @@ ExecStart=/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py s
 Restart=on-failure
 RestartSec=10
 RestartPreventExitStatus=2
-# Задания API convert запускают LibreOffice и pandoc: запас памяти под них.
-MemoryMax=1G
+# Задания convert (LibreOffice, pandoc), просмотр через Calibre (ebook-convert) и convert --only fb2 через Calibre
+# в 12 потоков (workers по умолчанию): запас памяти под них.
+MemoryMax=8G
 
-# Ограничения: запись — каталог подпроекта (БД, блокировка, reports/), логи и каталог книг. В каталог книг пишут
-# только задания API fix-encoding/unpack-fb2zip/convert, и боевой запуск принимается лишь после успешного dry-run.
-# Чтобы интерфейс никогда не менял книги, уберите /mnt/copy/Books (systemctl --user edit books-library.service).
-# Если books_dir в books_library.json другой — поправьте путь здесь («-» — не ошибка, если каталога нет).
+# Ограничения: запись — каталог подпроекта (БД, блокировка, reports/), логи, каталог книг и карантин. В каталог книг
+# и карантин пишут только задания API fix-encoding/unpack-fb2zip/convert/dedup/zip-books, и боевой запуск принимается
+# лишь после успешного dry-run. Чтобы интерфейс никогда не менял книги, уберите /mnt/copy/Books и /mnt/copy/Books-removed
+# (systemctl --user edit books-library.service).
+# Если books_dir или quarantine_dir в books_library.json другие — поправьте пути здесь («-» — не ошибка, если каталога нет).
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=@MYTASKS_DIR@/books_library @MYTASKS_DIR@/logs -/mnt/copy/Books
+ReadWritePaths=@MYTASKS_DIR@/books_library @MYTASKS_DIR@/logs -/mnt/copy/Books -/mnt/copy/Books-removed
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=yes
 RestrictRealtime=yes

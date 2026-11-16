@@ -27,6 +27,7 @@ import email
 import fcntl
 import hmac
 import html
+import io
 import json
 import logging
 import os
@@ -40,10 +41,12 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import zipfile
+import zlib
 from collections.abc import Callable, Iterator
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing, contextmanager
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import ExitStack, closing, contextmanager
 from datetime import UTC, datetime
 from email import policy as email_policy
 from email.utils import parseaddr
@@ -61,6 +64,8 @@ CONFIG_PATH = PROJECT_DIR / "books_library.json"
 LOCK_PATH = PROJECT_DIR / ".books_library.lock"
 # Всё хозяйство подпроекта — в его каталоге: БД (db_path по умолчанию), блокировка и JSON-отчёты перед изменениями.
 REPORTS_DIR = PROJECT_DIR / "reports"
+# Кэш просмотра (восстановимый): страницы DjVu в PNG и EPUB, полученные Calibre из MOBI/AZW/DOC/RTF/CHM и т. п.
+CACHE_DIR = PROJECT_DIR / "cache"
 
 LOG = logging.getLogger(SERVICE)
 
@@ -73,6 +78,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "reader_max_mb": 64,
     "page_size": 50,
     "convert_timeout": 300,
+    "cache_mb": 4096,
+    # Карантин служебных режимов: вместо удаления файлы переносятся сюда (<причина>/<путь в каталоге книг>).
+    "quarantine_dir": "/mnt/copy/Books-removed",
+    "workers": 12,
     "auth": {"user": "", "password": "", "password_env": "BOOKS_LIBRARY_PASSWORD"},
 }
 
@@ -189,6 +198,30 @@ MIGRATIONS: list[str] = [
     ) WITHOUT ROWID;
     CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
     """,
+    # v2: однокнижные zip прозрачны (формат — книги внутри): все zip перечитываются при следующем scan;
+    # результаты режима dedup для вкладки «Дубликаты».
+    """
+    UPDATE books SET mtime=-1 WHERE lower(path) LIKE '%.zip';
+    CREATE TABLE dup_groups(
+        id INTEGER PRIMARY KEY,
+        key TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created REAL NOT NULL
+    );
+    CREATE TABLE dup_members(
+        group_id INTEGER NOT NULL REFERENCES dup_groups(id) ON DELETE CASCADE,
+        path TEXT NOT NULL,
+        fmt TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        words INTEGER NOT NULL,
+        coverage REAL,
+        role TEXT NOT NULL,
+        keeper TEXT NOT NULL DEFAULT '',
+        quarantine TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY(group_id, path)
+    ) WITHOUT ROWID;
+    CREATE INDEX dup_members_path ON dup_members(path);
+    """,
 ]
 DB_LATEST = len(MIGRATIONS)
 
@@ -231,15 +264,18 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
             else:
                 cfg[key] = value
     for key, low, high in (("port", 1, 65535), ("scan_workers", 1, 64), ("reader_max_mb", 1, 1024), ("page_size", 10, 500),
-                            ("convert_timeout", 10, 3600)):
+                            ("convert_timeout", 10, 3600), ("cache_mb", 100, 1_000_000), ("workers", 1, 64)):
         if not isinstance(cfg[key], int) or isinstance(cfg[key], bool) or not low <= cfg[key] <= high:
             raise ConfigError(f"{key} должен быть целым от {low} до {high}")
-    for key in ("books_dir", "db_path", "host"):
+    for key in ("books_dir", "db_path", "host", "quarantine_dir"):
         if not isinstance(cfg[key], str) or not cfg[key]:
             raise ConfigError(f"{key} должен быть непустой строкой")
     db_path = Path(cfg["db_path"]).expanduser()
     cfg["db_path"] = str(db_path if db_path.is_absolute() else PROJECT_DIR / db_path)
     cfg["books_dir"] = str(Path(cfg["books_dir"]).expanduser())
+    cfg["quarantine_dir"] = str(Path(cfg["quarantine_dir"]).expanduser())
+    if Path(cfg["quarantine_dir"]).resolve().is_relative_to(Path(cfg["books_dir"]).resolve()):
+        raise ConfigError("quarantine_dir не может быть внутри books_dir: карантин не индексируется")
     auth = cfg["auth"]
     if not auth.get("password") and auth.get("password_env"):
         auth["password"] = os.environ.get(str(auth["password_env"]), "")
@@ -260,7 +296,9 @@ class JsonlHandler(logging.Handler):
         for stale in old[max(keep - 1, 0):]:
             stale.unlink(missing_ok=True)
         self.path = log_dir / f"{SERVICE}-{datetime.now():%Y-%m-%d-%H-%M-%S}.jsonl"
-        self.stream = self.path.open("a", encoding="utf-8")
+        # Файл создаётся при первой записи: проверки без событий (check_mytasks --status → --migrate-db --dry-run)
+        # не плодят пустые журналы, которые ротация оставила бы вместо настоящих.
+        self.stream: Any = None
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
@@ -268,18 +306,22 @@ class JsonlHandler(logging.Handler):
             event = getattr(record, "event", "message")
             message = record.getMessage()
             detail = str(getattr(record, "detail", ""))
-            self.stream.write(json.dumps({
+            line = json.dumps({
                 "@timestamp": datetime.now(UTC).astimezone().isoformat(timespec="seconds"),
                 "schema.version": "1.0", "log.level": level, "message": message, "event.action": event,
                 "service.name": SERVICE, "script": f"{SERVICE}.py", "event": event, "level": level,
                 "msg": message, "detail": detail,
-            }, ensure_ascii=False) + "\n")
+            }, ensure_ascii=False) + "\n"
+            if self.stream is None:
+                self.stream = self.path.open("a", encoding="utf-8")
+            self.stream.write(line)
             self.stream.flush()
         except (OSError, ValueError):
             self.handleError(record)
 
     def close(self) -> None:
-        self.stream.close()
+        if self.stream is not None:
+            self.stream.close()
         super().close()
 
 
@@ -332,7 +374,7 @@ def migrate_database(db_path: str, dry_run: bool = False, out: Callable[[str], N
             out(f"[dry-run] будет: {'обновить' if exists else 'создать'} БД {db_path} до схемы v{DB_LATEST}")
             say("план миграции", "dry_migrate", detail=f"v{version}->v{DB_LATEST}")
         else:
-            out(f"БД {db_path}: схема v{version}, миграции не нужны")
+            out(f"БД {db_path}: уже v{version}, миграции не нужны")  # «уже vN» читает check_mytasks.sh
         return version
     with closing(connect(db_path)) as conn:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -538,13 +580,62 @@ class Epub:
 
 
 def split_name(rel: str) -> tuple[str, str]:
-    """Имя без расширения и формат по имени файла (fb2.zip — составное расширение)."""
+    """Имя без расширения и формат по имени файла: name.<ext>.zip — однокнижный архив формата ext."""
     name = PurePosixPath(rel).name
-    lower = name.lower()
-    if lower.endswith(".fb2.zip"):
-        return name[:-8], "fb2.zip"
     stem, _, ext = name.rpartition(".")
+    if ext.lower() == "zip" and stem:
+        inner_stem, _, inner_ext = stem.rpartition(".")
+        if inner_stem and inner_ext.lower() in INNER_EXTENSIONS:
+            return inner_stem, inner_ext.lower()
     return (stem or name), ext.lower()
+
+
+# Форматы книги внутри однокнижного zip (zip в zip не бывает книгой).
+INNER_EXTENSIONS = BOOK_EXTENSIONS - {"zip"}
+# Наибольшая допустимая степень сжатия записи zip: выше — признак zip-бомбы (текст fb2/txt сжимается в 3–15 раз).
+ZIP_MAX_RATIO = 200
+
+
+def single_member(archive: zipfile.ZipFile) -> zipfile.ZipInfo | None:
+    """Единственная запись-книга однокнижного zip или None (многофайловый архив, вложенный zip, странное имя)."""
+    files = [i for i in archive.infolist() if not i.is_dir()]
+    if len(files) != 1:
+        return None
+    name = PurePosixPath(files[0].filename.replace("\\", "/")).name
+    ext = name.rpartition(".")[2].lower()
+    if not name or name.startswith(".") or "." not in name or ext not in INNER_EXTENSIONS:
+        return None
+    return files[0]
+
+
+def member_ext(info: zipfile.ZipInfo) -> str:
+    return info.filename.rpartition(".")[2].lower()
+
+
+def read_member(archive: zipfile.ZipFile, info: zipfile.ZipInfo, limit: int) -> bytes:
+    """Запись zip целиком с защитой от zip-бомб: заявленный размер, степень сжатия и фактически прочитанное."""
+    if info.file_size > limit:
+        raise ValueError(f"{info.filename}: {info.file_size} байт больше предела {limit}")
+    if info.file_size > 1024 * 1024 and info.file_size > ZIP_MAX_RATIO * max(info.compress_size, 1):
+        raise ValueError(f"{info.filename}: подозрительная степень сжатия (zip-бомба?)")
+    with archive.open(info) as handle:
+        data = handle.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError(f"{info.filename}: фактический размер больше предела {limit}")
+    return data
+
+
+def is_wrapped(rel: str, fmt: str) -> bool:
+    """Однокнижный zip: файл .zip, а формат книги — внутренний (fb2, pdf…); fb2.zip — запись прежней схемы до scan."""
+    return rel.lower().endswith(".zip") and fmt not in ("zip", "fb2.zip")
+
+
+def display_path(rel: str, fmt: str) -> str:
+    """Путь для интерфейса: однокнижный zip показывается как name.ext (zip не упоминается)."""
+    if not is_wrapped(rel, fmt):
+        return rel
+    stem = rel[:-4]
+    return stem if stem.lower().endswith(f".{fmt}") else f"{stem}.{fmt}"
 
 
 def section_name(folder: str) -> str:
@@ -586,14 +677,22 @@ def read_book_meta(root: Path, rel: str) -> dict[str, Any]:
         if meta["fmt"] == "fb2":
             with full.open("rb") as handle:
                 found = fb2_meta(handle.read(FB2_HEAD_BYTES))
-        elif meta["fmt"] in {"zip", "fb2.zip", "epub"}:
+        elif meta["fmt"] == "epub" and not rel.lower().endswith(".zip"):
             with zipfile.ZipFile(full) as archive:
-                if meta["fmt"] == "epub":
-                    found = Epub(archive).meta()
-                elif inner := zip_fb2_name(archive):
+                found = Epub(archive).meta()
+        elif rel.lower().endswith(".zip"):
+            with zipfile.ZipFile(full) as archive:
+                inner = single_member(archive)
+                meta["fmt"] = member_ext(inner) if inner else "zip"
+                if inner and meta["fmt"] == "fb2":
+                    if inner.file_size > ZIP_MAX_RATIO * max(inner.compress_size, 1) and inner.file_size > 1024 * 1024:
+                        raise ValueError("подозрительная степень сжатия")
                     with archive.open(inner) as handle:
                         found = fb2_meta(handle.read(FB2_HEAD_BYTES))
-                    meta["fmt"] = "fb2.zip"
+                elif inner and meta["fmt"] == "epub":
+                    data = read_member(archive, inner, 256 * 1024 * 1024)
+                    with zipfile.ZipFile(io.BytesIO(data)) as nested:
+                        found = Epub(nested).meta()
         # Автор-ник (как у fb2 после pandoc-конвертации) не заменяет автора из имени папки.
         if found.pop("nick_only", False) and meta["authors"]:
             found.pop("authors", None)
@@ -835,81 +934,6 @@ def report_progress(state: dict[str, float], done: int, found: int, what: str) -
     if now - state["last"] >= 30:
         say(f"{what}: проверено {done}, найдено {found}, {done / max(now - state['start'], 1e-6):.0f} файлов/с", "progress")
         state["last"] = now
-
-
-def fix_encoding(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None, only: str = "all",
-                 out: Callable[[str], None] = print) -> dict[str, int]:
-    """Лечит кодировку книг (замена прежних replace_encoding.sh и cp1251_to_utf8.sh, но с проверкой содержимого).
-
-    fb2: заявлена не UTF-8 (обычно windows-1251), а байты — корректный UTF-8 → в XML-объявлении меняется только
-    значение encoding. txt: текст в cp1251 → перекодируется в UTF-8. Остальное не трогается; fb2 внутри ZIP —
-    тоже. Запись атомарная, перед изменениями — JSON-отчёт books_library/reports/fix-encoding-<время>.json
-    (путь, размер, прежняя кодировка). --path — любой каталог (по умолчанию каталог книг).
-    """
-    target = target_dir(cfg, path)
-    suffixes = {"all": (".fb2", ".txt"), "fb2": (".fb2",), "txt": (".txt",)}[only]
-    limit = cfg["reader_max_mb"] * 1024 * 1024
-    errors: list[str] = []
-    found: list[dict[str, Any]] = []
-    checked = 0
-    progress = {"start": time.monotonic(), "last": time.monotonic()}
-    for full, size in walk_files(target, suffixes, errors):
-        if size > limit:
-            continue
-        checked += 1
-        try:
-            with full.open("rb") as handle:
-                if full.name.lower().endswith(".fb2"):
-                    match = DECL_RE.search(handle.read(300))
-                    if not match or codecs.lookup(match.group(2).decode("ascii")).name == "utf-8":
-                        continue
-                    handle.seek(0)
-                    declared = wrong_declaration(handle.read())
-                    if declared:
-                        found.append({"path": str(full), "size": size, "kind": "fb2-declaration", "declared": declared})
-                elif cp1251_text(handle.read()):
-                    found.append({"path": str(full), "size": size, "kind": "txt-recode", "declared": "cp1251"})
-        except LookupError:
-            continue
-        except OSError as error:
-            errors.append(f"{full}: {error}")
-        report_progress(progress, checked, len(found), "кодировка")
-    stats = {"checked": checked, "wrong": len(found), "errors": len(errors)}
-    for error in errors[:20]:
-        say(f"ошибка чтения: {error}", "read_error", logging.WARNING, detail=error)
-    if dry_run:
-        for item in found[:30]:
-            action = "заменить encoding на UTF-8 в" if item["kind"] == "fb2-declaration" else "перекодировать cp1251 → UTF-8"
-            out(f"[dry-run] будет: {action} {item['path']}")
-        kinds = {k: sum(1 for i in found if i["kind"] == k) for k in ("fb2-declaration", "txt-recode")}
-        out(f"[dry-run] будет: исправить {len(found)} из {checked} файлов (fb2: {kinds['fb2-declaration']}, "
-              f"txt: {kinds['txt-recode']}); перед изменением — JSON-отчёт в {REPORTS_DIR}")
-        say("план исправления кодировки", "dry_fix_encoding", detail=json.dumps(stats))
-        return stats
-    if not found:
-        say(f"неверных кодировок нет (проверено {checked})", "fix_encoding_done", detail=json.dumps(stats))
-        return stats
-    report = write_report("fix-encoding", {"target": str(target), "files": found})
-    fixed = 0
-    for item in found:
-        full = Path(item["path"])
-        try:
-            raw = full.read_bytes()
-            if item["kind"] == "fb2-declaration":
-                if wrong_declaration(raw) != item["declared"]:
-                    continue  # файл изменился после проверки
-                data = DECL_RE.sub(rb"\g<1>utf-8\g<3>", raw, count=1)
-            else:
-                if not cp1251_text(raw):
-                    continue
-                data = raw.decode("cp1251").encode("utf-8")
-            atomic_write(full, data, "fix-encoding")
-            fixed += 1
-        except OSError as error:
-            say(f"не исправлен {item['path']}: {error}", "fix_failed", logging.ERROR, detail=str(error))
-    stats["fixed"] = fixed
-    say(f"кодировка исправлена в {fixed} файлах, отчёт {report}", "fix_encoding_done", detail=json.dumps(stats))
-    return stats
 
 
 # ----------------------------------------------------------------------
@@ -1269,7 +1293,775 @@ def convert_documents(cfg: dict[str, Any], dry_run: bool = False, path: str | No
     return stats
 
 
-FILE_CHANGING = ("fix-encoding", "unpack-fb2zip", "convert")
+# ======================================================================
+# Ночные режимы: карантин, кодировки, fb2 → epub, дубликаты, упаковка книг в zip
+# ======================================================================
+
+# Причины карантина: <quarantine_dir>/<причина>/<путь в каталоге книг>. Карантин не индексируется.
+QUARANTINE_REASONS = ("replaced", "duplicate", "edited", "rejected-convert", "rejected-zip", "rejected-encoding",
+                      "rejected-name")
+# Уже сжатые форматы кладутся в zip без сжатия: deflate их не уменьшит, только потратит процессор.
+STORED_EXTENSIONS = {"pdf", "djvu", "chm", "docx", "odt", "mobi", "azw", "azw3", "epub", "mp3", "jpg", "jpeg", "png",
+                     "gif", "webp"}
+# Имя, недопустимое для NTFS/Windows (Syncthing): запрещённые символы, управляющие, точка или пробел в конце.
+NTFS_BAD = re.compile(r'[<>:"\\|?*\x00-\x1f]|[. ]$')
+# Значимость форматов для dedup: остаётся самый значимый (epub → fb2 → txt → pdf → djvu → прочие).
+FORMAT_RANK = {"epub": 0, "fb2": 1, "txt": 2, "pdf": 3, "djvu": 4}
+DEDUP_MIN_WORDS = 200
+DEDUP_COVERAGE = 0.97
+DEDUP_GROUP_MAX = 16
+# «Полу-cp866»: заглавные кириллицы cp866 (0x80–0x9F) прочитаны как cp1251, строчные верны («‘тейнбек „жон»).
+SEMI_CP866 = {bytes([b]).decode("cp1251"): bytes([b]).decode("cp866") for b in range(0x80, 0xA0) if b != 0x98}
+_SEMI = re.escape("".join(SEMI_CP866))
+SEMI_START = re.compile(f"[{_SEMI}](?=[а-яё])")
+SEMI_ANY = re.compile(f"(?<=[а-яёА-ЯЁ{_SEMI}])[{_SEMI}]|[{_SEMI}](?=[а-яёА-ЯЁ{_SEMI}])")
+UPPER_CYR = re.compile("[А-ЯЁ]")
+# Однобуквенные слова (А, В, И, К, О, С, У, Я) в искажённом тексте стоят отдельно, без соседних букв.
+SEMI_ALONE = re.compile(r"(?<!\w)[Ђ‚€ЉЋ‘“џ](?!\w)")
+
+
+def norm_key(text: str) -> str:
+    """Ключ сравнения имён: NFKC, регистр, ё→е, только слова из букв и цифр."""
+    return " ".join(re.findall(r"[^\W_]+", unicodedata.normalize("NFKC", text).casefold().replace("ё", "е")))
+
+
+def fix_semi_cp866(text: str, field: bool = False) -> tuple[str, int]:
+    """Восстанавливает заглавные «полу-cp866». Только если настоящих заглавных кириллицы (почти) нет, а
+    «заглавная + строчные» встречается: в документе — от 3 раз, в поле метаданных — от 1. Возвращает текст и число замен."""
+    hits = len(SEMI_START.findall(text))
+    if not hits or (not field and hits < 3) or len(UPPER_CYR.findall(text)) > hits // 50:
+        return text, 0
+    fixed, count = SEMI_ANY.subn(lambda m: SEMI_CP866[m.group(0)], text)
+    fixed, alone = SEMI_ALONE.subn(lambda m: SEMI_CP866[m.group(0)], fixed)
+    return fixed, count + alone
+
+
+def fix_fb2_text(text: str) -> tuple[str, int]:
+    """«Полу-cp866» во всём fb2, иначе — в отдельных полях описания (title-info и т. п.)."""
+    fixed, count = fix_semi_cp866(text)
+    if count:
+        return fixed, count
+    match = re.search(r"<(?:\w+:)?description\b.*?</(?:\w+:)?description>", text, re.S)
+    if not match:
+        return text, 0
+    total = 0
+
+    def field(m: re.Match[str]) -> str:
+        nonlocal total
+        value, n = fix_semi_cp866(m.group(1), field=True)
+        total += n
+        return f">{value}<"
+
+    description = re.sub(r">([^<>]+)<", field, match.group(0))
+    return (text[:match.start()] + description + text[match.end():], total) if total else (text, 0)
+
+
+def detect_txt(raw: bytes) -> tuple[str | None, str]:
+    """Текст и кодировка TXT: UTF-8/UTF-16 с BOM, UTF-8, затем cp1251/KOI8-R/cp866 по доле строчных среди кириллических
+    букв (≥ 0,8 — у верной кодировки ~0,95, у неверной заглавные и строчные перепутаны), затем cp1252. None — не распознан."""
+    if raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        try:
+            return raw.decode("utf-16"), "utf-16"
+        except UnicodeDecodeError:
+            return None, "utf-16?"
+    if b"\x00" in raw:
+        return None, "binary"
+    try:
+        return raw.decode("utf-8-sig"), "utf-8"
+    except UnicodeDecodeError:
+        pass
+    best: tuple[float, str, str] | None = None
+    for encoding, min_letters in (("cp1251", 0.7), ("koi8_r", 0.7), ("cp866", 0.3)):
+        try:
+            text = raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        high = [ch for ch in text if ord(ch) > 127]
+        letters = [ch for ch in high if ch.isalpha()]
+        cyr = [ch for ch in letters if "\u0400" <= ch <= "\u04ff"]
+        if not cyr or len(letters) < min_letters * len(high) or len(cyr) < 0.8 * len(letters):
+            continue
+        share = sum(ch.islower() for ch in cyr) / len(cyr)
+        if share >= 0.8 and (best is None or share > best[0]):
+            best = (share, text, encoding)
+    if best:
+        return best[1], best[2]
+    try:
+        text = raw.decode("cp1252")
+    except UnicodeDecodeError:
+        return None, "unknown"
+    high = [ch for ch in text if ord(ch) > 127]
+    if sum(ch.isalpha() or ch in "’‘“”–—…«»•©°" for ch in high) >= 0.8 * len(high):
+        return text, "cp1252"
+    return None, "unknown"
+
+
+def normalize_txt(raw: bytes) -> tuple[bytes, str, int]:
+    """TXT → UTF-8 без BOM, переводы строк LF, исправленная «полу-cp866». ValueError — кодировка не распознана."""
+    text, encoding = detect_txt(raw)
+    if text is None:
+        raise ValueError(f"кодировка не распознана ({encoding})")
+    text, semi = fix_semi_cp866(text)
+    return text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8"), encoding, semi
+
+
+def normalize_fb2(raw: bytes) -> tuple[bytes, list[str], int]:
+    """fb2: UTF-8 при заявленной иной кодировке; «полу-cp866» в тексте и описании. Данные, что сделано, число замен."""
+    done: list[str] = []
+    declared = wrong_declaration(raw)
+    if declared:
+        raw = DECL_RE.sub(rb"\g<1>utf-8\g<3>", raw, count=1)
+        done.append(f"encoding {declared}→utf-8")
+    match = DECL_RE.search(raw[:300])
+    encoding = match.group(2).decode("ascii") if match else "utf-8"
+    try:
+        text = raw.decode(encoding)
+    except (UnicodeDecodeError, LookupError):
+        return raw, done, 0  # битые байты: не перекодируем, чтобы не потерять их
+    fixed, semi = fix_fb2_text(text)
+    if semi:
+        try:
+            raw = fixed.encode(encoding)
+        except UnicodeEncodeError:
+            raw = DECL_RE.sub(rb"\g<1>utf-8\g<3>", fixed.encode("utf-8"), count=1)
+        done.append(f"полу-cp866: {semi}")
+    return raw, done, semi
+
+
+def calibre_env(tmp: Path) -> dict[str, str]:
+    """Окружение Calibre во временном каталоге: в песочнице службы домашний каталог только для чтения."""
+    for sub in ("config", "cache", "temp", "xdg"):
+        (tmp / sub).mkdir(exist_ok=True)
+    return {**os.environ, "HOME": str(tmp), "CALIBRE_CONFIG_DIRECTORY": str(tmp / "config"),
+            "CALIBRE_CACHE_DIRECTORY": str(tmp / "cache"), "CALIBRE_TEMP_DIR": str(tmp / "temp"),
+            "XDG_CACHE_HOME": str(tmp / "xdg"), "QT_QPA_PLATFORM": "offscreen"}
+
+
+def relink(db_path: str, pairs: list[tuple[str, str]]) -> int:
+    """Переносит отметки и полки со старого пути книги на новый (упаковка, замена, переименование, дубликат)."""
+    if not pairs or not Path(db_path).is_file():
+        return 0
+    with closing(connect(db_path)) as conn, conn:
+        if conn.execute("PRAGMA user_version").fetchone()[0] < 1:
+            return 0
+        for old, new in pairs:
+            conn.execute("UPDATE OR IGNORE marks SET path=? WHERE path=?", (new, old))
+            conn.execute("UPDATE OR IGNORE shelf_items SET path=? WHERE path=?", (new, old))
+            conn.execute("DELETE FROM shelf_items WHERE path=?", (old,))
+    return len(pairs)
+
+
+def zip_date(mtime: float) -> tuple[int, int, int, int, int, int]:
+    return max(datetime.fromtimestamp(mtime).timetuple()[:6], (1980, 1, 1, 0, 0, 0))
+
+
+def name_ok(name: str) -> bool:
+    return len(name.encode("utf-8")) <= 255 and not NTFS_BAD.search(name)
+
+
+def parallel(items: Iterator[Any], fn: Callable[[Any], None], workers: int, run: NightRun) -> None:
+    """fn для каждого элемента в workers потоках (в очереди не больше workers*4). Сбой одного файла режим не останавливает."""
+    def guarded(item: Any) -> None:
+        try:
+            fn(item)
+        except Exception as error:  # noqa: BLE001 — правило: режим никогда не останавливается из-за одного файла
+            what = item[0] if isinstance(item, tuple) else item
+            run.record("failed", str(what)[:500], reason=f"{type(error).__name__}: {error}")
+        run.tick()
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pending: set[Any] = set()
+        for item in items:
+            pending.add(pool.submit(guarded, item))
+            if len(pending) >= workers * 4:
+                _done, pending = wait(pending, return_when=FIRST_COMPLETED)
+        wait(pending)
+
+
+class NightRun:
+    """Общее хозяйство изменяющего режима: карантин, журнал действий (JSONL по ходу работы — переживает обрыв),
+    прогресс раз в 30 с, итоговый JSON-отчёт и перенос отметок/полок на новые пути."""
+
+    def __init__(self, cfg: dict[str, Any], kind: str, dry_run: bool, path: str | None, out: Callable[[str], None]) -> None:
+        self.cfg, self.kind, self.dry_run, self.out = cfg, kind, dry_run, out
+        self.root = Path(cfg["books_dir"])
+        self.target = target_dir(cfg, path)
+        self.qroot = Path(cfg["quarantine_dir"])
+        self.limit = cfg["reader_max_mb"] * 1024 * 1024
+        self.lock = threading.Lock()
+        self.stats: dict[str, int] = {"checked": 0}
+        self.relinks: list[tuple[str, str]] = []
+        self.started = self.last = time.monotonic()
+        REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = f"{datetime.now():%Y-%m-%d-%H-%M-%S}"
+        self.journal_path = REPORTS_DIR / f"{kind}{'-dry-run' if dry_run else ''}-{stamp}.jsonl"
+        self.journal = self.journal_path.open("a", encoding="utf-8")
+        say(f"{kind}{' (dry-run)' if dry_run else ''}: {self.target}, журнал {self.journal_path}", "night_start")
+
+    def rel(self, full: Path) -> str:
+        for base in (self.root, self.target):
+            try:
+                return full.relative_to(base).as_posix()
+            except ValueError:
+                continue
+        return full.name
+
+    def record(self, action: str, path: Path | str, **extra: Any) -> None:
+        line = json.dumps({"action": action, "path": str(path), **extra}, ensure_ascii=False)
+        with self.lock:
+            self.stats[action] = self.stats.get(action, 0) + 1
+            self.journal.write(line + "\n")
+            self.journal.flush()
+            show = self.dry_run and self.stats[action] <= 20
+        if show:
+            self.out(f"[dry-run] будет: {action} {path}{' → ' + str(extra['to']) if 'to' in extra else ''}")
+        if action.startswith("rejected") or action == "failed":
+            say(f"{self.kind}: {action} {path}", action.replace("-", "_"), logging.WARNING, detail=str(extra.get("reason", "")))
+
+    def count(self, key: str) -> None:
+        with self.lock:
+            self.stats[key] = self.stats.get(key, 0) + 1
+
+    def tick(self) -> None:
+        with self.lock:
+            self.stats["checked"] += 1
+            now = time.monotonic()
+            if now - self.last < 30:
+                return
+            self.last = now
+            stats = dict(self.stats)
+        done = sum(v for k, v in stats.items() if k not in ("checked", "ok", "skipped"))
+        say(f"{self.kind}: проверено {stats['checked']}, сделано {done}, {stats['checked'] / max(now - self.started, 1e-6):.1f} "
+            f"файлов/с · {json.dumps(stats, ensure_ascii=False)}", "progress")
+
+    def quarantine(self, full: Path, folder: str, **extra: Any) -> Path:
+        """Переносит файл в карантин <folder>/; в dry-run только запись плана. Имя занято — суффикс _1, _2…"""
+        if folder not in QUARANTINE_REASONS:
+            raise ValueError(f"неизвестная причина карантина {folder}")
+        dest = self.qroot / folder / self.rel(full)
+        if not self.dry_run:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with self.lock:
+                if dest.exists():
+                    dest = unique_path(dest.parent, dest.name, set())
+                shutil.move(full, dest)  # одна файловая система — это rename
+        self.record(folder, full, to=str(dest), **extra)
+        return dest
+
+    def backup(self, full: Path, folder: str = "replaced") -> Path:
+        """Копия прежней версии файла в карантин перед его заменой (сам файл остаётся на месте)."""
+        dest = self.qroot / folder / self.rel(full)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with self.lock:
+            if dest.exists():
+                dest = unique_path(dest.parent, dest.name, set())
+            shutil.copy2(full, dest)
+        return dest
+
+    def moved(self, old: Path, new: Path) -> None:
+        with self.lock:
+            self.relinks.append((self.rel(old), self.rel(new)))
+
+    def finish(self, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        self.journal.close()
+        if not self.dry_run:
+            self.stats["relinked"] = relink(self.cfg["db_path"], self.relinks)
+        report = write_report(f"{self.kind}{'-dry-run' if self.dry_run else ''}",
+                              {"target": str(self.target), "dry_run": self.dry_run, "stats": self.stats,
+                               "journal": str(self.journal_path), **(extra or {})})
+        say(f"{self.kind}{' (dry-run)' if self.dry_run else ''} завершён: {json.dumps(self.stats, ensure_ascii=False)}, "
+            f"отчёт {report}", "night_done", detail=json.dumps(self.stats))
+        if self.dry_run:
+            self.out(f"[dry-run] итог {self.kind}: {json.dumps(self.stats, ensure_ascii=False)}; журнал {self.journal_path}")
+        return {**self.stats, "report": str(report)}
+
+
+def walk_dirs(target: Path, errors: list[str]) -> Iterator[tuple[Path, list[str]]]:
+    """Каталоги и имена файлов в них (служебные каталоги и ресурсы HTML пропускаются)."""
+    def onerror(error: OSError) -> None:
+        errors.append(f"{error.filename}: {error.strerror}")
+
+    for current, dirs, files in os.walk(target, onerror=onerror):
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith(".") and not d.endswith(HTML_SIDECAR_SUFFIXES))
+        yield Path(current), sorted(f for f in files if not f.startswith("."))
+
+
+def write_zip(tmp: Path, name: str, mtime: float, source: Any, size: int, ext: str) -> int:
+    """Однокнижный zip из потока source; возвращает CRC32 прочитанных данных (для сверки с записанным)."""
+    info = zipfile.ZipInfo(name, date_time=zip_date(mtime))
+    info.compress_type = zipfile.ZIP_STORED if ext in STORED_EXTENSIONS else zipfile.ZIP_DEFLATED
+    info.file_size = size  # по нему zipfile заранее решает, нужен ли ZIP64
+    info.external_attr = 0o644 << 16
+    crc = 0
+    with zipfile.ZipFile(tmp, "w", compresslevel=6) as archive, archive.open(info, "w") as sink:
+        while chunk := source.read(4 * 1024 * 1024):
+            crc = zlib.crc32(chunk, crc)
+            sink.write(chunk)
+    return crc
+
+
+def verify_zip(path: Path, name: str, size: int, crc: int) -> str | None:
+    """Проверка упакованного: одна запись с тем же именем, размер и CRC как у исходника, testzip без ошибок."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            infos = archive.infolist()
+            if len(infos) != 1 or infos[0].filename != name:
+                return "не одна запись или чужое имя"
+            if infos[0].file_size != size or infos[0].CRC != crc:
+                return "размер или CRC не совпадают с исходником"
+            if archive.testzip() is not None:
+                return "ошибка CRC при чтении"
+    except (OSError, zipfile.BadZipFile, EOFError) as error:
+        return f"{type(error).__name__}: {error}"
+    return None
+
+
+def replace_zip_member(run: NightRun, full: Path, info: zipfile.ZipInfo, data: bytes) -> None:
+    """Перепаковка однокнижного zip с новым содержимым книги: проверка, копия прежнего в карантин, атомарная замена."""
+    fd, tmp_name = tempfile.mkstemp(prefix=".repack.", suffix=".tmp", dir=full.parent)
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        name = info.filename
+        crc = write_zip(tmp, name, full.stat().st_mtime, io.BytesIO(data), len(data), member_ext(info))
+        problem = verify_zip(tmp, name, len(data), crc)
+        if problem:
+            raise ValueError(f"перепаковка: {problem}")
+        os.chmod(tmp, full.stat().st_mode & 0o666)
+        run.backup(full)
+        os.replace(tmp, full)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+# ----------------------------------------------------------------------
+# fix-encoding: fb2 (encoding, «полу-cp866»), txt (cp1251/KOI8-R/cp866 → UTF-8, CRLF → LF), то же внутри однокнижных zip
+# ----------------------------------------------------------------------
+
+def fix_encoding(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None, only: str = "all",
+                 out: Callable[[str], None] = print) -> dict[str, Any]:
+    """Лечит кодировку книг; файлы правятся на месте атомарно. Исправление «полу-cp866» сохраняет прежнюю версию
+    в карантин replaced/, перепакованный zip — тоже. Нераспознанная кодировка txt — в карантин rejected-encoding/."""
+    run = NightRun(cfg, "fix-encoding", dry_run, path, out)
+    kinds = {"all": ("fb2", "txt"), "fb2": ("fb2",), "txt": ("txt",)}[only]
+    suffixes = (*(f".{k}" for k in kinds), ".zip")
+
+    def transform(kind: str, raw: bytes) -> tuple[bytes, str, int]:
+        if kind == "fb2":
+            data, done, semi = normalize_fb2(raw)
+            return data, ", ".join(done), semi
+        data, encoding, semi = normalize_txt(raw)
+        return data, f"{encoding}→utf-8+LF" + (f", полу-cp866: {semi}" if semi else ""), semi
+
+    def one(item: tuple[Path, int]) -> None:
+        full, size = item
+        kind = full.name.rpartition(".")[2].lower()
+        if kind == "zip":
+            try:
+                with zipfile.ZipFile(full) as archive:
+                    info = single_member(archive)
+                    if info is None or member_ext(info) not in kinds:
+                        return
+                    raw = read_member(archive, info, run.limit)
+            except (ValueError, zipfile.BadZipFile, EOFError) as error:
+                run.record("skipped", full, reason=str(error))  # битые zip разбирает zip-books
+                return
+            try:
+                data, what, _semi = transform(member_ext(info), raw)
+            except ValueError as error:
+                run.quarantine(full, "rejected-encoding", reason=str(error))
+                return
+            if data != raw:
+                run.record("fixed-zip", full, what=what)
+                if not dry_run:
+                    replace_zip_member(run, full, info, data)
+            return
+        if size > run.limit:
+            run.record("skipped", full, reason="больше reader_max_mb")
+            return
+        if kind == "fb2":
+            with full.open("rb") as handle:
+                head = handle.read(FB2_HEAD_BYTES)
+            # Полностью читается только fb2 с признаками ошибки в начале: «полу-cp866» или UTF-8 при иной заявленной.
+            match = DECL_RE.search(head[:300])
+            try:
+                declared_utf8 = not match or codecs.lookup(match.group(2).decode("ascii")).name == "utf-8"
+            except LookupError:
+                declared_utf8 = False
+            suspicious = bool(SEMI_START.search(decode_xml(head)))
+            if not declared_utf8 and not suspicious:
+                try:
+                    head.decode("utf-8")
+                    suspicious = True
+                except UnicodeDecodeError as error:
+                    suspicious = error.start >= len(head) - 4  # UTF-8, обрезанный посреди символа
+            if not suspicious:
+                return
+        raw = full.read_bytes()
+        try:
+            data, what, semi = transform(kind, raw)
+        except ValueError as error:
+            run.quarantine(full, "rejected-encoding", reason=str(error))
+            return
+        if data == raw:
+            return
+        run.record("fixed", full, what=what)
+        if not dry_run:
+            if semi:
+                run.backup(full)
+            atomic_write(full, data, "fix-encoding")
+
+    errors: list[str] = []
+    parallel(walk_files(run.target, suffixes, errors), one, cfg["workers"], run)
+    for error in errors[:20]:
+        say(f"ошибка обхода: {error}", "walk_error", logging.WARNING, detail=error)
+    return run.finish({"walk_errors": errors[:200]})
+
+
+# ----------------------------------------------------------------------
+# convert fb2 → epub (Calibre), в т. ч. fb2 внутри однокнижного zip
+# ----------------------------------------------------------------------
+
+def convert_fb2(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None, workers: int | None = None,
+                out: Callable[[str], None] = print) -> dict[str, Any]:
+    """fb2 и однокнижный zip с fb2 → name.epub рядом (имя как у fb2), проверка verify_book, исходник — в карантин
+    replaced/. Рядом уже есть epub с тем же нормализованным именем — исходник сразу в replaced/ без конвертации.
+    Сбой Calibre или проверки — исходник в rejected-convert/."""
+    if not dry_run and not shutil.which("ebook-convert"):
+        raise ConfigError("не найден ebook-convert (Calibre)")
+    run = NightRun(cfg, "convert-fb2", dry_run, path, out)
+    timeout = cfg["convert_timeout"]
+
+    def tasks() -> Iterator[tuple[Path, dict[str, str]]]:
+        for folder, names in walk_dirs(run.target, errors):
+            epubs = {norm_key(n[:-5]): n for n in names if n.lower().endswith(".epub")}
+            for name in names:
+                if name.lower().endswith((".fb2", ".zip")):
+                    yield folder / name, epubs
+
+    def one(item: tuple[Path, dict[str, str]]) -> None:
+        src, epubs = item
+        data: bytes | None = None
+        if src.name.lower().endswith(".zip"):
+            try:
+                with zipfile.ZipFile(src) as archive:
+                    info = single_member(archive)
+                    if info is None or member_ext(info) != "fb2":
+                        return
+                    data = read_member(archive, info, 256 * 1024 * 1024)
+            except (ValueError, zipfile.BadZipFile, EOFError) as error:
+                run.record("skipped", src, reason=str(error))
+                return
+        stem = split_name(src.name)[0]
+        result = src.parent / f"{stem}.epub"
+        existing = epubs.get(norm_key(stem))
+        if existing or result.exists():
+            keeper = src.parent / (existing or result.name)
+            run.quarantine(src, "replaced", reason="рядом уже есть epub", keeper=str(keeper))
+            run.moved(src, keeper)
+            return
+        if not name_ok(result.name):
+            run.quarantine(src, "rejected-name", reason="имя epub недопустимо")
+            return
+        if dry_run:
+            run.record("convert", src, to=str(result))
+            return
+        with tempfile.TemporaryDirectory(prefix="books_library-fb2-") as tmp_name:
+            tmp = Path(tmp_name)
+            staged, produced = tmp / "book.fb2", tmp / "book.epub"
+            if data is None:
+                shutil.copyfile(src, staged)
+            else:
+                staged.write_bytes(data)
+            try:
+                done = subprocess.run(["ebook-convert", str(staged), str(produced)], capture_output=True, env=calibre_env(tmp),
+                                      cwd=tmp, timeout=timeout, check=False, stdin=subprocess.DEVNULL)
+                problem = None if done.returncode == 0 and produced.is_file() else \
+                    f"ebook-convert: {done.stderr.decode('utf-8', errors='replace')[-300:] or done.returncode}"
+            except subprocess.TimeoutExpired:
+                problem = f"ebook-convert: тайм-аут {timeout} с"
+            problem = problem or verify_book(produced, "epub")
+            if problem:
+                run.quarantine(src, "rejected-convert", reason=problem)
+                return
+            fd, tmp_out = tempfile.mkstemp(prefix=".convert.", suffix=".tmp", dir=src.parent)
+            os.close(fd)
+            try:
+                shutil.copyfile(produced, tmp_out)
+                os.chmod(tmp_out, 0o644)
+                if result.exists():  # появился, пока конвертировали
+                    raise FileExistsError(str(result))
+                os.replace(tmp_out, result)
+            finally:
+                Path(tmp_out).unlink(missing_ok=True)
+        run.quarantine(src, "replaced", reason="заменён проверенным epub", keeper=str(result))
+        run.moved(src, result)
+
+    errors: list[str] = []
+    parallel(tasks(), one, workers or cfg["workers"], run)
+    return run.finish({"walk_errors": errors[:200]})
+
+
+# ----------------------------------------------------------------------
+# dedup: дубликаты по значимости формата с подтверждением по тексту (шинглы по 5 слов)
+# ----------------------------------------------------------------------
+
+def book_text(cfg: dict[str, Any], full: Path, fmt: str, tmp: Path) -> str:
+    """Текст книги для сравнения: fb2/epub/txt — сами, pdf — pdftotext, djvu — djvutxt, прочее — ebook-convert в txt."""
+    limit = cfg["reader_max_mb"] * 1024 * 1024
+    timeout = cfg["convert_timeout"]
+    if full.name.lower().endswith(".zip"):
+        with zipfile.ZipFile(full) as archive:
+            info = single_member(archive)
+            if info is None:
+                return ""
+            staged = tmp / f"inner.{member_ext(info)}"
+            staged.write_bytes(read_member(archive, info, limit))
+        return book_text(cfg, staged, member_ext(info), tmp)
+    if fmt == "fb2":
+        text = decode_xml(read_limited(full, limit))
+        start, end = text.find("<body"), text.find("<binary")
+        return re.sub(r"<[^>]*>", " ", text[max(start, 0):end if end > start else None])
+    if fmt == "epub":
+        with zipfile.ZipFile(full) as archive:
+            epub = Epub(archive)
+            return " ".join(re.sub(r"<[^>]*>", " ", decode_xml(zip_read(archive, p))) for p in epub.spine())
+    if fmt == "txt":
+        return decode_text(read_limited(full, limit))
+    if fmt in ("pdf", "djvu"):
+        args = ["pdftotext", "-q", "-enc", "UTF-8", str(full), "-"] if fmt == "pdf" else ["djvutxt", str(full)]
+        done = subprocess.run(args, capture_output=True, timeout=timeout, check=False, stdin=subprocess.DEVNULL)
+        return done.stdout[:limit].decode("utf-8", errors="replace")
+    if fmt in CALIBRE_FORMATS or fmt in ("azw", "azw3", "mobi"):
+        staged, result = tmp / f"book.{fmt}", tmp / "book.txt"
+        shutil.copyfile(full, staged)
+        subprocess.run(["ebook-convert", str(staged), str(result)], capture_output=True, env=calibre_env(tmp), cwd=tmp,
+                       timeout=timeout, check=False, stdin=subprocess.DEVNULL)
+        return decode_text(result.read_bytes()[:limit]) if result.is_file() else ""
+    return ""
+
+
+def shingles(text: str) -> tuple[int, set[int], bool]:
+    """Число слов и хэши шинглов по 5 слов. У длинных текстов — выборка хэшей с остатком 0 по модулю 4: фильтр один
+    для всех файлов, поэтому доля «шинглы младшего в старшем» оценивается без смещения, а памяти вчетверо меньше."""
+    words = re.findall(r"[^\W_]+", fold(text))
+    hashes = {hash(tuple(words[i:i + 5])) for i in range(max(len(words) - 4, 0))}
+    sampled = len(words) > 20000
+    if sampled:
+        hashes = {h for h in hashes if h % 4 == 0}
+    return len(words), hashes, sampled
+
+
+def dedup(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None, workers: int | None = None,
+          out: Callable[[str], None] = print) -> dict[str, Any]:
+    """Группы-кандидаты: автор+название из метаданных (по всей библиотеке) и имя файла в той же папке. В группе
+    книги упорядочены по значимости формата (epub → fb2 → txt → pdf → djvu → прочие), затем по объёму текста и
+    размеру. Книга — дубль (карантин duplicate/) только если ≥ 97 % её шинглов есть у оставляемой и в ней ≥ 200 слов;
+    уникальный текст в любом формате остаётся, такие группы — «похожие» для ручного решения. Итог — в dup_groups."""
+    run = NightRun(cfg, "dedup", dry_run, path, out)
+    root = run.root
+    if not run.target.resolve().is_relative_to(root.resolve()):
+        raise ConfigError("dedup: --path должен быть внутри каталога книг")
+    errors: list[str] = []
+    known: dict[str, sqlite3.Row] = {}
+    if Path(cfg["db_path"]).is_file():
+        with closing(connect(cfg["db_path"], readonly=True)) as conn:
+            if conn.execute("PRAGMA user_version").fetchone()[0] >= 1:
+                known = {r["path"]: r for r in conn.execute("SELECT path, size, mtime, fmt, title, authors FROM books")}
+    files = [(rel, size, mtime) for rel, size, mtime in iter_book_files(run.target, errors)]
+    prefix = run.rel(run.target)
+    prefix = "" if prefix in ("", ".") else prefix + "/"
+    files = [(prefix + rel, size, mtime) for rel, size, mtime in files]
+
+    def meta_of(item: tuple[str, int, float]) -> dict[str, Any]:
+        rel, size, mtime = item
+        row = known.get(rel)
+        if row and row["size"] == size and row["mtime"] == mtime and row["fmt"] != "fb2.zip":
+            return {"fmt": row["fmt"], "title": row["title"], "authors": [a for a in row["authors"].split("; ") if a]}
+        return read_book_meta(root, rel)
+
+    with ThreadPoolExecutor(max_workers=workers or cfg["workers"]) as pool:
+        metas = list(pool.map(meta_of, files, chunksize=64))
+    say(f"dedup: метаданные {len(files)} файлов собраны", "progress")
+    parent = list(range(len(files)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    first: dict[str, int] = {}
+    for index, ((rel, _size, _mtime), meta) in enumerate(zip(files, metas, strict=True)):
+        if meta["fmt"] == "zip":
+            continue  # многофайловый архив — не книга для сравнения
+        keys = [f"n:{PurePosixPath(rel).parent}/{norm_key(split_name(rel)[0])}"]
+        title = norm_key(meta.get("title", ""))
+        authors = " ".join(sorted(norm_key(" ".join(meta.get("authors", []))).split()))
+        if authors and re.search(r"[^\W\d_]", title):
+            keys.append(f"m:{authors}|{title}")
+        for key in keys:
+            if key in first:
+                parent[find(index)] = find(first[key])
+            else:
+                first[key] = index
+    groups: dict[int, list[int]] = {}
+    for index in range(len(files)):
+        if metas[index]["fmt"] != "zip":
+            groups.setdefault(find(index), []).append(index)
+    candidates = [g for g in groups.values() if len(g) > 1]
+    say(f"dedup: групп-кандидатов {len(candidates)}", "progress")
+    results: list[dict[str, Any]] = []
+
+    def one(group: list[int]) -> None:
+        if len(group) > DEDUP_GROUP_MAX:
+            run.record("group-too-large", files[group[0]][0], members=len(group))
+            return
+        members = []
+        with tempfile.TemporaryDirectory(prefix="books_library-dedup-") as tmp_name:
+            for index in group:
+                rel, size, _mtime = files[index]
+                fmt = metas[index]["fmt"]
+                try:
+                    words, shingle_set, sampled = shingles(book_text(cfg, root / rel, fmt, Path(tmp_name)))
+                except (OSError, ValueError, KeyError, zipfile.BadZipFile, EOFError, subprocess.TimeoutExpired) as error:
+                    words, shingle_set, sampled = 0, set(), False
+                    run.record("no-text", rel, reason=f"{type(error).__name__}: {error}")
+                members.append({"path": rel, "fmt": fmt, "size": size, "words": words, "sh": shingle_set, "sampled": sampled})
+        members.sort(key=lambda m: (FORMAT_RANK.get(m["fmt"], 5), -m["words"], -m["size"]))
+        kept: list[dict[str, Any]] = []
+        for member in members:
+            best, keeper = 0.0, None
+            for other in kept:
+                mine = member["sh"]
+                if other["sampled"] and not member["sampled"]:  # сравнивать с выборкой — по той же выборке
+                    mine = {h for h in mine if h % 4 == 0}
+                if mine and other["sh"]:
+                    coverage = len(mine & other["sh"]) / len(mine)
+                    if coverage > best:
+                        best, keeper = coverage, other
+            member["coverage"] = round(best, 4) if kept else None
+            if keeper is not None and member["words"] >= DEDUP_MIN_WORDS and best >= DEDUP_COVERAGE:
+                member.update(role="duplicate", keeper=keeper["path"])
+                dest = run.quarantine(root / member["path"], "duplicate", keeper=keeper["path"], coverage=member["coverage"])
+                member["quarantine"] = str(dest)
+                run.moved(root / member["path"], root / keeper["path"])
+            else:
+                member.update(role="kept", keeper="", quarantine="")
+                kept.append(member)
+        for member in members:
+            member.pop("sh")
+            member.pop("sampled")
+        status = "similar" if len(kept) > 1 else "auto"
+        if status == "auto" and len(kept) == len(members):
+            return
+        with run.lock:
+            results.append({"key": min(files[i][0] for i in group), "status": status, "members": members})
+
+    parallel(iter(candidates), one, workers or cfg["workers"], run)
+    if not dry_run and results:
+        migrate_database(cfg["db_path"], out=out)
+        with closing(connect(cfg["db_path"])) as conn, conn:
+            resolved = {r[0] for r in conn.execute("SELECT key FROM dup_groups WHERE status='resolved'")}
+            conn.execute("DELETE FROM dup_groups WHERE status <> 'resolved'")
+            for group in results:
+                if group["status"] == "similar" and group["key"] in resolved:
+                    continue
+                gid = conn.execute("INSERT INTO dup_groups(key, status, created) VALUES (?,?,?)",
+                                   (group["key"], group["status"], time.time())).lastrowid
+                conn.executemany("INSERT OR IGNORE INTO dup_members VALUES (?,?,?,?,?,?,?,?,?)",
+                                 [(gid, m["path"], m["fmt"], m["size"], m["words"], m["coverage"], m["role"], m["keeper"],
+                                   m["quarantine"]) for m in group["members"]])
+    run.stats["groups"] = len(results)
+    run.stats["similar_groups"] = sum(g["status"] == "similar" for g in results)
+    return run.finish({"walk_errors": errors[:200], "groups": results})
+
+
+# ----------------------------------------------------------------------
+# zip-books: каждая книга (кроме epub и zip) → name.ext.zip; однокнижные zip — к виду name.ext.zip
+# ----------------------------------------------------------------------
+
+def zip_books(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None, workers: int | None = None,
+              out: Callable[[str], None] = print) -> dict[str, Any]:
+    """Упаковка: уже сжатые форматы — ZIP_STORED, прочие — deflate 6. Проверка: одна запись, размер и CRC как у
+    исходника, testzip; только после неё исходник удаляется (содержимое в zip побайтно — это не карантин).
+    Многофайловые zip не трогаются; битые zip — в rejected-zip/, недопустимые для NTFS или длинные имена — в rejected-name/."""
+    run = NightRun(cfg, "zip-books", dry_run, path, out)
+    suffixes = tuple(f".{x}" for x in BOOK_EXTENSIONS if x != "epub")
+
+    def old_zip(src: Path) -> None:
+        try:
+            with zipfile.ZipFile(src) as archive:
+                info = single_member(archive)
+                if info is None:
+                    return  # многофайловый архив — не трогаем
+                if archive.testzip() is not None:
+                    raise zipfile.BadZipFile("ошибка CRC")
+        except (zipfile.BadZipFile, EOFError, ValueError) as error:
+            run.quarantine(src, "rejected-zip", reason=f"{type(error).__name__}: {error}")
+            return
+        wanted = f"{split_name(src.name)[0]}.{member_ext(info)}.zip"
+        if src.name == wanted:
+            run.count("ok")
+            return
+        if not name_ok(wanted):
+            run.quarantine(src, "rejected-name", reason=f"имя {wanted} недопустимо")
+            return
+        dest = src.parent / wanted
+        if dest.exists():
+            run.record("conflict", src, to=str(dest))
+            return
+        run.record("renamed", src, to=str(dest))
+        if not dry_run:
+            os.rename(src, dest)
+            run.moved(src, dest)
+
+    def one(item: tuple[Path, int]) -> None:
+        src, size = item
+        ext = src.name.rpartition(".")[2].lower()
+        if ext == "zip":
+            old_zip(src)
+            return
+        dest = src.parent / f"{src.name}.zip"
+        if not name_ok(dest.name):
+            run.quarantine(src, "rejected-name", reason="имя zip длиннее 255 байт или недопустимо для NTFS")
+            return
+        if dest.exists():
+            run.quarantine(src, "rejected-zip", reason=f"имя занято: {dest.name}")
+            return
+        if dry_run:
+            run.record("zipped", src, to=str(dest))
+            return
+        stat = src.stat()
+        fd, tmp_name = tempfile.mkstemp(prefix=".zip-books.", suffix=".tmp", dir=src.parent)
+        os.close(fd)
+        tmp = Path(tmp_name)
+        try:
+            with src.open("rb") as source:
+                crc = write_zip(tmp, src.name, stat.st_mtime, source, stat.st_size, ext)
+            problem = verify_zip(tmp, src.name, stat.st_size, crc)
+            now = src.stat()
+            if problem or (now.st_size, now.st_mtime) != (stat.st_size, stat.st_mtime):
+                raise ValueError(problem or "исходник изменился во время упаковки")
+            os.chmod(tmp, stat.st_mode & 0o666)
+            os.utime(tmp, (stat.st_atime, stat.st_mtime))
+            if dest.exists():
+                raise FileExistsError(str(dest))
+            os.replace(tmp, dest)
+        except (OSError, ValueError, zipfile.BadZipFile) as error:
+            tmp.unlink(missing_ok=True)
+            run.quarantine(src, "rejected-zip", reason=f"{type(error).__name__}: {error}")
+            return
+        src.unlink()
+        run.record("zipped", src, to=str(dest), size=stat.st_size, zip_size=dest.stat().st_size)
+        run.moved(src, dest)
+
+    errors: list[str] = []
+    parallel(walk_files(run.target, suffixes, errors), one, workers or cfg["workers"], run)
+    return run.finish({"walk_errors": errors[:200]})
+
+
+FILE_CHANGING = ("fix-encoding", "unpack-fb2zip", "convert", "dedup", "zip-books")
 COMMANDS = ("scan", "migrate", *FILE_CHANGING)
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
@@ -1283,7 +2075,8 @@ def command_params(command: str, raw: dict[str, Any]) -> dict[str, Any]:
     allowed = {
         "scan": set(), "migrate": set(), "fix-encoding": {"path", "only"}, "unpack-fb2zip": {"path", "max_mb"},
         "convert": {"path", "only", "to", "overwrite", "skip_newer", "exclude", "author", "title_mode", "toc", "toc_depth",
-                    "delete_source"},
+                    "delete_source", "workers"},
+        "dedup": {"path", "workers"}, "zip-books": {"path", "workers"},
     }[command]
     unknown = set(raw) - allowed
     if unknown:
@@ -1295,10 +2088,15 @@ def command_params(command: str, raw: dict[str, Any]) -> dict[str, Any]:
             raise ConfigError("path должен быть непустой строкой")
         params["path"] = path
     if "only" in allowed:
-        valid = ("all", "fb2", "txt") if command == "fix-encoding" else ("all", *CONVERT_SOURCES)
+        valid = ("all", "fb2", "txt") if command == "fix-encoding" else ("all", "fb2", *CONVERT_SOURCES)
         params["only"] = raw.get("only", "all")
         if params["only"] not in valid:
             raise ConfigError(f"only: допустимо {', '.join(valid)}")
+    if "workers" in allowed:
+        params["workers"] = raw.get("workers")
+        if params["workers"] is not None and (not isinstance(params["workers"], int) or isinstance(params["workers"], bool)
+                                              or not 1 <= params["workers"] <= 64):
+            raise ConfigError("workers: целое 1..64")
     if command == "unpack-fb2zip":
         params["max_mb"] = raw.get("max_mb", 200)
         if not isinstance(params["max_mb"], int) or isinstance(params["max_mb"], bool) or not 1 <= params["max_mb"] <= 4096:
@@ -1333,7 +2131,14 @@ def run_command(cfg: dict[str, Any], command: str, dry_run: bool, params: dict[s
             return fix_encoding(cfg, dry_run, params["path"], params["only"], out=out)
         if command == "unpack-fb2zip":
             return unpack_fb2zip(cfg, dry_run, params["path"], params["max_mb"], out=out)
-        return convert_documents(cfg, dry_run, params["path"], out=out, **{k: v for k, v in params.items() if k != "path"})
+        if command == "dedup":
+            return dedup(cfg, dry_run, params["path"], params["workers"], out=out)
+        if command == "zip-books":
+            return zip_books(cfg, dry_run, params["path"], params["workers"], out=out)
+        if params["only"] == "fb2":
+            return convert_fb2(cfg, dry_run, params["path"], params["workers"], out=out)
+        return convert_documents(cfg, dry_run, params["path"], out=out,
+                                 **{k: v for k, v in params.items() if k not in ("path", "workers")})
 
     if dry_run or command == "migrate":
         return action()
@@ -1504,6 +2309,188 @@ def safe_image_type(ctype: str, name: str = "") -> str | None:
 
 
 # ======================================================================
+# Просмотр прочих форматов: серверные инструменты дают браузеру понятный вид
+# ======================================================================
+
+# Calibre (ebook-convert) переводит их в EPUB, дальше работает обычная читалка EPUB.
+CALIBRE_FORMATS = {"mobi", "azw", "azw3", "doc", "docx", "rtf", "odt", "chm"}
+# Постраничные форматы: позиция чтения — номер главы/страницы плюс доля прокрутки.
+PAGED_FORMATS = {"epub", "djvu", *CALIBRE_FORMATS}
+# Текстовые файлы внутри ZIP, которые показываются как текст.
+TEXT_EXTENSIONS = {"txt", "nfo", "diz", "ini", "log", "md", "csv", "xml", "json", "pas", "c", "cpp", "h", "hpp", "cs",
+                   "java", "py", "js", "bas", "asm", "bat", "sql"}
+DJVU_PAGE_WIDTH = 1400
+_CACHE_LOCKS: dict[str, threading.Lock] = {}
+_CACHE_LOCKS_GUARD = threading.Lock()
+
+
+def cache_lock(key: str) -> threading.Lock:
+    """Одна конвертация на ключ: параллельные запросы той же книги ждут готовый результат."""
+    with _CACHE_LOCKS_GUARD:
+        return _CACHE_LOCKS.setdefault(key, threading.Lock())
+
+
+def cache_key(book: sqlite3.Row) -> str:
+    """Ключ кэша меняется вместе с файлом (размер и mtime): устаревший результат не используется."""
+    return f"{book['id']}-{book['size']}-{int(book['mtime'])}"
+
+
+def cache_store(path: Path, data: bytes, limit_mb: int) -> None:
+    """Атомарная запись в кэш и удаление самых старых файлов сверх cache_mb."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=".cache.", dir=CACHE_DIR)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(data)
+    os.replace(tmp_name, path)
+    cache_prune(limit_mb)
+
+
+def cache_prune(limit_mb: int) -> None:
+    files = []
+    for item in CACHE_DIR.glob("*"):
+        if item.is_file() and not item.name.startswith("."):
+            stat = item.stat()
+            files.append((stat.st_atime, stat.st_size, item))
+    total = sum(size for _, size, _ in files)
+    for _, size, item in sorted(files):
+        if total <= limit_mb * 1024 * 1024:
+            break
+        item.unlink(missing_ok=True)
+        total -= size
+
+
+def pnm_to_png(data: bytes) -> bytes:
+    """PNM (P4/P5/P6, вывод ddjvu) → PNG средствами zlib: браузеры PNM не показывают."""
+    tokens: list[bytes] = []
+    pos = 0
+    needed = 3
+    while len(tokens) < needed + 1:
+        while pos < len(data) and data[pos:pos + 1].isspace():
+            pos += 1
+        if data[pos:pos + 1] == b"#":
+            pos = data.index(b"\n", pos) + 1
+            continue
+        start = pos
+        while pos < len(data) and not data[pos:pos + 1].isspace():
+            pos += 1
+        tokens.append(data[start:pos])
+        if tokens[0] == b"P4":
+            needed = 2
+    pos += 1  # один пробельный символ после заголовка
+    magic, width, height = tokens[0], int(tokens[1]), int(tokens[2])
+    if magic == b"P4":
+        row_len, depth, color = (width + 7) // 8, 1, 0
+        pixels = bytes(255 - b for b in data[pos:pos + row_len * height])  # в PNM 1 — чёрный, в PNG 0 — чёрный
+    elif magic in (b"P5", b"P6") and int(tokens[3]) <= 255:
+        channels = 1 if magic == b"P5" else 3
+        row_len, depth, color = width * channels, 8, 0 if channels == 1 else 2
+        pixels = data[pos:pos + row_len * height]
+    else:
+        raise ValueError(f"неподдерживаемый PNM {magic!r}")
+    if len(pixels) < row_len * height:
+        raise ValueError("обрезанный PNM")
+    raw = b"".join(b"\x00" + pixels[i * row_len:(i + 1) * row_len] for i in range(height))
+
+    def chunk(kind: bytes, body: bytes) -> bytes:
+        return len(body).to_bytes(4, "big") + kind + body + zlib.crc32(kind + body).to_bytes(4, "big")
+
+    header = width.to_bytes(4, "big") + height.to_bytes(4, "big") + bytes([depth, color, 0, 0, 0])
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b"")
+
+
+def djvu_page_count(path: Path, timeout: int) -> int:
+    done = subprocess.run(["djvused", "-e", "n", str(path)], capture_output=True, timeout=timeout, check=False,
+                          stdin=subprocess.DEVNULL)
+    count = done.stdout.decode("ascii", errors="replace").strip()
+    if done.returncode != 0 or not count.isdigit() or int(count) < 1:
+        raise ValueError(f"djvused: {done.stderr.decode('utf-8', errors='replace')[-200:] or 'нет страниц'}")
+    return int(count)
+
+
+def djvu_page_png(cfg: dict[str, Any], book: sqlite3.Row, path: Path, page: int) -> bytes:
+    """Страница DjVu картинкой (ddjvu → PNM → PNG) с кэшированием."""
+    target = CACHE_DIR / f"djvu-{cache_key(book)}-p{page}-w{DJVU_PAGE_WIDTH}.png"
+    with cache_lock(target.name):
+        if target.is_file():
+            os.utime(target)
+            return target.read_bytes()
+        done = subprocess.run(["ddjvu", "-format=pnm", f"-page={page}", f"-size={DJVU_PAGE_WIDTH}x{DJVU_PAGE_WIDTH * 3}",
+                               str(path), "-"], capture_output=True, timeout=cfg["convert_timeout"], check=False,
+                              stdin=subprocess.DEVNULL)
+        if done.returncode != 0 or not done.stdout:
+            raise ValueError(f"ddjvu: {done.stderr.decode('utf-8', errors='replace')[-200:]}")
+        png = pnm_to_png(done.stdout)
+        cache_store(target, png, cfg["cache_mb"])
+        return png
+
+
+def djvu_page_text(path: Path, page: int, timeout: int) -> str:
+    done = subprocess.run(["djvutxt", f"--page={page}", str(path)], capture_output=True, timeout=timeout, check=False,
+                          stdin=subprocess.DEVNULL)
+    return done.stdout.decode("utf-8", errors="replace") if done.returncode == 0 else ""
+
+
+def unwrap_book(cfg: dict[str, Any], book: sqlite3.Row, raw: Path) -> Path:
+    """Книга однокнижного zip для просмотра: распаковка в cache/ (пределы reader_max_mb и cache_mb, защита от бомб).
+
+    Имя файла в кэше — из id/размера/mtime и формата из БД (только известные расширения), не из архива.
+    """
+    if book["fmt"] not in INNER_EXTENSIONS:
+        raise ValueError(f"неизвестный формат {book['fmt']!r}")
+    target = CACHE_DIR / f"unzip-{cache_key(book)}.{book['fmt']}"
+    with cache_lock(target.name):
+        if target.is_file():
+            os.utime(target)
+            return target
+        with zipfile.ZipFile(raw) as archive:
+            inner = single_member(archive)
+            if inner is None or member_ext(inner) != book["fmt"]:
+                raise ValueError("архив изменился после сканирования")
+            data = read_member(archive, inner, cfg["reader_max_mb"] * 1024 * 1024)
+        cache_store(target, data, cfg["cache_mb"])
+        return target
+
+
+def calibre_epub(cfg: dict[str, Any], book: sqlite3.Row, path: Path, create: bool = True) -> Path | None:
+    """EPUB для просмотра MOBI/AZW/AZW3/DOC/DOCX/RTF/ODT/CHM: ebook-convert (Calibre) один раз, затем из кэша.
+
+    Calibre работает во временном каталоге со своими каталогами настроек и кэша: в песочнице службы домашний
+    каталог только для чтения. Результат проверяется так же, как у convert (verify_book).
+    """
+    target = CACHE_DIR / f"calibre-{cache_key(book)}.epub"
+    with cache_lock(target.name):
+        if target.is_file():
+            os.utime(target)
+            return target
+        if not create:
+            return None
+        if not shutil.which("ebook-convert"):
+            raise ValueError("не найден ebook-convert (Calibre)")
+        with tempfile.TemporaryDirectory(prefix="books_library-view-") as tmp_name:
+            tmp = Path(tmp_name)
+            staged = tmp / f"book.{book['fmt']}"
+            shutil.copyfile(path, staged)
+            env = {**os.environ, "HOME": str(tmp), "CALIBRE_CONFIG_DIRECTORY": str(tmp / "config"),
+                   "CALIBRE_CACHE_DIRECTORY": str(tmp / "cache"), "CALIBRE_TEMP_DIR": str(tmp / "temp"),
+                   "XDG_CACHE_HOME": str(tmp / "xdg"), "QT_QPA_PLATFORM": "offscreen"}
+            for sub in ("config", "cache", "temp", "xdg"):
+                (tmp / sub).mkdir()
+            result = tmp / "book.epub"
+            try:
+                done = subprocess.run(["ebook-convert", str(staged), str(result)], capture_output=True, env=env, cwd=tmp,
+                                      timeout=cfg["convert_timeout"], check=False, stdin=subprocess.DEVNULL)
+            except subprocess.TimeoutExpired as error:
+                raise ValueError(f"ebook-convert: тайм-аут {cfg['convert_timeout']} с") from error
+            if done.returncode != 0 or not result.is_file():
+                raise ValueError(f"ebook-convert: {done.stderr.decode('utf-8', errors='replace')[-300:] or done.returncode}")
+            problem = verify_book(result, "epub")
+            if problem:
+                raise ValueError(f"ebook-convert: {problem}")
+            cache_store(target, result.read_bytes(), cfg["cache_mb"])
+        return target
+
+
+# ======================================================================
 # Веб-интерфейс
 # ======================================================================
 
@@ -1598,11 +2585,14 @@ def set_shelves(conn: sqlite3.Connection, path: str, shelf_ids: list[int]) -> No
 
 def book_json(row: sqlite3.Row) -> dict[str, Any]:
     data = {k: row[k] for k in row.keys() if k not in ("mtime",)}  # noqa: SIM118 — у sqlite3.Row нет __iter__ по ключам
+    data["path"] = display_path(row["path"], row["fmt"])
     data["authors"] = [a for a in row["authors"].split("; ") if a]
     data["genres"] = [g for g in row["genres"].split("; ") if g]
     data["cover"] = bool(row["cover"])
     data["links"] = {"page": f"/book/{row['id']}", "file": f"/file/{row['id']}", "read": f"/read/{row['id']}",
                      "cover": f"/cover/{row['id']}" if row["cover"] else None}
+    if is_wrapped(row["path"], row["fmt"]):
+        data["links"]["raw"] = f"/api/books/{row['id']}/file"  # исходный однокнижный архив — только через API
     return data
 
 
@@ -1698,11 +2688,22 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return conn.execute("SELECT * FROM books WHERE id=?", (int(raw_id),)).fetchone()
 
-    def book_path(self, book: sqlite3.Row) -> Path | None:
-        """Полный путь книги с проверкой, что он внутри каталога книг (защита от обхода каталогов)."""
+    def raw_path(self, book: sqlite3.Row) -> Path | None:
+        """Полный путь файла книги с проверкой, что он внутри каталога книг (защита от обхода каталогов)."""
         root = Path(self.cfg["books_dir"]).resolve()
         full = (root / book["path"]).resolve()
         return full if full.is_relative_to(root) and full.is_file() else None
+
+    def book_path(self, book: sqlite3.Row) -> Path | None:
+        """Файл книги для просмотра: у однокнижного zip — распакованная копия в кэше."""
+        full = self.raw_path(book)
+        if full is None or not is_wrapped(book["path"], book["fmt"]):
+            return full
+        try:
+            return unwrap_book(self.cfg, book, full)
+        except (OSError, ValueError, KeyError, zipfile.BadZipFile, EOFError) as error:
+            say(f"не распакован {book['path']}", "unwrap_error", logging.WARNING, detail=str(error))
+            return None
 
     # ---- маршрутизация ---------------------------------------------
     def do_HEAD(self) -> None:  # noqa: N802 — имя задано http.server
@@ -1757,7 +2758,8 @@ class Handler(BaseHTTPRequestHandler):
         route = (method, parts[0] if parts else "")
         handlers: dict[tuple[str, str], Callable[[list[str]], None]] = {
             ("GET", ""): self.view_search, ("GET", "book"): self.view_book, ("GET", "read"): self.view_read,
-            ("GET", "file"): self.view_file, ("GET", "cover"): self.view_cover, ("GET", "res"): self.view_res,
+            ("GET", "file"): self.view_file, ("GET", "cover"): self.view_cover, ("GET", "res"): self.view_res, ("GET", "page"): self.view_djvu_page,
+            ("GET", "zip"): self.view_zip,
             ("GET", "authors"): self.view_authors, ("GET", "sections"): self.view_sections, ("GET", "series"): self.view_series, ("GET", "genres"): self.view_genres,
             ("GET", "browse"): self.view_browse, ("GET", "shelves"): self.view_shelves, ("GET", "recent"): self.view_recent,
             ("GET", "stats"): self.view_stats, ("GET", "opds"): self.view_opds, ("GET", "app.js"): self.view_js,
@@ -1951,13 +2953,15 @@ class Handler(BaseHTTPRequestHandler):
             ids = {}
             for start in range(0, len(files), 500):
                 chunk = files[start:start + 500]
-                ids.update(conn.execute(f"SELECT path, id FROM books WHERE path IN ({','.join('?' * len(chunk))})", chunk).fetchall())
+                ids.update((r[0], (r[1], r[2])) for r in
+                           conn.execute(f"SELECT path, id, fmt FROM books WHERE path IN ({','.join('?' * len(chunk))})", chunk))
         crumbs, acc = ['<a href="/browse">Книги</a>'], []
         for piece in PurePosixPath(base).parts:
             acc.append(piece)
             crumbs.append(f'<a href="/browse?dir={quote("/".join(acc))}">{e(piece)}</a>')
         dir_links = "".join(f'<a href="/browse?dir={quote(f"{base}/{d}" if base else d)}">📁 {e(d)}</a>' for d in dirs)
-        file_links = "".join(f'<a href="/book/{ids[f]}">{e(PurePosixPath(f).name)}</a>' for f in files if f in ids)
+        file_links = "".join(f'<a href="/book/{ids[f][0]}">{e(PurePosixPath(display_path(f, ids[f][1])).name)}</a>'
+                             for f in files if f in ids)
         more = f' · <a href="/?dir={quote(base)}">книги папки поиском</a>' if base else ""
         self.page(base or "Папки", f'<h2>{" / ".join(crumbs)}</h2><p class="mut">Папок {len(dirs)}, книг {len(ids)}{more}</p>'
                                    f'<div class="cols">{dir_links}{file_links}</div>')
@@ -2014,10 +3018,12 @@ class Handler(BaseHTTPRequestHandler):
         genres = " ".join(f'<a class="tag" href="/?genre={quote(g)}">{e(genre_name(g))}</a>' for g in book["genres"].split("; ") if g)
         series = (f'<p>Серия: <a href="/?series={quote(book["series"])}&sort=series">{e(book["series"])}</a>'
                   f'{" #" + str(book["series_no"]) if book["series_no"] else ""}</p>') if book["series"] else ""
-        readable = book["fmt"] in {"fb2", "fb2.zip", "epub", "txt"}
-        actions = [f'<a href="/read/{bid}"><b>Читать</b></a>'] if readable else []
         if book["fmt"] == "pdf":
-            actions.append(f'<a href="/file/{bid}?inline=1"><b>Открыть PDF</b></a>')
+            actions = [f'<a href="/file/{bid}?inline=1"><b>Открыть PDF</b></a>']
+        elif book["fmt"] == "zip":
+            actions = [f'<a href="/read/{bid}"><b>Содержимое архива</b></a>']
+        else:
+            actions = [f'<a href="/read/{bid}"><b>Читать</b></a>']
         actions.append(f'<a href="/file/{bid}">Скачать ({human_size(book["size"])})</a>')
         folder = str(PurePosixPath(book["path"]).parent)
         actions.append(f'<a href="/browse?dir={quote(folder if folder != "." else "")}">Папка</a>')
@@ -2030,12 +3036,14 @@ class Handler(BaseHTTPRequestHandler):
                               f'{e(s["name"])}</label> ' for s in shelves)
         progress = ""
         if mark and mark["progress"]:
-            progress = (f' · глава {int(mark["progress"]) + 1}' if book["fmt"] == "epub"
+            progress = (f' · {"страница" if book["fmt"] == "djvu" else "глава"} {int(mark["progress"]) + 1}'
+                        if book["fmt"] in PAGED_FORMATS
                         else f' · прочитано {mark["progress"] * 100:.0f} %')
         cover = f'<img src="/cover/{bid}" alt="Обложка">' if book["cover"] else ""
         annotation = "".join(f"<p>{e(p)}</p>" for p in book["annotation"].split("\n") if p)
         body = (f'<div class="book">{cover}<div class="info"><h2>{e(book["title"])}</h2><p>{authors}</p>{series}<p>{genres}</p>'
-                f'<p class="mut">{e(book["fmt"])} · {e(book["lang"])} · {e(book["year"])}{progress}<br>{e(book["path"])}</p>'
+                f'<p class="mut">{e(book["fmt"])} · {e(book["lang"])} · {e(book["year"])}{progress}<br>'
+                f'{e(display_path(book["path"], book["fmt"]))}</p>'
                 f'<p>{" · ".join(actions)}</p>{annotation}'
                 f'<form method="post" action="/book/{bid}/mark"><p><select name="status">{status_opts}</select> '
                 f'<select name="rating">{rating_opts}</select> <label><input type="checkbox" name="favorite" value="1"'
@@ -2116,12 +3124,15 @@ class Handler(BaseHTTPRequestHandler):
                 with conn:
                     conn.execute("INSERT INTO marks(path, progress, updated) VALUES (?,?,?) ON CONFLICT(path) DO UPDATE SET "
                                  "progress=excluded.progress, updated=excluded.updated",
-                                 (book["path"], chapter + progress if book["fmt"] == "epub" else progress, time.time()))
+                                 (book["path"], chapter + progress if book["fmt"] in PAGED_FORMATS else progress, time.time()))
         self.send_body(b"ok", "text/plain")
 
     # ---- JSON API ---------------------------------------------------
     def api_get(self, parts: list[str]) -> None:
         name = parts[0] if parts else ""
+        if name == "books" and len(parts) == 3 and parts[2] == "file":
+            self.view_file([parts[1]], raw=True)
+            return
         if not name:
             self.send_json({"endpoints": API_HELP})
             return
@@ -2242,27 +3253,46 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": str(error)}, HTTPStatus.CONFLICT)
 
     # ---- файлы, обложки, чтение -----------------------------------
-    def view_file(self, parts: list[str]) -> None:
+    def view_file(self, parts: list[str], raw: bool = False) -> None:
+        """Файл книги. Однокнижный zip отдаётся распакованным потоком (name.ext); raw — исходный файл (только API)."""
         with closing(self.db()) as conn:
             book = self.book_or_404(conn, parts[0] if parts else "")
-        full = self.book_path(book) if book else None
+        full = self.raw_path(book) if book else None
         if not full:
             self.error_page(HTTPStatus.NOT_FOUND, "Файл не найден")
             return
         inline = self.query.get("inline") == "1" and book["fmt"] == "pdf"
         ctype = "application/pdf" if inline else "application/octet-stream"
         disposition = "inline" if inline else "attachment"
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(full.stat().st_size))
-        self.send_header("Content-Disposition", f"{disposition}; filename*=UTF-8''{quote(full.name)}")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.end_headers()
-        if self.command == "HEAD":
-            return
-        with full.open("rb") as handle:
-            while chunk := handle.read(1024 * 1024):
-                self.wfile.write(chunk)
+        with ExitStack() as stack:
+            if is_wrapped(book["path"], book["fmt"]) and not raw:
+                try:
+                    archive = stack.enter_context(zipfile.ZipFile(full))
+                    inner = single_member(archive)
+                    if inner is None or member_ext(inner) != book["fmt"] or \
+                            (inner.file_size > 1024 * 1024 and inner.file_size > ZIP_MAX_RATIO * max(inner.compress_size, 1)):
+                        raise ValueError("архив изменился или подозрителен")
+                    size, source = inner.file_size, stack.enter_context(archive.open(inner))
+                except (OSError, ValueError, zipfile.BadZipFile, EOFError) as error:
+                    self.error_page(HTTPStatus.UNPROCESSABLE_ENTITY, f"Архив не читается: {error}")
+                    return
+                name = PurePosixPath(display_path(book["path"], book["fmt"])).name
+            else:
+                size, source, name = full.stat().st_size, stack.enter_context(full.open("rb")), full.name
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition", f"{disposition}; filename*=UTF-8''{quote(name)}")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            if self.command == "HEAD":
+                return
+            try:
+                while chunk := source.read(1024 * 1024):
+                    self.wfile.write(chunk)
+            except (zipfile.BadZipFile, EOFError) as error:  # заголовки уже отправлены: только журнал и обрыв
+                say(f"обрыв выдачи {book['path']}", "stream_error", logging.WARNING, detail=str(error))
+                self.close_connection = True
 
     def send_image(self, found: tuple[str, bytes] | None) -> None:
         ctype = safe_image_type(*found[:1]) if found else None
@@ -2284,7 +3314,12 @@ class Handler(BaseHTTPRequestHandler):
                     head = re.search(rb"<(?:\w+:)?coverpage\b.*?href=[\"']#?([^\"']+)", raw[:FB2_HEAD_BYTES], re.S)
                     ref = head.group(1).decode("utf-8", errors="replace") if head else None
                 return fb2_binary(raw, ref) if ref else None
-            if book["fmt"] == "epub":
+            if book["fmt"] in CALIBRE_FORMATS:
+                converted = calibre_epub(self.cfg, book, full, create=False)  # обложку ради списка не конвертируем
+                if not converted:
+                    return None
+                full = converted
+            if book["fmt"] == "epub" or book["fmt"] in CALIBRE_FORMATS:
                 with zipfile.ZipFile(full) as archive:
                     epub = Epub(archive)
                     path = epub.cover_path() if ref is None else ref
@@ -2334,7 +3369,33 @@ class Handler(BaseHTTPRequestHandler):
                 text = decode_text(read_limited(full, limit))
                 blocks = re.split(r"\n\s*\n", text) if text.count("\n\n") > text.count("\n") / 10 else text.splitlines()
                 content = "".join(f"<p>{e(b.strip())}</p>" for b in blocks if b.strip())
-            elif fmt == "epub":
+            elif fmt == "djvu":
+                pages = djvu_page_count(full, self.cfg["convert_timeout"])
+                if self.query.get("page", "").isdigit():
+                    index, progress = int(self.query["page"]) - 1, 0.0
+                elif self.query.get("ch", "").isdigit():
+                    index, progress = int(self.query["ch"]), 0.0
+                else:
+                    index, progress = int(saved), saved - int(saved)
+                index = min(max(index, 0), pages - 1)
+                text = djvu_page_text(full, index + 1, self.cfg["convert_timeout"]).strip()
+                text_block = f"<details><summary>Текст страницы</summary><pre>{e(text)}</pre></details>" if text else ""
+                content = f'<p><img src="/page/{bid}/{index + 1}" alt="Страница {index + 1}"></p>{text_block}'
+                chapter = str(index)
+                prev_link = f'<a href="/read/{bid}?ch={index - 1}">← стр.</a>' if index > 0 else ""
+                next_link = f'<a href="/read/{bid}?ch={index + 1}">стр. →</a>' if index < pages - 1 else ""
+                jump = (f'<form class="s" action="/read/{bid}" style="display:inline"><input name="page" type="number" min="1" '
+                        f'max="{pages}" value="{index + 1}" style="width:5em"><button>перейти</button></form>')
+                chapter_nav = f"{prev_link} <span class='mut'>{index + 1}/{pages}</span> {next_link} {jump}"
+            elif fmt == "zip":
+                self.redirect(f"/zip/{bid}")
+                return
+            elif fmt == "epub" or fmt in CALIBRE_FORMATS:
+                if fmt in CALIBRE_FORMATS:
+                    converted = calibre_epub(self.cfg, book, full)
+                    if converted is None:
+                        raise ValueError("EPUB для просмотра не создан")
+                    full = converted
                 with zipfile.ZipFile(full) as archive:
                     epub = Epub(archive)
                     spine = epub.spine()
@@ -2359,7 +3420,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.redirect(f"/file/{bid}?inline=1" if fmt == "pdf" else f"/book/{bid}")
                 return
-        except (OSError, ValueError, KeyError, zipfile.BadZipFile, EOFError) as error:
+        except (OSError, ValueError, KeyError, zipfile.BadZipFile, EOFError, subprocess.TimeoutExpired) as error:
             self.error_page(HTTPStatus.UNPROCESSABLE_ENTITY, f"Книгу не удалось открыть в браузере: {error}. Скачайте файл.")
             return
         bar = (f'<div class="bar"><a href="/book/{bid}">← {e(book["title"])}</a> {chapter_nav} '
@@ -2367,6 +3428,76 @@ class Handler(BaseHTTPRequestHandler):
         body = (f'{bar}<article class="reader" data-id="{bid}" data-ch="{e(chapter)}" data-progress="{progress:.4f}">'
                 f'{content}</article>{bar if chapter_nav else ""}')
         self.page(book["title"], body)
+
+    def view_djvu_page(self, parts: list[str]) -> None:
+        """Картинка страницы DjVu: /page/<id>/<номер с 1>."""
+        with closing(self.db()) as conn:
+            book = self.book_or_404(conn, parts[0] if parts else "")
+        full = self.book_path(book) if book and book["fmt"] == "djvu" else None
+        if not full or len(parts) != 2 or not parts[1].isdigit() or int(parts[1]) < 1:
+            self.send_body(b"", "text/plain", HTTPStatus.NOT_FOUND)
+            return
+        try:
+            png = djvu_page_png(self.cfg, book, full, int(parts[1]))
+        except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+            say(f"страница DjVu не получена: {book['path']}", "djvu_error", logging.WARNING, detail=str(error))
+            self.send_body(b"", "text/plain", HTTPStatus.UNPROCESSABLE_ENTITY)
+            return
+        self.send_body(png, "image/png", headers={"Cache-Control": "max-age=86400"})
+
+    def view_zip(self, parts: list[str]) -> None:
+        """Содержимое ZIP: список файлов (/zip/<id>) и просмотр файла из архива (/zip/<id>?e=<имя>)."""
+        with closing(self.db()) as conn:
+            book = self.book_or_404(conn, parts[0] if parts else "")
+        full = self.book_path(book) if book and book["fmt"] in {"zip", "fb2.zip"} else None
+        if not full:
+            self.error_page(HTTPStatus.NOT_FOUND, "Архив не найден")
+            return
+        bid, entry = book["id"], self.query.get("e", "")
+        limit = self.cfg["reader_max_mb"] * 1024 * 1024
+        try:
+            with zipfile.ZipFile(full) as archive:
+                infos = [i for i in archive.infolist() if not i.is_dir()]
+                if not entry:
+                    rows = "".join(
+                        f'<tr><td><a href="/zip/{bid}?e={quote(i.filename)}">{e(i.filename)}</a></td>'
+                        f'<td class="mut">{human_size(i.file_size)}</td><td><a href="/zip/{bid}?e={quote(i.filename)}&dl=1">'
+                        f'скачать</a></td></tr>' for i in infos[:3000])
+                    more = f"<p class='mut'>Показаны первые 3000 из {len(infos)}.</p>" if len(infos) > 3000 else ""
+                    self.page(book["title"], f'<p><a href="/book/{bid}">← {e(book["title"])}</a></p><h2>Содержимое архива '
+                                             f'({len(infos)})</h2>{more}<div style="overflow-x:auto"><table>{rows}</table></div>')
+                    return
+                info = next((i for i in infos if i.filename == entry), None)
+                if info is None:
+                    self.error_page(HTTPStatus.NOT_FOUND, "Файла нет в архиве")
+                    return
+                data = zip_read(archive, info.filename, limit)
+        except (OSError, ValueError, KeyError, zipfile.BadZipFile, EOFError) as error:
+            self.error_page(HTTPStatus.UNPROCESSABLE_ENTITY, f"Архив не читается: {error}")
+            return
+        name = PurePosixPath(info.filename.replace("\\", "/")).name or "file"
+        ext = name.rpartition(".")[2].lower()
+        back = f'<div class="bar"><a href="/zip/{bid}">← содержимое архива</a> <span class="mut">{e(info.filename)}</span></div>'
+        if self.query.get("dl") == "1":
+            self.send_body(data, "application/octet-stream",
+                           headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(name)}"})
+        elif (ctype := safe_image_type("", name)) is not None:
+            self.send_body(data, ctype, headers={"Cache-Control": "max-age=86400"})
+        elif ext == "pdf":
+            self.send_body(data, "application/pdf", headers={"Content-Disposition": f"inline; filename*=UTF-8''{quote(name)}"})
+        elif ext == "fb2":
+            text = decode_xml(data)
+            start = max(text.find("<body"), 0)
+            end = text.find("<binary", start)
+            body = sanitize(text[start:end if end > 0 else None], lambda _ref: None, fb2=True)
+            self.page(name, f'{back}<article class="reader">{body}</article>')
+        elif ext in {"htm", "html", "xhtml"}:
+            self.page(name, f'{back}<article class="reader">{sanitize(decode_part(data, None), lambda _ref: None)}</article>')
+        elif ext in TEXT_EXTENSIONS or b"\x00" not in data[:4096]:
+            self.page(name, f'{back}<pre class="reader" style="white-space:pre-wrap">{e(decode_text(data))}</pre>')
+        else:
+            self.send_body(data, "application/octet-stream",
+                           headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(name)}"})
 
     # ---- OPDS для читалок -----------------------------------------
     def view_opds(self, _parts: list[str]) -> None:
@@ -2416,10 +3547,12 @@ def serve(cfg: dict[str, Any], dry_run: bool = False) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Лёгкая веб-библиотека книг: каталог в SQLite и интерфейс в браузере.")
-    parser.add_argument("command", nargs="?", choices=("serve", "scan", "fix-encoding", "unpack-fb2zip", "convert"),
-                        default="serve", help="serve (по умолчанию), scan, fix-encoding, unpack-fb2zip или convert")
+    parser.add_argument("command", nargs="?", choices=("serve", "scan", *FILE_CHANGING), default="serve",
+                        help="serve (по умолчанию), scan, fix-encoding, unpack-fb2zip, convert, dedup или zip-books")
     parser.add_argument("-p", "--path", help="fix-encoding/unpack-fb2zip/convert: каталог (по умолчанию каталог книг)")
-    parser.add_argument("--only", default="all", help="fix-encoding: all|fb2|txt; convert: all|doc|docx|rtf|odt|mht|mhtml")
+    parser.add_argument("--only", default="all",
+                        help="fix-encoding: all|fb2|txt; convert: all|fb2|doc|docx|rtf|odt|mht|mhtml (fb2 — в epub через Calibre)")
+    parser.add_argument("--workers", type=int, help="convert --only fb2, dedup, zip-books: потоков (по умолчанию workers из конфига)")
     parser.add_argument("--max-mb", type=int, default=200, help="unpack-fb2zip: предел размера записи, МБ")
     parser.add_argument("--to", choices=("epub", "fb2"), default="epub", help="convert: формат результата (по умолчанию epub)")
     parser.add_argument("--overwrite", action="store_true", help="convert: перезаписывать существующий результат")
@@ -2445,6 +3578,10 @@ def main(argv: list[str] | None = None) -> int:
                 raw = {"path": args.path, "only": args.only}
             if command == "unpack-fb2zip":
                 raw = {"path": args.path, "max_mb": args.max_mb}
+            elif command in ("dedup", "zip-books"):
+                raw = {"path": args.path, "workers": args.workers}
+            elif command == "convert" and args.only == "fb2":
+                raw.update(workers=args.workers)
             elif command == "convert":
                 raw.update(to=args.to, overwrite=args.overwrite, skip_newer=args.skip_newer, exclude=args.exclude,
                            author=args.author, title_mode=args.title_mode, toc=not args.no_toc, toc_depth=args.toc_depth,

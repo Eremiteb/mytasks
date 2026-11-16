@@ -386,7 +386,7 @@ journalctl --user -u check-backups.service -n 20
 3. Затем прописывает себя в автозагрузку: user-юнит `check-mytasks.service` при входе в графический сеанс запускает `check_mytasks.sh --no-create --notify` (таблица в журнале и уведомление о проблемах).
 4. Записывает каталог mytasks — каталог, откуда запущен скрипт, — в `conf/check_mytasks.conf` (`MYTASKS_DIR`). Если репозиторий перенесён и каталог в конфиге другой, предупреждает и предлагает обновить его, а затем и все юниты.
 5. При первом запуске (нет `conf/check_mytasks.conf`) проводит мастер всех отсутствующих конфигов по `conf/*.conf.example`, `music_downloader/*.json.example`, `utility_bills/*.json.example` и `books_library/*.json.example` (кроме `cloud_backup_qnap.conf`): окна `zenity` (без него — `kdialog`), без графики — вопросы в терминале. Описание каждого значения берётся из комментариев примера, значения по умолчанию — из примера с подстановкой `@MYTASKS_DIR@`/`@HOME@`. Строки примера без изменений копируются как есть (`${HOME}` и т.п. сохраняются).
-6. Проверяет зависимости (обязательные и необязательные) и ставит пакеты менеджером своего семейства одним запросом прав.
+6. Проверяет зависимости — все обязательные, ставятся без вопросов, в том числе с `--yes` (неприменимые к машине отсекают условия `family:`/`fs:`/`cmd:`) — и ставит пакеты менеджером своего семейства одним запросом прав.
 7. Проверяет задания и для каждого отсутствующего или неработающего выводит предупреждение с описанием и вопрос «создать?»: «да» — создаёт, «нет» — ничего не меняет и в этом запуске больше не спрашивает.
 
 Кнопки окон: **«Отмена»** относится только к текущему окну (конфиг не создаётся, поле остаётся со значением по умолчанию); **«Стоп»** (в терминале — ответ «стоп») прерывает весь процесс — дальше ничего не спрашивается и не меняется, уже сделанное остаётся, выводится итоговая таблица; продолжить — запустить скрипт снова. «Стоп» есть во всех окнах `zenity`; у `kdialog` — кнопкой в вопросах «да/нет» и пунктом «■ Стоп» в списках (в полях ввода kdialog третьей кнопки нет), поэтому `zenity` выбирается первым (`UI="kdialog"` — принудительно kdialog). Значения по умолчанию, которые можно определить на машине, мастер подставляет сам: `OS_FAMILY` — семейство по `/etc/os-release`, для `conf/llamactl.conf` — `CUDA_ARCH` (compute capability из `nvidia-smi`) и `BUILD_JOBS` (`nproc` − 2).
@@ -410,13 +410,13 @@ journalctl --user -u check-backups.service -n 20
 | `music-downloader.timer` | user-юнит | `music_downloader.sh` ежедневно в 21:00, пропущенный запуск — после загрузки |
 | `utility-bills.timer` | user-юнит | `utility_bills.sh` 20-го числа в 10:00, пропущенный запуск — после загрузки: квитанции ЖКУ из почты в SQLite |
 | `books-library.service` | user-юнит | `books_library/books_library.py serve` постоянно: веб-интерфейс библиотеки книг на 127.0.0.1:8090 |
-| `books-library-scan.timer` | user-юнит | `books_library/books_library.py scan` ежедневно в 04:30, пропущенный запуск — после загрузки: индексация каталога книг |
+| `books-library-scan.timer` | user-юнит | `books_library/books_library.py scan` ежедневно в 04:30 и через 10 мин после включения и каждой загрузки, пропущенный запуск — после загрузки: индексация каталога книг |
 | `btrfs-monitor.timer` | user-юнит | `btrfs_monitor.sh` в 00/06/12/18 ч, пропущенный — после загрузки (только если `/` на Btrfs) |
 | `getip.timer` | user-юнит | `getip.sh` через 2 мин после загрузки и каждые 30 мин |
 | `crontab` | старый cron | в crontab нет строк `music_downloader.sh`, `sources.sh`, `btrfs_monitor.sh`, `getip.sh`, `utility_bills.sh` (иначе — второй, параллельный запуск); исправление — удаление строк вместе с комментарием `# mytasks:` |
 | `conf/check_backups.conf`, `conf/sources.conf`, `music_downloader/music_downloader.json`, `utility_bills/utility_bills.json`, `books_library/books_library.json` | конфиг | создаются мастером |
 | `music_downloader/venv`, `utility_bills/venv` | venv | `music_downloader/setup_venv.sh`, `utility_bills/setup_venv.sh` |
-| `system_monitor/system_monitor.db`, `music_downloader/music_downloader.db`, `utility_bills/utility_bills.db`, `books_library/books_library.db` | база данных (`db`) | проверка — `<команда> --dry-run` (`system_monitor.sh --migrate-db`, `music_downloader.py --migrate-db`, `utility_bills.sh --migrate-db`, `python3 books_library/books_library.py --migrate-db`): строка `[dry-run] будет:` — база отсутствует или устарела (ВНИМАНИЕ), иначе OK со «схема vN»; исправление — `<команда>` от пользователя; нет исполняемого файла — ВНИМАНИЕ, при исправлении «не создана: нет …» |
+| `system_monitor/system_monitor.db`, `music_downloader/music_downloader.db`, `utility_bills/utility_bills.db`, `books_library/books_library.db` | база данных (`db`) | проверка — `<команда> --dry-run` (`system_monitor.sh --migrate-db`, `music_downloader.py --migrate-db`, `utility_bills.sh --migrate-db`, `books_library/books_library.py --migrate-db`): строка `[dry-run] будет:` — база отсутствует или устарела (ВНИМАНИЕ), иначе OK со «схема vN»; исправление — `<команда>` от пользователя; нет исполняемого файла — ВНИМАНИЕ, при исправлении «не создана: нет …» |
 | `llamactl`, `llamactl-tray`, `llamactl-tray.desktop`, `llama-server.service`, `llama-fim.service` | ссылки, автозапуск, сервисы | только если есть каталог `LLAMA_PREFIX` (из `conf/check_mytasks.conf`, иначе из `conf/llamactl.conf`, иначе `/opt/llama.cpp`) |
 
 Шаблоны юнитов и автозапуска лежат в `systemd/` (`systemd/*.service|timer` — системные, `systemd/user/` — пользовательские, `systemd/autostart/` — XDG autostart) и содержат плейсхолдер `@MYTASKS_DIR@`; установленный файл, отличающийся от отрисованного шаблона (старая версия или другой каталог), отмечается «отличается» и предлагается к обновлению. Порядок между заданиями задан `After=`: `sources.service` начинается после `music-downloader.service`, `check-backups.service` — после `sources.service` (действует и когда оба таймера догоняют пропуск сразу после загрузки). Таймеры включаются с `--now`, сервисы входа в сеанс — только `enable`.
@@ -943,7 +943,8 @@ SQLite `utility_bills/utility_bills.db` с представлениями для
 Домашняя библиотека книг `/mnt/copy/Books`: движок `books_library/books_library.py` (только
 стандартная библиотека Python, без venv и без обёртки). `scan` индексирует каталог в SQLite (FTS5)
 инкрементально, `serve` поднимает веб-интерфейс на `127.0.0.1:8090` (поиск, статусы чтения, читалка
-fb2/epub/txt, OPDS). Служебные режимы меняют файлы только с предварительным `-n` и JSON-отчётом в `books_library/reports/`:
+fb2/epub/txt, OPDS). Просмотр всех форматов каталога в браузере: DjVu постранично (`djvulibre`), прочие через
+EPUB (`calibre`, `ebook-convert`), ZIP — содержимое архива; кэш в `books_library/cache/`. Служебные режимы меняют файлы только с предварительным `-n` и JSON-отчётом в `books_library/reports/`:
 `fix-encoding` (кодировка fb2 и txt), `unpack-fb2zip` (распаковка fb2.zip), `convert` (DOC/DOCX/RTF/ODT и MHT/MHTML → EPUB;
 исходник удаляется только с `--delete-source` после проверки результата).
 
@@ -960,7 +961,7 @@ python3 books_library/books_library.py serve                         # веб-и
 `cp1251_to_utf8.sh` и `replace_encoding.sh` → `fix-encoding` (с проверкой содержимого); `mht_to_fb2.py` → `convert` (MHT/MHTML, по умолчанию EPUB; CHM не поддерживается).
 
 **Настройки:** `books_library/books_library.json` (каталог книг, база, адрес и порт, авторизация,
-`convert_timeout`). **Расписание и сервис:** `systemd/user/books-library-scan.timer` — ежедневно в 04:30,
+`convert_timeout`). **Расписание и сервис:** `systemd/user/books-library-scan.timer` — ежедневно в 04:30 и через 10 мин после включения и загрузки,
 `Persistent=true`; `systemd/user/books-library.service` — постоянный веб-сервер (ставит `check_mytasks.sh`).
 **JSON API** (`/api`): поиск, отметки, полки и фоновые задания; боевой запуск изменяющих режимов — только с `confirm` успешного dry-run (см. [README проекта](books_library/README.md#json-api)).
 **Логи:** `logs/books_library-*.jsonl`. Подробно — [README проекта](books_library/README.md), CI —
@@ -977,7 +978,7 @@ python3 books_library/books_library.py serve                         # веб-и
 | `btrfs_monitor.sh` | Bash, `btrfs`, `findmnt`, `awk`; опц.: `notify-send` |
 | `check-store-mount.sh` | Bash, `mountpoint`, `timeout`; опц.: `notify-send` |
 | `check_backups.sh` | Bash, `find`, `sort`, `timeout`; опц.: `notify-send`, `zstd`/`gzip`/`unzip`/`7z`/`tar` (проверка целостности) |
-| `check_mytasks.sh` | Bash, `systemctl`, `crontab`, `findmnt`, `pgrep`; опц.: `zenity`/`kdialog` (окна вопросов), `sudo -A`/`pkexec`, `notify-send`; пакеты — `pacman`/`apt-get`/`dnf`/`yum`/`rpm-ostree`/`zypper`/`apk`/`xbps-install`/`emerge`/`eopkg` |
+| `check_mytasks.sh` | Bash, `systemctl`, `crontab`, `findmnt`, `pgrep`; `zenity`/`kdialog` (окна вопросов), `sudo -A`/`pkexec`, `notify-send`; пакеты — `pacman`/`apt-get`/`dnf`/`yum`/`rpm-ostree`/`zypper`/`apk`/`xbps-install`/`emerge`/`eopkg` |
 | `cloud_backup_qnap.sh` | Entware Bash, `wireguard-go`, `ncat`, `xxd`, `ssh`; удалённо: `docker`, `tar`, `nc`, один из `zstd`/`pigz`/`gzip` |
 | `delete_by_ext.sh` | `find` |
 | `getip.sh` | `curl` |
@@ -985,7 +986,7 @@ python3 books_library/books_library.py serve                         # веб-и
 | `llamactl/llamactl.sh` | Bash, `python3` (статус через `llamactl_status.py`), `curl`, `jq`, `flock` (util-linux), `systemctl`, `journalctl`, `sudo -A` (askpass); опц.: `nvidia-smi`, `git`+`cmake`+CUDA (`update`), `sha256sum` (`add`) |
 | `llamactl/llamactl_status.py` | Python 3 (только стандартная библиотека), `systemctl`; опц.: драйвер NVIDIA (`libnvidia-ml.so.1`) или `nvidia-smi` |
 | `llamactl/llamactl_tray.py` | Python 3 + PyQt6, `llamactl_status.py`, `llamactl.sh`; опц.: `konsole`, `xdg-open` |
-| `books_library/books_library.py` | Python 3 (только стандартная библиотека, без venv); опц.: `pandoc` и LibreOffice (`convert`, в т. ч. MHT), `unrtf`, `antiword`, `catdoc`, `wvText` (запасные пути `convert`) |
+| `books_library/books_library.py` | Python 3 (только стандартная библиотека, без venv); `djvulibre` (`ddjvu`, `djvused`, `djvutxt`) и `calibre` (`ebook-convert`) — просмотр DjVu и прочих форматов в браузере; `pandoc` и LibreOffice (`convert`, в т. ч. MHT; ставит `check_mytasks.sh`), `unrtf`, `antiword`, `catdoc`, `wvText` (запасные пути `convert`) |
 | `lowercase_ext.sh` | Bash, `find`, `mv` |
 | `music_downloader.sh` | Bash, Python 3, локальный проект `music_downloader/`; после успеха — `split_by_dash.sh` |
 | `utility_bills.sh` | Bash, Python 3 (venv: numpy, pillow), `tesseract` с языками rus/kaz/eng, `pdfimages` (poppler) |
