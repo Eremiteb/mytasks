@@ -4,10 +4,10 @@
 
 ## Окружение и деплой
 
-- QNAP **192.168.88.99** — тот же хост, что отдаёт NFS `/mnt/store` (`192.168.88.99:/Public`, nfs4). `/mnt/store/tasks/` — рабочий каталог скрипта на QNAP; деплой — `cp -f`, без SSH.
+- QNAP (адрес — `~/.config/ai-context/machine-notes.md`) — тот же хост, что отдаёт NFS `/mnt/store` (`<QNAP>:/Public`, nfs4). `/mnt/store/tasks/` — рабочий каталог скрипта на QNAP; деплой — `cp -f`, без SSH.
 - SSH ассистента к QNAP:
-  - ключ `~/.ssh/id_ed25519_qnap` (с 2026-11-14, в `~/.ssh/config` для `192.168.88.99`), без парольной фразы, права 600;
-  - пароль `admin@192.168.88.99` через `ssh-askpass-gui` (вход по паролю оставлен включённым); окно на каждый вызов — независимые проверки объединять в одну SSH-команду.
+  - ключ `~/.ssh/id_ed25519_qnap` (с 2026-11-14, в `~/.ssh/config` для адреса QNAP), без парольной фразы, права 600;
+  - пароль учётной записи QNAP через `ssh-askpass-gui` (вход по паролю оставлен включённым); окно на каждый вызов — независимые проверки объединять в одну SSH-команду.
 - Публичный ключ — `/etc/config/ssh/authorized_keys` (700/600, постоянный том; `/root/.ssh` → `/etc/config/ssh`). `/share/homes/admin/.ssh` sshd не читает.
 - `admin` — uid 0, сеанс получает `HOME=/root` (не `/share/homes/admin`).
 - QNAP не добавлять как SSH-хост удалённой сессии Claude: её `/root/.claude/remote` переполняет корень (см. «Корень и `/root`»).
@@ -62,7 +62,7 @@
 - `_progress_monitor()`: тик 60 с; каждый 5-й — удалённые loadavg/mem и RTT (отдельное SSH + ping); каждый 10-й — локальные CPU+RAM+IO одним замером (`backup_resource_diag`), чтобы значения относились к одному моменту.
 - Средние (`avg_local_load1`, `avg_remote_load1`, `avg_rtt_ms`, `avg_io_util_pct`) и `network_test_mib_s` — в `backup_metrics`; по ним `probable_cause` в `backup_degradation` (в т.ч. `network_throughput_limit`). Порог — `BACKUP_DEGRADATION_MIBS_THRESHOLD` (4 МиБ/с).
 - Ориентир (сентябрь 2026): ~9 МиБ/с, 23–35 ГБ за 2600–3900 с; `io_util_pct` QNAP ~11–15 % — диск не узкое место.
-- Сжатие — `zstd -5 --threads=0` на удалённом сервере (`10.66.66.1`); QNAP принимает уже сжатый поток.
+- Сжатие — `zstd -5 --threads=0` на удалённом сервере (сервер esimych-cloud в туннеле WG); QNAP принимает уже сжатый поток.
 
 ## Raw TCP
 
@@ -74,7 +74,7 @@
 - Клиент на QNAP — цикл подключений (`RAW_TRANSFER_CONNECT_RETRIES`, 10 попыток по 2 с). Обрыв посреди потока не повторяется: листенера уже нет.
 - Обязательный опрос статус-файла на сервере (`RAW_TRANSFER_STATUS_POLL_RETRIES`): EOF у `nc` не доказывает, что `tar`/`zstd` не упали.
 - Фолбэк на SSH при `raw_transfer_nc_missing` или `raw_transfer_connect_exhausted` (WARN) безопасен: в `BACKUP_PATH` ещё ничего не записано. `detail` у `raw_transfer_connect_exhausted` — `remote_status=<rc|none>, remote_err=<stderr|none>`.
-- Правило фаервола: `ufw allow from 10.66.66.0/24 to any port 8873 proto tcp` в docker-томе `ufw_data:/etc/ufw` контейнера `esimych-cloud-fail2ban` (`network_mode: host`, `NET_ADMIN`); управлять только через `docker exec esimych-cloud-fail2ban ufw ...`. При пересборке сервера теряется вместе с томом.
+- Правило фаервола: `ufw allow from <сеть WG> to any port 8873 proto tcp` (`<сеть WG>` — значение в `~/.config/ai-context/machine-notes.md`) в docker-томе `ufw_data:/etc/ufw` контейнера `esimych-cloud-fail2ban` (`network_mode: host`, `NET_ADMIN`); управлять только через `docker exec esimych-cloud-fail2ban ufw ...`. При пересборке сервера теряется вместе с томом.
 - Диагностика по stderr `ncat` (`ncat_rc=1`):
   - `Ncat: TIMEOUT.` (`remote_status=none, remote_err=none`) — пакеты дропаются фаерволом: `docker exec esimych-cloud-fail2ban ufw show added | grep 8873`;
   - `Ncat: Connection refused.` — порт открыт, листенер не поднялся: смотреть rc и stderr упавшего `nc`/`tar` в `detail`.
@@ -82,8 +82,8 @@
 
 ## WireGuard и SSH к серверу
 
-- `REMOTE_HOST="10.66.66.1"` — адрес сервера в туннеле. `WG_ENDPOINT` (необязательный) заменяет `Endpoint` из `/opt/etc/wireguard/<WG_INTERFACE>.conf`; выбор — событие `wg_endpoint_selected`.
-- На сервере в `/etc/wireguard/wg0.conf` — оба пира: десктоп `10.66.66.2` и QNAP `10.66.66.3`.
+- `REMOTE_HOST="<сервер esimych-cloud в туннеле WG>"` — адрес сервера в туннеле (значение — `~/.config/ai-context/machine-notes.md`). `WG_ENDPOINT` (необязательный) заменяет `Endpoint` из `/opt/etc/wireguard/<WG_INTERFACE>.conf`; выбор — событие `wg_endpoint_selected`.
+- На сервере в `/etc/wireguard/wg0.conf` — оба пира: пир рабочего ПК и пир QNAP (адреса — `~/.config/ai-context/machine-notes.md`).
 - Туннель не поднимается, в логах сервера тишина, на QNAP `tx_bytes>0`, `rx_bytes=0` — проверить `[Peer].PublicKey` в конфиге QNAP: сервер молча отбрасывает handshake с неверным ключом (штатно для WG). Диагностика — `tcpdump` на сервере при ручном подъёме с QNAP.
 - Ключ QNAP (`admin@EsimychStore-1`) — в `authorized_keys` root на сервере.
 - После смены host key сервера `ssh_remote()` падает на каждом шаге, в т.ч. ложно как `network_speed_test_skip_no_nc`/`raw_transfer_nc_missing`. Новый отпечаток — сверять с десктопом и `ssh-keyscan`; старые записи — `ssh-keygen -R`.

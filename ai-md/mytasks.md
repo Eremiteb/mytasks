@@ -22,7 +22,7 @@
 
 - Сессии и чаты — только с `/home/esimych/esimych-docs/mytasks`.
 - Группа `tasks` (QNAP): каталог `/mnt/store/tasks` (NFS `/share/Public/tasks`) — боевая копия `cloud_backup_qnap.sh`, `conf/`, `logs/` (JSONL), `state/`. Исходник и git — `mytasks`: правки здесь, затем копия в `/mnt/store/tasks/cloud_backup_qnap.sh`. `conf/cloud_backup_qnap.conf` — только на QNAP, не в git. `/mnt/store/tasks` — не git-репозиторий.
-- esimych-cloud (`root@10.66.66.1:/opt/esimych-cloud`) — только по прямому указанию пользователя в текущем запросе: не подключаться для сверки, диагностики, открытых вопросов. Скрипты, работающие с сервером (`cloud_backup_qnap.sh`), правятся здесь как обычно.
+- esimych-cloud (`root@<сервер в туннеле WG>:/opt/esimych-cloud`, адрес — `~/.config/ai-context/machine-notes.md`) — только по прямому указанию пользователя в текущем запросе: не подключаться для сверки, диагностики, открытых вопросов. Скрипты, работающие с сервером (`cloud_backup_qnap.sh`), правятся здесь как обычно.
 
 ## Язык
 
