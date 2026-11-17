@@ -10,7 +10,9 @@ setup() {
   export MYTASKS_LOG_DIR="$TMP_DIR/logs"
   mkdir -p "$HOME/.claude" "$HOME/.codex" "$HOME/.gemini" "$TMP_DIR/conf" "$TMP_DIR/ai-md"
   cp "$REPO_ROOT/install_agent_skills.sh" "$TMP_DIR/"
-  cp "$REPO_ROOT/ai-md/AI.md" "$TMP_DIR/ai-md/"
+  cp "$REPO_ROOT/ai-md/AI.md" "$REPO_ROOT/ai-md/skills.md" "$REPO_ROOT/ai-md/projects.md" "$TMP_DIR/ai-md/"
+  mkdir -p "$TMP_DIR/ai-md/agents"
+  cp "$REPO_ROOT"/ai-md/agents/*.md "$TMP_DIR/ai-md/agents/"
   cp -r "$REPO_ROOT/agent-skills" "$TMP_DIR/"
   chmod +x "$TMP_DIR/install_agent_skills.sh"
 }
@@ -32,6 +34,7 @@ teardown() {
   [ ! -e "$HOME/.claude/skills" ]
   [ ! -e "$HOME/.claude/CLAUDE.md" ]
   [ ! -e "$HOME/.config/ai-context/AI.md" ]
+  [ ! -e "$HOME/.config/ai-context/agents" ]
   [[ "$output" == *"[dry-run] будет: подключить хук PreToolUse"* ]]
   [[ "$output" == *"[dry-run] будет: подключить хук UserPromptSubmit"* ]]
   [[ "$output" == *"[dry-run] будет: подключить хук BeforeTool"* ]]
@@ -126,7 +129,7 @@ EOF
   [[ "$output" == *'"hookEventName": "BeforeAgent"'* ]]
 }
 
-@test "--apply ставит навыки и AI.md, не создаёт файлы агентов, повторный запуск идемпотентен" {
+@test "--apply ставит навыки и индекс ai-md, не создаёт файлы агентов, повторный запуск идемпотентен" {
   run "$TMP_DIR/install_agent_skills.sh" --apply local
   [ "$status" -eq 0 ]
   [ -f "$HOME/.claude/skills/model-routing/SKILL.md" ]
@@ -138,6 +141,13 @@ EOF
     cmp "$base/music-library-merge/SKILL.md" "$TMP_DIR/agent-skills/music-library-merge/SKILL.md"
   done
   cmp "$HOME/.config/ai-context/AI.md" "$TMP_DIR/ai-md/AI.md"
+  cmp "$HOME/.config/ai-context/skills.md" "$TMP_DIR/ai-md/skills.md"
+  cmp "$HOME/.config/ai-context/projects.md" "$TMP_DIR/ai-md/projects.md"
+  for agent in claude codex gemini; do
+    cmp "$HOME/.config/ai-context/agents/$agent.md" "$TMP_DIR/ai-md/agents/$agent.md"
+  done
+  [ ! -e "$HOME/.config/ai-context/mytasks.md" ]
+  [ ! -e "$HOME/.config/ai-context/topics" ]
   [ ! -e "$HOME/.claude/CLAUDE.md" ]
   [ ! -e "$HOME/.codex/AGENTS.md" ]
   [ -f "$HOME/.gemini/settings.json" ]

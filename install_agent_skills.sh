@@ -93,7 +93,7 @@ Usage:
   ${SCRIPT_NAME} --dry-run [HOST...]
   ${SCRIPT_NAME} --apply   [HOST...]
 
-Доставляет AI.md и навыки model-routing, best-practices, infosec и music-library-merge для Claude Code,
+Доставляет индекс ai-md (AI.md, skills.md, projects.md, agents/*.md) и навыки model-routing, best-practices, infosec и music-library-merge для Claude Code,
 Codex и Gemini CLI на этом устройстве (local) и на удалённых хостах по ssh.
 Подключает нативные хуки проверки плана и напоминания: Claude Code
 (PreToolUse/UserPromptSubmit), Codex (PreToolUse/UserPromptSubmit) и Gemini CLI
@@ -115,12 +115,24 @@ encode_file() {
   base64 -w0 < "${file}"
 }
 
+# Файл индекса ai-md в base64 одной строкой (путь относительно ai-md/).
+encode_ai_doc() {
+  local file="${SCRIPT_DIR}/ai-md/$1"
+  [[ -r "${file}" ]] || { echo "Error: нет файла ${file}" >&2; exit 1; }
+  base64 -w0 < "${file}"
+}
+
 # Сценарий, который выполняется на целевом устройстве (stdin у bash -s).
 build_payload() {
-  local dry="$1" ai_doc claude_skill agents_skill plan_guard remind
+  local dry="$1" ai_doc doc_skills doc_projects doc_claude doc_codex doc_gemini
+  local claude_skill agents_skill plan_guard remind
   local bp_skill infosec_skill infosec_ref mlm_skill
-  [[ -r "${SCRIPT_DIR}/ai-md/AI.md" ]] || { echo "Error: нет файла ${SCRIPT_DIR}/ai-md/AI.md" >&2; exit 1; }
-  ai_doc="$(base64 -w0 < "${SCRIPT_DIR}/ai-md/AI.md")"
+  ai_doc="$(encode_ai_doc AI.md)"
+  doc_skills="$(encode_ai_doc skills.md)"
+  doc_projects="$(encode_ai_doc projects.md)"
+  doc_claude="$(encode_ai_doc agents/claude.md)"
+  doc_codex="$(encode_ai_doc agents/codex.md)"
+  doc_gemini="$(encode_ai_doc agents/gemini.md)"
   claude_skill="$(encode_file model-routing/claude.SKILL.md)"
   agents_skill="$(encode_file model-routing/agents.SKILL.md)"
   plan_guard="$(encode_file model-routing/plan-guard.py)"
@@ -129,8 +141,9 @@ build_payload() {
   infosec_skill="$(encode_file infosec/SKILL.md)"
   infosec_ref="$(encode_file infosec/reference.md)"
   mlm_skill="$(encode_file music-library-merge/SKILL.md)"
-  printf 'DRY=%s\nAI_DOC=%s\nCLAUDE_SKILL=%s\nAGENTS_SKILL=%s\nPLAN_GUARD=%s\nREMIND=%s\nBP_SKILL=%s\nINFOSEC_SKILL=%s\nINFOSEC_REF=%s\nMLM_SKILL=%s\n' \
-    "${dry}" "${ai_doc}" "${claude_skill}" "${agents_skill}" "${plan_guard}" "${remind}" \
+  printf 'DRY=%s\nAI_DOC=%s\nDOC_SKILLS=%s\nDOC_PROJECTS=%s\nDOC_CLAUDE=%s\nDOC_CODEX=%s\nDOC_GEMINI=%s\nCLAUDE_SKILL=%s\nAGENTS_SKILL=%s\nPLAN_GUARD=%s\nREMIND=%s\nBP_SKILL=%s\nINFOSEC_SKILL=%s\nINFOSEC_REF=%s\nMLM_SKILL=%s\n' \
+    "${dry}" "${ai_doc}" "${doc_skills}" "${doc_projects}" "${doc_claude}" "${doc_codex}" "${doc_gemini}" \
+    "${claude_skill}" "${agents_skill}" "${plan_guard}" "${remind}" \
     "${bp_skill}" "${infosec_skill}" "${infosec_ref}" "${mlm_skill}"
   cat <<'PAYLOAD'
 set -euo pipefail
@@ -225,7 +238,7 @@ if [ -d "$HOME/.claude" ]; then
     "python3 -I ${HOME}/.claude/hooks/model-routing-plan-guard.py" model-routing-plan-guard 10 \
     "Проверка меток модели в плане"
   hook "$HOME/.claude/settings.json" UserPromptSubmit "" \
-    "python3 -I ~/.claude/skills/model-routing/remind.py" model-routing/remind.py 5 ""
+    "python3 -I ~/.claude/skills/model-routing/remind.py claude" model-routing/remind.py 5 ""
 fi
 if [ -d "$HOME/.codex" ] || [ -d "$HOME/.gemini" ] || [ -d "$HOME/.agents" ]; then
   found=1
@@ -239,7 +252,7 @@ if [ -d "$HOME/.codex" ]; then
     "python3 -I ${HOME}/.codex/hooks/model-routing-plan-guard.py" model-routing-plan-guard 10 \
     "Проверка меток модели в плане"
   hook "$HOME/.codex/hooks.json" UserPromptSubmit "" \
-    "python3 -I ${HOME}/.codex/hooks/model-routing-remind.py" model-routing-remind 5 ""
+    "python3 -I ${HOME}/.codex/hooks/model-routing-remind.py codex" model-routing-remind 5 ""
 fi
 if [ -d "$HOME/.gemini" ]; then
   put "$HOME/.gemini/hooks/model-routing-plan-guard.py" "$PLAN_GUARD"
@@ -247,9 +260,16 @@ if [ -d "$HOME/.gemini" ]; then
   hook "$HOME/.gemini/settings.json" BeforeTool write_todos \
     "python3 -I ${HOME}/.gemini/hooks/model-routing-plan-guard.py" model-routing-plan-guard 10000 ""
   hook "$HOME/.gemini/settings.json" BeforeAgent "" \
-    "python3 -I ${HOME}/.gemini/hooks/model-routing-remind.py" model-routing-remind 5000 ""
+    "python3 -I ${HOME}/.gemini/hooks/model-routing-remind.py gemini" model-routing-remind 5000 ""
 fi
-if [ "$found" -eq 1 ]; then put "$HOME/.config/ai-context/AI.md" "$AI_DOC"; fi
+if [ "$found" -eq 1 ]; then
+  put "$HOME/.config/ai-context/AI.md" "$AI_DOC"
+  put "$HOME/.config/ai-context/skills.md" "$DOC_SKILLS"
+  put "$HOME/.config/ai-context/projects.md" "$DOC_PROJECTS"
+  put "$HOME/.config/ai-context/agents/claude.md" "$DOC_CLAUDE"
+  put "$HOME/.config/ai-context/agents/codex.md" "$DOC_CODEX"
+  put "$HOME/.config/ai-context/agents/gemini.md" "$DOC_GEMINI"
+fi
 if [ "$found" -eq 0 ]; then echo "[пропуск] нет ~/.claude, ~/.codex, ~/.gemini, ~/.agents"; fi
 PAYLOAD
 }

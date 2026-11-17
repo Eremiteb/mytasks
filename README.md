@@ -664,11 +664,11 @@ sudo ./hp_p1005_garuda.sh --all
 
 ### `install_agent_skills.sh`
 
-Копирует единый источник требований `ai-md/AI.md` в `~/.config/ai-context/AI.md` на выбранных хостах и устанавливает навыки `model-routing`, `best-practices`, `infosec`, `music-library-merge` для Claude Code, Codex и Gemini CLI. Глобальные и проектные `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` остаются короткими ссылками на `AI.md`; установщик их не меняет. Доставляется только `AI.md` с общими правилами; правила проекта (`ai-md/mytasks.md`) и справки по темам (`ai-md/topics/*.md`) нужны только внутри mytasks и читаются из репозитория.
+Копирует индекс требований `ai-md/` (`AI.md`, `skills.md`, `projects.md`, `agents/{claude,codex,gemini}.md`) в `~/.config/ai-context/` на выбранных хостах и устанавливает навыки `model-routing`, `best-practices`, `infosec`, `music-library-merge` для Claude Code, Codex и Gemini CLI. Глобальные и проектные `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` остаются короткими ссылками на `AI.md`; установщик их не меняет. Доставляется только индекс с общими правилами; правила проекта (`ai-md/mytasks.md`) и справки по темам (`ai-md/topics/*.md`) нужны только внутри mytasks и читаются из репозитория.
 
-Источники навыков и хуков — `agent-skills/model-routing/`, `agent-skills/best-practices/`, `agent-skills/infosec/` и `agent-skills/music-library-merge/`. Новые запрошенные навыки и хуки сначала регистрируются в `ai-md/AI.md`, для навыков проекта затем добавляются в установщик и тесты, для внешних пакетов — ставятся штатно без копирования в Git.
+Источники навыков и хуков — `agent-skills/model-routing/`, `agent-skills/best-practices/`, `agent-skills/infosec/` и `agent-skills/music-library-merge/`. Новые запрошенные навыки и хуки сначала регистрируются в `ai-md/skills.md`, для навыков проекта затем добавляются в установщик и тесты, для внешних пакетов — ставятся штатно без копирования в Git.
 
-Остальные пользовательские навыки (`graphify`, `perplexity-web-research`, `ponytail`, `security-best-practices`) ставятся нативно в пользовательские каталоги каждой платформы из доверенного источника; содержимое внешних пакетов в публичный репозиторий не копируется. Их назначение и порядок распространения описаны в `ai-md/AI.md`.
+Остальные пользовательские навыки (`graphify`, `perplexity-web-research`, `ponytail`, `security-best-practices`) ставятся нативно в пользовательские каталоги каждой платформы из доверенного источника; содержимое внешних пакетов в публичный репозиторий не копируется. Их назначение и порядок распространения описаны в `ai-md/skills.md`.
 
 Два поведения хуков ставятся всем доступным агентам: проверка меток модели у шагов плана и напоминание о `model-routing` перед каждым запросом. Claude Code использует `PreToolUse` (`mcp__ccd_turn__update_plan`, метки `[Haiku]`/`[Opus]`) и `UserPromptSubmit` в `~/.claude/settings.json`. Codex использует `PreToolUse` (`update_plan`) и `UserPromptSubmit` в `~/.codex/hooks.json`; после установки новые хуки нужно просмотреть и доверить им через `/hooks` или Settings → Hooks. Gemini CLI использует `BeforeTool` (`write_todos`) и `BeforeAgent` в `~/.gemini/settings.json`; эти хуки начнут работать после установки CLI.
 
@@ -682,7 +682,7 @@ sudo ./hp_p1005_garuda.sh --all
 - Хосты — массив `HOSTS` в `conf/install_agent_skills.conf` (шаблон `.example`): `local` — это устройство,
   остальные — имена из `~/.ssh/config` (вход по ключу, `BatchMode`). Недоступный хост пропускается, код 1.
 - `SKILLS_SRC_DIR` — каталог источников навыка, по умолчанию `agent-skills` рядом со скриптом.
-- Повторный запуск идемпотентен: копия AI.md и файлы навыков записываются атомарно, только если отличаются; файлы агентов не изменяются.
+- Повторный запуск идемпотентен: копии файлов индекса ai-md и файлы навыков записываются атомарно, только если отличаются; файлы агентов не изменяются.
 - Агент ставится там, где есть его каталог (`~/.claude`, `~/.codex`, `~/.gemini`, `~/.agents`).
 - Постоянно — `agent-skills-sync.timer` (задание `check_mytasks.sh`): через 6 мин после загрузки и раз в сутки.
 - Тесты — `tests/install_agent_skills.bats`.
