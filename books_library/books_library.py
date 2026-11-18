@@ -5287,7 +5287,7 @@ def unzip_books(cfg: dict[str, Any], dry_run: bool = False, path: str | None = N
 # unpack-collections и sort-underscore: книги из раздела сборников / служебных папок «_» — в папки авторов (только CLI; в веб и API не выведены)
 # ----------------------------------------------------------------------
 
-CLI_COMMANDS = ("unpack-collections", "merge-authors", "sort-underscore", "misplaced")
+CLI_COMMANDS = ("unpack-collections", "merge-authors", "sort-underscore", "misplaced", "purge-quarantine")
 COLLECTIONS_SECTION = "Сборники"  # section_name папки «_…» каталога книг: раздел сборников
 RELINK_BATCH = 1000  # пар переноса на один relink: при сбое связи и файлы расходятся не больше чем на пачку
 FOLDER_NAME_MAX = 120
@@ -6990,6 +6990,155 @@ def strip_suffix(cfg: dict[str, Any], dry_run: bool = False, path: str | None = 
     return run.finish({"walk_errors": walk_errors})
 
 
+# ----------------------------------------------------------------------
+# purge-quarantine: окончательное удаление папок карантина по причинам (только CLI; НЕОБРАТИМО, только по решению пользователя)
+# ----------------------------------------------------------------------
+
+PURGE_PROGRESS_SECONDS = 30
+
+
+class PurgeProgress:
+    """Прогресс удаления: файлов сделано из всех, скорость и ETA — не чаще PURGE_PROGRESS_SECONDS."""
+
+    def __init__(self, total: int) -> None:
+        self.total = max(total, 1)
+        self.done = 0
+        self.started = self.last = time.monotonic()
+
+    def advance(self) -> None:
+        self.done += 1
+        now = time.monotonic()
+        if now - self.last < PURGE_PROGRESS_SECONDS and self.done < self.total:
+            return
+        self.last = now
+        rate = self.done / max(now - self.started, 1e-6)
+        eta = (self.total - self.done) / rate / 60 if rate > 0 else 0.0
+        say(f"purge-quarantine: файлов {self.done}/{self.total} ({self.done * 100 // self.total} %), "
+            f"{rate:.1f} файлов/с, осталось ~{eta:.1f} мин", "progress")
+
+
+def purge_fail(stats: dict[str, int], message: str) -> None:
+    """Ошибка одной записи: счётчик errors и журнал, удаление продолжается."""
+    stats["errors"] += 1
+    say(f"purge-quarantine: {message}", "purge_error", logging.WARNING)
+
+
+def purge_inventory(qroot: Path, reason_dir: Path, errors: list[str]) -> list[tuple[str, int]]:
+    """Файлы и симлинки папки причины: (путь от quarantine_dir, размер). Симлинк — размер самой ссылки; каталоги по ссылкам не обходятся."""
+    items: list[tuple[str, int]] = []
+
+    def onerror(error: OSError) -> None:
+        errors.append(f"{error.filename}: {error.strerror}")
+
+    for current, dirs, files in os.walk(reason_dir, onerror=onerror, followlinks=False):
+        found = [Path(current) / name for name in files]
+        found += [Path(current) / name for name in dirs if os.path.islink(Path(current) / name)]
+        for full in found:
+            try:
+                size = full.lstat().st_size
+            except OSError as error:
+                errors.append(f"{full}: {error.strerror}")
+                size = 0
+            items.append((full.relative_to(qroot).as_posix(), size))
+    return items
+
+
+def purge_delete(reason_dir: Path, progress: PurgeProgress, stats: dict[str, int]) -> None:
+    """Удаление снизу вверх: файлы и симлинки — os.unlink (ссылка, не цель), каталоги — os.rmdir; затем сама папка причины."""
+    def onerror(error: OSError) -> None:
+        purge_fail(stats, f"обход {error.filename}: {error.strerror}")
+
+    for current, dirs, files in os.walk(reason_dir, topdown=False, onerror=onerror, followlinks=False):
+        for name in files:
+            full = os.path.join(current, name)
+            try:
+                size = os.lstat(full).st_size
+                os.unlink(full)
+            except OSError as error:
+                purge_fail(stats, f"не удалён файл {full}: {error.strerror}")
+                continue
+            stats["files"] += 1
+            stats["bytes"] += size
+            progress.advance()
+        for name in dirs:
+            full = os.path.join(current, name)
+            try:
+                if os.path.islink(full):
+                    size = os.lstat(full).st_size
+                    os.unlink(full)
+                    stats["files"] += 1
+                    stats["bytes"] += size
+                    progress.advance()
+                else:
+                    os.rmdir(full)
+                    stats["dirs"] += 1
+            except OSError as error:
+                purge_fail(stats, f"не удалён {full}: {error.strerror}")
+    try:
+        os.rmdir(reason_dir)
+        stats["dirs"] += 1
+    except OSError as error:
+        purge_fail(stats, f"не удалена папка причины {reason_dir}: {error.strerror}")
+
+
+def purge_quarantine(cfg: dict[str, Any], reasons: list[str], dry_run: bool) -> dict[str, Any]:
+    """Окончательное удаление папок карантина по причинам. Сначала инвентарь; в dry-run — только счётчики.
+    Боевой запуск: JSON-отчёт со всеми путями пишется ДО удаления, при сбое записи отчёта ничего не удаляется."""
+    qroot = Path(cfg["quarantine_dir"]).resolve()
+    inventory: dict[str, list[tuple[str, int]]] = {}
+    errors: list[str] = []
+    for reason in reasons:
+        if reason not in QUARANTINE_REASONS:
+            raise ConfigError(f"неизвестная причина карантина {reason!r}; допустимо: {', '.join(QUARANTINE_REASONS)}")
+        reason_dir = qroot / reason
+        if reason_dir.is_symlink():
+            raise ConfigError(f"{reason}: папка причины — симлинк, удаление отменено")
+        if not reason_dir.exists():
+            inventory[reason] = []
+            continue
+        if not reason_dir.is_dir():
+            raise ConfigError(f"{reason}: в карантине не каталог")
+        resolved = reason_dir.resolve()
+        if resolved == qroot or not resolved.is_relative_to(qroot):
+            raise ConfigError(f"{reason}: путь вне карантина: {resolved}")
+        inventory[reason] = purge_inventory(qroot, reason_dir, errors)
+
+    total = sum(len(items) for items in inventory.values())
+    size = sum(s for items in inventory.values() for _, s in items)
+    for reason, items in inventory.items():
+        say(f"purge-quarantine{' (dry-run)' if dry_run else ''}: {reason}: файлов {len(items)}, "
+            f"{sum(s for _, s in items)} байт", "purge_plan")
+    if dry_run:
+        say(f"purge-quarantine (dry-run): всего файлов {total}, {size} байт; ничего не удалено, отчёт не записан",
+            "purge_plan")
+        return {"files": total, "bytes": size, "dry_run": True}
+
+    data = {"quarantine_dir": str(qroot), "created": datetime.now().isoformat(timespec="seconds"),
+            "reasons": {reason: {"files": len(items), "bytes": sum(s for _, s in items),
+                                 "items": [{"path": p, "bytes": s} for p, s in items]}
+                        for reason, items in inventory.items()},
+            "inventory_errors": errors}
+    try:
+        report = write_report("purge-quarantine", data)
+    except OSError as error:
+        raise OSError(f"отчёт не записан, карантин не тронут: {error}") from error
+    say(f"purge-quarantine: отчёт {report}; к удалению файлов {total}, {size} байт", "purge_report")
+
+    progress = PurgeProgress(total)
+    stats = {"files": 0, "bytes": 0, "dirs": 0, "errors": 0}
+    for reason in inventory:
+        reason_dir = qroot / reason
+        if not reason_dir.exists():
+            continue
+        if reason_dir.is_symlink() or not reason_dir.is_dir():
+            purge_fail(stats, f"{reason}: папка причины изменилась после отчёта, пропущена")
+            continue
+        purge_delete(reason_dir, progress, stats)
+    say(f"purge-quarantine: готово, файлов {stats['files']}, каталогов {stats['dirs']}, байт {stats['bytes']}, "
+        f"ошибок {stats['errors']}", "purge_done")
+    return stats
+
+
 FILE_CHANGING = ("fix-encoding", "unpack-fb2zip", "convert", "dedup", "dedup-folders", "zip-books", "unzip-books",
                  "author-variants", "reconvert-fb2", "fix-misplaced", "merge-folder", "strip-suffix")
 COMMANDS = ("scan", "migrate", *FILE_CHANGING)
@@ -7012,7 +7161,7 @@ def command_params(command: str, raw: dict[str, Any]) -> dict[str, Any]:
         "author-variants": set(), "sort-underscore": {"limit"},
         "reconvert-fb2": {"path", "workers", "limit", "sample", "out", "epubcheck"},
         "misplaced": set(), "fix-misplaced": set(), "merge-folder": {"from", "to", "non_books_to_quarantine"},
-        "strip-suffix": {"path"},
+        "strip-suffix": {"path"}, "purge-quarantine": {"reasons"},
     }[command]
     unknown = set(raw) - allowed
     if unknown:
@@ -7089,6 +7238,15 @@ def command_params(command: str, raw: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(non_books, bool):
             raise ConfigError("non_books_to_quarantine: true или false")
         params.update(sources=list(sources), target=target, non_books_to_quarantine=non_books)
+    if command == "purge-quarantine":
+        reasons = raw.get("reasons")
+        if not isinstance(reasons, list) or not reasons or not all(isinstance(x, str) for x in reasons):
+            raise ConfigError("reasons: непустой список причин карантина (--reason)")
+        unknown = [x for x in reasons if x not in QUARANTINE_REASONS]
+        if unknown:
+            raise ConfigError(f"purge-quarantine: неизвестная причина {', '.join(unknown)}; "
+                              f"допустимо: {', '.join(QUARANTINE_REASONS)}")
+        params["reasons"] = list(dict.fromkeys(reasons))
     return params
 
 
@@ -7131,6 +7289,8 @@ def run_command(cfg: dict[str, Any], command: str, dry_run: bool, params: dict[s
                                 non_books_to_quarantine=params["non_books_to_quarantine"])
         if command == "strip-suffix":
             return strip_suffix(cfg, dry_run, params["path"], out=out)
+        if command == "purge-quarantine":
+            return purge_quarantine(cfg, params["reasons"], dry_run)
         if command == "reconvert-fb2":
             return reconvert_fb2(cfg, dry_run, params["path"], params["workers"], params["limit"], params["sample"],
                                  params["out"], params["epubcheck"], out=out)
@@ -7139,7 +7299,8 @@ def run_command(cfg: dict[str, Any], command: str, dry_run: bool, params: dict[s
         return convert_documents(cfg, dry_run, params["path"], out=out,
                                  **{k: v for k, v in params.items() if k not in ("path", "workers")})
 
-    if dry_run or command == "migrate":
+    # purge-quarantine — только CLI и без scan_lock (карантин не каталог книг); боевой запуск необратим.
+    if dry_run or command in ("migrate", "purge-quarantine"):
         return action()
     with scan_lock():
         return action()
@@ -9090,7 +9251,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("command", nargs="?", choices=("serve", "scan", *FILE_CHANGING, *CLI_COMMANDS), default="serve",
                         help="serve (по умолчанию), scan, fix-encoding, unpack-fb2zip, convert, reconvert-fb2, dedup, dedup-folders, "
                              "zip-books, unzip-books, unpack-collections, merge-authors, sort-underscore, author-variants, "
-                             "misplaced, fix-misplaced, merge-folder (--from A --to B) или strip-suffix")
+                             "misplaced, fix-misplaced, merge-folder (--from A --to B), strip-suffix или purge-quarantine (--reason R, необратимо)")
+    parser.add_argument("--reason", dest="reasons", action="append", default=[],
+                        help="purge-quarantine: причина карантина, папка которой удаляется окончательно (можно повторять): "
+                             + ", ".join(QUARANTINE_REASONS))
     parser.add_argument("-p", "--path", help="fix-encoding/unpack-fb2zip/convert/strip-suffix: каталог (по умолчанию каталог книг)")
     parser.add_argument("--from", dest="from_folders", action="append", default=[],
                         help="merge-folder: папка верхнего уровня или папка внутри «_…» (например «_Сборники/Серия/Автор»), "
@@ -9142,6 +9306,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--reparse применяется только к scan")
     if (args.multi or args.ignore_md5) and args.command != "unpack-fb2zip":
         parser.error("--multi и --ignore-md5 применяются только к unpack-fb2zip")
+    if args.reasons and args.command != "purge-quarantine":
+        parser.error("--reason применяется только к purge-quarantine")
     try:
         cfg = load_config(args.config)
         if args.migrate_db or args.command != "serve":
@@ -9167,6 +9333,8 @@ def main(argv: list[str] | None = None) -> int:
                 raw = {"from": args.from_folders, "to": args.to, "non_books_to_quarantine": args.non_books_to_quarantine}
             elif command == "strip-suffix":
                 raw = {"path": args.path}
+            elif command == "purge-quarantine":
+                raw = {"reasons": args.reasons}
             elif command == "scan":
                 raw = {"reparse": args.reparse}
             elif command == "convert" and args.only == "fb2":

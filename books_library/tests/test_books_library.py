@@ -3620,3 +3620,68 @@ def test_dedup_folders_keeps_native_epub_though_converted_is_larger(authors_cfg:
     assert result["duplicate"] == 1
     assert (folder / "Тёмный лес.epub").is_file()
     assert not (folder / "Тёмный лес (конверт).epub").exists()
+
+# ----------------------------------------------------------------------
+# purge-quarantine: окончательное удаление папок карантина по причинам (синтетика во временном карантине)
+# ----------------------------------------------------------------------
+
+def make_purge_tree(cfg: dict[str, Any], tmp_path: Path) -> tuple[Path, Path, Path]:
+    """duplicate/a (файл и симлинк на внешний файл) и replaced/b (файл); отчёты — во временном каталоге."""
+    qroot = Path(cfg["quarantine_dir"])
+    dup = qroot / "duplicate" / "a"
+    dup.mkdir(parents=True)
+    (dup / "x.fb2").write_bytes(b"12345")
+    (dup / "link").symlink_to(tmp_path / "outside.txt")
+    kept = qroot / "replaced" / "b"
+    kept.mkdir(parents=True)
+    (kept / "y.fb2").write_bytes(b"678")
+    (tmp_path / "outside.txt").write_bytes(b"keep")
+    return qroot, dup, kept
+
+
+def test_purge_quarantine_removes_one_reason_and_writes_report(cfg: dict[str, Any], tmp_path: Path,
+                                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    qroot, dup, kept = make_purge_tree(cfg, tmp_path)
+    params = bl.command_params("purge-quarantine", {"reasons": ["duplicate"]})
+    stats = bl.run_command(cfg, "purge-quarantine", False, params)
+    assert not (qroot / "duplicate").exists()
+    assert (kept / "y.fb2").read_bytes() == b"678"
+    assert (tmp_path / "outside.txt").read_bytes() == b"keep"  # симлинк удалён как ссылка, цель не тронута
+    assert stats["files"] == 2 and stats["errors"] == 0
+    report_file = next((tmp_path / "reports").glob("purge-quarantine-*.json"))
+    report = json.loads(report_file.read_text(encoding="utf-8"))
+    assert list(report["reasons"]) == ["duplicate"]
+    assert "duplicate/a/x.fb2" in [item["path"] for item in report["reasons"]["duplicate"]["items"]]
+
+
+def test_purge_quarantine_dry_run_deletes_nothing_and_writes_no_report(cfg: dict[str, Any], tmp_path: Path,
+                                                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    qroot, dup, _kept = make_purge_tree(cfg, tmp_path)
+    bl.run_command(cfg, "purge-quarantine", True, bl.command_params("purge-quarantine", {"reasons": ["duplicate"]}))
+    assert (dup / "x.fb2").read_bytes() == b"12345"
+    assert not (tmp_path / "reports").exists()
+
+
+def test_purge_quarantine_report_failure_deletes_nothing(cfg: dict[str, Any], tmp_path: Path,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken_report(kind: str, data: dict[str, Any]) -> Path:
+        raise OSError("отчёт недоступен")
+
+    monkeypatch.setattr(bl, "write_report", broken_report)
+    _qroot, dup, _kept = make_purge_tree(cfg, tmp_path)
+    params = bl.command_params("purge-quarantine", {"reasons": ["duplicate"]})
+    with pytest.raises(OSError):
+        bl.run_command(cfg, "purge-quarantine", False, params)
+    assert (dup / "x.fb2").read_bytes() == b"12345"
+
+
+def test_purge_quarantine_params_and_api_refusal(cfg: dict[str, Any]) -> None:
+    with pytest.raises(bl.ConfigError):
+        bl.command_params("purge-quarantine", {"reasons": ["unknown"]})
+    with pytest.raises(bl.ConfigError):
+        bl.command_params("purge-quarantine", {"reasons": []})
+    assert bl.command_params("purge-quarantine", {"reasons": ["duplicate", "duplicate"]}) == {"reasons": ["duplicate"]}
+    with pytest.raises(bl.ConfigError):
+        bl.start_job(cfg, "purge-quarantine", False, {"reasons": ["duplicate"]})
