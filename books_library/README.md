@@ -64,6 +64,7 @@ python3 books_library/books_library.py <режим> [ключи]
 | `--delete-source` | `convert`; `unpack-fb2zip --multi`: исходник (архив) в карантин `replaced/` после полной распаковки (без флага архив остаётся) |
 | `--to epub\|fb2` | `convert`: формат результата (по умолчанию EPUB — правило библиотеки); `merge-folder --to B`: папка автора верхнего уровня или путь внутри `_разобрать` |
 | `--from NAME` | `merge-folder`: папка верхнего уровня или путь внутри `_…` (`_Сборники/Серия/Автор`), которую склеить или переименовать; ключ можно повторять |
+| `--non-books-to-quarantine` | `merge-folder`: только с `--to` внутри `_разобрать`; файлы не книг уходят в карантин `not-book/` вместо переноса |
 | `--overwrite` | `convert`: перезаписывать существующий результат |
 | `--skip-newer` | `convert` с `--overwrite`: не трогать результат, который новее исходника |
 | `--allow-no-author` | `convert --only html`: конвертировать HTML без автора в `<title>`; название — весь `<title>` (или первый `<h2>`, если `<title>` пуст), имя «Название.epub», автор в epub не пишется |
@@ -141,6 +142,7 @@ python3 books_library/books_library.py serve                            # веб
 | `rejected-name` | имя длиннее 255 байт UTF-8 или недопустимо для NTFS (Syncthing, Windows); для `unzip-books` ещё имя с `..` или разделителем пути |
 | `replaced-calibre` | epub, собранный Calibre из fb2, до замены собственным конвертером `reconvert-fb2` (путь книги не меняется); `replaced-calibre/<путь в каталоге книг>` |
 | `unzipped` | однокнижный zip после распаковки `unzip-books` (книга уже лежит рядом; то же для двойника), путь `unzipped/<путь архива>`; карантин чистит пользователь |
+| `not-book` | файл не книга (не из набора форматов scan; html/htm тоже сюда): оглавление, картинка, служебный `.adb`/`.err`, css; `merge-folder --non-books-to-quarantine` при переносе остатка сборника в `_разобрать`, путь `not-book/<путь в каталоге книг>` |
 
 Перенос в карантин в `--dry-run` только записывается в журнал. Отметки и полки книги переносятся на новый путь
 (relink), если путь изменился (упаковка, замена, переименование).
@@ -437,7 +439,15 @@ python3 books_library/books_library.py merge-folder --from "_Сборники/С
 python3 books_library/books_library.py scan
 ```
 
-Журнал `reports/merge-folder-<время>.jsonl`: `rename`, `move`, `merge`, `error`; откат — по `from`/`to`.
+Журнал `reports/merge-folder-<время>.jsonl`: `rename`, `move`, `merge`, `error`, `not-book` (с `to` в карантине); откат — по `from`/`to`.
+
+`--non-books-to-quarantine` (только с `--to` внутри `_разобрать`): книги переносятся в B как обычно, а файлы, которые не книги
+(расширение не из набора scan, html/htm не считаются книгами), уходят в карантин `not-book/<путь в каталоге книг>`, а не в B.
+Счётчик `quarantined_not_book`; в `-n` ничего не переносится. Пример:
+
+```
+python3 books_library/books_library.py merge-folder --from "_Сборники/Серия/Иван Петров" --to "_разобрать/Серия" --non-books-to-quarantine -n
+```
 
 ### strip-suffix (только командная строка)
 

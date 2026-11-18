@@ -3029,6 +3029,53 @@ def test_merge_folder_dry_run_changes_nothing(tmp_path: Path, monkeypatch: pytes
     assert not (root / "Петров Иван").exists()
 
 
+NON_BOOK_FILES = {
+    "_Сборники/X/a.epub": b"not really epub",  # битый epub: scan оставляет книгу по пути, расширение решает
+    "_Сборники/X/index.html": "<html></html>",
+    "_Сборники/X/pic.gif": b"GIF89a",
+}
+
+
+def test_merge_folder_non_books_go_to_quarantine_not_book(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, NON_BOOK_FILES)
+    root = Path(cfg["books_dir"])
+
+    stats = bl.folder_merge(cfg, ["_Сборники/X"], "_разобрать/X", non_books_to_quarantine=True)
+
+    assert stats["moved"] == 1
+    assert stats["quarantined_not_book"] == 2
+    assert stats["not-book"] == 2
+    assert (root / "_разобрать" / "X" / "a.epub").is_file()
+    assert not (root / "_разобрать" / "X" / "index.html").exists()
+    assert not (root / "_разобрать" / "X" / "pic.gif").exists()
+    quarantine = Path(cfg["quarantine_dir"]) / "not-book" / "_Сборники" / "X"
+    assert (quarantine / "index.html").is_file()
+    assert (quarantine / "pic.gif").is_file()
+
+
+def test_merge_folder_non_books_dry_run_changes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, NON_BOOK_FILES)
+    root = Path(cfg["books_dir"])
+
+    stats = bl.folder_merge(cfg, ["_Сборники/X"], "_разобрать/X", dry_run=True, out=lambda _line: None,
+                            non_books_to_quarantine=True)
+
+    assert stats["quarantined_not_book"] == 2
+    assert (root / "_Сборники" / "X" / "a.epub").is_file()
+    assert (root / "_Сборники" / "X" / "index.html").is_file()
+    assert (root / "_Сборники" / "X" / "pic.gif").is_file()
+    assert not (root / "_разобрать").exists()
+    assert not (Path(cfg["quarantine_dir"]) / "not-book").exists()
+
+
+def test_merge_folder_non_books_flag_requires_razobrat_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {"Иван Петров/a.txt": "А.\n"})
+
+    with pytest.raises(bl.ConfigError):
+        bl.folder_merge(cfg, ["Иван Петров"], "Петров Иван", non_books_to_quarantine=True)
+    assert (Path(cfg["books_dir"]) / "Иван Петров" / "a.txt").is_file()
+
+
 def test_strip_suffix_renames_free_names_and_skips_conflicts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = merge_cfg(tmp_path, monkeypatch, {
         "Иванов Иван/A_1.txt": "А.\n",
@@ -3073,7 +3120,12 @@ def test_strip_suffix_dry_run_changes_nothing(tmp_path: Path, monkeypatch: pytes
 
 
 def test_command_params_merge_folder_and_strip_suffix() -> None:
-    assert bl.command_params("merge-folder", {"from": ["A"], "to": "B"}) == {"sources": ["A"], "target": "B"}
+    assert bl.command_params("merge-folder", {"from": ["A"], "to": "B"}) == {
+        "sources": ["A"], "target": "B", "non_books_to_quarantine": False}
+    assert bl.command_params("merge-folder", {"from": ["A"], "to": "_разобрать/X", "non_books_to_quarantine": True})[
+        "non_books_to_quarantine"] is True
+    with pytest.raises(bl.ConfigError):
+        bl.command_params("merge-folder", {"from": ["A"], "to": "B", "non_books_to_quarantine": "yes"})
     assert bl.command_params("strip-suffix", {"path": "Иванов Иван"}) == {"path": "Иванов Иван"}
     with pytest.raises(bl.ConfigError):
         bl.command_params("merge-folder", {"from": [], "to": "B"})

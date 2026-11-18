@@ -2226,7 +2226,7 @@ def convert_documents(cfg: dict[str, Any], dry_run: bool = False, path: str | No
 
 # Причины карантина: <quarantine_dir>/<причина>/<путь в каталоге книг>. Карантин не индексируется.
 QUARANTINE_REASONS = ("replaced", "duplicate", "edited", "rejected-convert", "rejected-zip", "rejected-encoding",
-                      "rejected-name", "unzipped", "replaced-calibre")
+                      "rejected-name", "unzipped", "replaced-calibre", "not-book")
 # Уже сжатые форматы кладутся в zip без сжатия: deflate их не уменьшит, только потратит процессор.
 STORED_EXTENSIONS = {"pdf", "djvu", "chm", "docx", "odt", "mobi", "azw", "azw3", "epub", "mp3", "jpg", "jpeg", "png",
                      "gif", "webp"}
@@ -5922,10 +5922,16 @@ def flush_relinks(db_path: str, pending: list[tuple[str, str]], force: bool = Fa
         pending.clear()
 
 
+def is_book_name(name: str) -> bool:
+    """Файл, который индексирует scan: расширение из BOOK_EXTENSIONS, не скрытый. html/htm сюда не входят (не книги)."""
+    return not name.startswith(".") and name.rpartition(".")[2].lower() in BOOK_EXTENSIONS
+
+
 def merge_folder(run: NightRun, db_path: str, root: Path, short: str, full: str, candidates: list[str],
-                 known: set[str], taken: set[Path], pending: list[tuple[str, str]]) -> None:
+                 known: set[str], taken: set[Path], pending: list[tuple[str, str]], non_books: bool = False) -> None:
     """Склейка: файлы и подпапки «короткой» папки — в «полную» (с тем же относительным путём, при конфликте имени —
-    unique_path); затем пустые папки короткой удаляются снизу вверх. Остатки не удаляются, а записываются ошибкой."""
+    unique_path); затем пустые папки короткой удаляются снизу вверх. Остатки не удаляются, а записываются ошибкой.
+    non_books: файлы, которые не книги, уходят в карантин not-book/ вместо переноса в «полную» папку."""
     dry_run = run.dry_run
     src_top, dst_top = root / short, root / full
     moved = 0
@@ -5941,6 +5947,16 @@ def merge_folder(run: NightRun, db_path: str, root: Path, short: str, full: str,
                 continue
         for name in files:
             src = Path(current) / name
+            if non_books and not is_book_name(name):
+                try:
+                    run.quarantine(src, "not-book")  # в dry-run только запись плана, файл на месте
+                except OSError as error:
+                    run.count("errors")
+                    journal_row(run, {"action": "error", "short": short, "full": full,
+                                      "from": src.relative_to(root).as_posix(), "error": str(error)})
+                else:
+                    run.count("quarantined_not_book")
+                continue
             dest = unique_path(target, name, taken)
             if dest.name != name:
                 run.count("conflicts")
@@ -6866,12 +6882,14 @@ def prepare_collections(cfg: dict[str, Any], dry_run: bool, out: Callable[[str],
 
 
 def folder_merge(cfg: dict[str, Any], sources: list[str], target: str, dry_run: bool = False,
-                 out: Callable[[str], None] = print) -> dict[str, Any]:
+                 out: Callable[[str], None] = print, non_books_to_quarantine: bool = False) -> dict[str, Any]:
     """merge-folder: папка A → B. A — папка верхнего уровня или папка внутри служебного раздела «_…» (--from
     «_Сборники/Серия/Автор»). B — папка автора верхнего уровня или путь внутри «_разобрать» (--to «_разобрать/Серия»),
     создаётся при отсутствии. Если B нет и A верхнего уровня — переименование A в B; иначе склейка (merge_folder: файлы
     и подпапки A переносятся в B с теми же относительными путями, конфликт имени — суффикс _1). Повторяемый --from —
-    несколько папок подряд. Связи и принадлежность к сборнику переносятся (relink). Журнал reports/merge-folder-*.jsonl."""
+    несколько папок подряд. Связи и принадлежность к сборнику переносятся (relink). Журнал reports/merge-folder-*.jsonl.
+    non_books_to_quarantine: только с --to внутри «_разобрать»; файлы не книг (не из BOOK_EXTENSIONS, в т. ч. html)
+    уходят в карантин not-book/ вместо переноса."""
     root = Path(cfg["books_dir"])
     db_path = cfg["db_path"]
     if not sources:
@@ -6896,6 +6914,8 @@ def folder_merge(cfg: dict[str, Any], sources: list[str], target: str, dry_run: 
             raise ConfigError("merge-folder: --from и --to совпадают или вложены друг в друга")
     if (root / target).exists() and not (root / target).is_dir():
         raise ConfigError(f"merge-folder: «{target}» есть, но это не папка")
+    if non_books_to_quarantine and "/" not in target:
+        raise ConfigError(f"merge-folder: --non-books-to-quarantine допустим только с --to внутри «{RAZOBRAT_SECTION}»")
     run = NightRun(cfg, "merge-folder", dry_run, None, out)
     prepare_collections(cfg, dry_run, out)
     target_exists = (root / target).is_dir()
@@ -6907,7 +6927,8 @@ def folder_merge(cfg: dict[str, Any], sources: list[str], target: str, dry_run: 
             continue
         if target_exists or "/" in name or "/" in target:  # вложенные — всегда склейка: переименовать верхний уровень нельзя
             known = {row["path"] for row in books_under(db_path, name)}
-            merge_folder(run, db_path, root, name, target, [target], known, taken, pending)
+            merge_folder(run, db_path, root, name, target, [target], known, taken, pending,
+                         non_books=non_books_to_quarantine)
         else:
             rename_folder(run, db_path, root, name, target, pending)
         target_exists = True  # дальше склейка: в dry-run — план, после переименования и склейки цель уже есть
@@ -6990,7 +7011,8 @@ def command_params(command: str, raw: dict[str, Any]) -> dict[str, Any]:
         "unzip-books": {"path", "workers"}, "unpack-collections": {"path"}, "merge-authors": set(),
         "author-variants": set(), "sort-underscore": {"limit"},
         "reconvert-fb2": {"path", "workers", "limit", "sample", "out", "epubcheck"},
-        "misplaced": set(), "fix-misplaced": set(), "merge-folder": {"from", "to"}, "strip-suffix": {"path"},
+        "misplaced": set(), "fix-misplaced": set(), "merge-folder": {"from", "to", "non_books_to_quarantine"},
+        "strip-suffix": {"path"},
     }[command]
     unknown = set(raw) - allowed
     if unknown:
@@ -7063,7 +7085,10 @@ def command_params(command: str, raw: dict[str, Any]) -> dict[str, Any]:
             raise ConfigError("from: список непустых имён папок")
         if not isinstance(target, str) or not target:
             raise ConfigError("to: имя папки")
-        params.update(sources=list(sources), target=target)
+        non_books = raw.get("non_books_to_quarantine", False)
+        if not isinstance(non_books, bool):
+            raise ConfigError("non_books_to_quarantine: true или false")
+        params.update(sources=list(sources), target=target, non_books_to_quarantine=non_books)
     return params
 
 
@@ -7102,7 +7127,8 @@ def run_command(cfg: dict[str, Any], command: str, dry_run: bool, params: dict[s
         if command == "fix-misplaced":
             return fix_misplaced(cfg, dry_run, out=out)
         if command == "merge-folder":
-            return folder_merge(cfg, params["sources"], params["target"], dry_run, out=out)
+            return folder_merge(cfg, params["sources"], params["target"], dry_run, out=out,
+                                non_books_to_quarantine=params["non_books_to_quarantine"])
         if command == "strip-suffix":
             return strip_suffix(cfg, dry_run, params["path"], out=out)
         if command == "reconvert-fb2":
@@ -9078,6 +9104,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--limit", type=int,
                         help="sort-underscore: не больше N книг; reconvert-fb2: не больше N сопоставленных книг")
     parser.add_argument("--to", help="convert: epub|fb2 (по умолчанию epub); merge-folder: папка автора или путь внутри «_разобрать»")
+    parser.add_argument("--non-books-to-quarantine", action="store_true",
+                        help="merge-folder: только с --to «_разобрать/…»; файлы не книг (оглавления, картинки, служебные) "
+                             "уходят в карантин not-book/, а не в папку назначения")
     parser.add_argument("--overwrite", action="store_true", help="convert: перезаписывать существующий результат")
     parser.add_argument("--skip-newer", action="store_true", help="convert: с --overwrite не трогать результат новее исходника")
     parser.add_argument("--allow-no-author", action="store_true",
@@ -9135,7 +9164,7 @@ def main(argv: list[str] | None = None) -> int:
             elif command in ("author-variants", "misplaced", "fix-misplaced"):
                 raw = {}
             elif command == "merge-folder":
-                raw = {"from": args.from_folders, "to": args.to}
+                raw = {"from": args.from_folders, "to": args.to, "non_books_to_quarantine": args.non_books_to_quarantine}
             elif command == "strip-suffix":
                 raw = {"path": args.path}
             elif command == "scan":
