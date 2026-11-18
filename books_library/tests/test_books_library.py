@@ -3772,3 +3772,105 @@ def test_series_from_folder_and_stop_words(tmp_path: Path) -> None:
     assert ("series_raw", "Рассказы") in meta_pairs(cfg, stop_folder_rel)
     assert rows[stop_desc_rel]["series"] == ""
     assert ("series_raw", "Рассказы") in meta_pairs(cfg, stop_desc_rel)
+
+
+# ----------------------------------------------------------------------
+# book_variants (схема v7): варианты из карантина сохраняются до удаления (синтетика во временном каталоге)
+# ----------------------------------------------------------------------
+
+def make_variant_tree(cfg: dict[str, Any]) -> Path:
+    """Библиотека: A/x.epub, B/y.epub, C/z.fb2. Карантин: duplicate/A/x.epub (dup_members: keeper A/x.epub),
+    replaced-calibre/B/y.epub, unzipped/C/z.fb2.zip (однокнижный архив с z.fb2 внутри)."""
+    library = Path(cfg["books_dir"])
+    for folder in ("A", "B", "C"):
+        (library / folder).mkdir()
+    make_epub(library / "A" / "x.epub")
+    make_epub(library / "B" / "y.epub")
+    (library / "C" / "z.fb2").write_bytes(make_fb2("Зелёная книга", "Иван", "Иванов"))
+    qroot = Path(cfg["quarantine_dir"])
+    (qroot / "duplicate" / "A").mkdir(parents=True)
+    make_epub(qroot / "duplicate" / "A" / "x.epub")
+    (qroot / "replaced-calibre" / "B").mkdir(parents=True)
+    make_epub(qroot / "replaced-calibre" / "B" / "y.epub")
+    (qroot / "unzipped" / "C").mkdir(parents=True)
+    with zipfile.ZipFile(qroot / "unzipped" / "C" / "z.fb2.zip", "w") as archive:
+        archive.writestr("z.fb2", make_fb2("Зелёная книга", "Иван", "Иванов"))
+    bl.scan(cfg)
+    with closing(bl.connect(cfg["db_path"])) as conn, conn:
+        group = conn.execute("INSERT INTO dup_groups(key, status, created) VALUES ('test', 'resolved', 0)").lastrowid
+        conn.execute("INSERT INTO dup_members(group_id, path, fmt, size, words, coverage, role, keeper, quarantine) "
+                     "VALUES (?,?,?,?,?,?,?,?,?)",
+                     (group, "A/x.epub", "epub", 10, 7, None, "duplicate", "A/x.epub",
+                      str(qroot / "duplicate" / "A" / "x.epub")))
+    return qroot
+
+
+def variant_rows(cfg: dict[str, Any]) -> dict[str, sqlite3.Row]:
+    with closing(bl.connect(cfg["db_path"])) as conn:
+        return {row["reason"]: row for row in conn.execute("SELECT * FROM book_variants")}
+
+
+VARIANT_PARAMS = {"reasons": ["duplicate", "replaced-calibre", "unzipped"]}
+
+
+def test_purge_writes_variants_with_keepers_then_deletes(cfg: dict[str, Any], tmp_path: Path,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    qroot = make_variant_tree(cfg)
+    bl.run_command(cfg, "purge-quarantine", False, bl.command_params("purge-quarantine", VARIANT_PARAMS))
+
+    rows = variant_rows(cfg)
+    assert set(rows) == {"duplicate", "replaced-calibre", "unzipped"}
+    assert rows["duplicate"]["variant_path"] == "duplicate/A/x.epub"
+    assert rows["duplicate"]["keeper"] == "A/x.epub"
+    assert rows["duplicate"]["words"] == 7  # из dup_members
+    assert rows["replaced-calibre"]["keeper"] == "B/y.epub"
+    assert rows["replaced-calibre"]["title"] == "Электронная книга"
+    assert rows["unzipped"]["variant_path"] == "unzipped/C/z.fb2.zip"
+    assert rows["unzipped"]["keeper"] == "C/z.fb2"  # распакованная книга — путь без .zip
+    assert rows["unzipped"]["fmt"] == "fb2"  # zip разобран как однокнижный архив
+    assert rows["unzipped"]["title"] == "Зелёная книга"
+    assert json.loads(rows["unzipped"]["meta"])["fmt"] == "fb2"
+    assert all(len(row["sha1"]) == 40 for row in rows.values())
+    assert all(row["removed"] is not None for row in rows.values())
+    assert not (qroot / "duplicate").exists()
+    assert not (qroot / "replaced-calibre").exists()
+    assert not (qroot / "unzipped").exists()
+
+
+def test_purge_keeps_files_when_variant_write_fails(cfg: dict[str, Any], tmp_path: Path,
+                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    qroot = make_variant_tree(cfg)
+    monkeypatch.setattr(bl, "VARIANT_INSERT", "INSERT INTO no_such_table VALUES (?)")
+    with pytest.raises(sqlite3.Error):
+        bl.run_command(cfg, "purge-quarantine", False, bl.command_params("purge-quarantine", VARIANT_PARAMS))
+    assert (qroot / "duplicate" / "A" / "x.epub").is_file()
+    assert (qroot / "unzipped" / "C" / "z.fb2.zip").is_file()
+    assert not (tmp_path / "reports").exists()  # отчёт не пишется до успешной записи вариантов
+    assert variant_rows(cfg) == {}
+
+
+def test_purge_dry_run_counts_variants_without_writing(cfg: dict[str, Any], tmp_path: Path,
+                                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    qroot = make_variant_tree(cfg)
+    stats = bl.run_command(cfg, "purge-quarantine", True, bl.command_params("purge-quarantine", VARIANT_PARAMS))
+    assert stats["variants"] == 3 and stats["variants_with_keeper"] == 3
+    assert (qroot / "duplicate" / "A" / "x.epub").is_file()
+    assert variant_rows(cfg) == {}
+
+
+def test_variant_card_shows_variants_of_kept_book(cfg: dict[str, Any], tmp_path: Path,
+                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    make_variant_tree(cfg)
+    bl.run_command(cfg, "purge-quarantine", False, bl.command_params("purge-quarantine", VARIANT_PARAMS))
+    for web in _serving(cfg, monkeypatch):
+        status, _headers, body = fetch(f"{web}/book/{book_id(cfg, 'C/z.fb2')}")
+        text = body.decode("utf-8")
+        assert status == 200
+        assert "<h3>Варианты</h3>" in text
+        assert "zip-архив" in text and "Зелёная книга" in text
+        status, _headers, body = fetch(f"{web}/book/{book_id(cfg, 'A/x.epub')}")
+        assert "дубль" in body.decode("utf-8")

@@ -300,12 +300,37 @@ MIGRATIONS: list[str] = [
         FROM book_collections bc JOIN books b ON b.path = bc.path
         GROUP BY bc.section, bc.collection, bc.subsection;
     """,
+    # v7: варианты книг из карантина. purge-quarantine до удаления сохраняет каждый файл причин duplicate,
+    # replaced-calibre, unzipped: keeper — путь книги библиотеки, вариантом которой был файл; removed — время удаления.
+    """
+    CREATE TABLE book_variants(
+        variant_path TEXT NOT NULL,      -- путь в карантине относительно quarantine_dir: причина/путь
+        reason TEXT NOT NULL,
+        keeper TEXT NOT NULL DEFAULT '', -- путь книги в библиотеке; '' — такой книги нет
+        fmt TEXT,
+        size INTEGER,
+        words INTEGER,
+        title TEXT,
+        authors TEXT,
+        series TEXT,
+        series_no INTEGER,
+        lang TEXT,
+        year TEXT,
+        meta TEXT NOT NULL DEFAULT '{}', -- JSON всех полей разбора (book_meta и детали)
+        sha1 TEXT,
+        removed REAL,                    -- время удаления файла; NULL — файл ещё в карантине
+        PRIMARY KEY(variant_path, reason)
+    ) WITHOUT ROWID;
+    CREATE INDEX book_variants_keeper ON book_variants(keeper);
+    """,
 ]
 DB_LATEST = len(MIGRATIONS)
 # Первая схема с book_collections и VIEW collections: новые запросы к ним — только при user_version >= этого значения.
 SCHEMA_COLLECTIONS = 4
 # Первая схема с book_meta и подразделами сборников (subsection, kind): новые запросы — только при user_version >= этого.
 SCHEMA_META = 6
+# Первая схема с book_variants: варианты книги в карточке и relink keeper — только при user_version >= этого.
+SCHEMA_VARIANTS = 7
 
 
 class ConfigError(Exception):
@@ -2517,6 +2542,8 @@ def relink(db_path: str, pairs: list[tuple[str, str]]) -> int:
                 conn.execute("DELETE FROM book_collections WHERE path=?", (old,))
                 conn.execute("UPDATE dup_members SET keeper=? WHERE keeper=?", (new, old))
                 conn.execute("UPDATE OR IGNORE dup_members SET path=? WHERE path=? AND role='kept'", (new, old))
+            if version >= SCHEMA_VARIANTS:
+                conn.execute("UPDATE book_variants SET keeper=? WHERE keeper=?", (new, old))
     return len(pairs)
 
 
@@ -7093,11 +7120,19 @@ def strip_suffix(cfg: dict[str, Any], dry_run: bool = False, path: str | None = 
 PURGE_PROGRESS_SECONDS = 30
 
 
-class PurgeProgress:
-    """Прогресс удаления: файлов сделано из всех, скорость и ETA — не чаще PURGE_PROGRESS_SECONDS."""
+VARIANT_REASONS = ("duplicate", "replaced-calibre", "unzipped")  # варианты этих причин сохраняются в book_variants до удаления
+VARIANT_REASON_TEXT = {"duplicate": "дубль", "replaced-calibre": "старый epub Calibre", "unzipped": "zip-архив"}
+VARIANT_BATCH = 200  # строк book_variants в одной транзакции
+VARIANT_INSERT = ("INSERT OR REPLACE INTO book_variants(variant_path, reason, keeper, fmt, size, words, title, authors, "
+                  "series, series_no, lang, year, meta, sha1, removed) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)")
 
-    def __init__(self, total: int) -> None:
+
+class PurgeProgress:
+    """Прогресс этапа: файлов сделано из всех, скорость и ETA — не чаще PURGE_PROGRESS_SECONDS."""
+
+    def __init__(self, total: int, label: str) -> None:
         self.total = max(total, 1)
+        self.label = label
         self.done = 0
         self.started = self.last = time.monotonic()
 
@@ -7109,7 +7144,7 @@ class PurgeProgress:
         self.last = now
         rate = self.done / max(now - self.started, 1e-6)
         eta = (self.total - self.done) / rate / 60 if rate > 0 else 0.0
-        say(f"purge-quarantine: файлов {self.done}/{self.total} ({self.done * 100 // self.total} %), "
+        say(f"{self.label}: файлов {self.done}/{self.total} ({self.done * 100 // self.total} %), "
             f"{rate:.1f} файлов/с, осталось ~{eta:.1f} мин", "progress")
 
 
@@ -7139,8 +7174,107 @@ def purge_inventory(qroot: Path, reason_dir: Path, errors: list[str]) -> list[tu
     return items
 
 
-def purge_delete(reason_dir: Path, progress: PurgeProgress, stats: dict[str, int]) -> None:
-    """Удаление снизу вверх: файлы и симлинки — os.unlink (ссылка, не цель), каталоги — os.rmdir; затем сама папка причины."""
+def quarantine_relpath(path: str, bases: tuple[Path, ...]) -> str | None:
+    """Путь относительно карантина (причина первым сегментом) или None, если путь не внутри карантина."""
+    target = Path(os.path.normpath(path))
+    for base in bases:
+        if target.is_relative_to(base):
+            return target.relative_to(base).as_posix()
+    return None
+
+
+def variant_keeper_for(variant: str, books: set[str], dups: dict[str, tuple[str, int]]) -> str:
+    """Путь книги библиотеки, вариантом которой был файл карантина. duplicate — keeper из dup_members, иначе путь;
+    replaced-calibre — та же позиция (новый epub на месте старого); unzipped — путь без «.zip». '' — книги нет в библиотеке."""
+    reason, _, rest = variant.partition("/")
+    if variant in dups and dups[variant][0]:
+        return dups[variant][0]
+    candidate = rest[:-4] if reason == "unzipped" and rest.lower().endswith(".zip") else rest
+    return candidate if candidate in books else ""
+
+
+def load_variant_context(db_path: str, bases: tuple[Path, ...]) -> tuple[set[str], dict[str, tuple[str, int]]]:
+    """Пути книг библиотеки и дубли из dup_members: путь варианта в карантине → (keeper, words).
+    Без файла базы — пусто; dup_members есть со схемы v2."""
+    if not Path(db_path).is_file():
+        return set(), {}
+    with closing(connect(db_path, readonly=True)) as conn:
+        books = {row[0] for row in conn.execute("SELECT path FROM books")}
+        dups: dict[str, tuple[str, int]] = {}
+        if conn.execute("PRAGMA user_version").fetchone()[0] >= 2:
+            for quarantine, keeper, words in conn.execute(
+                    "SELECT quarantine, keeper, words FROM dup_members WHERE role='duplicate' AND quarantine <> ''"):
+                rel = quarantine_relpath(quarantine, bases)
+                if rel is not None:
+                    dups[rel] = (keeper, words)
+    return books, dups
+
+
+def variant_meta(qroot: Path, variant: str, cache: TextCache | None) -> tuple[dict[str, Any], str | None, int]:
+    """Разбор файла карантина тем же read_book_meta, что у scan (detail), и sha1 потоком. Симлинк не разыменовывается.
+    Ошибки не прерывают прогон: в meta — поле error, sha1 — None."""
+    reason, _, rest = variant.partition("/")
+    full = qroot / variant
+    try:
+        info = full.lstat()
+    except OSError as error:
+        return {**path_meta(rest), "error": f"OSError: {error}"}, None, 0
+    if full.is_symlink():
+        return {**path_meta(rest), "error": "симлинк: не читается и не разбирается"}, None, info.st_size
+    meta = read_book_meta(qroot / reason, rest, info.st_size, info.st_mtime, cache, detail=True)
+    digest = hashlib.sha1(usedforsecurity=False)
+    try:
+        with full.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+    except OSError as error:
+        meta.setdefault("error", f"OSError: {error}")
+        return meta, None, info.st_size
+    return meta, digest.hexdigest(), info.st_size
+
+
+def variant_row(qroot: Path, variant: str, books: set[str], dups: dict[str, tuple[str, int]],
+                cache: TextCache | None) -> tuple[Any, ...]:
+    """Строка book_variants (порядок VARIANT_INSERT) для файла карантина."""
+    reason = variant.partition("/")[0]
+    meta, sha1, size = variant_meta(qroot, variant, cache)
+    dup = dups.get(variant)
+    words = dup[1] if dup else next((value for key, value in meta.get("kv", []) if key == "words"), None)
+    series_no = meta.get("series_no")
+    return (variant, reason, variant_keeper_for(variant, books, dups), str(meta.get("fmt", "")), size, words,
+            str(meta.get("title", "")), "; ".join(meta.get("authors", [])), str(meta.get("series", "")),
+            series_no if isinstance(series_no, int) else None, str(meta.get("lang", "")), str(meta.get("year", "")),
+            json.dumps(meta, ensure_ascii=False, default=str), sha1)
+
+
+def record_variants(db_path: str, qroot: Path, variants: list[str], books: set[str],
+                    dups: dict[str, tuple[str, int]], cache: TextCache | None, progress: PurgeProgress) -> tuple[int, int]:
+    """Запись вариантов пачками по VARIANT_BATCH в транзакции. Возвращает (записано, с keeper).
+    Сбой записи (sqlite3.Error) — исключение: вызывающий не начинает удаление."""
+    written = with_keeper = 0
+    batch: list[tuple[Any, ...]] = []
+    with closing(connect(db_path)) as conn:
+        for variant in variants:
+            row = variant_row(qroot, variant, books, dups, cache)
+            batch.append(row)
+            with_keeper += bool(row[2])
+            progress.advance()
+            if len(batch) >= VARIANT_BATCH:
+                with conn:
+                    conn.executemany(VARIANT_INSERT, batch)
+                written += len(batch)
+                batch.clear()
+        if batch:
+            with conn:
+                conn.executemany(VARIANT_INSERT, batch)
+            written += len(batch)
+    return written, with_keeper
+
+
+def purge_delete(reason_dir: Path, progress: PurgeProgress, stats: dict[str, int],
+                 on_removed: Callable[[str], None]) -> None:
+    """Удаление снизу вверх: файлы и симлинки — os.unlink (ссылка, не цель), каталоги — os.rmdir; затем сама папка причины.
+    on_removed(путь) вызывается после удаления каждого файла или симлинка (не должна бросать исключений)."""
     def onerror(error: OSError) -> None:
         purge_fail(stats, f"обход {error.filename}: {error.strerror}")
 
@@ -7155,6 +7289,7 @@ def purge_delete(reason_dir: Path, progress: PurgeProgress, stats: dict[str, int
                 continue
             stats["files"] += 1
             stats["bytes"] += size
+            on_removed(full)
             progress.advance()
         for name in dirs:
             full = os.path.join(current, name)
@@ -7164,6 +7299,7 @@ def purge_delete(reason_dir: Path, progress: PurgeProgress, stats: dict[str, int
                     os.unlink(full)
                     stats["files"] += 1
                     stats["bytes"] += size
+                    on_removed(full)
                     progress.advance()
                 else:
                     os.rmdir(full)
@@ -7179,6 +7315,7 @@ def purge_delete(reason_dir: Path, progress: PurgeProgress, stats: dict[str, int
 
 def purge_quarantine(cfg: dict[str, Any], reasons: list[str], dry_run: bool) -> dict[str, Any]:
     """Окончательное удаление папок карантина по причинам. Сначала инвентарь; в dry-run — только счётчики.
+    Варианты причин VARIANT_REASONS сохраняются в book_variants ДО JSON-отчёта и удаления; сбой записи — ничего не удаляется.
     Боевой запуск: JSON-отчёт со всеми путями пишется ДО удаления, при сбое записи отчёта ничего не удаляется."""
     qroot = Path(cfg["quarantine_dir"]).resolve()
     inventory: dict[str, list[tuple[str, int]]] = {}
@@ -7204,32 +7341,76 @@ def purge_quarantine(cfg: dict[str, Any], reasons: list[str], dry_run: bool) -> 
     for reason, items in inventory.items():
         say(f"purge-quarantine{' (dry-run)' if dry_run else ''}: {reason}: файлов {len(items)}, "
             f"{sum(s for _, s in items)} байт", "purge_plan")
+    db_path = cfg["db_path"]
+    bases = (Path(os.path.normpath(cfg["quarantine_dir"])), qroot)
+    variants = [rel for reason in VARIANT_REASONS for rel, _ in inventory.get(reason, [])]
+
     if dry_run:
+        books, dups = load_variant_context(db_path, bases)
+        with_keeper = sum(bool(variant_keeper_for(v, books, dups)) for v in variants)
+        say(f"purge-quarantine (dry-run): вариантов в book_variants {len(variants)}, с keeper {with_keeper}, "
+            f"без keeper {len(variants) - with_keeper}", "purge_plan")
         say(f"purge-quarantine (dry-run): всего файлов {total}, {size} байт; ничего не удалено, отчёт не записан",
             "purge_plan")
-        return {"files": total, "bytes": size, "dry_run": True}
+        return {"files": total, "bytes": size, "variants": len(variants), "variants_with_keeper": with_keeper,
+                "dry_run": True}
+
+    variant_stats = {"written": 0, "with_keeper": 0}
+    if variants:
+        migrate_database(db_path, out=lambda line: say(line, "purge_migrate"))
+        books, dups = load_variant_context(db_path, bases)
+        cache = TextCache.open(cfg)
+        try:
+            written, with_keeper = record_variants(db_path, qroot, variants, books, dups, cache,
+                                                   PurgeProgress(len(variants), "purge-quarantine: варианты"))
+        finally:
+            if cache is not None:
+                cache.close()
+        variant_stats = {"written": written, "with_keeper": with_keeper}
+        say(f"purge-quarantine: в book_variants записано {written}, с keeper {with_keeper}", "purge_variants")
 
     data = {"quarantine_dir": str(qroot), "created": datetime.now().isoformat(timespec="seconds"),
             "reasons": {reason: {"files": len(items), "bytes": sum(s for _, s in items),
                                  "items": [{"path": p, "bytes": s} for p, s in items]}
                         for reason, items in inventory.items()},
-            "inventory_errors": errors}
+            "variants": variant_stats, "inventory_errors": errors}
     try:
         report = write_report("purge-quarantine", data)
     except OSError as error:
         raise OSError(f"отчёт не записан, карантин не тронут: {error}") from error
     say(f"purge-quarantine: отчёт {report}; к удалению файлов {total}, {size} байт", "purge_report")
 
-    progress = PurgeProgress(total)
+    progress = PurgeProgress(total, "purge-quarantine: удаление")
     stats = {"files": 0, "bytes": 0, "dirs": 0, "errors": 0}
-    for reason in inventory:
-        reason_dir = qroot / reason
-        if not reason_dir.exists():
-            continue
-        if reason_dir.is_symlink() or not reason_dir.is_dir():
-            purge_fail(stats, f"{reason}: папка причины изменилась после отчёта, пропущена")
-            continue
-        purge_delete(reason_dir, progress, stats)
+    marker = connect(db_path) if variants else None
+
+    def on_removed(full: str) -> None:
+        """Время удаления — в book_variants.removed; сбой записи не прерывает удаление."""
+        if marker is None:
+            return
+        rel = Path(full).relative_to(qroot).as_posix()
+        reason = rel.partition("/")[0]
+        if reason not in VARIANT_REASONS:
+            return
+        try:
+            with marker:
+                marker.execute("UPDATE book_variants SET removed=? WHERE variant_path=? AND reason=?",
+                               (time.time(), rel, reason))
+        except sqlite3.Error as error:
+            purge_fail(stats, f"removed не записан для {rel}: {error}")
+
+    try:
+        for reason in inventory:
+            reason_dir = qroot / reason
+            if not reason_dir.exists():
+                continue
+            if reason_dir.is_symlink() or not reason_dir.is_dir():
+                purge_fail(stats, f"{reason}: папка причины изменилась после отчёта, пропущена")
+                continue
+            purge_delete(reason_dir, progress, stats, on_removed)
+    finally:
+        if marker is not None:
+            marker.close()
     say(f"purge-quarantine: готово, файлов {stats['files']}, каталогов {stats['dirs']}, байт {stats['bytes']}, "
         f"ошибок {stats['errors']}", "purge_done")
     return stats
@@ -7910,6 +8091,31 @@ def details_html(details: list[tuple[str, list[str]]]) -> str:
     return f'<h3>Сведения</h3><table class="details">{"".join(rows)}</table>'
 
 
+def book_variants(conn: sqlite3.Connection, path: str) -> list[sqlite3.Row]:
+    """Варианты книги из карантина (book_variants, схема v7): keeper — путь книги. До схемы v7 таблицы нет — пусто."""
+    if conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VARIANTS:
+        return []
+    return conn.execute("SELECT * FROM book_variants WHERE keeper=? ORDER BY reason, variant_path", (path,)).fetchall()
+
+
+def variants_html(variants: list[sqlite3.Row]) -> str:
+    """Блок «Варианты»: причина, формат, размер, слов, название и авторы варианта, дата удаления; значения экранируются."""
+    if not variants:
+        return ""
+    rows = []
+    for variant in variants:
+        removed = (datetime.fromtimestamp(variant["removed"]).strftime("%Y-%m-%d %H:%M")
+                   if variant["removed"] else "ещё в карантине")
+        size = human_size(variant["size"]) if variant["size"] is not None else "—"
+        words = str(variant["words"]) if variant["words"] is not None else "—"
+        name = variant["title"] or PurePosixPath(variant["variant_path"]).name
+        reason = VARIANT_REASON_TEXT.get(variant["reason"], variant["reason"])
+        rows.append(f"<tr><td>{e(reason)}</td><td>{e(variant['fmt'])}</td><td>{e(size)}</td><td>{e(words)}</td>"
+                    f"<td>{e(name)}<br><span class=mut>{e(variant['authors'])}</span></td><td>{e(removed)}</td></tr>")
+    return ('<h3>Варианты</h3><table class="details"><tr><th>Причина</th><th>Формат</th><th>Размер</th><th>Слов</th>'
+            '<th>Название и авторы</th><th>Удалён</th></tr>' + "".join(rows) + "</table>")
+
+
 def book_collections(conn: sqlite3.Connection, paths: list[str]) -> dict[str, list[Collection]]:
     """Все сборники книг по путям из book_collections (папки, дубли и сборники из метаданных).
     До схемы v4 таблицы нет — пусто; subsection и kind появляются со схемы v6."""
@@ -8495,6 +8701,7 @@ class Handler(BaseHTTPRequestHandler):
                                     (book["series"], book["id"])).fetchall()
             colls = book_collections(conn, [book["path"]]).get(book["path"], [])
             details = book_details(conn, book["path"])
+            variants = book_variants(conn, book["path"])
         bid = book["id"]
         authors = ", ".join(f'<a href="/?author={quote(a)}">{e(a)}</a>' for a in book["authors"].split("; ") if a) or "—"
         genres = " ".join(f'<a class="tag" href="/?genre={quote(g)}">{e(genre_name(g))}</a>' for g in book["genres"].split("; ") if g)
@@ -8543,6 +8750,7 @@ class Handler(BaseHTTPRequestHandler):
                 f'<p>Полки: {shelf_boxes or "<span class=mut>нет полок</span>"} <input name="new_shelf" placeholder="новая полка">'
                 f'</p><button>Сохранить</button></form></div></div>')
         body += details_html(details)
+        body += variants_html(variants)
         if same:
             body += "<h3>Другие книги серии</h3>" + self.book_list(same)
         self.page(book["title"], body)
