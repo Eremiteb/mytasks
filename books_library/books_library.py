@@ -5232,6 +5232,8 @@ AUTHOR_PARTICLES = frozenset({"де", "фон", "ван", "да", "ди", "дю"
                               "van", "von", "de", "du", "da", "di", "del", "la", "le", "el", "al", "bin", "ibn"})
 PERSON_APOSTROPHES = ("'", "’")
 PERSON_PREFIX_LETTERS = frozenset({"д", "л", "о", "o", "d", "l"})  # «д'Артаньян», «О'Нил»
+COAUTHOR_SPLIT = re.compile(r", | и ")  # соавторы внутри одной записи автора: «Иван Иванов, Пётр Петров», «А и Б»
+INITIALS_WORD = re.compile(r"^((?:[А-ЯЁA-Z]\.)+)([А-ЯЁA-Z][а-яёa-z-]+)$")  # «И.Гарин», «И.О.Гарин» — инициалы у фамилии
 
 
 def author_norm(text: str) -> str:
@@ -5282,6 +5284,22 @@ def person_name(name: str) -> bool:
     return checked
 
 
+def split_authors(authors: str) -> list[str]:
+    """Авторы книги из поля authors: записи через «; »; внутри записи «, » или « и » — соавторы, но только если каждая
+    часть похожа на имя (person_name). Иначе запись остаётся целой: «Охота на драконов, эпос Японский» — не делится."""
+    result: list[str] = []
+    for entry in authors.split("; "):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = [part.strip() for part in COAUTHOR_SPLIT.split(entry)]
+        if len(parts) > 1 and all(person_name(part) for part in parts):
+            result.extend(parts)
+        else:
+            result.append(entry)
+    return result
+
+
 def folder_name(name: str) -> str:
     """Имя папки для Windows и Syncthing: без запрещённых и управляющих символов, без пробелов и точек по краям,
     не длиннее FOLDER_NAME_MAX. Пустой результат — имени нет."""
@@ -5311,7 +5329,8 @@ def author_index(root: Path) -> dict[frozenset[str], str]:
 def pick_folder(author: str, key: frozenset[str], parent: str, index: dict[frozenset[str], str]) -> tuple[str, str]:
     """Папка автора и способ выбора: exact — точный ключ; parent — папка, где лежит файл, названа как автор;
     subset — ровно одна папка с пересечением ≥ 2 слов и ключом ⊆ или ⊇; иначе new — «Фамилия Имя Отчество»
-    (последнее слово автора первым). Пустое имя у new — имени нет.
+    (последнее слово автора первым). Пустое имя у new — имени нет. Автор «И.Гарин» (инициалы у фамилии) — существующая
+    папка по initials («initials»), иначе новая «Гарин И»; частица из двух слов («Де Рокамболь») не переставляется.
     not-person — метаданные не похожи на имя человека (название, жанр, кракозябры): имени нет, папку не создавать."""
     if key in index:
         return index[key], "exact"
@@ -5325,6 +5344,13 @@ def pick_folder(author: str, key: frozenset[str], parent: str, index: dict[froze
     if not person_name(author):
         return "", "not-person"
     words = author.split()
+    initials = INITIALS_WORD.match(author.strip())
+    if initials is not None:  # «И.Гарин» → «Гарин И.» (folder_name уберёт точку на конце)
+        surname_form = f"{initials.group(2)} {initials.group(1)}"
+        found = initials_folder(surname_form, index)
+        return (found, "initials") if found else (folder_name(surname_form), "new")
+    if len(words) == 2 and words[0].casefold() in AUTHOR_PARTICLES:
+        return folder_name(author), "new"  # «Де Рокамболь»: частица — часть фамилии, не переставляется
     return folder_name(" ".join([words[-1], *words[:-1]])), "new"
 
 
@@ -5575,8 +5601,8 @@ def unpack_collections(cfg: dict[str, Any], dry_run: bool = False, path: str | N
         src = root / rel
         top = root / PurePosixPath(rel).parts[0]
         label = section_name(top.name)
-        authors = [name.strip() for name in books[rel]["authors"].split("; ") if name.strip()]
-        author = books[rel]["authors"].split("; ")[0].strip()
+        authors = split_authors(books[rel]["authors"])  # первый — автор папки, остальные — соавторы (copy_coauthors)
+        author = authors[0] if authors else ""
         key = author_key(author) if author else None
         parent = "" if src.parent == top or src.parent.name.startswith(("_", ".")) else src.parent.name
         folder, match, source, found_by, name, failure = "", "", "", "", "", ""

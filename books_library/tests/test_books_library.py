@@ -1803,6 +1803,23 @@ def test_pick_folder_not_person_creates_no_folder() -> None:
     assert bl.pick_folder("Охота на драконов", frozenset({"охота", "на", "драконов"}), "", {}) == ("", "not-person")
 
 
+def test_split_authors_first_author_is_folder_and_rest_are_coauthors() -> None:
+    assert bl.split_authors("Григорий Белых, Алексей Пантелеев") == ["Григорий Белых", "Алексей Пантелеев"]
+    assert bl.split_authors("Григорий Белых и Алексей Пантелеев; Иван Иванов") == \
+        ["Григорий Белых", "Алексей Пантелеев", "Иван Иванов"]
+    assert bl.split_authors("Охота на драконов, эпос Японский") == ["Охота на драконов, эпос Японский"]
+    first = bl.split_authors("Григорий Белых, Алексей Пантелеев")[0]
+    assert bl.pick_folder(first, bl.author_key(first), "", {}) == ("Белых Григорий", "new")
+
+
+def test_pick_folder_initials_before_surname_and_particle_keep_order() -> None:
+    assert bl.pick_folder("И.Гарин", bl.author_key("И.Гарин"), "", {}) == ("Гарин И", "new")
+    assert bl.pick_folder("И.О.Гарин", bl.author_key("И.О.Гарин"), "", {}) == ("Гарин И.О", "new")
+    existing = {bl.author_key("Гарин Иван"): "Гарин Иван"}
+    assert bl.pick_folder("И.Гарин", bl.author_key("И.Гарин"), "", existing) == ("Гарин Иван", "initials")
+    assert bl.pick_folder("Де Рокамболь", bl.author_key("Де Рокамболь"), "", {}) == ("Де Рокамболь", "new")
+
+
 def unpack_cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     """Каталог: автор «Иванов Иван» (папка есть), раздел сборников с двумя книгами одного имени, книгой без автора
     и пустой папкой."""
