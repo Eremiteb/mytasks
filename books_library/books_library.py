@@ -5,7 +5,7 @@
   scan            — проиндексировать каталог книг (инкрементально по размеру и mtime);
   serve           — запустить веб-интерфейс (по умолчанию);
   fix-encoding    — вылечить кодировку: fb2 с заявленной не UTF-8 при тексте в UTF-8, txt в cp1251 → UTF-8;
-  unpack-fb2zip   — извлечь .fb2 из *.fb2.zip рядом с архивом;
+  unpack-fb2zip   — извлечь .fb2 из *.fb2.zip рядом с архивом; с --multi — и из многокнижных .zip (папка, md5, --out);
   convert         — DOC/DOCX/RTF/ODT/MHT → EPUB (или FB2) через pandoc/LibreOffice;
   reconvert-fb2   — calibre-epub из fb2 пересобрать собственным конвертером fb2 → EPUB 3 (с --dry-run и --sample);
   --migrate-db    — только миграции схемы БД;
@@ -1208,60 +1208,305 @@ def unique_path(directory: Path, name: str, taken: set[Path]) -> Path:
     return candidate
 
 
-def unpack_fb2zip(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None, max_mb: int = 200,
-                  out: Callable[[str], None] = print) -> dict[str, int]:
-    """Извлекает .fb2 из *.fb2.zip рядом с архивом (без внутренних путей), архив остаётся на месте.
+UNPACK_PROGRESS_SECONDS = 30
+UNPACK_CHUNK = 1024 * 1024
+MULTI_MIN_MEMBERS = 2
+MD5_LINE = re.compile(r"^(.+?)\t+:\s*([0-9a-fA-F]{32})\s*$")
+FB2_NUMBER_NAME = re.compile(r"[0-9]+\.fb2", re.IGNORECASE)
+UNPACK_ERRORS = (OSError, ValueError, zipfile.BadZipFile, zlib.error, EOFError)
 
-    Конфликты имён — суффиксы _1, _2…; запись больше max_mb пропускается; CRC проверяет zipfile при чтении.
-    """
-    target = target_dir(cfg, path)
-    limit = max_mb * 1024 * 1024
-    errors: list[str] = []
-    stats = {"archives": 0, "extracted": 0, "skipped": 0, "failed": 0}
+
+class UnpackProgress:
+    """Прогресс распаковки: файлов сделано из всех, скорость и ETA — не чаще раза в UNPACK_PROGRESS_SECONDS."""
+
+    def __init__(self, total: int) -> None:
+        self.total = max(total, 1)
+        self.done = 0
+        self.started = self.last = time.monotonic()
+
+    def advance(self, count: int = 1) -> None:
+        self.done += count
+        now = time.monotonic()
+        if now - self.last < UNPACK_PROGRESS_SECONDS and self.done < self.total:
+            return
+        self.last = now
+        rate = self.done / max(now - self.started, 1e-6)
+        eta = (self.total - self.done) / rate / 60 if rate > 0 else 0.0
+        say(f"unpack-fb2zip: файлов {self.done}/{self.total} ({self.done * 100 // self.total} %), "
+            f"{rate:.1f} файлов/с, осталось ~{eta:.1f} мин", "progress")
+
+
+def unpack_out_dir(cfg: dict[str, Any], out_dir: str, dry_run: bool) -> Path:
+    """Каталог --out для --multi: абсолютный, не внутри каталога книг и карантина; создаётся с правами 0700 (не в dry-run)."""
+    candidate = Path(out_dir).expanduser()
+    if not candidate.is_absolute():
+        raise ConfigError("--out: нужен абсолютный путь")
+    resolved = candidate.resolve()
+    if resolved in (Path("/"), Path.home().resolve()):
+        raise ConfigError(f"--out: корневой или домашний каталог не подходит: {resolved}")
+    for forbidden, what in ((Path(cfg["books_dir"]).resolve(), "каталога книг"),
+                            (Path(cfg["quarantine_dir"]).resolve(), "карантина")):
+        if resolved.is_relative_to(forbidden):
+            raise ConfigError(f"--out не может быть внутри {what}: {resolved}")
+    if resolved.exists() and not resolved.is_dir():
+        raise ConfigError(f"--out не каталог: {resolved}")
+    if not dry_run:
+        resolved.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return resolved
+
+
+def file_md5(path: Path) -> str:
+    """MD5 потоком (контроль целостности при копировании, не защита от подделки)."""
+    digest = hashlib.md5(usedforsecurity=False)
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(UNPACK_CHUNK), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def read_md5_list(directory: Path, cache: dict[Path, dict[str, str]]) -> dict[str, str]:
+    """Строки «<имя архива>\\t\\t: <md5>» из md5_sum.txt каталога; кэш на каталог. Нет файла — пусто."""
+    if directory not in cache:
+        sums: dict[str, str] = {}
+        listing = directory / "md5_sum.txt"
+        if listing.is_file():
+            for line in listing.read_text(encoding="utf-8", errors="replace").splitlines():
+                found = MD5_LINE.match(line)
+                if found:
+                    sums[found.group(1).strip()] = found.group(2).lower()
+        cache[directory] = sums
+    return cache[directory]
+
+
+def member_base(raw: str) -> str | None:
+    """Имя записи без пути. None — путь, «..», скрытое или пустое имя: такая запись отбрасывается."""
+    normalized = raw.replace("\\", "/")
+    base = PurePosixPath(normalized).name
+    if normalized != base or not base or base.startswith("."):
+        return None
+    return base
+
+
+def member_problem(info: zipfile.ZipInfo, limit: int, max_mb: int) -> str | None:
+    """Причина отказа от записи по размеру и степени сжатия (zip-бомба) или None."""
+    if info.file_size > limit:
+        return f"больше {max_mb} МБ"
+    if info.file_size > 1024 * 1024 and info.file_size > ZIP_MAX_RATIO * max(info.compress_size, 1):
+        return "подозрительная степень сжатия (zip-бомба?)"
+    return None
+
+
+def multi_name(base: str, head: bytes) -> str | None:
+    """Имя файла: при имени-номере librusec («24.fb2») — «Фамилия - Название.fb2» по метаданным, без них —
+    «librusec-24.fb2»; иное имя — очищенное исходное. None — имя пустое после очистки."""
+    stem = base[:-4]
+    if FB2_NUMBER_NAME.fullmatch(base):
+        meta = fb2_meta(head)
+        authors = meta.get("authors") or []
+        title = str(meta.get("title") or "").strip()
+        if authors and title:
+            # fb2_meta пишет фамилию первой («Петров Иван»), поэтому берём первое слово.
+            return lib_ru_name(authors[0].split(" ", 1)[0], title, "fb2")
+        return f"librusec-{stem}.fb2"
+    clean = folder_name(stem)
+    return f"{clean}.fb2" if clean else None
+
+
+def store_member(run: NightRun, archive: zipfile.ZipFile, archive_path: Path, info: zipfile.ZipInfo, base: str,
+                 dest: Path, limit: int, taken: set[Path]) -> Path:
+    """Одна запись многокнижного zip: потоковая запись во временный файл в dest (CRC проверяет zipfile при чтении
+    до конца), затем атомарная замена на итоговое имя. В dry-run — только план."""
+    if run.dry_run:
+        with archive.open(info) as handle:
+            head = handle.read(FB2_HEAD_BYTES)
+        name = multi_name(base, head)
+        if name is None:
+            raise ValueError(f"{info.filename}: пустое имя после очистки")
+        target = unique_path(dest, name, taken)
+        run.record("planned", archive_path, member=info.filename, to=str(target))
+        return target
+    fd, tmp_name = tempfile.mkstemp(prefix=".unpack-multi.", suffix=".tmp", dir=dest)
+    tmp = Path(tmp_name)
+    try:
+        written = 0
+        with os.fdopen(fd, "wb") as sink, archive.open(info) as source:
+            while chunk := source.read(UNPACK_CHUNK):
+                written += len(chunk)
+                if written > limit:
+                    raise ValueError(f"{info.filename}: фактический размер больше предела")
+                sink.write(chunk)
+        if written == 0:
+            raise ValueError(f"{info.filename}: пустая запись")
+        with tmp.open("rb") as check:
+            head = check.read(FB2_HEAD_BYTES)
+        name = multi_name(base, head)
+        if name is None:
+            raise ValueError(f"{info.filename}: пустое имя после очистки")
+        target = unique_path(dest, name, taken)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, target)
+    finally:
+        tmp.unlink(missing_ok=True)
+    run.record("extracted", archive_path, member=info.filename, to=str(target))
+    return target
+
+
+def unpack_multi(run: NightRun, archive_path: Path, members: list[zipfile.ZipInfo], *, limit: int, max_mb: int,
+                 ignore_md5: bool, delete_source: bool, base_dir: Path, sums: dict[Path, dict[str, str]],
+                 progress: UnpackProgress) -> None:
+    """Многокнижный zip: записи в папку «<архив без .zip>/» в base_dir. Сначала сверка md5 из md5_sum.txt (если строка
+    есть), затем распаковка. Архив переносится в карантин replaced/ только после полной распаковки и с delete_source."""
+    expected = read_md5_list(archive_path.parent, sums).get(archive_path.name)
+    if expected is None:
+        run.count("md5_unlisted")
+        say(f"нет строки md5 для {archive_path.name} в md5_sum.txt", "md5_unlisted", logging.WARNING, detail=str(archive_path))
+    else:
+        actual = file_md5(archive_path)
+        if actual != expected:
+            reason = f"ожидался {expected}, факт {actual}"
+            if not ignore_md5:
+                run.record("md5_mismatch", archive_path, reason=reason)
+                say(f"md5 не совпал, архив пропущен: {archive_path} ({reason})", "md5_mismatch", logging.ERROR,
+                    detail=reason)
+                progress.advance(len(members))
+                return
+            run.record("md5_ignored", archive_path, reason=reason)
+            say(f"md5 не совпал, распаковка по --ignore-md5: {archive_path} ({reason})", "md5_ignored",
+                logging.WARNING, detail=reason)
+    stem = folder_name(archive_path.name[:-4])
+    if not stem:
+        run.record("skipped", archive_path, reason="пустое имя папки")
+        progress.advance(len(members))
+        return
+    dest = base_dir / stem
+    if dest.exists():
+        run.record("skipped", archive_path, reason=f"папка уже есть, прежняя распаковка: {dest}")
+        progress.advance(len(members))
+        return
+    if not run.dry_run:
+        dest.mkdir()
     taken: set[Path] = set()
-    for archive_path, _size in walk_files(target, (".fb2.zip",), errors):
-        stats["archives"] += 1
+    extracted = failed = skipped = 0
+    with zipfile.ZipFile(archive_path) as archive:
+        for info in members:
+            progress.advance()
+            base = member_base(info.filename)
+            problem = "путь, «..» или скрытое имя" if base is None else member_problem(info, limit, max_mb)
+            if base is None or problem is not None:
+                skipped += 1
+                run.record("skipped", archive_path, member=info.filename, reason=problem or "")
+                continue
+            try:
+                store_member(run, archive, archive_path, info, base, dest, limit, taken)
+            except UNPACK_ERRORS as error:
+                failed += 1
+                run.record("failed", archive_path, member=info.filename, reason=str(error))
+            else:
+                extracted += 1
+    if not run.dry_run and extracted == 0 and not any(dest.iterdir()):
+        dest.rmdir()
+    if failed or skipped or extracted != len(members):
+        say(f"архив {archive_path.name} остаётся на месте: распаковано {extracted} из {len(members)}, "
+            f"ошибок {failed}, пропущено {skipped}", "archive_kept", logging.WARNING, detail=str(archive_path))
+        return
+    run.count("complete")
+    if delete_source:
+        run.quarantine(archive_path, "replaced", dest_dir=str(dest), extracted=extracted)
+
+
+def unpack_single(run: NightRun, archive_path: Path, members: list[zipfile.ZipInfo], *, limit: int, max_mb: int,
+                  taken: set[Path], progress: UnpackProgress) -> None:
+    """Однокнижный *.fb2.zip, как раньше: запись рядом с архивом под исходным именем, конфликт — суффикс _1, _2…"""
+    parent = archive_path.parent
+    if not members:
+        say(f"в архиве нет .fb2: {archive_path}", "no_fb2_inside", logging.WARNING, detail=str(archive_path))
+    with zipfile.ZipFile(archive_path) as archive:
+        for info in members:
+            progress.advance()
+            name = PurePosixPath(info.filename.replace("\\", "/")).name
+            problem = "скрытое или пустое имя" if not name or name.startswith(".") else member_problem(info, limit, max_mb)
+            if problem is not None:
+                run.record("skipped", archive_path, member=info.filename, reason=problem)
+                continue
+            target_file = unique_path(parent, name, taken)
+            if run.dry_run:
+                run.record("planned", archive_path, member=info.filename, to=str(target_file))
+                continue
+            with archive.open(info) as handle:
+                data = handle.read(limit + 1)
+            if not data or len(data) > limit:
+                raise ValueError(f"{info.filename}: пустая или слишком большая запись")
+            fd, tmp_name = tempfile.mkstemp(prefix=".unpack-fb2zip.", dir=parent)
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(data)
+                os.chmod(tmp_name, archive_path.stat().st_mode & 0o666)
+                if target_file.exists():  # появился после планирования — новое свободное имя
+                    target_file = unique_path(parent, name, taken)
+                os.replace(tmp_name, target_file)
+            finally:
+                Path(tmp_name).unlink(missing_ok=True)
+            run.record("extracted", archive_path, member=info.filename, to=str(target_file))
+
+
+def scan_archives(run: NightRun, paths: list[Path], multi: bool,
+                  errors: list[str]) -> list[tuple[Path, bool, list[zipfile.ZipInfo]]]:
+    """Архивы для распаковки: (путь, многокнижный, записи .fb2). Многокнижный — с двумя и более .fb2 (--multi);
+    *.fb2.zip без --multi или с одной записью — однокнижный; прочие zip пропускаются."""
+    jobs: list[tuple[Path, bool, list[zipfile.ZipInfo]]] = []
+    for archive_path in paths:
         try:
             with zipfile.ZipFile(archive_path) as archive:
-                entries = [i for i in archive.infolist() if i.filename.lower().endswith(".fb2") and not i.is_dir()]
-                if not entries:
-                    say(f"в архиве нет .fb2: {archive_path}", "no_fb2_inside", detail=str(archive_path))
-                for info in entries:
-                    name = PurePosixPath(info.filename.replace("\\", "/")).name
-                    if not name or name.startswith("."):
-                        stats["skipped"] += 1
-                        continue
-                    if info.file_size > limit:
-                        stats["skipped"] += 1
-                        say(f"запись больше {max_mb} МБ пропущена: {archive_path}:{info.filename}", "entry_too_large",
-                            logging.WARNING, detail=str(archive_path))
-                        continue
-                    target_file = unique_path(archive_path.parent, name, taken)
-                    if dry_run:
-                        out(f"[dry-run] будет: извлечь {archive_path} → {target_file}")
-                        continue
-                    with archive.open(info) as handle:
-                        data = handle.read(limit + 1)
-                    if not data or len(data) > limit:
-                        raise ValueError(f"{info.filename}: пустая или слишком большая запись")
-                    fd, tmp_name = tempfile.mkstemp(prefix=".unpack-fb2zip.", dir=archive_path.parent)
-                    with os.fdopen(fd, "wb") as handle:
-                        handle.write(data)
-                    os.chmod(tmp_name, archive_path.stat().st_mode & 0o666)
-                    if target_file.exists():  # появился после планирования — новое свободное имя
-                        target_file = unique_path(archive_path.parent, name, taken)
-                    os.replace(tmp_name, target_file)
-                    stats["extracted"] += 1
-                    say(f"извлечён {target_file}", "extracted", detail=f"{archive_path} -> {target_file}")
-        except (OSError, ValueError, zipfile.BadZipFile, EOFError) as error:
-            stats["failed"] += 1
-            say(f"ошибка архива {archive_path}: {error}", "extract_failed", logging.ERROR, detail=str(error))
+                members = [i for i in archive.infolist() if not i.is_dir() and i.filename.lower().endswith(".fb2")]
+        except (OSError, zipfile.BadZipFile, EOFError) as error:
+            if archive_path.name.lower().endswith(".fb2.zip"):
+                run.record("failed", archive_path, reason=str(error))
+            else:
+                run.count("not_multi")
+            continue
+        if multi and len(members) >= MULTI_MIN_MEMBERS:
+            jobs.append((archive_path, True, members))
+        elif archive_path.name.lower().endswith(".fb2.zip"):
+            jobs.append((archive_path, False, members))
+        else:
+            run.count("not_multi")
     for error in errors[:20]:
         say(f"ошибка обхода: {error}", "walk_error", logging.WARNING, detail=error)
-    if dry_run:
-        out(f"[dry-run] будет: архивов {stats['archives']}, пропущено записей {stats['skipped']}, ошибок {stats['failed']}")
-    say(f"распаковка: {json.dumps(stats, ensure_ascii=False)}", "dry_unpack_done" if dry_run else "unpack_done", detail=json.dumps(stats))
-    return stats
+    return jobs
+
+
+def unpack_fb2zip(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None, max_mb: int = 200,
+                  out: Callable[[str], None] = print, *, multi: bool = False, out_dir: str | None = None,
+                  delete_source: bool = False, ignore_md5: bool = False) -> dict[str, Any]:
+    """Извлекает .fb2 из *.fb2.zip рядом с архивом (без внутренних путей), архив остаётся на месте.
+
+    --multi: многокнижные .zip (два и более .fb2) — записи в папку «<архив без .zip>/» рядом с архивом или в --out;
+    имена по метаданным fb2, md5 из md5_sum.txt рядом (несовпадение — архив пропускается, если не --ignore-md5),
+    архив в карантин replaced/ только с --delete-source и после полной распаковки. Журнал — NightRun (reports/).
+    """
+    if not multi and (out_dir or delete_source or ignore_md5):
+        raise ConfigError("--out, --delete-source и --ignore-md5 применяются только с --multi")
+    base_override = unpack_out_dir(cfg, out_dir, dry_run) if out_dir else None
+    run = NightRun(cfg, "unpack-fb2zip", dry_run, path, out)
+    limit = max_mb * 1024 * 1024
+    errors: list[str] = []
+    paths = [p for p, _size in walk_files(run.target, (".zip",) if multi else (".fb2.zip",), errors)]
+    jobs = scan_archives(run, paths, multi, errors)
+    progress = UnpackProgress(sum(len(members) for _p, _m, members in jobs))
+    taken: set[Path] = set()
+    sums: dict[Path, dict[str, str]] = {}
+    for archive_path, is_multi, members in jobs:
+        run.count("archives")
+        try:
+            if is_multi:
+                unpack_multi(run, archive_path, members, limit=limit, max_mb=max_mb, ignore_md5=ignore_md5,
+                             delete_source=delete_source, base_dir=base_override or archive_path.parent,
+                             sums=sums, progress=progress)
+            else:
+                unpack_single(run, archive_path, members, limit=limit, max_mb=max_mb, taken=taken, progress=progress)
+        except UNPACK_ERRORS as error:
+            run.record("failed", archive_path, reason=str(error))
+    return run.finish({"walk_errors": len(errors), "multi": multi, "out": str(base_override or "")})
 
 
 # ----------------------------------------------------------------------
@@ -6591,7 +6836,8 @@ def command_params(command: str, raw: dict[str, Any]) -> dict[str, Any]:
     if command not in (*COMMANDS, *CLI_COMMANDS):
         raise ConfigError(f"неизвестная команда {command!r}; допустимо: {', '.join(COMMANDS)}")
     allowed = {
-        "scan": {"reparse"}, "migrate": set(), "fix-encoding": {"path", "only"}, "unpack-fb2zip": {"path", "max_mb"},
+        "scan": {"reparse"}, "migrate": set(), "fix-encoding": {"path", "only"},
+        "unpack-fb2zip": {"path", "max_mb", "multi", "out", "delete_source", "ignore_md5"},
         "convert": {"path", "only", "to", "overwrite", "skip_newer", "exclude", "author", "title_mode", "toc", "toc_depth",
                     "delete_source", "workers"},
         "dedup": {"path", "workers"}, "dedup-folders": {"path", "workers"}, "zip-books": {"path", "workers"},
@@ -6632,6 +6878,11 @@ def command_params(command: str, raw: dict[str, Any]) -> dict[str, Any]:
         params["max_mb"] = raw.get("max_mb", 200)
         if not isinstance(params["max_mb"], int) or isinstance(params["max_mb"], bool) or not 1 <= params["max_mb"] <= 4096:
             raise ConfigError("max_mb: целое 1..4096")
+        params.update(multi=raw.get("multi", False), delete_source=raw.get("delete_source", False),
+                      ignore_md5=raw.get("ignore_md5", False), out=raw.get("out") or None)
+        if not all(isinstance(params[k], bool) for k in ("multi", "delete_source", "ignore_md5")) or \
+                not (params["out"] is None or isinstance(params["out"], str)):
+            raise ConfigError("multi, delete_source, ignore_md5 — логические значения; out — строка пути")
     if command == "reconvert-fb2":
         params.update(epubcheck=raw.get("epubcheck", False), out=raw.get("out") or None)
         for key, high in (("limit", 1_000_000), ("sample", 10_000)):
@@ -6679,7 +6930,9 @@ def run_command(cfg: dict[str, Any], command: str, dry_run: bool, params: dict[s
         if command == "fix-encoding":
             return fix_encoding(cfg, dry_run, params["path"], params["only"], out=out)
         if command == "unpack-fb2zip":
-            return unpack_fb2zip(cfg, dry_run, params["path"], params["max_mb"], out=out)
+            return unpack_fb2zip(cfg, dry_run, params["path"], params["max_mb"], out=out, multi=params["multi"],
+                                 out_dir=params["out"], delete_source=params["delete_source"],
+                                 ignore_md5=params["ignore_md5"])
         if command == "dedup":
             return dedup(cfg, dry_run, params["path"], params["workers"], out=out)
         if command == "dedup-folders":
@@ -7306,7 +7559,7 @@ API_HELP = {
                       "author-variants, dry_run: true (по умолчанию), "
                       "confirm: <id успешного dry-run с теми же параметрами> — обязателен для боевого запуска fix-encoding/unpack-fb2zip/"
                       "convert/dedup/dedup-folders/zip-books/unzip-books/author-variants, "
-                      "параметры режима: path, only (для convert — fb2 и источники), workers, max_mb, to, overwrite, skip_newer, exclude, "
+                      "параметры режима: path, only (для convert — fb2 и источники), workers, max_mb, multi, out, ignore_md5 (unpack-fb2zip), to, overwrite, skip_newer, exclude, "
                       "author, title_mode, toc, "
                       "toc_depth, delete_source}",
     "GET /api/dups": "группы дублей: status=similar|auto|resolved (по умолчанию similar), page (по 50); "
@@ -8685,10 +8938,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-toc", action="store_true", help="convert: без оглавления")
     parser.add_argument("--toc-depth", type=int, default=3, help="convert: глубина оглавления")
     parser.add_argument("--delete-source", action="store_true",
-                        help="convert: удалить исходник после проверки результата (с JSON-отчётом)")
+                        help="convert: удалить исходник после проверки результата (с JSON-отчётом); "
+                             "unpack-fb2zip --multi: архив в карантин после полной распаковки")
+    parser.add_argument("--multi", action="store_true",
+                        help="unpack-fb2zip: и многокнижные .zip (два и более .fb2) — в папку «<архив без .zip>/»")
+    parser.add_argument("--ignore-md5", action="store_true",
+                        help="unpack-fb2zip --multi: распаковать, даже если md5 архива не совпал (предупреждение в журнале)")
     parser.add_argument("--sample", type=int, default=0,
                         help="reconvert-fb2: N книг в --out для проверки глазами; библиотека не меняется")
-    parser.add_argument("--out", help="reconvert-fb2 с --sample: каталог выборки (вне каталога книг)")
+    parser.add_argument("--out", help="reconvert-fb2 с --sample: каталог выборки (вне каталога книг); "
+                                      "unpack-fb2zip --multi: абсолютный каталог распаковки вне каталога книг и карантина")
     parser.add_argument("--epubcheck", action="store_true",
                         help="reconvert-fb2: проверять каждый новый epub утилитой epubcheck (медленно, выборочно)")
     parser.add_argument("-n", "--dry-run", action="store_true", help="ничего не менять, показать план")
@@ -8702,6 +8961,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--limit применяется только к sort-underscore и reconvert-fb2")
     if args.reparse and args.command != "scan":
         parser.error("--reparse применяется только к scan")
+    if (args.multi or args.ignore_md5) and args.command != "unpack-fb2zip":
+        parser.error("--multi и --ignore-md5 применяются только к unpack-fb2zip")
     try:
         cfg = load_config(args.config)
         if args.migrate_db or args.command != "serve":
@@ -8710,7 +8971,8 @@ def main(argv: list[str] | None = None) -> int:
             if command in FILE_CHANGING:
                 raw = {"path": args.path, "only": args.only}
             if command == "unpack-fb2zip":
-                raw = {"path": args.path, "max_mb": args.max_mb}
+                raw = {"path": args.path, "max_mb": args.max_mb, "multi": args.multi, "out": args.out,
+                       "delete_source": args.delete_source, "ignore_md5": args.ignore_md5}
             elif command == "reconvert-fb2":
                 raw = {"path": args.path, "workers": args.workers, "limit": args.limit, "sample": args.sample,
                        "out": args.out, "epubcheck": args.epubcheck}

@@ -595,6 +595,132 @@ def test_unpack_skips_entry_over_max_mb(tmp_path: Path) -> None:
     assert not (root / "big.fb2").exists()
 
 
+def make_multi(path: Path, members: dict[str, bytes]) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, data in members.items():
+            archive.writestr(name, data)
+
+
+def multi_members() -> dict[str, bytes]:
+    """Три записи: две с метаданными/без (номера librusec) и запись с путём «..», которая должна быть отброшена."""
+    return {
+        "24.fb2": make_fb2("Книга", "Иван", "Петров"),
+        "3.fb2": b"<FictionBook>no meta</FictionBook>",
+        "../x.fb2": make_fb2("Чужая", "Иван", "Чужой"),
+    }
+
+
+@pytest.fixture
+def multi_cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    root = tmp_path / "lib"
+    root.mkdir()
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    return make_cfg(tmp_path, root)
+
+
+def test_multi_extracts_into_folder_with_metadata_names(multi_cfg: dict[str, Any]) -> None:
+    root = Path(multi_cfg["books_dir"])
+    make_multi(root / "lib-3.zip", multi_members())
+
+    stats = bl.unpack_fb2zip(multi_cfg, multi=True)
+
+    folder = root / "lib-3"
+    assert sorted(p.name for p in folder.iterdir()) == ["Петров - Книга.fb2", "librusec-3.fb2"]
+    assert (folder / "librusec-3.fb2").read_bytes() == b"<FictionBook>no meta</FictionBook>"
+    assert not (root / "x.fb2").exists()
+    assert not (root.parent / "x.fb2").exists()
+    assert (root / "lib-3.zip").is_file()  # запись отброшена — распаковка неполная, архив остаётся
+    assert stats["extracted"] == 2
+    assert stats["skipped"] == 1
+
+
+def test_multi_dry_run_writes_nothing(multi_cfg: dict[str, Any]) -> None:
+    root = Path(multi_cfg["books_dir"])
+    make_multi(root / "lib-3.zip", multi_members())
+
+    bl.unpack_fb2zip(multi_cfg, dry_run=True, multi=True)
+
+    assert not (root / "lib-3").exists()
+    assert (root / "lib-3.zip").is_file()
+
+
+def test_multi_md5_mismatch_skips_archive(multi_cfg: dict[str, Any]) -> None:
+    root = Path(multi_cfg["books_dir"])
+    make_multi(root / "lib-3.zip", multi_members())
+    (root / "md5_sum.txt").write_text("lib-3.zip\t\t: " + "0" * 32 + "\n", encoding="utf-8")
+
+    stats = bl.unpack_fb2zip(multi_cfg, multi=True)
+
+    assert stats["md5_mismatch"] == 1
+    assert not (root / "lib-3").exists()
+    assert (root / "lib-3.zip").is_file()
+
+
+def test_multi_ignore_md5_extracts_with_warning(multi_cfg: dict[str, Any]) -> None:
+    root = Path(multi_cfg["books_dir"])
+    make_multi(root / "lib-3.zip", multi_members())
+    (root / "md5_sum.txt").write_text("lib-3.zip\t\t: " + "0" * 32 + "\n", encoding="utf-8")
+
+    stats = bl.unpack_fb2zip(multi_cfg, multi=True, ignore_md5=True)
+
+    assert stats["md5_ignored"] == 1
+    assert stats["extracted"] == 2
+
+
+def test_multi_matching_md5_passes(multi_cfg: dict[str, Any]) -> None:
+    root = Path(multi_cfg["books_dir"])
+    make_multi(root / "lib-3.zip", multi_members())
+    (root / "md5_sum.txt").write_text(f"lib-3.zip\t\t: {bl.file_md5(root / 'lib-3.zip')}\n", encoding="utf-8")
+
+    stats = bl.unpack_fb2zip(multi_cfg, multi=True)
+
+    assert stats["extracted"] == 2
+    assert "md5_mismatch" not in stats
+
+
+def test_multi_delete_source_quarantines_archive_after_full_unpack(multi_cfg: dict[str, Any]) -> None:
+    root = Path(multi_cfg["books_dir"])
+    make_multi(root / "lib-2.zip", {"24.fb2": make_fb2("Книга", "Иван", "Петров"), "3.fb2": b"<FictionBook/>"})
+
+    stats = bl.unpack_fb2zip(multi_cfg, multi=True, delete_source=True)
+
+    assert (root / "lib-2" / "Петров - Книга.fb2").is_file()
+    assert not (root / "lib-2.zip").exists()
+    assert (Path(multi_cfg["quarantine_dir"]) / "replaced" / "lib-2.zip").is_file()
+    assert stats["replaced"] == 1
+
+
+def test_multi_out_dir_outside_books(multi_cfg: dict[str, Any], tmp_path: Path) -> None:
+    root = Path(multi_cfg["books_dir"])
+    make_multi(root / "lib-3.zip", multi_members())
+    out = tmp_path / "ssd" / "unpacked"
+
+    bl.unpack_fb2zip(multi_cfg, multi=True, out_dir=str(out))
+
+    assert sorted(p.name for p in (out / "lib-3").iterdir()) == ["Петров - Книга.fb2", "librusec-3.fb2"]
+    assert not (root / "lib-3").exists()
+
+
+def test_multi_out_dir_inside_books_rejected(multi_cfg: dict[str, Any]) -> None:
+    root = Path(multi_cfg["books_dir"])
+    with pytest.raises(bl.ConfigError):
+        bl.unpack_fb2zip(multi_cfg, dry_run=True, multi=True, out_dir=str(root / "inside"))
+
+
+def test_out_requires_multi(zip_cfg: dict[str, Any], tmp_path: Path) -> None:
+    with pytest.raises(bl.ConfigError):
+        bl.unpack_fb2zip(zip_cfg, out_dir=str(tmp_path / "out"))
+
+
+def test_single_fb2zip_unchanged_with_multi_flag(zip_cfg: dict[str, Any]) -> None:
+    root = Path(zip_cfg["books_dir"])
+
+    bl.unpack_fb2zip(zip_cfg, multi=True)
+
+    assert (root / "a.fb2").read_bytes() == b"<FictionBook>a</FictionBook>"
+    assert (root / "a.fb2.zip").is_file()
+
+
 # ---- convert: безопасность и проверка результата --------------------------------------------
 
 def test_strip_foreign_images_keeps_only_media_paths(tmp_path: Path) -> None:

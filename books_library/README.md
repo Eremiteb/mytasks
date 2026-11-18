@@ -32,7 +32,7 @@ python3 books_library/books_library.py <режим> [ключи]
 | `scan` | индексация каталога: новые и изменённые по размеру и mtime, исчезнувшие удаляются из базы; однокнижные zip перечитываются | нет (только база) |
 | `scan --reparse` | то же, но метаданные перечитываются у всех книг (схема v6: `book_meta`, подразделы и сборники из метаданных) | нет (только база) |
 | `fix-encoding` | кодировка fb2 (объявление и «полу-cp866») и txt (в UTF-8 без BOM, LF); то же внутри однокнижных zip | да, с журналом и карантином |
-| `unpack-fb2zip` | `.fb2` из `*.fb2.zip` рядом с архивом | да (добавляет файлы), архив остаётся |
+| `unpack-fb2zip` | `.fb2` из `*.fb2.zip` рядом с архивом; с `--multi` — и из многокнижных `.zip` (два и более `.fb2`) в папку `<архив без .zip>/` (рядом или `--out`), имена по метаданным fb2 («Фамилия - Название.fb2», без метаданных — `librusec-N.fb2`), сверка md5 с `md5_sum.txt` рядом | да (добавляет файлы); архив остаётся; с `--multi --delete-source` — в карантин `replaced/` после полной распаковки |
 | `convert` | DOC/DOCX/RTF/ODT/MHT/MHTML → EPUB (по умолчанию, по главам `--split-level=2`) или FB2; `--only html` — HTML библиотеки Мошкова → «Фамилия - Название.epub» рядом; `--only fb2` — fb2 и однокнижный zip с fb2 → EPUB (собственный конвертер, при сбое — Calibre) | да; исходник — в карантин `replaced/` (`--only fb2`) или только с `--delete-source` (любой формат, не удаляется) |
 | `reconvert-fb2` | пересборка epub, которые ночью сделал Calibre из fb2 (OPF `calibre:timestamp` 16–18 ноября 2026), собственным конвертером EPUB 3; `--sample N --out DIR` — выборка для проверки | да (замена epub в библиотеке с переносом старого в `replaced-calibre/`); `--dry-run` и `--sample` — нет |
 | `unpack-collections` | книги из раздела «Сборники» — в папки авторов (только командная строка) | да (перенос файлов), база |
@@ -58,6 +58,10 @@ python3 books_library/books_library.py <режим> [ключи]
 | `--only` | `fix-encoding`: `all`, `fb2`, `txt`; `convert`: `all`, `fb2`, `doc`, `docx`, `rtf`, `odt`, `mht`, `mhtml`, `html` (`html` — только явно, в `all` не входит) |
 | `--workers N` | `convert --only fb2`, `dedup`, `zip-books`: число потоков, 1..64 (по умолчанию `workers` из конфига); `unzip-books`: по умолчанию `unzip_workers` |
 | `--max-mb N` | `unpack-fb2zip`: предел размера одной распаковываемой книги, МБ (по умолчанию 200, допустимо 1..4096) |
+| `--multi` | `unpack-fb2zip`: обрабатывать и многокнижные `.zip`; записи с путями и `..` отбрасываются, zip-бомбы (степень сжатия выше 200) пропускаются |
+| `--out DIR` | `unpack-fb2zip --multi`: абсолютный каталог, куда класть папку `<архив>/` вместо папки рядом с архивом; не внутри каталога книг и карантина; создаётся с правами 0700 |
+| `--ignore-md5` | `unpack-fb2zip --multi`: распаковать архив, даже если md5 не совпал с `md5_sum.txt` (предупреждение в журнале; CRC записей всё равно проверяется) |
+| `--delete-source` | `convert`; `unpack-fb2zip --multi`: исходник (архив) в карантин `replaced/` после полной распаковки (без флага архив остаётся) |
 | `--to epub\|fb2` | `convert`: формат результата (по умолчанию EPUB — правило библиотеки); `merge-folder --to B`: папка автора верхнего уровня или путь внутри `_разобрать` |
 | `--from NAME` | `merge-folder`: папка верхнего уровня или путь внутри `_…` (`_Сборники/Серия/Автор`), которую склеить или переименовать; ключ можно повторять |
 | `--overwrite` | `convert`: перезаписывать существующий результат |
@@ -89,6 +93,8 @@ python3 books_library/books_library.py fix-encoding -n --only all       # пла
 python3 books_library/books_library.py fix-encoding --only all          # исправление (после -n)
 python3 books_library/books_library.py unpack-fb2zip -n -p /книги       # план распаковки
 python3 books_library/books_library.py unpack-fb2zip -p /книги          # распаковка (после -n)
+python3 books_library/books_library.py unpack-fb2zip -n --multi -p /книги                          # план: многокнижные zip
+python3 books_library/books_library.py unpack-fb2zip --multi --out /var/lib/lib-rus -p /книги --delete-source  # боевой (после -n)
 python3 books_library/books_library.py convert -n -p /книги --only doc  # план конвертации DOC
 python3 books_library/books_library.py convert -p /книги --only doc     # конвертация (после -n)
 python3 books_library/books_library.py convert -n --only fb2            # план: fb2 → EPUB через Calibre
@@ -538,6 +544,8 @@ zip и вложенные zip не трогаются.
 
 Каталог — `books_library/reports/`.
 
+- Порядок для Lib.rus.ec (многокнижные архивы librusec в `/mnt/copy/Books/_Сборники/Lib.rus.ec - Официальная/`): `unpack-fb2zip --multi` → `convert --only fb2` → `scan` → `dedup` → `sort-underscore` → `dedup-folders`; каждый режим сначала с `-n`.
+- `unpack-fb2zip` пишет журнал `unpack-fb2zip[-dry-run]-<время>.jsonl` (архив, запись, итоговое имя или причина пропуска; actions `extracted`, `planned`, `skipped`, `failed`, `md5_mismatch`, `md5_ignored`, `replaced`).
 - `<режим>[-dry-run]-<время>.jsonl` — журнал действий, пишется по ходу работы (переживает обрыв): строка на действие
   (`fixed`, `zipped`, `renamed`, `replaced`, `duplicate`, `rejected-*`, `skipped`, `failed`…) с путём, целью и причиной.
 - `<режим>[-dry-run]-<время>.json` — итог по завершении: каталог, режим, статистика, путь журнала, ошибки обхода.
