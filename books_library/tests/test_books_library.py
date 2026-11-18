@@ -3469,3 +3469,80 @@ def test_meta_label_prefixes_and_details_escaping() -> None:
     assert bl.meta_label("неизвестно") == "неизвестно"
     html_block = bl.details_html([("keyword", ["<script>x</script>"])])
     assert "<script>" not in html_block and "&lt;script&gt;" in html_block
+
+
+# ---- нативный epub предпочтительнее сконвертированного из fb2 -------------------------------------
+
+def make_text_epub(path: Path, text: str, *, converted: bool) -> None:
+    """Epub с одним текстом. converted — метка fb2_to_epub3 в OPF; без неё epub выглядит как издательский."""
+    generator = f'<meta name="generator" content="{bl.FB2_CONVERTER_GENERATOR}"/>' if converted else ""
+    container = (
+        '<?xml version="1.0"?>'
+        '<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+        '<rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>'
+        "</container>"
+    )
+    opf = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<package xmlns="http://www.idpf.org/2007/opf" version="3.0">'
+        '<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">'
+        "<dc:title>Книга</dc:title><dc:creator>Иванов Иван</dc:creator><dc:language>ru</dc:language>"
+        f"{generator}</metadata>"
+        '<manifest><item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/></manifest>'
+        '<spine><itemref idref="c1"/></spine></package>'
+    )
+    chapter = ('<?xml version="1.0" encoding="utf-8"?>'
+               f'<html xmlns="http://www.w3.org/1999/xhtml"><body><p>{text}</p></body></html>')
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("mimetype", "application/epub+zip")
+        archive.writestr("META-INF/container.xml", container)
+        archive.writestr("OEBPS/content.opf", opf)
+        archive.writestr("OEBPS/ch1.xhtml", chapter)
+
+
+def test_fb2_to_epub3_writes_generator_meta_and_is_converted(tmp_path: Path) -> None:
+    epub = tmp_path / "book.epub"
+    bl.fb2_to_epub3(make_fb2("Тёмный лес", "Иван", "Иванов"), epub)
+    with zipfile.ZipFile(epub) as archive:
+        opf = archive.read("OEBPS/content.opf").decode("utf-8")
+    assert f'<meta name="generator" content="{bl.FB2_CONVERTER_GENERATOR}"/>' in opf
+    assert bl.epub_converted(epub) is True
+
+
+def test_native_epub_is_not_converted(tmp_path: Path) -> None:
+    epub = tmp_path / "native.epub"
+    make_epub(epub)
+    assert bl.epub_converted(epub) is False
+
+
+def test_converted_opf_markers_calibre_pandoc_and_fb2_manifest() -> None:
+    calibre = '<dc:contributor opf:role="bkp">calibre 5.44.0 [https://calibre-ebook.com]</dc:contributor>'
+    pandoc = '<package version="3.0" unique-identifier="epub-id-1">'
+    fb2_manifest = ('<manifest><item id="css" href="css/book.css" media-type="text/css"/>'
+                    '<item id="title-page" href="text/title.xhtml" media-type="application/xhtml+xml"/></manifest>')
+    assert bl.converted_opf(f"<metadata>{calibre}</metadata>") is True
+    assert bl.converted_opf(pandoc) is True
+    assert bl.converted_opf(fb2_manifest) is True
+    assert bl.converted_opf('<package unique-identifier="pub-id"><manifest/></package>') is False
+
+
+def test_mark_roles_native_epub_wins_over_converted() -> None:
+    base = {"fmt": "epub", "s": {1, 2, 3, 4}, "reason": "", "role": "kept", "coverage": None, "keeper": "", "quarantine": ""}
+    texts = [{**base, "path": "A/Конверт.epub", "words": 300, "converted": True},
+             {**base, "path": "A/Нативный.epub", "words": 250, "converted": False}]
+    bl.mark_roles(texts)
+    assert {t["path"]: t["role"] for t in texts} == {"A/Конверт.epub": "duplicate", "A/Нативный.epub": "kept"}
+
+
+def test_dedup_folders_keeps_native_epub_though_converted_is_larger(authors_cfg: dict[str, Any]) -> None:
+    folder = Path(authors_cfg["books_dir"]) / "Иванов Иван Иванович"
+    folder.mkdir(parents=True)
+    text = folder_text(300, "слово")
+    make_text_epub(folder / "Тёмный лес (конверт).epub", text, converted=True)
+    make_text_epub(folder / "Тёмный лес.epub", text, converted=False)
+
+    result = bl.dedup_folders(authors_cfg, out=lambda _line: None)
+
+    assert result["duplicate"] == 1
+    assert (folder / "Тёмный лес.epub").is_file()
+    assert not (folder / "Тёмный лес (конверт).epub").exists()

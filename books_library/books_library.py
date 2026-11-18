@@ -4007,6 +4007,7 @@ def fb2_to_epub3(data: bytes, out: Path) -> None:
             meta.append(f'<meta refines="#c1" property="group-position">{_esc(book.series_no)}</meta>')
             meta.append(f'<meta name="calibre:series_index" content="{_esc(book.series_no)}"/>')
     meta.append(f'<meta property="dcterms:modified">{modified}</meta>')
+    meta.append(f'<meta name="generator" content="{FB2_CONVERTER_GENERATOR}"/>')
     if book.cover_name:
         meta.append('<meta name="cover" content="cover-image"/>')
     opf = ('<?xml version="1.0" encoding="utf-8"?>\n'
@@ -4157,13 +4158,47 @@ FB2_SOURCE_HEAD = 64 * 1024
 SOURCE_LIMIT = 256 * 1024 * 1024
 
 
+# Метка собственного конвертера fb2_to_epub3 в OPF (<meta name="generator">); у выпусков до неё — манифест ниже.
+FB2_CONVERTER_GENERATOR = "books_library fb2_to_epub3"
+EPUB_CONVERTED_CACHE: dict[tuple[str, int, int], bool] = {}
+
+
+def calibre_marked(opf: str) -> bool:
+    """Метка Calibre: dc:contributor opf:role="bkp" с текстом calibre."""
+    return any(re.search(r'\bopf:role\s*=\s*"bkp"', attrs) and strip_tags(body).startswith("calibre")
+               for attrs, body in re.findall(r"<dc:contributor\b([^>]*)>(.*?)</dc:contributor>", opf, re.S))
+
+
+def converted_opf(opf: str) -> bool:
+    """Epub сделан конвертером, а не издателем: Calibre; fb2_to_epub3 (meta generator или фиксированный манифест
+    css/book.css + title-page); pandoc (unique-identifier="epub-id-1" в package)."""
+    if f'content="{FB2_CONVERTER_GENERATOR}"' in opf:
+        return True
+    if '<item id="css" href="css/book.css"' in opf and '<item id="title-page" href="text/title.xhtml"' in opf:
+        return True
+    return 'unique-identifier="epub-id-1"' in opf or calibre_marked(opf)
+
+
+def epub_converted(path: Path) -> bool:
+    """Признак «сконвертирован из fb2/doc/html» для epub (см. converted_opf). Кэш по (путь, размер, mtime) на время
+    прогона. Нечитаемый epub — не сконвертирован: сортировка для него не меняется."""
+    try:
+        stat = path.stat()
+        key = (str(path), stat.st_size, stat.st_mtime_ns)
+        if key not in EPUB_CONVERTED_CACHE:
+            with zipfile.ZipFile(path) as archive:
+                EPUB_CONVERTED_CACHE[key] = converted_opf(Epub(archive).opf)
+        return EPUB_CONVERTED_CACHE[key]
+    except (OSError, KeyError, ValueError, EOFError, zipfile.BadZipFile):
+        return False
+
+
 def epub_opf_facts(epub: Path) -> dict[str, Any]:
     """Признаки из OPF epub (читается только он): метка calibre в dc:contributor opf:role="bkp", дата
     calibre:timestamp, название и первый автор."""
     with zipfile.ZipFile(epub) as archive:
         opf = Epub(archive).opf
-    calibre = any(re.search(r'\bopf:role\s*=\s*"bkp"', attrs) and strip_tags(body).startswith("calibre")
-                  for attrs, body in re.findall(r"<dc:contributor\b([^>]*)>(.*?)</dc:contributor>", opf, re.S))
+    calibre = calibre_marked(opf)
     stamp = None
     for tag in re.findall(r"<(?:\w+:)?meta\b([^>]*)>", opf):
         attrs = parse_attrs(tag)
@@ -4670,10 +4705,13 @@ def dedup(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None, w
             run.record("group-too-large", files[group[0]][0], members=len(group))
             return
         members = []
+        # признак «сконвертирован» читается только для групп из двух и более epub
+        epub_group = sum(metas[index]["fmt"] == "epub" for index in group) >= 2
         with tempfile.TemporaryDirectory(prefix="books_library-dedup-") as tmp_name:
             for index in group:
                 rel, size, mtime = files[index]
                 fmt = metas[index]["fmt"]
+                converted = epub_group and fmt == "epub" and epub_converted(root / rel)
                 try:
                     text = cache.get(rel, size, mtime, fmt) if cache is not None else None
                     if text is None:
@@ -4688,8 +4726,8 @@ def dedup(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None, w
                     words, shingle_set, sampled = 0, set(), False
                     run.record("no-text", rel, reason=f"{type(error).__name__}: {error}")
                 members.append({"path": rel, "fmt": fmt, "size": size, "words": words, "sh": shingle_set, "sampled": sampled,
-                                "authors": metas[index]["authors"]})
-        members.sort(key=lambda m: (FORMAT_RANK.get(m["fmt"], 5), -m["words"], -m["size"]))
+                                "authors": metas[index]["authors"], "converted": converted})
+        members.sort(key=lambda m: (FORMAT_RANK.get(m["fmt"], 5), m["converted"], -m["words"], -m["size"]))
         # копии одной книги в папках её соавторов — не дубли: в группу не входят (счётчик coauthor-copy)
         unique_members: list[dict[str, Any]] = []
         for member in members:
@@ -4817,11 +4855,12 @@ def text_item(cfg: dict[str, Any], root: Path, cache: TextCache | None, known: d
 
 
 def mark_roles(texts: list[dict[str, Any]]) -> None:
-    """Жадный проход по значимости (формат → кириллическое имя → больше слов → путь). Книга — дубль, если ≥ 97 % её
-    шинглов уже есть у оставленных и похожих и в ней ≥ 200 слов; похожая — от 85 % до 97 %; иначе оставлена. Без текста
-    оставлена и в сравнении не участвует. У дубля и похожего keeper — оставленный с наибольшей долей общих шинглов."""
-    texts.sort(key=lambda t: (FORMAT_RANK.get(t["fmt"], 5), not CYRILLIC.search(split_name(t["path"])[0]),
-                              -t["words"], t["path"]))
+    """Жадный проход по значимости (формат → нативный раньше сконвертированного → кириллическое имя → больше слов →
+    путь). Книга — дубль, если ≥ 97 % её шинглов уже есть у оставленных и похожих и в ней ≥ 200 слов; похожая — от 85 %
+    до 97 %; иначе оставлена. Без текста оставлена и в сравнении не участвует. У дубля и похожего keeper — оставленный
+    с наибольшей долей общих шинглов."""
+    texts.sort(key=lambda t: (FORMAT_RANK.get(t["fmt"], 5), t.get("converted", False),
+                              not CYRILLIC.search(split_name(t["path"])[0]), -t["words"], t["path"]))
     union: set[int] = set()
     kept: list[dict[str, Any]] = []
     for item in texts:
@@ -4871,6 +4910,10 @@ def keeper_renames(texts: list[dict[str, Any]]) -> dict[str, str]:
 def dedup_folder(run: NightRun, folder_rel: str, texts: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
     """Решения по одной папке автора: дубли — в карантин, оставленный с транслитным именем — переименовывается.
     Возвращает группы для dup_groups и пары переноса путей (старый → новый) для relink."""
+    # признак «сконвертирован» читается только для папок из двух и более epub
+    epub_folder = sum(t["fmt"] == "epub" for t in texts) >= 2
+    for item in texts:
+        item["converted"] = epub_folder and item["fmt"] == "epub" and epub_converted(run.root / item["path"])
     mark_roles(texts)
     for item in texts:
         if not item["s"]:
