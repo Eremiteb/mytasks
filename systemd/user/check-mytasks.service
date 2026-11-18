@@ -1,5 +1,5 @@
 [Unit]
-Description=Проверка сервисов и заданий mytasks при входе в сеанс (уведомление в трее)
+Description=Проверка сервисов и заданий mytasks и точек монтирования из /etc/fstab при входе в сеанс (уведомление в трее)
 Documentation=file://@MYTASKS_DIR@/README.md
 After=graphical-session.target
 Wants=graphical-session.target
@@ -8,6 +8,9 @@ Wants=graphical-session.target
 Type=oneshot
 # Пауза, чтобы таймеры, автозапуск и сервисы сеанса успели подняться
 ExecStartPre=/usr/bin/env sleep 60
+# Первым шагом — проверка монтирования из /etc/fstab (раньше — отдельный юнит
+# check-store-mount.service). Префикс «-»: сбой этой проверки не мешает check_mytasks.sh
+ExecStart=-@MYTASKS_DIR@/check-store-mount.sh
 # Без вопросов: таблица состояния в журнале и уведомление о проблемах
 ExecStart=@MYTASKS_DIR@/check_mytasks.sh --no-create --notify
 # Код 1 — найдены незапущенные или не прописанные задания: штатный результат

@@ -298,7 +298,7 @@ crontab /etc/config/crontab
 - Пропускает виртуальные ФС (`/proc`, `/sys`, `/dev`, `swap` и др.)
 - При обнаружении несмонтированных точек отправляет desktop-уведомление через `notify-send`
 - Дублирует сообщение в консоль
-- Запускается при входе в графический сеанс user-юнитом `systemd/user/check-store-mount.service` (устанавливает `check_mytasks.sh`)
+- Запускается при входе в графический сеанс user-юнитом `check-mytasks.service` (первым шагом; устанавливает `check_mytasks.sh`)
 
 **Конфигурация** (необязательно, `conf/check-store-mount.conf`, пример — `conf/check-store-mount.conf.example`; значения можно передать и окружением):
 
@@ -383,7 +383,7 @@ journalctl --user -u check-backups.service -n 20
 
    **Alpine / postmarketOS:** скрипты mytasks на Bash, а в Alpine по умолчанию только busybox — перед первым запуском выполните `apk add bash`; GNU `find`/`coreutils` (нужны `find -printf`, `stat -c` и т.п.) скрипт проверит как зависимости `gnu:find`/`gnu:stat` и предложит `findutils`/`coreutils`. **NixOS:** нет `/bin/bash`, `/usr/bin/python3`, `/usr/bin/sleep` — шебанги и юниты mytasks используют `/usr/bin/env`; пакеты объявляйте в `configuration.nix`.
 2. **Обязательно обновляет систему** штатной командой своего семейства (столбец «Обновление системы»; одно повышение прав) — до любых изменений. Если обновление не удалось или для ОС не поддерживается, пакеты в этом запуске не ставятся (в rolling-дистрибутивах установка без обновления — неподдерживаемое частичное обновление), остальные проверки идут. После обновления ядра или при флаге `/run/reboot-required` скрипт напоминает о перезагрузке. В режимах `--status`, `--no-create` и без терминала/окон без `--yes` обновление не выполняется; `GARUDA_UPDATE="no"` — на Garuda чистый `pacman -Syu` вместо `garuda-update`.
-3. Затем прописывает себя в автозагрузку: user-юнит `check-mytasks.service` при входе в графический сеанс запускает `check_mytasks.sh --no-create --notify` (таблица в журнале и уведомление о проблемах).
+3. Затем прописывает себя в автозагрузку: user-юнит `check-mytasks.service` при входе в графический сеанс первым шагом запускает `check-store-mount.sh` (проверка точек монтирования из `/etc/fstab`), затем `check_mytasks.sh --no-create --notify` (таблица в журнале и уведомление о проблемах).
 4. Записывает каталог mytasks — каталог, откуда запущен скрипт, — в `conf/check_mytasks.conf` (`MYTASKS_DIR`). Если репозиторий перенесён и каталог в конфиге другой, предупреждает и предлагает обновить его, а затем и все юниты.
 5. При первом запуске (нет `conf/check_mytasks.conf`) проводит мастер всех отсутствующих конфигов по `conf/*.conf.example`, `music_downloader/*.json.example`, `utility_bills/*.json.example` и `books_library/*.json.example` (кроме `cloud_backup_qnap.conf`): окна `zenity` (без него — `kdialog`), без графики — вопросы в терминале. Описание каждого значения берётся из комментариев примера, значения по умолчанию — из примера с подстановкой `@MYTASKS_DIR@`/`@HOME@`. Строки примера без изменений копируются как есть (`${HOME}` и т.п. сохраняются).
 6. Проверяет зависимости — все обязательные, ставятся без вопросов, в том числе с `--yes` (неприменимые к машине отсекают условия `family:`/`fs:`/`cmd:`) — и ставит пакеты менеджером своего семейства одним запросом прав.
@@ -396,14 +396,13 @@ journalctl --user -u check-backups.service -n 20
 
 | Задание | Вид | Что делает |
 |---|---|---|
-| `check-mytasks.service` | user-юнит | сам скрипт при входе в сеанс |
+| `check-mytasks.service` | user-юнит | при входе в сеанс: `check-store-mount.sh` (точки монтирования из `/etc/fstab`), затем сам скрипт |
 | `conf/check_mytasks.conf` | конфиг | каталог mytasks, семейство ОС, способ повышения прав |
 | `system-monitor.timer` | системный юнит | `system_monitor.sh` каждые 6 ч: запускает root-копию из `ROOT_LIB_DIR` в песочнице systemd |
 | `system_monitor.sh`, `system_monitor.conf`, `llamactl-root` | root-file | root-копии (`root:root`) в `ROOT_LIB_DIR` и настройки в `ROOT_CONF_DIR`; «отличается» — содержимое или права не совпадают с исходником, обновление с подтверждением |
 | `check-backups.timer` | user-юнит | `check_backups.sh` раз в сутки |
 | `sources.timer` | user-юнит | `sources.sh` ежедневно в 21:30, пропущенный запуск — после загрузки; ждёт окончания скачивания музыки, блокирует выключение до конца |
 | `agent-skills-sync.timer` | user-юнит | `install_agent_skills.sh --apply` раз в сутки: навык `model-routing` на всех устройствах |
-| `check-store-mount.service` | user-юнит | `check-store-mount.sh` при входе в сеанс |
 | `beufm-recorder.service` | user-юнит | `music_downloader/beufm_recorder.py` постоянно: запись эфира Beu FM |
 | `enable-linger` | linger | `loginctl enable-linger` пользователя: user-службы (запись эфира) работают с загрузки, без входа в сеанс |
 | `beufm-recorder` | работа службы | запись эфира идёт: лог `logs/beufm_recorder-*.jsonl` обновлялся не позже 20 мин назад и без ошибок, иначе `systemctl --user restart` |
