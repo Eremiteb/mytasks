@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import fcntl
 import importlib
 import json
 import os
@@ -3667,6 +3668,7 @@ def make_purge_tree(cfg: dict[str, Any], tmp_path: Path) -> tuple[Path, Path, Pa
 def test_purge_quarantine_removes_one_reason_and_writes_report(cfg: dict[str, Any], tmp_path: Path,
                                                                monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    monkeypatch.setattr(bl, "LOCK_PATH", tmp_path / ".books_library.lock")
     qroot, dup, kept = make_purge_tree(cfg, tmp_path)
     params = bl.command_params("purge-quarantine", {"reasons": ["duplicate"]})
     stats = bl.run_command(cfg, "purge-quarantine", False, params)
@@ -3689,11 +3691,47 @@ def test_purge_quarantine_dry_run_deletes_nothing_and_writes_no_report(cfg: dict
     assert not (tmp_path / "reports").exists()
 
 
+def run_cli(argv: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> int:
+    """main() с изолированными логом и блокировкой: возвращает код выхода, как sys.exit(main())."""
+    monkeypatch.setenv("MYTASKS_LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setattr(bl, "LOCK_PATH", tmp_path / ".books_library.lock")
+    return bl.main([*argv, "--config", str(tmp_path / "books_library.json")])
+
+
+def test_purge_quarantine_busy_scan_lock_refuses_without_deleting(cfg: dict[str, Any], tmp_path: Path,
+                                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    _qroot, dup, _kept = make_purge_tree(cfg, tmp_path)
+    params = bl.command_params("purge-quarantine", {"reasons": ["duplicate"]})
+    with (tmp_path / ".books_library.lock").open("w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)  # другой процесс сканирования держит блокировку
+        with pytest.raises(bl.ScanBusyError):
+            bl.run_command(cfg, "purge-quarantine", False, params)
+        assert run_cli(["purge-quarantine", "--reason", "duplicate"], tmp_path, monkeypatch) == 3
+    assert (dup / "x.fb2").read_bytes() == b"12345"
+    assert not (tmp_path / "reports").exists()  # отчёт не пишется, если блокировка не получена
+
+
+def test_cli_exit_code_missing_folder_is_config_error_2(cfg: dict[str, Any], tmp_path: Path,
+                                                        monkeypatch: pytest.MonkeyPatch) -> None:
+    assert run_cli(["merge-folder", "--from", "Нет Такой", "--to", "Петров Иван"], tmp_path, monkeypatch) == 2
+
+
+def test_cli_exit_code_database_error_is_1(cfg: dict[str, Any], tmp_path: Path,
+                                           monkeypatch: pytest.MonkeyPatch) -> None:
+    def locked(*_args: Any, **_kwargs: Any) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(bl, "run_command", locked)
+    assert run_cli(["purge-quarantine", "--reason", "duplicate"], tmp_path, monkeypatch) == 1
+
+
 def test_purge_quarantine_report_failure_deletes_nothing(cfg: dict[str, Any], tmp_path: Path,
                                                          monkeypatch: pytest.MonkeyPatch) -> None:
     def broken_report(kind: str, data: dict[str, Any]) -> Path:
         raise OSError("отчёт недоступен")
 
+    monkeypatch.setattr(bl, "LOCK_PATH", tmp_path / ".books_library.lock")
     monkeypatch.setattr(bl, "write_report", broken_report)
     _qroot, dup, _kept = make_purge_tree(cfg, tmp_path)
     params = bl.command_params("purge-quarantine", {"reasons": ["duplicate"]})

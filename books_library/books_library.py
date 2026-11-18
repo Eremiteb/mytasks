@@ -7576,8 +7576,9 @@ def run_command(cfg: dict[str, Any], command: str, dry_run: bool, params: dict[s
         return convert_documents(cfg, dry_run, params["path"], out=out,
                                  **{k: v for k, v in params.items() if k not in ("path", "workers")})
 
-    # purge-quarantine — только CLI и без scan_lock (карантин не каталог книг); боевой запуск необратим.
-    if dry_run or command in ("migrate", "purge-quarantine"):
+    # purge-quarantine пишет в book_variants общей БД, поэтому боевой запуск берёт scan_lock как остальные изменяющие
+    # режимы (карантин — не каталог книг, но база одна). Dry-run только читает и блокировку не берёт.
+    if dry_run or command == "migrate":
         return action()
     with scan_lock():
         return action()
