@@ -61,7 +61,7 @@ from html.parser import HTMLParser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -4610,7 +4610,7 @@ def unzip_books(cfg: dict[str, Any], dry_run: bool = False, path: str | None = N
 # unpack-collections и sort-underscore: книги из раздела сборников / служебных папок «_» — в папки авторов (только CLI; в веб и API не выведены)
 # ----------------------------------------------------------------------
 
-CLI_COMMANDS = ("unpack-collections", "merge-authors", "sort-underscore")
+CLI_COMMANDS = ("unpack-collections", "merge-authors", "sort-underscore", "misplaced")
 COLLECTIONS_SECTION = "Сборники"  # section_name папки «_…» каталога книг: раздел сборников
 RELINK_BATCH = 1000  # пар переноса на один relink: при сбое связи и файлы расходятся не больше чем на пачку
 FOLDER_NAME_MAX = 120
@@ -5753,8 +5753,427 @@ def variant_action(cfg: dict[str, Any], a: str, b: str, action: str) -> str:
             f"конфликтов имён {run.stats.get('conflicts', 0)}")
 
 
+# ----------------------------------------------------------------------
+# misplaced / fix-misplaced / merge-folder / strip-suffix: книги не в своей папке автора и разбор папок (CLI)
+# ----------------------------------------------------------------------
+
+CAT_OK = "ok"
+CAT_NO_META = "no-meta"
+CAT_META_NOT_AUTHOR = "meta-not-author"
+CAT_MISPLACED_EXISTING = "misplaced-existing"
+CAT_MISPLACED_NO_TARGET = "misplaced-no-target"
+MISPLACED_CATEGORIES = (CAT_OK, CAT_NO_META, CAT_META_NOT_AUTHOR, CAT_MISPLACED_EXISTING, CAT_MISPLACED_NO_TARGET)
+MISPLACED_EXAMPLES = 30  # примеров misplaced-existing в выводе и в JSON-отчёте
+MISPLACED_TOP = 50  # папок в JSON-отчёте (по числу неверно лежащих книг)
+MERGE_MIN_BOOKS = 2  # папка решается целиком только при стольких книгах с метаданными
+FOLDER_TMP_SUFFIX = ".rename-tmp"  # временное имя при переименовании папки только по регистру
+SUFFIX_RE = re.compile(r"^(?P<base>.+)_(?P<num>[1-9][0-9]?)(?P<ext>\.[^.]+)$")  # «имя_N.ext», N — 1..99
+
+
+def same_author(folder_key: frozenset[str], key: frozenset[str]) -> bool:
+    """Ключи совпадают или пересекаются ≥ 2 словами, и один из них вложен в другой (⊆ или ⊇)."""
+    return folder_key == key or (
+        len(folder_key & key) >= 2 and (folder_key <= key or folder_key >= key))
+
+
+def folder_matches(folder: str, authors: list[str], index: dict[frozenset[str], str]) -> bool:
+    """Папка подходит хотя бы одному автору книги: по ключу либо как инициалы этого автора (соавтор тоже годится)."""
+    folder_key = author_key(folder)
+    for author in authors:
+        key = author_key(author)
+        if key is None:
+            continue
+        if folder_key is not None and same_author(folder_key, key):
+            return True
+        if is_initials(author) and initials_folder(author, index) == folder:
+            return True
+    return False
+
+
+def expected_folder(author: str, index: dict[frozenset[str], str]) -> tuple[str, str]:
+    """Папка, которую выбрал бы unpack-collections по автору: (папка или '', способ). Инициалы — как в initials_folder."""
+    if is_initials(author):
+        return initials_folder(author, index), "initials"
+    key = author_key(author)
+    if key is None:
+        return "", "no-key"
+    return pick_folder(author, key, "", index)
+
+
+def classify(folder: str, authors: list[str], index: dict[frozenset[str], str]) -> tuple[str, str]:
+    """Категория книги и ожидаемая папка (только для misplaced-*; для остальных — '')."""
+    if not authors:
+        return CAT_NO_META, ""
+    if folder_matches(folder, authors, index):
+        return CAT_OK, ""
+    if author_key(authors[0]) is None:
+        return CAT_META_NOT_AUTHOR, ""
+    expected, method = expected_folder(authors[0], index)
+    if not expected or method in ("new", "not-person", "no-key"):
+        return CAT_MISPLACED_NO_TARGET, ""
+    return CAT_MISPLACED_EXISTING, expected
+
+
+def top_level_folder(path: str) -> str:
+    """Папка верхнего уровня, если книга лежит в папке автора (не «_…» и не «.…»); иначе ''."""
+    if "/" not in path:
+        return ""
+    folder = PurePosixPath(path).parts[0]
+    return "" if folder.startswith(("_", ".")) else folder
+
+
+def misplaced_books(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Все книги в папках авторов верхнего уровня из БД: путь, папка, авторы (строка как в БД), категория и ожидаемая
+    папка. Только чтение: база открывается readonly, файлы не трогаются. Общая выборка для misplaced и fix-misplaced."""
+    db_path = cfg["db_path"]
+    if not Path(db_path).is_file():
+        raise ConfigError(f"база не найдена: {db_path}")
+    index = author_index(Path(cfg["books_dir"]))
+    rows: list[dict[str, Any]] = []
+    with closing(connect(db_path, readonly=True)) as conn:
+        for row in conn.execute("SELECT path, authors FROM books ORDER BY path"):
+            folder = top_level_folder(row["path"])
+            if not folder:
+                continue
+            authors = str(row["authors"] or "")
+            names = [name.strip() for name in authors.split("; ") if name.strip()]
+            category, expected = classify(folder, names, index)
+            rows.append({"path": row["path"], "folder": folder, "authors": authors,
+                         "category": category, "expected": expected})
+    return rows
+
+
+def misplaced(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str], None] = print) -> dict[str, int]:
+    """Отчёт без изменений: счётчики по категориям, EXAMPLES примеров misplaced-existing; JSON — в reports/ (кроме dry-run)."""
+    rows = misplaced_books(cfg)
+    stats = {category: 0 for category in MISPLACED_CATEGORIES}
+    for row in rows:
+        stats[row["category"]] += 1
+    out("категории:")
+    for category in MISPLACED_CATEGORIES:
+        out(f"  {category}: {stats[category]}")
+    existing = sorted((row for row in rows if row["category"] == CAT_MISPLACED_EXISTING), key=lambda row: row["path"])
+    out(f"примеры misplaced-existing ({min(len(existing), MISPLACED_EXAMPLES)} из {len(existing)}):")
+    for row in existing[:MISPLACED_EXAMPLES]:
+        out(f"  {row['authors']} | {row['path']} → {row['expected']}")
+    if dry_run:
+        out("dry-run: JSON не записан")
+        return stats
+    misplaced_rows = [row for row in rows if row["category"] in (CAT_MISPLACED_EXISTING, CAT_MISPLACED_NO_TARGET)]
+    by_folder = Counter(row["folder"] for row in misplaced_rows)
+    top = sorted(by_folder.items(), key=lambda item: (-item[1], item[0]))[:MISPLACED_TOP]
+    report = write_report("misplaced", {
+        "stats": stats,
+        "by_folder": [{"folder": folder, "misplaced": count} for folder, count in top],
+        "rows": misplaced_rows,
+    })
+    out(f"JSON: {report}")
+    return stats
+
+
+def move_guard(folder: str, target: str) -> str:
+    """Причина, по которой книги или папку из folder нельзя переносить в target; '' — можно. Запреты общие, без списков:
+    папка в скобках (псевдоним или настоящее имя); цель хуже исходной (меньше слов); цель — инициалы; в цели
+    несколько авторов; цель не похожа на имя человека; у папки и цели нет общего слова и разные фамилии (другой человек)."""
+    if "(" in folder or ")" in folder:
+        return "skip-brackets"
+    if len(author_words(target)) < len(author_words(folder)):
+        return "skip-worse"
+    if is_initials(target):
+        return "skip-initials"
+    if COAUTHOR_SEPARATOR.search(target):
+        return "skip-coauthors-target"
+    if not person_name(target):
+        return "skip-not-person"
+    folder_key, target_key = author_key(folder), author_key(target)
+    if folder_key is None or target_key is None:
+        return "skip-no-key"
+    if not folder_key & target_key and author_norm(folder.split()[0]) != author_norm(target.split()[0]):
+        return "skip-other-person"
+    return ""
+
+
+def first_author(authors: str) -> str:
+    return authors.split("; ")[0].strip()
+
+
+def folder_action(run: NightRun, db_path: str, root: Path, index: dict[frozenset[str], str], folder: str,
+                  rows: list[dict[str, Any]], taken: set[Path], pending: list[tuple[str, str]]) -> bool:
+    """Решение по всей папке: склейка в существующую папку автора (100 % книг с метаданными голосуют за неё)
+    или переименование в имя по pick_folder («new»). True — папка обработана, её книги на этапе книг не трогаются."""
+    with_authors = [row for row in rows if row["authors"].strip()]
+    total = len(with_authors)
+    if total < MERGE_MIN_BOOKS:
+        return False
+    votes = Counter(row["expected"] for row in with_authors if row["category"] == CAT_MISPLACED_EXISTING)
+    if votes:
+        if len(votes) != 1:
+            return False
+        target, count = next(iter(votes.items()))
+        if count != total or target == folder or not (root / target).is_dir() or move_guard(folder, target):
+            return False
+        run.out(f"{folder} → {target} (книг {total} из {total})")
+        known = {row["path"] for row in rows}
+        merge_folder(run, db_path, root, folder, target, [target], known, taken, pending)
+        run.count("folder-merged")
+        return True
+    if total != len(rows):
+        return False
+    keys = {author_key(first_author(row["authors"])) for row in rows}
+    if len(keys) != 1:
+        return False
+    key = keys.pop()
+    author = first_author(rows[0]["authors"])
+    if key is None or author_key(folder) == key:
+        return False
+    name, method = pick_folder(author, key, "", index)
+    if method != "new" or not name or name == folder or (root / name).exists() or move_guard(folder, name):
+        return False
+    run.out(f"{folder} → {name} (переименование, книг {total})")
+    if run.dry_run:
+        run.count("folder-renamed")
+        journal_row(run, {"action": "rename", "from": folder, "to": name, "status": "dry", "error": ""})
+        return True
+    try:
+        os.rename(root / folder, root / name)
+    except OSError as error:
+        run.count("errors")
+        journal_row(run, {"action": "error", "from": folder, "to": name, "error": str(error)})
+        return True
+    run.count("folder-renamed")
+    journal_row(run, {"action": "rename", "from": folder, "to": name, "status": "moved", "error": ""})
+    pending.extend((row["path"], name + row["path"][len(folder):]) for row in rows)
+    flush_relinks(db_path, pending)
+    return True
+
+
+class Move(NamedTuple):
+    rel: str       # путь книги относительно каталога книг: «папка/файл»
+    name: str      # имя файла
+    expected: str  # папка автора, в которую переносится книга
+
+
+def select_moves(rows: list[dict[str, Any]], root: Path, run: NightRun) -> list[Move]:
+    """Книги к переносу: только misplaced-existing, путь «папка/файл», один автор, цель существует и проходит move_guard.
+    Каждая отброшенная книга учитывается счётчиком своей причины."""
+    moves: list[Move] = []
+    for row in rows:
+        if row["category"] != CAT_MISPLACED_EXISTING:
+            continue
+        path, expected = row["path"], row["expected"]
+        parts = PurePosixPath(path).parts
+        if not expected or not safe_relative(expected) or not (root / expected).is_dir() \
+                or (len(parts) == 2 and parts[0] == expected):
+            run.count("skip-no-target")
+            continue
+        if len(parts) != 2 or not safe_relative(path):
+            run.count("skip-subfolder")
+            continue
+        if "; " in row["authors"]:
+            run.count("skip-coauthors")
+            continue
+        reason = move_guard(parts[0], expected)
+        if reason:
+            run.count(reason)
+            continue
+        if not (root / path).is_file():
+            run.count("skip-missing")
+            continue
+        moves.append(Move(path, parts[1], expected))
+    return moves
+
+
+def safe_relative(text: str) -> bool:
+    """Относительный путь без абсолютного начала и без «..» — чтобы не выйти за пределы каталога книг."""
+    posix = PurePosixPath(text)
+    return bool(posix.parts) and not posix.is_absolute() and ".." not in posix.parts
+
+
+def move_one(run: NightRun, root: Path, db_path: str, move: Move, taken: set[Path], pending: list[tuple[str, str]]) -> None:
+    """Перенос одной книги в папку автора; при занятом имени — суффикс _1, _2… (unique_path). Связи — пачками."""
+    dest = unique_path(root / move.expected, move.name, taken)
+    if dest.name != move.name:
+        run.count("conflicts")
+    dst = dest.relative_to(root).as_posix()
+    if run.dry_run:
+        run.count("moved")
+        journal_row(run, {"action": "move", "from": move.rel, "to": dst, "status": "dry", "error": ""})
+        return
+    try:
+        os.rename(root / move.rel, dest)
+    except OSError as error:
+        run.count("errors")
+        journal_row(run, {"action": "error", "from": move.rel, "to": dst, "error": str(error)})
+        return
+    run.count("moved")
+    journal_row(run, {"action": "move", "from": move.rel, "to": dst, "status": "moved", "error": ""})
+    pending.append((move.rel, dst))
+    flush_relinks(db_path, pending)
+
+
+def remove_emptied(run: NightRun, root: Path, tops: set[str]) -> None:
+    """Папки верхнего уровня, из которых перенесли книги и в которых не осталось файлов, — пустые подпапки и сама папка
+    удаляются снизу вверх (remove_empty_folder, только os.rmdir)."""
+    for top in sorted(tops):
+        base = root / top
+        if base.is_dir() and not any(path.is_file() for path in base.rglob("*")):
+            remove_empty_folder(run, base)
+
+
+def fix_misplaced(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str], None] = print) -> dict[str, Any]:
+    """Этап папок (folder_action), затем этап книг (select_moves/move_one), затем удаление опустевших папок.
+    Журнал reports/fix-misplaced-*.jsonl: move/rename с полями from/to для отката."""
+    root = Path(cfg["books_dir"])
+    db_path = cfg["db_path"]
+    rows = misplaced_books(cfg)
+    index = author_index(root)
+    by_folder: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_folder.setdefault(row["folder"], []).append(row)
+    run = NightRun(cfg, "fix-misplaced", dry_run, None, out)
+    taken: set[Path] = set()
+    pending: list[tuple[str, str]] = []
+    handled: set[str] = set()
+    for folder in sorted(by_folder):
+        if not (root / folder).is_dir():
+            continue
+        if folder_action(run, db_path, root, index, folder, by_folder[folder], taken, pending):
+            handled.add(folder)
+        flush_relinks(db_path, pending, force=True)
+    moves = select_moves([row for row in rows if row["folder"] not in handled], root, run)
+    run.out(f"к переносу: {len(moves)}")
+    for move in moves:
+        move_one(run, root, db_path, move, taken, pending)
+    flush_relinks(db_path, pending, force=True)
+    if not dry_run:
+        remove_emptied(run, root, {PurePosixPath(move.rel).parts[0] for move in moves})
+    return run.finish()
+
+
+def folder_top_ok(name: str) -> bool:
+    """Имя папки верхнего уровня: непустое, без разделителей пути и NUL, не «_…» и не «.…»."""
+    return bool(name) and "/" not in name and "\\" not in name and "\x00" not in name and not name.startswith(("_", "."))
+
+
+def rename_folder(run: NightRun, db_path: str, root: Path, src: str, dst: str, pending: list[tuple[str, str]]) -> None:
+    """Переименование папки верхнего уровня, если «dst» нет. Отличие только регистром — через временное имя.
+    Связи (отметки, полки, коллекции) переносятся по всем книгам папки."""
+    pairs = [(row["path"], dst + row["path"][len(src):]) for row in books_under(db_path, src)]
+    if run.dry_run:
+        run.count("renamed")
+        journal_row(run, {"action": "rename", "from": src, "to": dst, "status": "dry", "error": ""})
+        return
+    try:
+        if src.casefold() == dst.casefold():
+            temp = root / (src + FOLDER_TMP_SUFFIX)
+            os.rename(root / src, temp)
+            os.rename(temp, root / dst)
+        else:
+            os.rename(root / src, root / dst)
+    except OSError as error:
+        run.count("errors")
+        journal_row(run, {"action": "error", "from": src, "to": dst, "error": str(error)})
+        return
+    run.count("renamed")
+    journal_row(run, {"action": "rename", "from": src, "to": dst, "status": "moved", "error": ""})
+    pending.extend(pairs)
+    flush_relinks(db_path, pending)
+
+
+def folder_merge(cfg: dict[str, Any], sources: list[str], target: str, dry_run: bool = False,
+                 out: Callable[[str], None] = print) -> dict[str, Any]:
+    """merge-folder: папка верхнего уровня A → B. Если B нет — переименование A в B; если есть — склейка (merge_folder:
+    файлы и подпапки A переносятся в B, конфликт имени — суффикс _1). Повторяемый --from — несколько папок подряд.
+    Проверки: A существует, обе — верхнего уровня, B проходит folder_name. Журнал reports/merge-folder-*.jsonl."""
+    root = Path(cfg["books_dir"])
+    db_path = cfg["db_path"]
+    if not sources:
+        raise ConfigError("merge-folder: укажите --from")
+    if not folder_top_ok(target) or folder_name(target) != target:
+        raise ConfigError(f"merge-folder: имя «{target}» не подходит для папки автора")
+    for name in sources:
+        if not folder_top_ok(name):
+            raise ConfigError(f"merge-folder: «{name}» — не папка верхнего уровня")
+        if name == target:
+            raise ConfigError("merge-folder: --from и --to совпадают")
+        if not (root / name).is_dir():
+            raise ConfigError(f"merge-folder: папки нет: {name}")
+    if (root / target).exists() and not (root / target).is_dir():
+        raise ConfigError(f"merge-folder: «{target}» есть, но это не папка")
+    run = NightRun(cfg, "merge-folder", dry_run, None, out)
+    target_exists = (root / target).is_dir()
+    taken: set[Path] = set()
+    pending: list[tuple[str, str]] = []
+    for name in dict.fromkeys(sources):
+        if not (root / name).is_dir():
+            run.count("skip-missing")  # уже склеена предыдущим --from
+            continue
+        if target_exists:
+            known = {row["path"] for row in books_under(db_path, name)}
+            merge_folder(run, db_path, root, name, target, [target], known, taken, pending)
+        else:
+            rename_folder(run, db_path, root, name, target, pending)
+            target_exists = True  # в dry-run — план: следующий --from склеивается с этим же именем
+        flush_relinks(db_path, pending, force=True)
+    return run.finish()
+
+
+def author_scope(current: Path, root: Path) -> bool:
+    """Каталог внутри папки автора верхнего уровня (не корень каталога книг и не «_…» / «.…»)."""
+    rel = current.relative_to(root)
+    return bool(rel.parts) and not rel.parts[0].startswith(("_", "."))
+
+
+def numbered_sibling(name: str, base: str, ext: str) -> bool:
+    """Имя «base_M.ext» (M — 1..99) с тем же основанием и расширением."""
+    match = SUFFIX_RE.match(name)
+    return bool(match) and match.group("base") == base and match.group("ext") == ext
+
+
+def strip_suffix(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None,
+                 out: Callable[[str], None] = print) -> dict[str, Any]:
+    """Файлы «имя_N.ext» (N — 1..99) → «имя.ext», если «имя.ext» свободно и в папке нет других «имя_M.ext».
+    Без --path — только внутри папок авторов верхнего уровня; с --path — внутри указанного каталога.
+    Связи переносятся relink по ходу прогона (NightRun.moved)."""
+    root = Path(cfg["books_dir"])
+    target = target_dir(cfg, path)
+    run = NightRun(cfg, "strip-suffix", dry_run, path, out)
+    walk_errors: list[str] = []
+    for current, names in walk_dirs(target, walk_errors):
+        if path is None and not author_scope(current, root):
+            continue
+        for name in names:
+            match = SUFFIX_RE.match(name)
+            if not match:
+                continue
+            run.tick()
+            base, ext = match.group("base"), match.group("ext")
+            src, dest = current / name, current / (base + ext)
+            if dest.exists():
+                run.count("skip-original-exists")
+                continue
+            if any(other != name and numbered_sibling(other, base, ext) for other in names):
+                run.count("skip-siblings")
+                continue
+            src_rel, dst_rel = run.rel(src), run.rel(dest)
+            if dry_run:
+                run.count("renamed")
+                journal_row(run, {"action": "move", "from": src_rel, "to": dst_rel, "status": "dry", "error": ""})
+                continue
+            try:
+                os.rename(src, dest)
+            except OSError as error:
+                run.count("errors")
+                journal_row(run, {"action": "error", "from": src_rel, "to": dst_rel, "error": str(error)})
+                continue
+            run.count("renamed")
+            journal_row(run, {"action": "move", "from": src_rel, "to": dst_rel, "status": "moved", "error": ""})
+            run.moved(src, dest)
+    return run.finish({"walk_errors": walk_errors})
+
+
 FILE_CHANGING = ("fix-encoding", "unpack-fb2zip", "convert", "dedup", "dedup-folders", "zip-books", "unzip-books",
-                 "author-variants", "reconvert-fb2")
+                 "author-variants", "reconvert-fb2", "fix-misplaced", "merge-folder", "strip-suffix")
 COMMANDS = ("scan", "migrate", *FILE_CHANGING)
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
@@ -5773,6 +6192,7 @@ def command_params(command: str, raw: dict[str, Any]) -> dict[str, Any]:
         "unzip-books": {"path", "workers"}, "unpack-collections": {"path"}, "merge-authors": set(),
         "author-variants": set(), "sort-underscore": {"limit"},
         "reconvert-fb2": {"path", "workers", "limit", "sample", "out", "epubcheck"},
+        "misplaced": set(), "fix-misplaced": set(), "merge-folder": {"from", "to"}, "strip-suffix": {"path"},
     }[command]
     unknown = set(raw) - allowed
     if unknown:
@@ -5828,6 +6248,13 @@ def command_params(command: str, raw: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(params["author"], str) or not isinstance(params["exclude"], list) or \
                 not all(isinstance(x, str) for x in params["exclude"]):
             raise ConfigError("author — строка, exclude — список строк")
+    if command == "merge-folder":
+        sources, target = raw.get("from"), raw.get("to")
+        if not isinstance(sources, list) or not all(isinstance(x, str) and x for x in sources):
+            raise ConfigError("from: список непустых имён папок")
+        if not isinstance(target, str) or not target:
+            raise ConfigError("to: имя папки")
+        params.update(sources=list(sources), target=target)
     return params
 
 
@@ -5859,6 +6286,14 @@ def run_command(cfg: dict[str, Any], command: str, dry_run: bool, params: dict[s
             return sort_underscore(cfg, dry_run, params["limit"], out=out)
         if command == "merge-authors":
             return merge_authors(cfg, dry_run, out=out)
+        if command == "misplaced":
+            return misplaced(cfg, dry_run, out=out)
+        if command == "fix-misplaced":
+            return fix_misplaced(cfg, dry_run, out=out)
+        if command == "merge-folder":
+            return folder_merge(cfg, params["sources"], params["target"], dry_run, out=out)
+        if command == "strip-suffix":
+            return strip_suffix(cfg, dry_run, params["path"], out=out)
         if command == "reconvert-fb2":
             return reconvert_fb2(cfg, dry_run, params["path"], params["workers"], params["limit"], params["sample"],
                                  params["out"], params["epubcheck"], out=out)
@@ -7706,8 +8141,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Лёгкая веб-библиотека книг: каталог в SQLite и интерфейс в браузере.")
     parser.add_argument("command", nargs="?", choices=("serve", "scan", *FILE_CHANGING, *CLI_COMMANDS), default="serve",
                         help="serve (по умолчанию), scan, fix-encoding, unpack-fb2zip, convert, reconvert-fb2, dedup, dedup-folders, "
-                             "zip-books, unzip-books, unpack-collections, merge-authors, sort-underscore или author-variants")
-    parser.add_argument("-p", "--path", help="fix-encoding/unpack-fb2zip/convert: каталог (по умолчанию каталог книг)")
+                             "zip-books, unzip-books, unpack-collections, merge-authors, sort-underscore, author-variants, "
+                             "misplaced, fix-misplaced, merge-folder (--from A --to B) или strip-suffix")
+    parser.add_argument("-p", "--path", help="fix-encoding/unpack-fb2zip/convert/strip-suffix: каталог (по умолчанию каталог книг)")
+    parser.add_argument("--from", dest="from_folders", action="append", default=[],
+                        help="merge-folder: папка верхнего уровня, которую склеить или переименовать (можно повторять)")
     parser.add_argument("--only", default="all",
                         help="fix-encoding: all|fb2|txt; convert: all|fb2|doc|docx|rtf|odt|mht|mhtml|html (fb2 — в epub через Calibre; html — только явно)")
     parser.add_argument("--workers", type=int,
@@ -7716,7 +8154,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-mb", type=int, default=200, help="unpack-fb2zip: предел размера записи, МБ")
     parser.add_argument("--limit", type=int,
                         help="sort-underscore: не больше N книг; reconvert-fb2: не больше N сопоставленных книг")
-    parser.add_argument("--to", choices=("epub", "fb2"), default="epub", help="convert: формат результата (по умолчанию epub)")
+    parser.add_argument("--to", help="convert: epub|fb2 (по умолчанию epub); merge-folder: имя папки-цели")
     parser.add_argument("--overwrite", action="store_true", help="convert: перезаписывать существующий результат")
     parser.add_argument("--skip-newer", action="store_true", help="convert: с --overwrite не трогать результат новее исходника")
     parser.add_argument("--exclude", action="append", default=[], help="convert: пропускать имена с этой подстрокой")
@@ -7756,12 +8194,16 @@ def main(argv: list[str] | None = None) -> int:
                 raw = {"path": args.path}
             elif command == "sort-underscore":
                 raw = {"limit": args.limit}
-            elif command == "author-variants":
+            elif command in ("author-variants", "misplaced", "fix-misplaced"):
                 raw = {}
+            elif command == "merge-folder":
+                raw = {"from": args.from_folders, "to": args.to}
+            elif command == "strip-suffix":
+                raw = {"path": args.path}
             elif command == "convert" and args.only == "fb2":
                 raw.update(workers=args.workers)
             elif command == "convert":
-                raw.update(to=args.to, overwrite=args.overwrite, skip_newer=args.skip_newer, exclude=args.exclude,
+                raw.update(to=args.to or "epub", overwrite=args.overwrite, skip_newer=args.skip_newer, exclude=args.exclude,
                            author=args.author, title_mode=args.title_mode, toc=not args.no_toc, toc_depth=args.toc_depth,
                            delete_source=args.delete_source)
             run_command(cfg, command, args.dry_run, command_params(command, raw))

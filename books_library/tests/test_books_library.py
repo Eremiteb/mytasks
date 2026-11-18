@@ -2551,3 +2551,268 @@ def test_text_patronymics_caps_name_is_title_cased(tmp_path: Path) -> None:
     rows = [{"path": "Рыжков Игорь/a.txt"}]
     assert bl.text_patronymics(_CapsNameCache(), tmp_path, rows,
                                bl.author_words("Рыжков Игорь")) == ["Рыжков Игорь Алексеевич"]
+
+
+# ---- misplaced / fix-misplaced / merge-folder / strip-suffix --------------------------------------
+
+def test_misplaced_counts_categories_and_writes_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "Иванов Иван/Ok.fb2": make_fb2("Ok", "Иван", "Иванов"),
+        "Иванов Иван/Чужая.fb2": make_fb2("Чужая", "Пётр", "Петров"),
+        "Петров Пётр/Своя.txt": "Текст.\n",
+        "Сидоров Сергей/Николай.fb2": make_fb2("Николай", "Николай", "Николаев"),
+    })
+    lines: list[str] = []
+
+    stats = bl.misplaced(cfg, out=lines.append)
+
+    assert stats == {"ok": 2, "no-meta": 0, "meta-not-author": 0, "misplaced-existing": 1, "misplaced-no-target": 1}
+    assert len(list((tmp_path / "reports").glob("misplaced-*.json"))) == 1
+    assert any("Иванов Иван/Чужая.fb2 → Петров Пётр" in line for line in lines)
+
+
+def test_misplaced_dry_run_writes_no_json(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "Иванов Иван/Чужая.fb2": make_fb2("Чужая", "Пётр", "Петров"),
+        "Петров Пётр/Своя.txt": "Текст.\n",
+    })
+
+    stats = bl.misplaced(cfg, dry_run=True, out=lambda _line: None)
+
+    assert stats["misplaced-existing"] == 1
+    assert not list((tmp_path / "reports").glob("misplaced-*.json"))
+
+
+def test_fix_misplaced_merges_whole_folder_when_every_book_votes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "Иванов Иван/A.fb2": make_fb2("A", "Иван", "Сидоров"),
+        "Иванов Иван/B.fb2": make_fb2("B", "Иван", "Сидоров"),
+        "Сидоров Иван/Своя.txt": "Текст.\n",
+    })
+    root = Path(cfg["books_dir"])
+
+    stats = bl.fix_misplaced(cfg)
+
+    assert stats["folder-merged"] == 1
+    assert stats["merged"] == 1
+    assert not (root / "Иванов Иван").exists()
+    assert (root / "Сидоров Иван" / "A.fb2").is_file()
+    assert (root / "Сидоров Иван" / "B.fb2").is_file()
+
+
+def test_fix_misplaced_moves_only_misplaced_books_when_folder_is_not_unanimous(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "Иванов Иван/Ok.fb2": make_fb2("Ok", "Иван", "Иванов"),
+        "Иванов Иван/A.fb2": make_fb2("A", "Иван", "Сидоров"),
+        "Иванов Иван/B.fb2": make_fb2("B", "Иван", "Сидоров"),
+        "Сидоров Иван/Своя.txt": "Текст.\n",
+    })
+    root = Path(cfg["books_dir"])
+    with closing(bl.connect(cfg["db_path"])) as conn, conn:
+        conn.execute("INSERT INTO marks(path, status, updated) VALUES (?,?,?)", ("Иванов Иван/A.fb2", "done", 1.0))
+
+    stats = bl.fix_misplaced(cfg)
+
+    assert stats.get("folder-merged", 0) == 0
+    assert stats.get("emptied", 0) == 0
+    assert stats["moved"] == 2
+    assert (root / "Иванов Иван" / "Ok.fb2").is_file()
+    assert (root / "Сидоров Иван" / "A.fb2").is_file()
+    assert (root / "Сидоров Иван" / "B.fb2").is_file()
+    with closing(bl.connect(cfg["db_path"])) as conn:
+        assert [r[0] for r in conn.execute("SELECT path FROM marks")] == ["Сидоров Иван/A.fb2"]
+
+
+def test_fix_misplaced_other_person_is_not_moved(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "Иванов Иван/A.fb2": make_fb2("A", "Пётр", "Петров"),
+        "Иванов Иван/B.fb2": make_fb2("B", "Пётр", "Петров"),
+        "Петров Пётр/Своя.txt": "Текст.\n",
+    })
+    root = Path(cfg["books_dir"])
+
+    stats = bl.fix_misplaced(cfg)
+
+    assert stats.get("folder-merged", 0) == 0
+    assert stats["skip-other-person"] == 2
+    assert (root / "Иванов Иван" / "A.fb2").is_file()
+    assert (root / "Иванов Иван" / "B.fb2").is_file()
+
+
+def test_fix_misplaced_bracket_folder_is_not_touched(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "Иванов Иван (Ps)/A.fb2": make_fb2("A", "Пётр", "Петров"),
+        "Иванов Иван (Ps)/B.fb2": make_fb2("B", "Пётр", "Петров"),
+        "Петров Пётр/Своя.txt": "Текст.\n",
+    })
+    root = Path(cfg["books_dir"])
+
+    stats = bl.fix_misplaced(cfg)
+
+    assert stats.get("folder-merged", 0) == 0
+    assert stats["skip-brackets"] == 2
+    assert (root / "Иванов Иван (Ps)" / "A.fb2").is_file()
+
+
+def test_fix_misplaced_fewer_words_and_initials_targets_are_skipped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "Иванов Иван Иванович/A.fb2": make_fb2("A", "Пётр", "Петров"),
+        "Петров Пётр/Своя.txt": "Текст.\n",
+        "Иванов Иван/B.fb2": make_fb2("B", "И.", "Петров"),
+        "Петров И/Своя.txt": "Текст.\n",
+    })
+    root = Path(cfg["books_dir"])
+
+    stats = bl.fix_misplaced(cfg)
+
+    assert stats["skip-worse"] == 1
+    assert stats["skip-initials"] == 1
+    assert stats.get("moved", 0) == 0
+    assert (root / "Иванов Иван Иванович" / "A.fb2").is_file()
+    assert (root / "Иванов Иван" / "B.fb2").is_file()
+
+
+def test_fix_misplaced_renames_folder_without_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # fb2 хранит фамилию первой; first/last переставлены, чтобы автор книги был «Иван Сидоров», как в именах файлов
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "Иван Петров/A.fb2": make_fb2("A", "Сидоров", "Иван"),
+        "Иван Петров/B.fb2": make_fb2("B", "Сидоров", "Иван"),
+    })
+    root = Path(cfg["books_dir"])
+
+    stats = bl.fix_misplaced(cfg)
+
+    assert stats["folder-renamed"] == 1
+    assert not (root / "Иван Петров").exists()
+    assert (root / "Сидоров Иван" / "A.fb2").is_file()
+    assert (root / "Сидоров Иван" / "B.fb2").is_file()
+
+
+def test_fix_misplaced_dry_run_changes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "Иванов Иван/Ok.fb2": make_fb2("Ok", "Иван", "Иванов"),
+        "Иванов Иван/A.fb2": make_fb2("A", "Иван", "Сидоров"),
+        "Сидоров Иван/Своя.txt": "Текст.\n",
+    })
+    root = Path(cfg["books_dir"])
+
+    stats = bl.fix_misplaced(cfg, dry_run=True, out=lambda _line: None)
+
+    assert stats["moved"] == 1
+    assert (root / "Иванов Иван" / "A.fb2").is_file()
+    assert not (root / "Сидоров Иван" / "A.fb2").exists()
+
+
+def test_merge_folder_renames_when_target_missing_and_relinks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {"Иван Петров/a.txt": "А.\n"})
+    root = Path(cfg["books_dir"])
+    with closing(bl.connect(cfg["db_path"])) as conn, conn:
+        conn.execute("INSERT INTO marks(path, status, updated) VALUES (?,?,?)", ("Иван Петров/a.txt", "done", 1.0))
+
+    stats = bl.folder_merge(cfg, ["Иван Петров"], "Петров Иван")
+
+    assert stats["renamed"] == 1
+    assert not (root / "Иван Петров").exists()
+    assert (root / "Петров Иван" / "a.txt").is_file()
+    with closing(bl.connect(cfg["db_path"])) as conn:
+        assert [r[0] for r in conn.execute("SELECT path FROM marks")] == ["Петров Иван/a.txt"]
+
+
+def test_merge_folder_merges_into_existing_and_counts_conflicts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "Иванов Иван/a.txt": "А.\n",
+        "Иванов Иван/sub/b.txt": "Б.\n",
+        "Иванов Иван Петрович/a.txt": "Другой.\n",
+    })
+    root = Path(cfg["books_dir"])
+    full = root / "Иванов Иван Петрович"
+
+    stats = bl.folder_merge(cfg, ["Иванов Иван"], "Иванов Иван Петрович")
+
+    assert stats["merged"] == 1
+    assert stats["conflicts"] == 1
+    assert not (root / "Иванов Иван").exists()
+    assert (full / "a.txt").read_text(encoding="utf-8") == "Другой.\n"
+    assert (full / "a_1.txt").read_text(encoding="utf-8") == "А.\n"
+    assert (full / "sub" / "b.txt").is_file()
+
+
+def test_merge_folder_rejects_bad_arguments(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {"Иван Петров/a.txt": "А.\n", "_Разбор/b.txt": "Б.\n"})
+    root = Path(cfg["books_dir"])
+
+    with pytest.raises(bl.ConfigError):
+        bl.folder_merge(cfg, ["Нет Такой"], "Петров Иван")
+    with pytest.raises(bl.ConfigError):
+        bl.folder_merge(cfg, ["_Разбор"], "Петров Иван")
+    with pytest.raises(bl.ConfigError):
+        bl.folder_merge(cfg, ["Иван Петров"], "Иван Петров")
+    with pytest.raises(bl.ConfigError):
+        bl.folder_merge(cfg, ["Иван Петров"], "Петров/Иван")
+    with pytest.raises(bl.ConfigError):
+        bl.folder_merge(cfg, [], "Петров Иван")
+    assert (root / "Иван Петров" / "a.txt").is_file()
+
+
+def test_merge_folder_dry_run_changes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {"Иван Петров/a.txt": "А.\n"})
+    root = Path(cfg["books_dir"])
+
+    stats = bl.folder_merge(cfg, ["Иван Петров"], "Петров Иван", dry_run=True, out=lambda _line: None)
+
+    assert stats["renamed"] == 1
+    assert (root / "Иван Петров" / "a.txt").is_file()
+    assert not (root / "Петров Иван").exists()
+
+
+def test_strip_suffix_renames_free_names_and_skips_conflicts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "Иванов Иван/A_1.txt": "А.\n",
+        "Иванов Иван/B_1.txt": "Б1.\n",
+        "Иванов Иван/B.txt": "Б.\n",
+        "Иванов Иван/C_1.txt": "В1.\n",
+        "Иванов Иван/C_2.txt": "В2.\n",
+        "_Разбор/D_1.txt": "Г.\n",
+    })
+    root = Path(cfg["books_dir"])
+    with closing(bl.connect(cfg["db_path"])) as conn, conn:
+        conn.execute("INSERT INTO marks(path, status, updated) VALUES (?,?,?)", ("Иванов Иван/A_1.txt", "done", 1.0))
+
+    stats = bl.strip_suffix(cfg)
+
+    assert stats["renamed"] == 1
+    assert stats["skip-original-exists"] == 1
+    assert stats["skip-siblings"] == 2
+    assert (root / "Иванов Иван" / "A.txt").read_text(encoding="utf-8") == "А.\n"
+    assert not (root / "Иванов Иван" / "A_1.txt").exists()
+    assert (root / "Иванов Иван" / "B_1.txt").is_file()
+    assert (root / "Иванов Иван" / "C_1.txt").is_file()
+    assert (root / "_Разбор" / "D_1.txt").is_file()
+    with closing(bl.connect(cfg["db_path"])) as conn:
+        assert [r[0] for r in conn.execute("SELECT path FROM marks")] == ["Иванов Иван/A.txt"]
+
+    explicit = bl.strip_suffix(cfg, path="_Разбор")
+
+    assert explicit["renamed"] == 1
+    assert (root / "_Разбор" / "D.txt").is_file()
+
+
+def test_strip_suffix_dry_run_changes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {"Иванов Иван/A_1.txt": "А.\n"})
+    root = Path(cfg["books_dir"])
+
+    stats = bl.strip_suffix(cfg, dry_run=True, out=lambda _line: None)
+
+    assert stats["renamed"] == 1
+    assert (root / "Иванов Иван" / "A_1.txt").is_file()
+    assert not (root / "Иванов Иван" / "A.txt").exists()
+
+
+def test_command_params_merge_folder_and_strip_suffix() -> None:
+    assert bl.command_params("merge-folder", {"from": ["A"], "to": "B"}) == {"sources": ["A"], "target": "B"}
+    assert bl.command_params("strip-suffix", {"path": "Иванов Иван"}) == {"path": "Иванов Иван"}
+    with pytest.raises(bl.ConfigError):
+        bl.command_params("merge-folder", {"from": [], "to": "B"})
+    with pytest.raises(bl.ConfigError):
+        bl.command_params("fix-misplaced", {"path": "x"})
