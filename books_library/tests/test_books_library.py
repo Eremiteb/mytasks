@@ -1822,6 +1822,97 @@ def test_merge_dry_run_changes_nothing(tmp_path: Path, monkeypatch: pytest.Monke
         assert [r[0] for r in conn.execute("SELECT path FROM marks")] == ["Иванов Иван/a.txt"]
 
 
+def test_merge_initials_folder_joins_full_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "Загоскин М. Н/a.txt": "А.\n",
+        "Загоскин Михаил Николаевич/b.txt": "Б.\n",
+    })
+    root = Path(cfg["books_dir"])
+
+    stats = bl.merge_authors(cfg)
+
+    assert stats["initials"] == 1
+    assert not (root / "Загоскин М. Н").exists()
+    assert (root / "Загоскин Михаил Николаевич" / "a.txt").read_text(encoding="utf-8") == "А.\n"
+    assert (root / "Загоскин Михаил Николаевич" / "b.txt").is_file()
+
+
+def test_merge_ambiguous_initials_change_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "Борисов А/a.txt": "А.\n",
+        "Борисов Андрей/b.txt": "Б.\n",
+        "Борисов Алексей Петрович/c.txt": "В.\n",
+    })
+    root = Path(cfg["books_dir"])
+
+    stats = bl.merge_authors(cfg)
+
+    assert stats.get("initials", 0) == 0
+    assert (root / "Борисов А" / "a.txt").is_file()
+    assert (root / "Борисов Андрей" / "b.txt").is_file()
+    assert (root / "Борисов Алексей Петрович" / "c.txt").is_file()
+
+
+SURNAMES_WITH_IVAN = ["Аксенов", "Белкин", "Волков", "Гаврилов", "Громов", "Данилов", "Егоров", "Жуков", "Зайцев", "Ильин"]
+
+
+def test_merge_name_first_folder_is_reordered(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    files: dict[str, str] = {f"{surname} Иван/a.txt": "А.\n" for surname in SURNAMES_WITH_IVAN}
+    files["Иван Тестовый/b.txt"] = "Б.\n"
+    cfg = merge_cfg(tmp_path, monkeypatch, files)
+    root = Path(cfg["books_dir"])
+
+    stats = bl.merge_authors(cfg)
+
+    assert stats["name_first"] == 1
+    assert not (root / "Иван Тестовый").exists()
+    assert (root / "Тестовый Иван" / "b.txt").is_file()
+
+
+def test_merge_name_first_joins_existing_full_folder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    files: dict[str, str] = {f"{surname} Иван/a.txt": "А.\n" for surname in SURNAMES_WITH_IVAN}
+    files["Иван Петров/a.txt"] = "А.\n"
+    files["Петров Иван Сергеевич/c.txt"] = "В.\n"
+    cfg = merge_cfg(tmp_path, monkeypatch, files)
+    root = Path(cfg["books_dir"])
+
+    stats = bl.merge_authors(cfg)
+
+    assert stats["name_first"] == 1
+    assert not (root / "Иван Петров").exists()
+    assert (root / "Петров Иван Сергеевич" / "a.txt").is_file()
+    assert (root / "Петров Иван Сергеевич" / "c.txt").is_file()
+    assert not (root / "Петров Иван").exists()
+
+
+def test_merge_patronymic_from_other_book_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "Петров Иван/a.txt": "А.\n",  # в метаданных папки отчества нет
+        "Иванов Сергей/Книга.fb2": make_fb2("Книга", "Иван Сергеевич", "Петров"),  # в БД другой книги: «Петров Иван Сергеевич»
+    })
+    root = Path(cfg["books_dir"])
+
+    stats = bl.merge_authors(cfg)
+
+    assert stats["renamed"] == 1
+    assert stats["patronymic_db"] == 1
+    assert not (root / "Петров Иван").exists()
+    assert (root / "Петров Иван Сергеевич" / "a.txt").is_file()
+
+
+def test_merge_other_book_name_without_patronymic_is_not_used(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "Петров Иван/a.txt": "А.\n",
+        "Иванов Сергей/Книга.fb2": make_fb2("Книга", "Иван Натали", "Петров"),  # «Натали» — не отчество
+    })
+    root = Path(cfg["books_dir"])
+
+    stats = bl.merge_authors(cfg)
+
+    assert stats["renamed"] == 0
+    assert stats.get("patronymic_db", 0) == 0
+    assert (root / "Петров Иван" / "a.txt").is_file()
+
 def test_unzip_keeps_double_dot_inside_name(unzip_cfg: dict[str, Any]) -> None:
     root = Path(unzip_cfg["books_dir"])
     make_archive(root / "Смолски С..djvu.zip", "Смолски С..djvu", b"djvu-data")

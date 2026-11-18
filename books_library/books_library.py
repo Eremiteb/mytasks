@@ -48,7 +48,7 @@ import uuid
 import xml.etree.ElementTree as ET
 import zipfile
 import zlib
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import ExitStack, closing, contextmanager
@@ -4866,6 +4866,62 @@ def patronymic_full(author: str, short_words: list[str]) -> str | None:
     return None
 
 
+PATRONYMIC_RE = re.compile(r"(?:ович|евич|ьич|ич|овна|евна|ична|инична|оглы|кызы)$", re.I)  # отчество по последнему слову
+HEAD_WORD_RE = re.compile(r"[А-ЯЁ][а-яё]+|[А-ЯЁ]{2,}")  # слово имени в начале текста книги
+HEAD_LINES = 40  # отчество ищется в первых стольких непустых строках начала текста книги
+
+
+def is_patronymic(name: str) -> bool:
+    """Результат patronymic_full из метаданных других книг или из текста принимается, только если третье слово — отчество."""
+    words = author_words(name)
+    return len(words) == 3 and PATRONYMIC_RE.search(words[2]) is not None
+
+
+def global_patronymics(db_path: str) -> dict[frozenset[str], set[str]]:
+    """Индекс имён из метаданных всех книг БД: пара слов трёхсловного имени автора → имена как в метаданных.
+    Строится один раз на прогон merge-authors. Без базы — пусто."""
+    index: dict[frozenset[str], set[str]] = {}
+    if not Path(db_path).is_file():
+        return index
+    with closing(connect(db_path, readonly=True)) as conn:
+        rows = conn.execute("SELECT authors FROM books WHERE authors <> ''").fetchall()
+    for row in rows:
+        for author in row["authors"].split("; "):
+            name = author.strip()
+            words = author_words(name)
+            if len(words) != 3:
+                continue
+            for i in range(3):
+                for j in range(i + 1, 3):
+                    index.setdefault(frozenset((words[i], words[j])), set()).add(name)
+    return index
+
+
+def text_patronymics(cache: TextCache, root: Path, rows: list[sqlite3.Row], short_words: list[str]) -> list[str]:
+    """Полные имена из начала текста книг папки. Только из кэша текста: промах — книга пропускается, текст не извлекается.
+    По каждой книге — первая строка из HEAD_LINES непустых строк из трёх слов имени, у которой третье слово — отчество."""
+    found: list[str] = []
+    for row in rows:
+        path = row["path"]
+        try:
+            stat = os.stat(root / path)
+        except OSError:
+            continue
+        text = cache.get(path, stat.st_size, stat.st_mtime, Path(path).suffix[1:].lower())
+        if not text:
+            continue
+        lines = [line.strip() for line in text[:TEXT_HEAD_CHARS].splitlines() if line.strip()][:HEAD_LINES]
+        for line in lines:
+            words = line.removesuffix(".").split()
+            if len(words) != 3 or not all(HEAD_WORD_RE.fullmatch(word) for word in words):
+                continue
+            name = patronymic_full(" ".join(words), short_words)
+            if name and is_patronymic(name):
+                found.append(name)
+                break
+    return found
+
+
 def books_under(db_path: str, folder: str) -> list[sqlite3.Row]:
     """Строки books внутри папки верхнего уровня; LIKE с экранированием % и _ (параметризованно)."""
     if not Path(db_path).is_file():
@@ -4943,13 +4999,89 @@ def merge_folder(run: NightRun, db_path: str, root: Path, short: str, full: str,
                       "status": status, "error": ""})
 
 
+NAME_FIRST_MIN_GIVEN = 10  # этап «Имя Фамилия»: сколько папок с этим словом на втором месте — признак порядка «Фамилия Имя»
+NAME_FIRST_SKIP = frozenset({"Марк Аврелий", "Виктор Поль-Эмиль", "Марк Эдвина"})  # настоящие «Имя Фамилия», не переставлять
+
+
+def merge_initials(run: NightRun, db_path: str, root: Path, pending: list[tuple[str, str]], taken: set[Path]) -> None:
+    """Этап «инициалы»: папка «Фамилия И. О» или «Фамилия И» → единственная полная папка того же автора (initials_folder).
+    Один инициал — только если папка с той же фамилией среди полных одна; иначе не трогается."""
+    index = author_index(root)
+    full = {key: name for key, name in index.items() if not is_initials(name)}
+    surnames = Counter(author_norm(name.split()[0]) for name in full.values())
+    for short in sorted(index.values()):
+        if not is_initials(short) or not (root / short).is_dir():
+            continue
+        target = initials_folder(short, full)
+        tokens = [token for token in re.split(r"[\s.]+", short) if token]
+        if not target or (len(tokens) - 1 < 2 and surnames[author_norm(tokens[0])] != 1):
+            continue
+        known = {row["path"] for row in books_under(db_path, short)}
+        merge_folder(run, db_path, root, short, target, [target], known, taken, pending)
+        run.count("initials")
+
+
+def merge_name_first(run: NightRun, db_path: str, root: Path, pending: list[tuple[str, str]], taken: set[Path]) -> None:
+    """Этап «Имя Фамилия»: папка из двух слов, где первое слово — имя (часто встречается на втором месте в других
+    папках), переставляется в «Фамилия Имя». Если уже есть ровно одна другая папка того же автора (≥ 2 общих слова,
+    ключ ⊆ или ⊇), склейка в неё."""
+    index = author_index(root)
+    with os.scandir(root) as entries:
+        names = sorted(e.name for e in entries if e.is_dir(follow_symlinks=False) and not e.name.startswith(("_", ".")))
+    given: Counter[str] = Counter()
+    sur: Counter[str] = Counter()
+    for name in names:
+        words = name.split()
+        if len(words) >= 2:
+            sur[author_norm(words[0])] += 1
+            given[author_norm(words[1])] += 1
+    for short in names:
+        words = short.split()
+        if len(words) != 2 or short in NAME_FIRST_SKIP or not (root / short).is_dir():
+            continue
+        first, last = words
+        given_first, given_last = given[author_norm(first)], given[author_norm(last)]
+        if given_first < NAME_FIRST_MIN_GIVEN or sur[author_norm(first)] * 10 > given_first or given_last > 1 \
+                or not last.istitle() or len(last) <= 2:
+            continue
+        key = author_key(short)
+        if key is None:
+            continue
+        close = [other for known_key, other in index.items()
+                 if other != short and len(known_key & key) >= 2 and (known_key <= key or known_key >= key)]
+        full = close[0] if len(close) == 1 else f"{last} {first}"
+        if full == short:
+            continue
+        known = {row["path"] for row in books_under(db_path, short)}
+        merge_folder(run, db_path, root, short, full, [full], known, taken, pending)
+        run.count("name_first")
+
+
 def merge_authors(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str], None] = print) -> dict[str, Any]:
     """Правило: «Фамилия Имя» и «Фамилия Имя Отчество» в одном каталоге — всё из короткой в полную; если полной нет,
     отчество берётся из метаданных книг короткой папки и папка переименовывается. Неоднозначное (несколько полных
-    или несколько отчеств) не трогается. Связи переносятся relink по ходу прогона; журнал — построчно (откат)."""
+    или несколько отчеств) не трогается. Связи переносятся relink по ходу прогона; журнал — построчно (откат).
+    Если в метаданных короткой папки отчества нет, ищется ещё в двух источниках (только если первый пуст): метаданные
+    всех книг БД (индекс один раз на прогон) и начало текста книг папки из кэша текста (без извлечения текста;
+    промах кэша — пропуск). Результат принимается, только если третье слово — отчество (PATRONYMIC_RE). Один полный
+    вариант из источников — переименование или склейка; несколько — неоднозначное.
+    После отчеств — два этапа, каждый со своим пересчётом author_index: «инициалы» (папка «Фамилия И. О» → полная
+    папка того же автора, только однозначная) и «Имя Фамилия» (папка «Иван Петров» → «Петров Иван» или склейка
+    в единственную полную папку; порядок определяется по частотам слов в именах папок)."""
+    cache = TextCache.open(cfg)  # один раз на прогон; None — источник из текста пропускается
+    try:
+        return _merge_authors(cfg, dry_run, out, cache)
+    finally:
+        if cache is not None:
+            cache.close()
+
+
+def _merge_authors(cfg: dict[str, Any], dry_run: bool, out: Callable[[str], None],
+                   cache: TextCache | None) -> dict[str, Any]:
     root = Path(cfg["books_dir"])
     db_path = cfg["db_path"]
     run = NightRun(cfg, "merge-authors", dry_run, None, out)
+    global_index = global_patronymics(db_path)
     with os.scandir(root) as entries:
         names = sorted(e.name for e in entries if e.is_dir(follow_symlinks=False) and not e.name.startswith(("_", ".")))
     pending: list[tuple[str, str]] = []
@@ -4967,12 +5099,24 @@ def merge_authors(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str
         if candidates:
             full, action = candidates[0], "merge"
         else:
+            short_words = author_words(short)
             fulls: dict[str, str] = {}
             for row in rows:
                 for author in row["authors"].split("; "):
-                    name = patronymic_full(author.strip(), author_words(short))
+                    name = patronymic_full(author.strip(), short_words)
                     if name:
                         fulls.setdefault(author_norm(name), name)
+            sources: dict[str, str] = {}  # откуда взято отчество (только если собственные метаданные папки пусты)
+            if not fulls:
+                for name in sorted(global_index.get(frozenset(short_words), ())):
+                    patronymic = patronymic_full(name, short_words)
+                    if patronymic and is_patronymic(patronymic):
+                        fulls.setdefault(author_norm(patronymic), patronymic)
+                        sources.setdefault(author_norm(patronymic), "patronymic_db")
+                if cache is not None:
+                    for patronymic in text_patronymics(cache, root, rows, short_words):
+                        fulls.setdefault(author_norm(patronymic), patronymic)
+                        sources.setdefault(author_norm(patronymic), "patronymic_text")
             if not fulls:
                 run.count("no_patronymic")  # только счётчик: журнал не раздувается
                 continue
@@ -4982,6 +5126,8 @@ def merge_authors(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str
                                   "moved": 0, "status": "skip", "error": ""})
                 continue
             full = next(iter(fulls.values()))
+            if sources:
+                run.count(sources[author_norm(full)])
             action = "merge" if (root / full).is_dir() else "rename"
             candidates = [full]
         known = {row["path"] for row in rows}
@@ -5004,10 +5150,15 @@ def merge_authors(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str
         flush_relinks(db_path, pending)
         journal_row(run, {"action": "rename", "short": short, "full": full, "candidates": candidates, "moved": 0,
                           "status": "done", "error": ""})
+    merge_initials(run, db_path, root, pending, taken)
+    merge_name_first(run, db_path, root, pending, taken)
     flush_relinks(db_path, pending, force=True)
     s = run.stats
     prefix = "будет " if dry_run else ""
-    line = (f"merge-authors: {prefix}склеено папок {s.get('merged', 0)}, {prefix}переименовано {s.get('renamed', 0)}, "
+    line = (f"merge-authors: {prefix}склеено папок {s.get('merged', 0)} (из них по инициалам {s.get('initials', 0)}, "
+            f"по порядку «Имя Фамилия» {s.get('name_first', 0)}), {prefix}переименовано {s.get('renamed', 0)} "
+            f"(отчество из метаданных других книг БД {s.get('patronymic_db', 0)}, из начала текста книг "
+            f"{s.get('patronymic_text', 0)}), "
             f"{prefix}перенесено файлов {s.get('moved', 0)}, конфликтов имён {s.get('conflicts', 0)}, "
             f"неоднозначных {s.get('ambiguous', 0)}, ошибок {s.get('errors', 0)}")
     out(line)
