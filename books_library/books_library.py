@@ -1582,19 +1582,27 @@ def lib_ru_text(raw: bytes) -> str:
     raise ValueError("не удалось декодировать HTML")
 
 
+def lib_ru_plain(match: re.Match[str] | None) -> str:
+    """Текст найденного элемента без тегов, сущности раскрыты, пробелы схлопнуты; нет совпадения — пустая строка."""
+    return " ".join(html.unescape(LIB_RU_TAG.sub(" ", match.group(1))).split()) if match else ""
+
+
 def lib_ru_html(path: Path, limit: int) -> tuple[str, str, str]:
     """HTML, название и автор из страницы библиотеки Мошкова (lib.ru).
 
     Автор и название — по первому «. » в <title> («Имя Фамилия. Название»): автор — 1–4 слова без цифр, иначе автора
-    нет и название — весь <title>. Текст внутри каждого <pre> превращается в абзацы <p>; вне <pre> HTML не меняется.
+    нет и название — весь <title>; если <title> пуст — первый <h2>. Текст внутри каждого <pre> превращается в абзацы
+    <p>; вне <pre> HTML не меняется.
     """
     text = lib_ru_text(read_limited(path, limit))
-    title_match = re.search(r"<title[^>]*>(.*?)</title>", text, re.S | re.I)
-    title = " ".join(html.unescape(LIB_RU_TAG.sub(" ", title_match.group(1))).split()) if title_match else ""
-    left, sep, right = title.partition(". ")
+    title = lib_ru_plain(re.search(r"<title[^>]*>(.*?)</title>", text, re.S | re.I))
     author = ""
-    if sep and right.strip() and 1 <= len(left.split()) <= 4 and not re.search(r"\d", left):
-        author, title = " ".join(left.split()), right.strip()
+    if not title:  # <h2> — только название, автора из него не выделяем
+        title = lib_ru_plain(re.search(r"<h2[^>]*>(.*?)</h2>", text, re.S | re.I))
+    else:
+        left, sep, right = title.partition(". ")
+        if sep and right.strip() and 1 <= len(left.split()) <= 4 and not re.search(r"\d", left):
+            author, title = " ".join(left.split()), right.strip()
     body = LIB_RU_PRE.sub(lambda match: f"<div>{lib_ru_paragraphs(match.group(1))}</div>", text)
     return body, title, author
 
@@ -1945,9 +1953,12 @@ def convert_one(src: Path, out: Path, fmt: str, cfg: dict[str, Any], options: di
     elif ext in HTML_SOURCES:
         page_html, meta_title, meta_author = lib_ru_html(src, limit)
     title = meta_title if options["title_mode"] == "auto" and meta_title else path_meta(src.name)["title"]
-    author = options["author"] or meta_author or next(iter(path_meta(str(src.relative_to(Path(cfg["books_dir"])))
-                                                                     if src.is_relative_to(Path(cfg["books_dir"])) else src.name)
-                                                           ["authors"]), "")
+    if ext in HTML_SOURCES and options.get("allow_no_author") and not meta_author:
+        author = options["author"]  # HTML без автора: автора из имени папки не берём, в epub он не пишется
+    else:
+        author = options["author"] or meta_author or next(iter(path_meta(str(src.relative_to(Path(cfg["books_dir"])))
+                                                                         if src.is_relative_to(Path(cfg["books_dir"])) else src.name)
+                                                               ["authors"]), "")
     with tempfile.TemporaryDirectory(prefix="books_library-convert-") as tmp_name:
         tmp = Path(tmp_name)
         produced = tmp / f"book.{fmt}"
@@ -2067,15 +2078,22 @@ def lib_ru_surname(author: str) -> str:
     return plain[-1] if plain else words[-1]
 
 
-def lib_ru_name(author: str, title: str, fmt: str) -> str:
-    """Имя результата HTML: «Фамилия - Название.fmt», фамилия — см. lib_ru_surname; не длиннее 120 символов."""
-    stem = folder_name(f"{lib_ru_surname(author)} - {title}")[: FOLDER_NAME_MAX - len(fmt) - 1]
+def lib_ru_file_name(stem_source: str, fmt: str) -> str:
+    """Имя файла результата HTML: folder_name, без пробелов и точек по краям, «.fmt», вместе не длиннее 120 символов."""
+    stem = folder_name(stem_source)[: FOLDER_NAME_MAX - len(fmt) - 1]
     return f"{stem.strip(' .')}.{fmt}"
 
 
-def html_candidate(src: Path, size: int, limit: int, stats: dict[str, int], fmt: str) -> str | None:
-    """Имя результата для HTML библиотеки или None: пропуск index*.htm(l), файлов меньше 5000 байт, без <pre>
-    и без автора в <title>; каждый пропуск — свой счётчик в stats."""
+def lib_ru_name(author: str, title: str, fmt: str) -> str:
+    """Имя результата HTML: «Фамилия - Название.fmt», фамилия — см. lib_ru_surname; не длиннее 120 символов."""
+    return lib_ru_file_name(f"{lib_ru_surname(author)} - {title}", fmt)
+
+
+def html_candidate(src: Path, size: int, limit: int, stats: dict[str, int], fmt: str,
+                   allow_no_author: bool = False) -> tuple[str, bool] | None:
+    """Имя результата для HTML библиотеки и признак «без автора» или None: пропуск index*.htm(l), файлов меньше
+    5000 байт, без <pre>; без автора в <title> — пропуск, если не allow_no_author (тогда имя «Название.fmt», название —
+    весь <title>, а при пустом <title> — первый <h2>); каждый пропуск — свой счётчик в stats."""
     if HTML_INDEX.match(src.name):
         stats["skipped_index"] += 1
         return None
@@ -2086,10 +2104,13 @@ def html_candidate(src: Path, size: int, limit: int, stats: dict[str, int], fmt:
         stats["skipped_no_pre"] += 1
         return None
     _body, title, author = lib_ru_html(src, limit)
-    if not author:
+    if author:
+        return lib_ru_name(author, title, fmt), False
+    name = lib_ru_file_name(title, fmt)
+    if not allow_no_author or name == f".{fmt}":  # пустое название (и нет <h2>) — пропуск
         stats["skipped_no_author"] += 1
         return None
-    return lib_ru_name(author, title, fmt)
+    return name, True
 
 
 def quarantine_source(cfg: dict[str, Any], source: Path) -> Path:
@@ -2126,21 +2147,27 @@ def convert_documents(cfg: dict[str, Any], dry_run: bool = False, path: str | No
     errors: list[str] = []
     plan: list[tuple[Path, Path]] = []
     taken: set[Path] = set()
+    anonymous: set[Path] = set()  # HTML без автора в <title> (--allow-no-author)
+    allow_no_author = bool(options.get("allow_no_author"))
     stats = {"sources": 0, "planned": 0, "skipped_exists": 0, "skipped_index": 0, "skipped_small": 0,
-             "skipped_no_pre": 0, "skipped_no_author": 0, "converted": 0, "failed": 0, "quarantined_sources": 0}
+             "skipped_no_pre": 0, "skipped_no_author": 0, "converted": 0, "converted_no_author": 0, "failed": 0,
+             "quarantined_sources": 0}
     for src, size in walk_files(target, tuple(f".{x}" for x in only), errors):
         stats["sources"] += 1
         if any(x in src.name.casefold() for x in excludes):
             continue
         if html_mode:
             try:
-                name = html_candidate(src, size, limit, stats, fmt)
+                found = html_candidate(src, size, limit, stats, fmt, allow_no_author)
             except (OSError, ValueError) as error:
                 stats["failed"] += 1
                 say(f"не прочитан {src}: {error}", "convert_failed", logging.ERROR, detail=str(error))
                 continue
-            if name is None:
+            if found is None:
                 continue
+            name, no_author = found
+            if no_author:
+                anonymous.add(src)
             result = src.parent / name
         else:
             result = src.with_suffix(f".{fmt}")
@@ -2158,7 +2185,7 @@ def convert_documents(cfg: dict[str, Any], dry_run: bool = False, path: str | No
         for src, result in plan[:30]:
             out(f"[dry-run] будет: {src} → {result}{' (исходник в карантин replaced/ после проверки)' if options['delete_source'] else ''}")
         out(f"[dry-run] будет: конвертировать {len(plan)} из {stats['sources']} документов в {fmt.upper()}, "
-              f"уже есть {stats['skipped_exists']}")
+              f"уже есть {stats['skipped_exists']}, из них без автора {sum(1 for src, _ in plan if src in anonymous)}")
         say("план конвертации", "dry_convert", detail=json.dumps(stats))
         return stats
     done_list: list[dict[str, Any]] = []
@@ -2167,6 +2194,8 @@ def convert_documents(cfg: dict[str, Any], dry_run: bool = False, path: str | No
         ok, err = convert_one(src, result, fmt, cfg, options)
         if ok:
             stats["converted"] += 1
+            if src in anonymous:
+                stats["converted_no_author"] += 1
             done_list.append({"source": str(src), "size": src.stat().st_size, "result": str(result), "result_size": result.stat().st_size})
             say(f"готово: {result}", "converted", detail=str(src))
         else:
@@ -6956,7 +6985,7 @@ def command_params(command: str, raw: dict[str, Any]) -> dict[str, Any]:
         "scan": {"reparse"}, "migrate": set(), "fix-encoding": {"path", "only"},
         "unpack-fb2zip": {"path", "max_mb", "multi", "out", "delete_source", "ignore_md5"},
         "convert": {"path", "only", "to", "overwrite", "skip_newer", "exclude", "author", "title_mode", "toc", "toc_depth",
-                    "delete_source", "workers"},
+                    "delete_source", "workers", "allow_no_author"},
         "dedup": {"path", "workers"}, "dedup-folders": {"path", "workers"}, "zip-books": {"path", "workers"},
         "unzip-books": {"path", "workers"}, "unpack-collections": {"path"}, "merge-authors": set(),
         "author-variants": set(), "sort-underscore": {"limit"},
@@ -7014,15 +7043,17 @@ def command_params(command: str, raw: dict[str, Any]) -> dict[str, Any]:
     if command == "convert":
         params.update(to=raw.get("to", "epub"), title_mode=raw.get("title_mode", "auto"), toc_depth=raw.get("toc_depth", 3),
                       author=raw.get("author", ""), exclude=raw.get("exclude", []))
-        for key in ("overwrite", "skip_newer", "delete_source"):
+        for key in ("overwrite", "skip_newer", "delete_source", "allow_no_author"):
             params[key] = raw.get(key, False)
         params["toc"] = raw.get("toc", True)
         if params["to"] not in ("epub", "fb2") or params["title_mode"] not in ("auto", "filename", "keep"):
             raise ConfigError("to: epub|fb2; title_mode: auto|filename|keep")
         if not isinstance(params["toc_depth"], int) or isinstance(params["toc_depth"], bool) or not 1 <= params["toc_depth"] <= 6:
             raise ConfigError("toc_depth: целое 1..6")
-        if not all(isinstance(params[k], bool) for k in ("overwrite", "skip_newer", "delete_source", "toc")):
-            raise ConfigError("overwrite, skip_newer, delete_source, toc — логические значения")
+        if not all(isinstance(params[k], bool) for k in ("overwrite", "skip_newer", "delete_source", "toc", "allow_no_author")):
+            raise ConfigError("overwrite, skip_newer, delete_source, toc, allow_no_author — логические значения")
+        if params["allow_no_author"] and params["only"] != "html":
+            raise ConfigError("allow_no_author задаётся только вместе с only=html")
         if not isinstance(params["author"], str) or not isinstance(params["exclude"], list) or \
                 not all(isinstance(x, str) for x in params["exclude"]):
             raise ConfigError("author — строка, exclude — список строк")
@@ -9049,6 +9080,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--to", help="convert: epub|fb2 (по умолчанию epub); merge-folder: папка автора или путь внутри «_разобрать»")
     parser.add_argument("--overwrite", action="store_true", help="convert: перезаписывать существующий результат")
     parser.add_argument("--skip-newer", action="store_true", help="convert: с --overwrite не трогать результат новее исходника")
+    parser.add_argument("--allow-no-author", action="store_true",
+                        help="convert --only html: конвертировать HTML без автора в <title> (название — весь <title>, автор в epub не пишется)")
     parser.add_argument("--exclude", action="append", default=[], help="convert: пропускать имена с этой подстрокой")
     parser.add_argument("--author", default="", help="convert: автор для всех документов")
     parser.add_argument("--title-mode", choices=("auto", "filename", "keep"), default="auto", help="convert: откуда название")
@@ -9112,7 +9145,7 @@ def main(argv: list[str] | None = None) -> int:
             elif command == "convert":
                 raw.update(to=args.to or "epub", overwrite=args.overwrite, skip_newer=args.skip_newer, exclude=args.exclude,
                            author=args.author, title_mode=args.title_mode, toc=not args.no_toc, toc_depth=args.toc_depth,
-                           delete_source=args.delete_source)
+                           delete_source=args.delete_source, allow_no_author=args.allow_no_author)
             run_command(cfg, command, args.dry_run, command_params(command, raw))
         else:
             serve(cfg, dry_run=args.dry_run)

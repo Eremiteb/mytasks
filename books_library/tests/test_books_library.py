@@ -914,6 +914,28 @@ def test_convert_html_selection_skips_index_small_no_pre_and_no_author(cfg: dict
     assert "Булгаков - Собачье сердце.epub" in capsys.readouterr().out
 
 
+def test_convert_html_allow_no_author_names_by_title(cfg: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+                                                     capsys: pytest.CaptureFixture[str]) -> None:
+    folder = Path(cfg["books_dir"]) / "Фольклор"
+    folder.mkdir()
+    (folder / "anon.html").write_text(html_page("Заметки без автора"), encoding="utf-8")
+    (folder / "h2.html").write_text(html_page("").replace("<title></title>", "<title></title><h2>Сказка о рыбаке</h2>"),
+                                    encoding="utf-8")
+    (folder / "nameless.html").write_text(html_page(""), encoding="utf-8")
+    monkeypatch.setattr(bl.shutil, "which", lambda _name: "/usr/bin/pandoc")
+
+    stats = bl.convert_documents(cfg, dry_run=True, only="html", to="epub", exclude=[], author="", title_mode="auto",
+                                 toc=True, toc_depth=3, delete_source=False, overwrite=False, skip_newer=False,
+                                 allow_no_author=True)
+
+    assert stats["planned"] == 2
+    assert stats["skipped_no_author"] == 1
+    out = capsys.readouterr().out
+    assert "Заметки без автора.epub" in out
+    assert "Сказка о рыбаке.epub" in out
+    assert "из них без автора 2" in out
+
+
 def test_convert_all_does_not_pick_html(cfg: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
     folder = Path(cfg["books_dir"]) / "Булгаков"
     folder.mkdir()
