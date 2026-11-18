@@ -2821,6 +2821,97 @@ def test_command_params_merge_folder_and_strip_suffix() -> None:
         bl.command_params("fix-misplaced", {"path": "x"})
 
 
+def test_merge_folder_from_nested_service_path_into_new_folder_keeps_collection(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "_Сборники/Серия/Иван Петров/a.txt": "А.\n",
+        "_Сборники/Серия/Иван Петров/sub/b.txt": "Б.\n",
+    })
+    root = Path(cfg["books_dir"])
+    old = "_Сборники/Серия/Иван Петров/a.txt"
+    with closing(bl.connect(cfg["db_path"])) as conn, conn:
+        conn.execute("INSERT INTO marks(path, status, updated) VALUES (?,?,?)", (old, "done", 1.0))
+
+    stats = bl.folder_merge(cfg, ["_Сборники/Серия/Иван Петров"], "Петров Иван")
+
+    assert stats["merged"] == 1
+    assert stats["moved"] == 2
+    assert (root / "Петров Иван" / "a.txt").is_file()
+    assert (root / "Петров Иван" / "sub" / "b.txt").is_file()
+    assert not (root / "_Сборники" / "Серия" / "Иван Петров").exists()
+    assert (root / "_Сборники" / "Серия").is_dir()
+    with closing(bl.connect(cfg["db_path"])) as conn:
+        marks = [r[0] for r in conn.execute("SELECT path FROM marks")]
+        rows = conn.execute("SELECT collection, orig_path FROM book_collections WHERE path=? AND source='folder'",
+                            ("Петров Иван/a.txt",)).fetchall()
+    assert marks == ["Петров Иван/a.txt"]
+    assert [tuple(r) for r in rows] == [("Серия", old)]
+
+
+def test_merge_folder_nested_into_existing_folder_counts_conflicts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "_Сборники/Серия/Иван Петров/a.txt": "А.\n",
+        "Петров Иван/a.txt": "Другой.\n",
+    })
+    root = Path(cfg["books_dir"])
+
+    stats = bl.folder_merge(cfg, ["_Сборники/Серия/Иван Петров"], "Петров Иван")
+
+    assert stats["merged"] == 1
+    assert stats["conflicts"] == 1
+    assert (root / "Петров Иван" / "a.txt").read_text(encoding="utf-8") == "Другой.\n"
+    assert (root / "Петров Иван" / "a_1.txt").read_text(encoding="utf-8") == "А.\n"
+
+
+def test_merge_folder_rejects_nested_path_outside_service_section(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {"Иван Петров/sub/a.txt": "А.\n", "_Сборники/Серия/x.txt": "Х.\n"})
+    root = Path(cfg["books_dir"])
+
+    for bad in ("Иван Петров/sub", "_Сборники/../Иван Петров", "../outside", "_Сборники", "_Сборники/Серия/Нет"):
+        with pytest.raises(bl.ConfigError):
+            bl.folder_merge(cfg, [bad], "Петров Иван")
+    assert (root / "Иван Петров" / "sub" / "a.txt").is_file()
+    assert (root / "_Сборники" / "Серия" / "x.txt").is_file()
+
+
+def test_merge_folder_into_razobrat_subfolder_keeps_subfolders_and_collection(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "_Сборники/X/_эпос/Книга.fb2": make_fb2("Книга", "Иван", "Иванов"),
+        "_Сборники/X/_эпос/Том 2/Книга2.txt": "Текст.\n",
+        "_Сборники/X/Остаётся.txt": "Х.\n",
+    })
+    root = Path(cfg["books_dir"])
+    old, new = "_Сборники/X/_эпос/Книга.fb2", "_разобрать/X/Книга.fb2"
+    with closing(bl.connect(cfg["db_path"])) as conn, conn:
+        conn.execute("INSERT INTO marks(path, status, updated) VALUES (?,?,?)", (old, "done", 1.0))
+
+    stats = bl.folder_merge(cfg, ["_Сборники/X/_эпос"], "_разобрать/X")
+
+    assert stats["merged"] == 1
+    assert stats["moved"] == 2
+    assert (root / new).is_file()
+    assert (root / "_разобрать" / "X" / "Том 2" / "Книга2.txt").is_file()
+    assert not (root / "_Сборники" / "X" / "_эпос").exists()
+    assert (root / "_Сборники" / "X" / "Остаётся.txt").is_file()
+    with closing(bl.connect(cfg["db_path"])) as conn:
+        marks = [r[0] for r in conn.execute("SELECT path FROM marks")]
+        rows = conn.execute("SELECT collection, orig_path FROM book_collections WHERE path=? AND source='folder'",
+                            (new,)).fetchall()
+    assert marks == [new]
+    assert [tuple(r) for r in rows] == [("X", old)]
+
+
+def test_merge_folder_target_must_be_author_folder_or_inside_razobrat(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {"Иван Петров/a.txt": "А.\n", "_Сборники/X/Книга.txt": "Х.\n"})
+    root = Path(cfg["books_dir"])
+
+    for bad in ("_Сборники/X", "_разобрать", "_разобрать/../x", "Петров/Иван"):
+        with pytest.raises(bl.ConfigError):
+            bl.folder_merge(cfg, ["Иван Петров"], bad)
+    assert (root / "Иван Петров" / "a.txt").is_file()
+
+
 # ---- (в) схема v6: book_meta, подразделы сборников, сборники из метаданных --------------------
 
 def make_fb2_full() -> bytes:

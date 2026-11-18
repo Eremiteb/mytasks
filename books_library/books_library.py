@@ -6444,27 +6444,69 @@ def rename_folder(run: NightRun, db_path: str, root: Path, src: str, dst: str, p
     flush_relinks(db_path, pending)
 
 
+RAZOBRAT_SECTION = "_разобрать"  # служебный раздел: в него можно склеивать папки через --to «_разобрать/…»
+
+
+def service_path(root: Path, rel: str, min_parts: int) -> Path:
+    """Папка внутри служебного раздела «_…» каталога книг: относительный путь без «..» и пустых сегментов, первый
+    сегмент — «_…», не короче min_parts сегментов. После разрешения ссылок путь должен остаться внутри каталога книг."""
+    parts = PurePosixPath(rel).parts
+    if not rel or "\x00" in rel or "\\" in rel or rel.startswith("/") or len(parts) < min_parts \
+            or not parts[0].startswith("_") or any(part in ("", ".", "..") for part in parts):
+        raise ConfigError(f"путь «{rel}» — папка внутри служебного раздела «_…» каталога книг")
+    full = root / rel
+    if not full.resolve().is_relative_to(root.resolve()):
+        raise ConfigError(f"путь «{rel}» выходит за пределы каталога книг")
+    if not full.is_dir():
+        raise ConfigError(f"папки нет: {rel}")
+    return full
+
+
+def prepare_collections(cfg: dict[str, Any], dry_run: bool, out: Callable[[str], None]) -> None:
+    """Перед переносом файлов: строки сборников книг из папок сборников (rebuild_collections в транзакции), чтобы
+    relink перенёс принадлежность к сборнику со старого пути. В dry-run и без базы схемы сборников — ничего не делает."""
+    db_path = cfg["db_path"]
+    if dry_run or not Path(db_path).is_file():
+        return
+    with closing(connect(db_path)) as conn, conn:
+        if conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_COLLECTIONS:
+            return
+        report_collections(rebuild_collections(conn), out)
+
+
 def folder_merge(cfg: dict[str, Any], sources: list[str], target: str, dry_run: bool = False,
                  out: Callable[[str], None] = print) -> dict[str, Any]:
-    """merge-folder: папка верхнего уровня A → B. Если B нет — переименование A в B; если есть — склейка (merge_folder:
-    файлы и подпапки A переносятся в B, конфликт имени — суффикс _1). Повторяемый --from — несколько папок подряд.
-    Проверки: A существует, обе — верхнего уровня, B проходит folder_name. Журнал reports/merge-folder-*.jsonl."""
+    """merge-folder: папка A → B. A — папка верхнего уровня или папка внутри служебного раздела «_…» (--from
+    «_Сборники/Серия/Автор»). B — папка автора верхнего уровня или путь внутри «_разобрать» (--to «_разобрать/Серия»),
+    создаётся при отсутствии. Если B нет и A верхнего уровня — переименование A в B; иначе склейка (merge_folder: файлы
+    и подпапки A переносятся в B с теми же относительными путями, конфликт имени — суффикс _1). Повторяемый --from —
+    несколько папок подряд. Связи и принадлежность к сборнику переносятся (relink). Журнал reports/merge-folder-*.jsonl."""
     root = Path(cfg["books_dir"])
     db_path = cfg["db_path"]
     if not sources:
         raise ConfigError("merge-folder: укажите --from")
-    if not folder_top_ok(target) or folder_name(target) != target:
+    if "/" in target:  # путь внутри «_разобрать»: создаётся при отсутствии, подпапки сохраняются
+        parts = PurePosixPath(target).parts
+        if len(parts) < 2 or parts[0] != RAZOBRAT_SECTION or any(part == ".." for part in parts) \
+                or "\x00" in target or "\\" in target or target.startswith("/"):
+            raise ConfigError(f"merge-folder: --to «{target}» — папка автора или путь внутри «{RAZOBRAT_SECTION}»")
+        if not (root / target).resolve().is_relative_to((root / RAZOBRAT_SECTION).resolve()):
+            raise ConfigError(f"merge-folder: --to «{target}» выходит за пределы «{RAZOBRAT_SECTION}»")
+    elif not folder_top_ok(target) or folder_name(target) != target:
         raise ConfigError(f"merge-folder: имя «{target}» не подходит для папки автора")
     for name in sources:
-        if not folder_top_ok(name):
+        if "/" in name:
+            service_path(root, name, 2)  # только внутри «_…», не короче двух сегментов
+        elif not folder_top_ok(name):
             raise ConfigError(f"merge-folder: «{name}» — не папка верхнего уровня")
-        if name == target:
-            raise ConfigError("merge-folder: --from и --to совпадают")
-        if not (root / name).is_dir():
+        elif not (root / name).is_dir():
             raise ConfigError(f"merge-folder: папки нет: {name}")
+        if name == target or target.startswith(name + "/") or name.startswith(target + "/"):
+            raise ConfigError("merge-folder: --from и --to совпадают или вложены друг в друга")
     if (root / target).exists() and not (root / target).is_dir():
         raise ConfigError(f"merge-folder: «{target}» есть, но это не папка")
     run = NightRun(cfg, "merge-folder", dry_run, None, out)
+    prepare_collections(cfg, dry_run, out)
     target_exists = (root / target).is_dir()
     taken: set[Path] = set()
     pending: list[tuple[str, str]] = []
@@ -6472,12 +6514,12 @@ def folder_merge(cfg: dict[str, Any], sources: list[str], target: str, dry_run: 
         if not (root / name).is_dir():
             run.count("skip-missing")  # уже склеена предыдущим --from
             continue
-        if target_exists:
+        if target_exists or "/" in name or "/" in target:  # вложенные — всегда склейка: переименовать верхний уровень нельзя
             known = {row["path"] for row in books_under(db_path, name)}
             merge_folder(run, db_path, root, name, target, [target], known, taken, pending)
         else:
             rename_folder(run, db_path, root, name, target, pending)
-            target_exists = True  # в dry-run — план: следующий --from склеивается с этим же именем
+        target_exists = True  # дальше склейка: в dry-run — план, после переименования и склейки цель уже есть
         flush_relinks(db_path, pending, force=True)
     return run.finish()
 
@@ -8624,7 +8666,8 @@ def main(argv: list[str] | None = None) -> int:
                              "misplaced, fix-misplaced, merge-folder (--from A --to B) или strip-suffix")
     parser.add_argument("-p", "--path", help="fix-encoding/unpack-fb2zip/convert/strip-suffix: каталог (по умолчанию каталог книг)")
     parser.add_argument("--from", dest="from_folders", action="append", default=[],
-                        help="merge-folder: папка верхнего уровня, которую склеить или переименовать (можно повторять)")
+                        help="merge-folder: папка верхнего уровня или папка внутри «_…» (например «_Сборники/Серия/Автор»), "
+                             "которую склеить или переименовать (можно повторять)")
     parser.add_argument("--only", default="all",
                         help="fix-encoding: all|fb2|txt; convert: all|fb2|doc|docx|rtf|odt|mht|mhtml|html (fb2 — в epub через Calibre; html — только явно)")
     parser.add_argument("--workers", type=int,
@@ -8633,7 +8676,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-mb", type=int, default=200, help="unpack-fb2zip: предел размера записи, МБ")
     parser.add_argument("--limit", type=int,
                         help="sort-underscore: не больше N книг; reconvert-fb2: не больше N сопоставленных книг")
-    parser.add_argument("--to", help="convert: epub|fb2 (по умолчанию epub); merge-folder: имя папки-цели")
+    parser.add_argument("--to", help="convert: epub|fb2 (по умолчанию epub); merge-folder: папка автора или путь внутри «_разобрать»")
     parser.add_argument("--overwrite", action="store_true", help="convert: перезаписывать существующий результат")
     parser.add_argument("--skip-newer", action="store_true", help="convert: с --overwrite не трогать результат новее исходника")
     parser.add_argument("--exclude", action="append", default=[], help="convert: пропускать имена с этой подстрокой")
