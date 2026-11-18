@@ -1633,7 +1633,7 @@ def office_meta(path: Path, fmt: str) -> dict[str, Any]:
 
 def text_meta(path: Path) -> dict[str, Any]:
     """TXT: первый кандидат-автор из начала текста (без папки — только как book_meta text_author)."""
-    head = decode_text(read_limited(path, TEXT_HEAD_BYTES))[:TEXT_HEAD_CHARS]
+    head = decode_text(read_head(path, TEXT_HEAD_BYTES))[:TEXT_HEAD_CHARS]
     name = next(text_names(head), "")
     return {"kv": [("text_author", name)]} if name else {}
 
@@ -1645,7 +1645,7 @@ def other_meta(full: Path, fmt: str, stem: str) -> dict[str, Any]:
     if fmt == "djvu":
         return djvu_meta(full)
     if fmt in ("mobi", "azw", "azw3"):
-        return mobi_meta(read_limited(full, MOBI_HEAD_BYTES), stem)
+        return mobi_meta(read_head(full, MOBI_HEAD_BYTES), stem)
     if fmt in ("docx", "odt"):
         return office_meta(full, fmt)
     return text_meta(full)
@@ -6802,6 +6802,12 @@ def sanitize(markup: str, image_url: Callable[[str], str | None], fb2: bool = Fa
     # сырой текст (теги fb2 внутри <title> вышли бы наружу текстом, а <script/> поглотил бы главу).
     cleaner.feed(re.sub(r"<(/?)(?=[A-Za-z])", r"<\1x-", markup))
     return cleaner.result()
+
+
+def read_head(path: Path, size: int) -> bytes:
+    """Начало файла не длиннее size байт (для метаданных: большой файл — не ошибка, в отличие от read_limited)."""
+    with path.open("rb") as handle:
+        return handle.read(size)
 
 
 def read_limited(path: Path, limit: int) -> bytes:
