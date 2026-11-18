@@ -1685,6 +1685,17 @@ def test_filename_author_separators_and_limits() -> None:
     assert bl.filename_author("Глава 2 - Книга") == ""
 
 
+def test_text_author_name_alone_on_line() -> None:
+    index = {frozenset({"лем", "станислав"}): "Лем Станислав", frozenset({"чапек", "карел"}): "Чапек Карел"}
+    assert bl.text_author("Станислав Лем\n\n   КАК МИКРОМИЛ\n", index) == ("Лем Станислав", "Станислав Лем")
+    assert bl.text_author("Карел Чапек. \n\n Эксперимент\n", index) == ("Чапек Карел", "Карел Чапек")
+    # имя-строка на 7-й непустой строке (позиция 6) не принимается
+    head = "".join(f"строка {i}\n" for i in range(6)) + "Станислав Лем\nНазвание\n"
+    assert bl.text_author(head, index) == ("", "")
+    # одиночная последняя строка «Станислав Лем» без следующей строки не принимается
+    assert bl.text_author("Станислав Лем", index) == ("", "")
+
+
 # ---- merge-authors: склейка «Фамилия Имя» + «Фамилия Имя Отчество» ---------------------------------------
 
 def merge_cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, files: dict[str, str | bytes]) -> dict[str, Any]:
