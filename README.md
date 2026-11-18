@@ -946,7 +946,7 @@ SQLite `utility_bills/utility_bills.db` с представлениями для
 fb2/epub/txt, OPDS). Просмотр всех форматов каталога в браузере: DjVu постранично (`djvulibre`), прочие через
 EPUB (`calibre`, `ebook-convert`), ZIP — содержимое архива; кэш в `books_library/cache/`. Служебные режимы меняют файлы только с предварительным `-n` и JSON-отчётом в `books_library/reports/`:
 `fix-encoding` (кодировка fb2 и txt), `unpack-fb2zip` (распаковка fb2.zip), `convert` (DOC/DOCX/RTF/ODT и MHT/MHTML → EPUB;
-исходник удаляется только с `--delete-source` после проверки результата).
+исходник переносится в карантин `replaced/` только с `--delete-source` после проверки результата).
 
 ```bash
 python3 books_library/books_library.py scan -n                       # план индексации; база не создаётся

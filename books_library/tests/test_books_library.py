@@ -692,6 +692,113 @@ def test_mht_without_text_raises(tmp_path: Path) -> None:
         bl.mht_html(path, MHT_LIMIT)
 
 
+# ---- HTML библиотеки Мошкова (--only html) ----------------------------------------------------
+
+LIB_RU_PAGE = (
+    '<html><head><title>Михаил Булгаков. Собачье сердце</title></head><body bgcolor="E9E3DB"><pre>\n'
+    "<dir><a name=0></a><h2>Михаил Булгаков. Собачье сердце</h2></dir>\n"
+    "\n"
+    "     Первый абзац книги,\n"
+    "строка два.\n"
+    "\n"
+    "     Второй абзац <a href=http://example.com/>ссылка</a> &amp; конец.\n"
+    "строка два.\n"
+    "</pre></body></html>\n"
+)
+
+
+def test_lib_ru_html_author_title_and_paragraphs(tmp_path: Path) -> None:
+    path = tmp_path / "dog.html"
+    path.write_bytes(LIB_RU_PAGE.encode("utf-8"))
+
+    html_text, title, author = bl.lib_ru_html(path, MHT_LIMIT)
+
+    assert author == "Михаил Булгаков"
+    assert title == "Собачье сердце"
+    assert '<a name="0"></a><h2>Михаил Булгаков. Собачье сердце</h2>' in html_text
+    assert "<p>Первый абзац книги, строка два.</p>" in html_text
+    assert "<p>Второй абзац ссылка &amp; конец. строка два.</p>" in html_text
+    assert "<pre" not in html_text
+    assert "example.com" not in html_text
+
+
+def test_lib_ru_html_title_with_digit_has_no_author(tmp_path: Path) -> None:
+    path = tmp_path / "chapter.html"
+    path.write_text(LIB_RU_PAGE.replace("Михаил Булгаков. Собачье сердце", "Глава 3. Текст"), encoding="utf-8")
+
+    _html_text, title, author = bl.lib_ru_html(path, MHT_LIMIT)
+
+    assert author == ""
+    assert title == "Глава 3. Текст"
+
+
+def test_lib_ru_name_skips_initials_and_limits_length() -> None:
+    assert bl.lib_ru_name("Михаил Булгаков", "Собачье сердце", "epub") == "Булгаков - Собачье сердце.epub"
+    assert bl.lib_ru_name("И.Л.Галинская", "X", "epub") == "Галинская - X.epub"
+    assert bl.lib_ru_name("Булгаков М.А", "X", "epub") == "Булгаков - X.epub"
+    assert bl.lib_ru_name("Иванов И", "X", "epub") == "Иванов - X.epub"
+    assert bl.lib_ru_name("Иван Петров И.И.", "X", "epub") == "Петров - X.epub"
+    long_name = bl.lib_ru_name("Иван Иванов", "я" * 300, "epub")
+    assert long_name.endswith(".epub")
+    assert len(long_name) <= 120
+
+
+def test_local_images_copies_only_files_inside_source_dir(tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "pic.gif").write_bytes(b"GIF89a")
+    (tmp_path / "secret.gif").write_bytes(b"x")
+    media = tmp_path / "media"
+    media.mkdir()
+    markup = '<img src="pic.gif"><img src="../secret.gif"><img src="http://example.com/c.gif">'
+
+    out = bl.local_images(markup, src, media, 1024)
+
+    assert out.count("<img") == 1
+    assert (media / "img1.gif").read_bytes() == b"GIF89a"
+    assert "secret.gif" not in out
+
+
+def html_page(title: str, *, pre: bool = True) -> str:
+    body = "Текст книги. " * 460  # больше 5000 байт
+    inner = f"<pre>\n     {body}\n</pre>" if pre else f"<p>{body}</p>"
+    return f"<html><head><title>{title}</title></head><body>{inner}</body></html>"
+
+
+def test_convert_html_selection_skips_index_small_no_pre_and_no_author(cfg: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+                                                                       capsys: pytest.CaptureFixture[str]) -> None:
+    folder = Path(cfg["books_dir"]) / "Булгаков"
+    folder.mkdir()
+    (folder / "index.html").write_text(html_page("Михаил Булгаков. Оглавление"), encoding="utf-8")
+    (folder / "small.html").write_text("<pre>x</pre>", encoding="utf-8")
+    (folder / "nopre.html").write_text(html_page("Михаил Булгаков. Без пре", pre=False), encoding="utf-8")
+    (folder / "noauthor.html").write_text(html_page("Заметки без автора"), encoding="utf-8")
+    (folder / "good.html").write_text(html_page("Михаил Булгаков. Собачье сердце"), encoding="utf-8")
+    monkeypatch.setattr(bl.shutil, "which", lambda _name: "/usr/bin/pandoc")
+
+    stats = bl.convert_documents(cfg, dry_run=True, only="html", to="epub", exclude=[], author="", title_mode="auto",
+                                 toc=True, toc_depth=3, delete_source=False, overwrite=False, skip_newer=False)
+
+    assert stats["skipped_index"] == 1
+    assert stats["skipped_small"] == 1
+    assert stats["skipped_no_pre"] == 1
+    assert stats["skipped_no_author"] == 1
+    assert stats["planned"] == 1
+    assert "Булгаков - Собачье сердце.epub" in capsys.readouterr().out
+
+
+def test_convert_all_does_not_pick_html(cfg: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    folder = Path(cfg["books_dir"]) / "Булгаков"
+    folder.mkdir()
+    (folder / "good.html").write_text(html_page("Михаил Булгаков. Собачье сердце"), encoding="utf-8")
+    monkeypatch.setattr(bl.shutil, "which", lambda _name: "/usr/bin/pandoc")
+
+    stats = bl.convert_documents(cfg, dry_run=True, only="all", to="epub", exclude=[], author="", title_mode="auto",
+                                 toc=True, toc_depth=3, delete_source=False, overwrite=False, skip_newer=False)
+
+    assert stats["sources"] == 0
+
+
 # ---- просмотр прочих форматов: PNM → PNG, кэш ----------------------------------------------------
 
 def read_png(png: bytes) -> tuple[int, int, int, int, bytes]:

@@ -26,6 +26,7 @@ import binascii
 import codecs
 import email
 import fcntl
+import functools
 import hashlib
 import hmac
 import html
@@ -1105,6 +1106,10 @@ def unpack_fb2zip(cfg: dict[str, Any], dry_run: bool = False, path: str | None =
 # ----------------------------------------------------------------------
 
 CONVERT_SOURCES = ("doc", "docx", "rtf", "odt", "mht", "mhtml")
+# HTML библиотеки Мошкова: только по явному --only html (в «all» не входит — ночной прогон их не трогает).
+HTML_SOURCES = ("html", "htm")
+HTML_INDEX = re.compile(r"^index.*\.html?$", re.I)
+HTML_MIN_BYTES = 5000
 
 
 def decode_part(raw: bytes, declared: str | None) -> str:
@@ -1146,6 +1151,130 @@ def mht_html(path: Path, limit: int) -> tuple[str, str, str]:
     title = " ".join(html.unescape(re.sub(r"<[^>]*>", " ", title_match.group(1))).split()) if title_match else ""
     name, address = parseaddr(str(message.get("From") or ""))
     return html_text, title or str(message.get("Subject") or "").strip(), (name or address).strip()
+
+
+# Библиотека Мошкова (зеркало lib.ru): текст книги в <pre>, абзац начинается со строки с отступом ≥ 3 пробела.
+LIB_RU_PRE = re.compile(r"<pre\b[^>]*>(.*?)(?:</pre\s*>|\Z)", re.S | re.I)
+LIB_RU_TAG = re.compile(r"<[^>]*>")
+LIB_RU_INLINE = re.compile(r"<[^<>]*>")
+LIB_RU_BLOCK = re.compile(r"<\s*(?:h[1-6]|hr|dir|img)\b|<a\s+name\b", re.I)
+LIB_RU_KEEP = frozenset({"b", "i", "h2", "h3", "hr", "dir"})
+# Ссылка или картинка с абсолютным адресом, протоколом или якорем не локальна: такие теги убираются.
+LOCAL_URL_NOT = re.compile(r"(?:[a-z][a-z0-9+.-]*:|/|#)", re.I)
+
+
+def lib_ru_text(raw: bytes) -> str:
+    """HTML библиотеки Мошкова: UTF-8, при ошибке декодирования — cp1251, затем koi8-r."""
+    for encoding in ("utf-8", "cp1251", "koi8-r"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    raise ValueError("не удалось декодировать HTML")
+
+
+def lib_ru_html(path: Path, limit: int) -> tuple[str, str, str]:
+    """HTML, название и автор из страницы библиотеки Мошкова (lib.ru).
+
+    Автор и название — по первому «. » в <title> («Имя Фамилия. Название»): автор — 1–4 слова без цифр, иначе автора
+    нет и название — весь <title>. Текст внутри каждого <pre> превращается в абзацы <p>; вне <pre> HTML не меняется.
+    """
+    text = lib_ru_text(read_limited(path, limit))
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", text, re.S | re.I)
+    title = " ".join(html.unescape(LIB_RU_TAG.sub(" ", title_match.group(1))).split()) if title_match else ""
+    left, sep, right = title.partition(". ")
+    author = ""
+    if sep and right.strip() and 1 <= len(left.split()) <= 4 and not re.search(r"\d", left):
+        author, title = " ".join(left.split()), right.strip()
+    body = LIB_RU_PRE.sub(lambda match: f"<div>{lib_ru_paragraphs(match.group(1))}</div>", text)
+    return body, title, author
+
+
+def lib_ru_paragraphs(inner: str) -> str:
+    """Содержимое <pre> → абзацы: пустая строка или строка с отступом ≥ 3 пробела начинает абзац,
+    остальные строки приклеиваются к нему через пробел. Строки с блочными тегами идут отдельно как есть."""
+    out: list[str] = []
+    lines: list[str] = []
+    anchors: list[bool] = []  # стек открытых <a>: True — якорь <a name>, его </a> сохраняется
+
+    def flush() -> None:
+        if lines:
+            out.append(f"<p>{' '.join(lines)}</p>")
+            lines.clear()
+
+    for raw_line in inner.expandtabs(8).split("\n"):
+        if not raw_line.strip():
+            flush()
+            continue
+        if LIB_RU_BLOCK.search(raw_line):
+            flush()
+            out.append(lib_ru_inline(raw_line.strip(), anchors))
+            continue
+        plain = LIB_RU_TAG.sub("", raw_line)
+        if len(plain) - len(plain.lstrip(" ")) >= 3:
+            flush()
+        piece = lib_ru_inline(re.sub(r"[ \t]+", " ", raw_line.strip()), anchors)
+        if piece:
+            lines.append(piece)
+    flush()
+    return "".join(out)
+
+
+def lib_ru_inline(segment: str, anchors: list[bool]) -> str:
+    """Строка из <pre>: текст экранируется, теги проходят через lib_ru_tag."""
+    out: list[str] = []
+    pos = 0
+    for match in LIB_RU_INLINE.finditer(segment):
+        out.append(html.escape(html.unescape(segment[pos:match.start()]), quote=False))
+        out.append(lib_ru_tag(match.group(0), anchors))
+        pos = match.end()
+    out.append(html.escape(html.unescape(segment[pos:]), quote=False))
+    return "".join(out)
+
+
+def lib_ru_tag(tag: str, anchors: list[bool]) -> str:
+    """Один тег из <pre>: сохраняются <a name>, <b>, <i>, <h2>, <h3>, <hr>, <dir> и локальный <img>; прочее уходит."""
+    found = re.match(r"<(/?)\s*([a-z0-9]+)\b([^>]*)>", tag, re.I)
+    if not found:
+        return ""
+    closing, name, attrs = bool(found.group(1)), found.group(2).lower(), found.group(3)
+    if name == "a":
+        if closing:
+            return "</a>" if anchors and anchors.pop() else ""
+        named = re.search(r"""name\s*=\s*["']?([\w.-]+)""", attrs, re.I)
+        anchors.append(named is not None)
+        return f'<a name="{named.group(1)}">' if named else ""
+    if name == "img" and not closing:
+        src = re.search(r"""src\s*=\s*["']?([^"'\s>]+)""", attrs, re.I)
+        if not src or LOCAL_URL_NOT.match(src.group(1)):
+            return ""
+        return f'<img src="{html.escape(src.group(1), quote=True)}" alt="">'
+    if name in LIB_RU_KEEP:
+        return f"<{'/' if closing else ''}{name}>"
+    return ""
+
+
+def local_images(markup: str, base: Path, media: Path, limit: int) -> str:
+    """Картинки HTML: локальный файл внутри каталога исходника копируется в media (каталог песочницы pandoc),
+    ссылка переписывается на копию; чужие, внешние, слишком большие и отсутствующие — убираются."""
+    base_dir = base.resolve()
+    copied = 0
+
+    def one(match: re.Match[str]) -> str:
+        nonlocal copied
+        src = re.search(r"""src\s*=\s*["']?([^"'\s>]+)""", match.group(0), re.I)
+        url = unquote(html.unescape(src.group(1))) if src else ""
+        if not url or LOCAL_URL_NOT.match(url):
+            return ""
+        origin = (base_dir / url).resolve()
+        if not origin.is_relative_to(base_dir) or not origin.is_file() or origin.stat().st_size > limit:
+            return ""
+        copied += 1
+        target = media / f"img{copied}{origin.suffix.lower()}"
+        shutil.copyfile(origin, target)
+        return f'<img src="{html.escape(str(target), quote=True)}" alt="">'
+
+    return re.sub(r"<img\b[^>]*>", one, markup, flags=re.I)
 
 
 def run_tool(args: list[str], timeout: int, cwd: Path | None = None) -> tuple[bool, str]:
@@ -1211,6 +1340,18 @@ def verify_book(path: Path, fmt: str) -> str | None:
     return None if len(text.strip()) >= 50 else "почти нет текста"
 
 
+@functools.lru_cache(maxsize=1)
+def pandoc_chapter_option() -> str:
+    """Разбивка EPUB на файлы по главам (уровень 2): --split-level с pandoc 3.0, --epub-chapter-level — для старых."""
+    try:
+        done = subprocess.run(["pandoc", "--version"], capture_output=True, text=True, timeout=30, check=False,
+                              stdin=subprocess.DEVNULL)
+        major = int(done.stdout.split()[1].split(".")[0])
+    except (OSError, subprocess.SubprocessError, IndexError, ValueError):
+        return "--split-level=2"
+    return "--split-level=2" if major >= 3 else "--epub-chapter-level=2"
+
+
 def convert_one(src: Path, out: Path, fmt: str, cfg: dict[str, Any], options: dict[str, Any]) -> tuple[bool, str]:
     """Цепочка как в doc2fb2.sh: docx/odt → pandoc; doc/rtf → LibreOffice → docx → pandoc;
     запасные пути: rtf → pandoc напрямую → unrtf; doc → html/antiword/catdoc/wvText → текст → pandoc.
@@ -1218,9 +1359,12 @@ def convert_one(src: Path, out: Path, fmt: str, cfg: dict[str, Any], options: di
     timeout = cfg["convert_timeout"]
     ext = src.suffix.lower().lstrip(".")
     meta_title, meta_author = docx_core(src) if ext == "docx" else ("", "")
-    mht_text = ""
+    limit = cfg["reader_max_mb"] * 1024 * 1024
+    page_html = ""
     if ext in {"mht", "mhtml"}:
-        mht_text, meta_title, meta_author = mht_html(src, cfg["reader_max_mb"] * 1024 * 1024)
+        page_html, meta_title, meta_author = mht_html(src, limit)
+    elif ext in HTML_SOURCES:
+        page_html, meta_title, meta_author = lib_ru_html(src, limit)
     title = meta_title if options["title_mode"] == "auto" and meta_title else path_meta(src.name)["title"]
     author = options["author"] or meta_author or next(iter(path_meta(str(src.relative_to(Path(cfg["books_dir"])))
                                                                      if src.is_relative_to(Path(cfg["books_dir"])) else src.name)
@@ -1253,13 +1397,19 @@ def convert_one(src: Path, out: Path, fmt: str, cfg: dict[str, Any], options: di
                 args += ["--metadata", f"author={author}"]
             if options["toc"]:
                 args += ["--toc", f"--toc-depth={options['toc_depth']}"]
+            if fmt == "epub" and not any(a.startswith(("--split-level", "--epub-chapter-level")) for a in args):
+                args.append(pandoc_chapter_option())
             return run_tool(args, timeout, cwd=tmp)
 
         staged = tmp / f"source.{ext}"  # копия с простым именем: внешние программы не видят странных имён
         attempts: list[Callable[[], tuple[bool, str]]] = []
-        if ext in {"mht", "mhtml"}:
+        if ext in {"mht", "mhtml"} or ext in HTML_SOURCES:
             staged = tmp / "source.html"
-            staged.write_text(mht_text, encoding="utf-8")
+            if ext in HTML_SOURCES:
+                # pandoc не видит каталог исходника: картинки копируются в media внутри tmp и ссылки переписываются
+                (tmp / "media").mkdir()
+                page_html = local_images(page_html, src.parent, tmp / "media", limit)
+            staged.write_text(page_html, encoding="utf-8")
             attempts.append(lambda: pandoc(staged, "html"))
         elif ext in {"docx", "odt"}:
             shutil.copyfile(src, staged)
@@ -1321,37 +1471,113 @@ def convert_one(src: Path, out: Path, fmt: str, cfg: dict[str, Any], options: di
         return False, "; ".join(errors)[-600:]
 
 
+LIB_RU_INITIAL_PREFIX = re.compile(r"^(?:[A-ZА-ЯЁ]\.)+")
+LIB_RU_INITIALS_WORD = re.compile(r"[A-ZА-ЯЁ](?:\.[A-ZА-ЯЁ])*\.?")
+
+
+def lib_ru_surname(author: str) -> str:
+    """Фамилия автора. Инициалы («И.», «М.А», приклеенные «И.Л.Галинская») убираются из слов. Если последнее слово —
+    не инициалы, оно и есть фамилия («Михаил Булгаков», «И.Л.Галинская»); иначе — первое неинициальное слово
+    («Булгаков М.А»)."""
+    words = [w for w in (LIB_RU_INITIAL_PREFIX.sub("", part) for part in author.split()) if w]
+    if not words:
+        return author.strip()
+    if not LIB_RU_INITIALS_WORD.fullmatch(words[-1]):
+        return words[-1]
+    plain = [w for w in words if not LIB_RU_INITIALS_WORD.fullmatch(w)]
+    return plain[-1] if plain else words[-1]
+
+
+def lib_ru_name(author: str, title: str, fmt: str) -> str:
+    """Имя результата HTML: «Фамилия - Название.fmt», фамилия — см. lib_ru_surname; не длиннее 120 символов."""
+    stem = folder_name(f"{lib_ru_surname(author)} - {title}")[: FOLDER_NAME_MAX - len(fmt) - 1]
+    return f"{stem.strip(' .')}.{fmt}"
+
+
+def html_candidate(src: Path, size: int, limit: int, stats: dict[str, int], fmt: str) -> str | None:
+    """Имя результата для HTML библиотеки или None: пропуск index*.htm(l), файлов меньше 5000 байт, без <pre>
+    и без автора в <title>; каждый пропуск — свой счётчик в stats."""
+    if HTML_INDEX.match(src.name):
+        stats["skipped_index"] += 1
+        return None
+    if size < HTML_MIN_BYTES:
+        stats["skipped_small"] += 1
+        return None
+    if not re.search(rb"<pre[\s>]", read_limited(src, limit), re.I):
+        stats["skipped_no_pre"] += 1
+        return None
+    _body, title, author = lib_ru_html(src, limit)
+    if not author:
+        stats["skipped_no_author"] += 1
+        return None
+    return lib_ru_name(author, title, fmt)
+
+
+def quarantine_source(cfg: dict[str, Any], source: Path) -> Path:
+    """HTML-исходник после проверки результата не удаляется, а переносится в replaced/<путь в каталоге книг>."""
+    root = Path(cfg["books_dir"])
+    rel = source.relative_to(root) if source.is_relative_to(root) else Path(source.name)
+    dest = Path(cfg["quarantine_dir"]) / "replaced" / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest = unique_path(dest.parent, dest.name, set())
+    shutil.move(source, dest)
+    return dest
+
+
 def convert_documents(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None,
                       out: Callable[[str], None] = print, **options: Any) -> dict[str, int]:
-    """Конвертирует DOC/DOCX/RTF/ODT в EPUB (по правилу библиотеки) или FB2 рядом с исходником.
+    """Конвертирует DOC/DOCX/RTF/ODT/MHT (и по --only html — HTML библиотеки Мошкова) в EPUB (по правилу библиотеки)
+    или FB2 рядом с исходником. HTML получает имя «Фамилия - Название.epub».
 
-    Существующий результат не перезаписывается без overwrite. Исходник удаляется только с delete_source и только
-    после проверки результата (verify_book); перед удалением — JSON-отчёт books_library/reports/convert-<время>.json.
+    Существующий результат не перезаписывается без overwrite. Исходник переносится в карантин replaced/ только с
+    delete_source и только после проверки результата (verify_book); не удаляется ни для одного формата (правило
+    карантина). Перед переносом — JSON-отчёт books_library/reports/convert-<время>.json.
     """
     if not shutil.which("pandoc"):
         raise ConfigError("не найден pandoc (нужен для convert)")
     target = target_dir(cfg, path)
     fmt = options["to"]
-    only = CONVERT_SOURCES if options["only"] == "all" else (options["only"],)
+    html_mode = options["only"] == "html"
+    if options["only"] == "all":
+        only = CONVERT_SOURCES
+    else:
+        only = HTML_SOURCES if html_mode else (options["only"],)
+    limit = cfg["reader_max_mb"] * 1024 * 1024
     excludes = [x.casefold() for x in options["exclude"]]
     errors: list[str] = []
     plan: list[tuple[Path, Path]] = []
-    stats = {"sources": 0, "planned": 0, "skipped_exists": 0, "converted": 0, "failed": 0, "deleted_sources": 0}
-    for src, _size in walk_files(target, tuple(f".{x}" for x in only), errors):
+    taken: set[Path] = set()
+    stats = {"sources": 0, "planned": 0, "skipped_exists": 0, "skipped_index": 0, "skipped_small": 0,
+             "skipped_no_pre": 0, "skipped_no_author": 0, "converted": 0, "failed": 0, "quarantined_sources": 0}
+    for src, size in walk_files(target, tuple(f".{x}" for x in only), errors):
         stats["sources"] += 1
         if any(x in src.name.casefold() for x in excludes):
             continue
-        result = src.with_suffix(f".{fmt}")
+        if html_mode:
+            try:
+                name = html_candidate(src, size, limit, stats, fmt)
+            except (OSError, ValueError) as error:
+                stats["failed"] += 1
+                say(f"не прочитан {src}: {error}", "convert_failed", logging.ERROR, detail=str(error))
+                continue
+            if name is None:
+                continue
+            result = src.parent / name
+        else:
+            result = src.with_suffix(f".{fmt}")
         if result.exists() and not (options["overwrite"] and not (options["skip_newer"] and result.stat().st_mtime >= src.stat().st_mtime)):
             stats["skipped_exists"] += 1
             continue
+        if html_mode and result in taken:  # два HTML с одним автором и названием в одной папке
+            result = unique_path(src.parent, result.name, taken)
+        taken.add(result)
         plan.append((src, result))
     stats["planned"] = len(plan)
     for error in errors[:20]:
         say(f"ошибка обхода: {error}", "walk_error", logging.WARNING, detail=error)
     if dry_run:
         for src, result in plan[:30]:
-            out(f"[dry-run] будет: {src} → {result}{' (исходник удалить после проверки)' if options['delete_source'] else ''}")
+            out(f"[dry-run] будет: {src} → {result}{' (исходник в карантин replaced/ после проверки)' if options['delete_source'] else ''}")
         out(f"[dry-run] будет: конвертировать {len(plan)} из {stats['sources']} документов в {fmt.upper()}, "
               f"уже есть {stats['skipped_exists']}")
         say("план конвертации", "dry_convert", detail=json.dumps(stats))
@@ -1374,13 +1600,14 @@ def convert_documents(cfg: dict[str, Any], dry_run: bool = False, path: str | No
                 "progress")
             last = now
     if options["delete_source"] and done_list:
-        report = write_report("convert", {"target": str(target), "deleted_sources": done_list,
+        report = write_report("convert", {"target": str(target), "quarantined_sources": done_list,
                                           "reason": f"исходник заменён проверенным {fmt.upper()}"})
         for item in done_list:
             if verify_book(Path(item["result"]), fmt) is None:
-                Path(item["source"]).unlink(missing_ok=True)
-                stats["deleted_sources"] += 1
-        say(f"удалено исходников: {stats['deleted_sources']}, отчёт {report}", "sources_deleted", detail=str(report))
+                quarantine_source(cfg, Path(item["source"]))
+                stats["quarantined_sources"] += 1
+        say(f"исходников в карантине replaced/: {stats['quarantined_sources']}, отчёт {report}", "sources_quarantined",
+            detail=str(report))
     say(f"конвертация: {json.dumps(stats, ensure_ascii=False)}", "convert_done", detail=json.dumps(stats))
     return stats
 
@@ -5557,7 +5784,7 @@ def command_params(command: str, raw: dict[str, Any]) -> dict[str, Any]:
             raise ConfigError("path должен быть непустой строкой")
         params["path"] = path
     if "only" in allowed:
-        valid = ("all", "fb2", "txt") if command == "fix-encoding" else ("all", "fb2", *CONVERT_SOURCES)
+        valid = ("all", "fb2", "txt") if command == "fix-encoding" else ("all", "fb2", "html", *CONVERT_SOURCES)
         params["only"] = raw.get("only", "all")
         if params["only"] not in valid:
             raise ConfigError(f"only: допустимо {', '.join(valid)}")
@@ -7482,7 +7709,7 @@ def main(argv: list[str] | None = None) -> int:
                              "zip-books, unzip-books, unpack-collections, merge-authors, sort-underscore или author-variants")
     parser.add_argument("-p", "--path", help="fix-encoding/unpack-fb2zip/convert: каталог (по умолчанию каталог книг)")
     parser.add_argument("--only", default="all",
-                        help="fix-encoding: all|fb2|txt; convert: all|fb2|doc|docx|rtf|odt|mht|mhtml (fb2 — в epub через Calibre)")
+                        help="fix-encoding: all|fb2|txt; convert: all|fb2|doc|docx|rtf|odt|mht|mhtml|html (fb2 — в epub через Calibre; html — только явно)")
     parser.add_argument("--workers", type=int,
                         help="convert --only fb2, dedup, dedup-folders, zip-books: потоков (по умолчанию workers из конфига); "
                              "unzip-books: потоков (по умолчанию unzip_workers)")
