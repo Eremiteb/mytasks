@@ -1558,8 +1558,9 @@ def test_person_name_accepts_people_and_rejects_titles_and_genres() -> None:
                    "Толкин Дж. Р. Р.", "Кадыр-заде Салам", "АЛЬТШУЛЛЕР Г. С", "Хью Дэфид аб"):
         assert bl.person_name(person), person
     for junk in ("драконов Охота на", "эпос Японский", "вБИТПЫЙО оЙЛПМБК", "автора без", "Tritsch by Bernhard",
-                 "Рафел Н и", "Р‘СЂР°СѓРЅ Р¤СЂРµРґРµСЂРёРє"):
+                 "Рафел Н и", "Р‘СЂР°СѓРЅ Р¤СЂРµРґРµСЂРёРє", "ЧЧЧЧ"):
         assert not bl.person_name(junk), junk
+    assert bl.author_key("ВЕЧЕ ИЗДАТЕЛЬСТВО") is None
 
 
 def test_pick_folder_not_person_creates_no_folder() -> None:
