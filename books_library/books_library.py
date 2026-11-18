@@ -288,6 +288,7 @@ MIGRATIONS: list[str] = [
         PRIMARY KEY(path, key, value)
     ) WITHOUT ROWID;
     CREATE INDEX book_meta_key ON book_meta(key, value);
+    CREATE INDEX book_collections_orig ON book_collections(orig_path, source);
     CREATE VIEW collection_sections AS
         SELECT bc.section, bc.collection, bc.subsection, count(DISTINCT bc.path) AS books
         FROM book_collections bc JOIN books b ON b.path = bc.path
