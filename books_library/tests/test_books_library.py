@@ -914,6 +914,28 @@ def test_convert_html_selection_skips_index_small_no_pre_and_no_author(cfg: dict
     assert "Булгаков - Собачье сердце.epub" in capsys.readouterr().out
 
 
+def test_convert_html_allow_no_author_names_by_title(cfg: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+                                                     capsys: pytest.CaptureFixture[str]) -> None:
+    folder = Path(cfg["books_dir"]) / "Фольклор"
+    folder.mkdir()
+    (folder / "anon.html").write_text(html_page("Заметки без автора"), encoding="utf-8")
+    (folder / "h2.html").write_text(html_page("").replace("<title></title>", "<title></title><h2>Сказка о рыбаке</h2>"),
+                                    encoding="utf-8")
+    (folder / "nameless.html").write_text(html_page(""), encoding="utf-8")
+    monkeypatch.setattr(bl.shutil, "which", lambda _name: "/usr/bin/pandoc")
+
+    stats = bl.convert_documents(cfg, dry_run=True, only="html", to="epub", exclude=[], author="", title_mode="auto",
+                                 toc=True, toc_depth=3, delete_source=False, overwrite=False, skip_newer=False,
+                                 allow_no_author=True)
+
+    assert stats["planned"] == 2
+    assert stats["skipped_no_author"] == 1
+    out = capsys.readouterr().out
+    assert "Заметки без автора.epub" in out
+    assert "Сказка о рыбаке.epub" in out
+    assert "из них без автора 2" in out
+
+
 def test_convert_all_does_not_pick_html(cfg: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
     folder = Path(cfg["books_dir"]) / "Булгаков"
     folder.mkdir()
@@ -3007,6 +3029,53 @@ def test_merge_folder_dry_run_changes_nothing(tmp_path: Path, monkeypatch: pytes
     assert not (root / "Петров Иван").exists()
 
 
+NON_BOOK_FILES = {
+    "_Сборники/X/a.epub": b"not really epub",  # битый epub: scan оставляет книгу по пути, расширение решает
+    "_Сборники/X/index.html": "<html></html>",
+    "_Сборники/X/pic.gif": b"GIF89a",
+}
+
+
+def test_merge_folder_non_books_go_to_quarantine_not_book(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, NON_BOOK_FILES)
+    root = Path(cfg["books_dir"])
+
+    stats = bl.folder_merge(cfg, ["_Сборники/X"], "_разобрать/X", non_books_to_quarantine=True)
+
+    assert stats["moved"] == 1
+    assert stats["quarantined_not_book"] == 2
+    assert stats["not-book"] == 2
+    assert (root / "_разобрать" / "X" / "a.epub").is_file()
+    assert not (root / "_разобрать" / "X" / "index.html").exists()
+    assert not (root / "_разобрать" / "X" / "pic.gif").exists()
+    quarantine = Path(cfg["quarantine_dir"]) / "not-book" / "_Сборники" / "X"
+    assert (quarantine / "index.html").is_file()
+    assert (quarantine / "pic.gif").is_file()
+
+
+def test_merge_folder_non_books_dry_run_changes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, NON_BOOK_FILES)
+    root = Path(cfg["books_dir"])
+
+    stats = bl.folder_merge(cfg, ["_Сборники/X"], "_разобрать/X", dry_run=True, out=lambda _line: None,
+                            non_books_to_quarantine=True)
+
+    assert stats["quarantined_not_book"] == 2
+    assert (root / "_Сборники" / "X" / "a.epub").is_file()
+    assert (root / "_Сборники" / "X" / "index.html").is_file()
+    assert (root / "_Сборники" / "X" / "pic.gif").is_file()
+    assert not (root / "_разобрать").exists()
+    assert not (Path(cfg["quarantine_dir"]) / "not-book").exists()
+
+
+def test_merge_folder_non_books_flag_requires_razobrat_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {"Иван Петров/a.txt": "А.\n"})
+
+    with pytest.raises(bl.ConfigError):
+        bl.folder_merge(cfg, ["Иван Петров"], "Петров Иван", non_books_to_quarantine=True)
+    assert (Path(cfg["books_dir"]) / "Иван Петров" / "a.txt").is_file()
+
+
 def test_strip_suffix_renames_free_names_and_skips_conflicts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = merge_cfg(tmp_path, monkeypatch, {
         "Иванов Иван/A_1.txt": "А.\n",
@@ -3051,7 +3120,12 @@ def test_strip_suffix_dry_run_changes_nothing(tmp_path: Path, monkeypatch: pytes
 
 
 def test_command_params_merge_folder_and_strip_suffix() -> None:
-    assert bl.command_params("merge-folder", {"from": ["A"], "to": "B"}) == {"sources": ["A"], "target": "B"}
+    assert bl.command_params("merge-folder", {"from": ["A"], "to": "B"}) == {
+        "sources": ["A"], "target": "B", "non_books_to_quarantine": False}
+    assert bl.command_params("merge-folder", {"from": ["A"], "to": "_разобрать/X", "non_books_to_quarantine": True})[
+        "non_books_to_quarantine"] is True
+    with pytest.raises(bl.ConfigError):
+        bl.command_params("merge-folder", {"from": ["A"], "to": "B", "non_books_to_quarantine": "yes"})
     assert bl.command_params("strip-suffix", {"path": "Иванов Иван"}) == {"path": "Иванов Иван"}
     with pytest.raises(bl.ConfigError):
         bl.command_params("merge-folder", {"from": [], "to": "B"})
@@ -3248,6 +3322,31 @@ def test_epub_belongs_to_collection_set_becomes_meta_collection(tmp_path: Path) 
     assert ("isbn", "9785000000002") in pairs
     assert ("group_position", "3") in pairs
     assert ("epub_version", "3.0") in pairs
+
+
+def test_fb2_to_epub3_keeps_publish_info_as_set_and_publisher_series(tmp_path: Path) -> None:
+    epub = tmp_path / "book.epub"
+    bl.fb2_to_epub3(make_fb2_full(), epub)
+    with zipfile.ZipFile(epub) as archive:
+        opf = archive.read("OEBPS/content.opf").decode("utf-8")
+    assert '<meta property="belongs-to-collection" id="edition1">Тёмный лес (издание)</meta>' in opf
+    assert '<meta refines="#edition1" property="collection-type">set</meta>' in opf
+    assert '<meta name="books_library:publisher-series" content="Издательская"/>' in opf
+    assert '<meta name="books_library:publisher-series-index" content="7"/>' in opf
+
+
+def test_converted_epub_publish_info_becomes_meta_collections(tmp_path: Path) -> None:
+    root = tmp_path / "books"
+    (root / "Иванов Иван").mkdir(parents=True)
+    rel = "Иванов Иван/Издание.epub"
+    bl.fb2_to_epub3(make_fb2_full(), root / rel)
+    cfg = make_cfg(tmp_path, root)
+    bl.scan(cfg)
+
+    assert meta_collections(cfg, rel) == {("set", "Тёмный лес (издание)"), ("publisher-series", "Издательская")}
+    pairs = meta_pairs(cfg, rel)
+    assert ("publisher_series", "Издательская") in pairs
+    assert ("publisher_series_no", "7") in pairs
 
 
 def test_subsection_from_orig_path_and_v6_backfill(tmp_path: Path) -> None:
@@ -3546,3 +3645,232 @@ def test_dedup_folders_keeps_native_epub_though_converted_is_larger(authors_cfg:
     assert result["duplicate"] == 1
     assert (folder / "Тёмный лес.epub").is_file()
     assert not (folder / "Тёмный лес (конверт).epub").exists()
+
+# ----------------------------------------------------------------------
+# purge-quarantine: окончательное удаление папок карантина по причинам (синтетика во временном карантине)
+# ----------------------------------------------------------------------
+
+def make_purge_tree(cfg: dict[str, Any], tmp_path: Path) -> tuple[Path, Path, Path]:
+    """duplicate/a (файл и симлинк на внешний файл) и replaced/b (файл); отчёты — во временном каталоге."""
+    qroot = Path(cfg["quarantine_dir"])
+    dup = qroot / "duplicate" / "a"
+    dup.mkdir(parents=True)
+    (dup / "x.fb2").write_bytes(b"12345")
+    (dup / "link").symlink_to(tmp_path / "outside.txt")
+    kept = qroot / "replaced" / "b"
+    kept.mkdir(parents=True)
+    (kept / "y.fb2").write_bytes(b"678")
+    (tmp_path / "outside.txt").write_bytes(b"keep")
+    return qroot, dup, kept
+
+
+def test_purge_quarantine_removes_one_reason_and_writes_report(cfg: dict[str, Any], tmp_path: Path,
+                                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    qroot, dup, kept = make_purge_tree(cfg, tmp_path)
+    params = bl.command_params("purge-quarantine", {"reasons": ["duplicate"]})
+    stats = bl.run_command(cfg, "purge-quarantine", False, params)
+    assert not (qroot / "duplicate").exists()
+    assert (kept / "y.fb2").read_bytes() == b"678"
+    assert (tmp_path / "outside.txt").read_bytes() == b"keep"  # симлинк удалён как ссылка, цель не тронута
+    assert stats["files"] == 2 and stats["errors"] == 0
+    report_file = next((tmp_path / "reports").glob("purge-quarantine-*.json"))
+    report = json.loads(report_file.read_text(encoding="utf-8"))
+    assert list(report["reasons"]) == ["duplicate"]
+    assert "duplicate/a/x.fb2" in [item["path"] for item in report["reasons"]["duplicate"]["items"]]
+
+
+def test_purge_quarantine_dry_run_deletes_nothing_and_writes_no_report(cfg: dict[str, Any], tmp_path: Path,
+                                                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    qroot, dup, _kept = make_purge_tree(cfg, tmp_path)
+    bl.run_command(cfg, "purge-quarantine", True, bl.command_params("purge-quarantine", {"reasons": ["duplicate"]}))
+    assert (dup / "x.fb2").read_bytes() == b"12345"
+    assert not (tmp_path / "reports").exists()
+
+
+def test_purge_quarantine_report_failure_deletes_nothing(cfg: dict[str, Any], tmp_path: Path,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken_report(kind: str, data: dict[str, Any]) -> Path:
+        raise OSError("отчёт недоступен")
+
+    monkeypatch.setattr(bl, "write_report", broken_report)
+    _qroot, dup, _kept = make_purge_tree(cfg, tmp_path)
+    params = bl.command_params("purge-quarantine", {"reasons": ["duplicate"]})
+    with pytest.raises(OSError):
+        bl.run_command(cfg, "purge-quarantine", False, params)
+    assert (dup / "x.fb2").read_bytes() == b"12345"
+
+
+def test_purge_quarantine_params_and_api_refusal(cfg: dict[str, Any]) -> None:
+    with pytest.raises(bl.ConfigError):
+        bl.command_params("purge-quarantine", {"reasons": ["unknown"]})
+    with pytest.raises(bl.ConfigError):
+        bl.command_params("purge-quarantine", {"reasons": []})
+    assert bl.command_params("purge-quarantine", {"reasons": ["duplicate", "duplicate"]}) == {"reasons": ["duplicate"]}
+    with pytest.raises(bl.ConfigError):
+        bl.start_job(cfg, "purge-quarantine", False, {"reasons": ["duplicate"]})
+
+
+def make_fb2_series(sequences: str) -> bytes:
+    """fb2 без издательских данных с заданными sequence в title-info."""
+    text = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0">'
+        "<description><title-info><genre>sf</genre>"
+        "<author><first-name>Иван</first-name><last-name>Иванов</last-name></author>"
+        f"<book-title>Книга</book-title><lang>ru</lang>{sequences}"
+        "</title-info></description>"
+        "<body><section><p>Текст.</p></section></body></FictionBook>"
+    )
+    return text.encode("utf-8")
+
+
+def test_fb2_two_series_go_to_epub_and_book_meta(tmp_path: Path) -> None:
+    epub = tmp_path / "two.epub"
+    bl.fb2_to_epub3(make_fb2_series('<sequence name="Первая" number="2"/><sequence name="Вторая" number="5"/>'), epub)
+    with zipfile.ZipFile(epub) as archive:
+        opf = archive.read("OEBPS/content.opf").decode("utf-8")
+    assert '<meta property="belongs-to-collection" id="c2">Вторая</meta>' in opf
+    assert '<meta refines="#c2" property="group-position">5</meta>' in opf
+    root = tmp_path / "books"
+    (root / "Иванов Иван").mkdir(parents=True)
+    rel = "Иванов Иван/Две серии.epub"
+    (root / rel).write_bytes(epub.read_bytes())
+    cfg = make_cfg(tmp_path, root)
+    bl.scan(cfg)
+
+    row = book_rows(cfg)[rel]
+    assert row["series"] == "Первая"
+    assert row["series_no"] == 2
+    assert ("series_extra", "Вторая #5") in meta_pairs(cfg, rel)
+
+
+def test_series_from_folder_and_stop_words(tmp_path: Path) -> None:
+    assert bl.folder_series("Иванов Иван/Двойной Герой (110,124)/2. Книга.epub") == ("Двойной Герой", 2)
+    assert bl.folder_series("_Сборники/Сборник/Двойной Герой (562,810)/2. Книга.epub") == ("Двойной Герой", 2)
+    assert bl.folder_series("Иванов Иван/2. Книга.epub") is None
+    assert bl.folder_series("Иванов Иван/Двойной Герой/Книга.epub") is None
+
+    root = tmp_path / "books"
+    (root / "Иванов Иван" / "Двойной Герой (110,124)").mkdir(parents=True)
+    (root / "Иванов Иван" / "Рассказы").mkdir()
+    folder_rel = "Иванов Иван/Двойной Герой (110,124)/2. Книга.fb2"
+    (root / folder_rel).write_bytes(make_fb2_series(""))
+    stop_folder_rel = "Иванов Иван/Рассказы/3. Ещё.fb2"
+    (root / stop_folder_rel).write_bytes(make_fb2_series(""))
+    stop_desc_rel = "Иванов Иван/Сборный.fb2"
+    (root / stop_desc_rel).write_bytes(make_fb2_series('<sequence name="Рассказы" number="1"/>'))
+    cfg = make_cfg(tmp_path, root)
+    bl.scan(cfg)
+
+    rows = book_rows(cfg)
+    assert rows[folder_rel]["series"] == "Двойной Герой"
+    assert rows[folder_rel]["series_no"] == 2
+    assert ("series_folder", "Двойной Герой #2") in meta_pairs(cfg, folder_rel)
+    assert rows[stop_folder_rel]["series"] == ""
+    assert ("series_raw", "Рассказы") in meta_pairs(cfg, stop_folder_rel)
+    assert rows[stop_desc_rel]["series"] == ""
+    assert ("series_raw", "Рассказы") in meta_pairs(cfg, stop_desc_rel)
+
+
+# ----------------------------------------------------------------------
+# book_variants (схема v7): варианты из карантина сохраняются до удаления (синтетика во временном каталоге)
+# ----------------------------------------------------------------------
+
+def make_variant_tree(cfg: dict[str, Any]) -> Path:
+    """Библиотека: A/x.epub, B/y.epub, C/z.fb2. Карантин: duplicate/A/x.epub (dup_members: keeper A/x.epub),
+    replaced-calibre/B/y.epub, unzipped/C/z.fb2.zip (однокнижный архив с z.fb2 внутри)."""
+    library = Path(cfg["books_dir"])
+    for folder in ("A", "B", "C"):
+        (library / folder).mkdir()
+    make_epub(library / "A" / "x.epub")
+    make_epub(library / "B" / "y.epub")
+    (library / "C" / "z.fb2").write_bytes(make_fb2("Зелёная книга", "Иван", "Иванов"))
+    qroot = Path(cfg["quarantine_dir"])
+    (qroot / "duplicate" / "A").mkdir(parents=True)
+    make_epub(qroot / "duplicate" / "A" / "x.epub")
+    (qroot / "replaced-calibre" / "B").mkdir(parents=True)
+    make_epub(qroot / "replaced-calibre" / "B" / "y.epub")
+    (qroot / "unzipped" / "C").mkdir(parents=True)
+    with zipfile.ZipFile(qroot / "unzipped" / "C" / "z.fb2.zip", "w") as archive:
+        archive.writestr("z.fb2", make_fb2("Зелёная книга", "Иван", "Иванов"))
+    bl.scan(cfg)
+    with closing(bl.connect(cfg["db_path"])) as conn, conn:
+        group = conn.execute("INSERT INTO dup_groups(key, status, created) VALUES ('test', 'resolved', 0)").lastrowid
+        conn.execute("INSERT INTO dup_members(group_id, path, fmt, size, words, coverage, role, keeper, quarantine) "
+                     "VALUES (?,?,?,?,?,?,?,?,?)",
+                     (group, "A/x.epub", "epub", 10, 7, None, "duplicate", "A/x.epub",
+                      str(qroot / "duplicate" / "A" / "x.epub")))
+    return qroot
+
+
+def variant_rows(cfg: dict[str, Any]) -> dict[str, sqlite3.Row]:
+    with closing(bl.connect(cfg["db_path"])) as conn:
+        return {row["reason"]: row for row in conn.execute("SELECT * FROM book_variants")}
+
+
+VARIANT_PARAMS = {"reasons": ["duplicate", "replaced-calibre", "unzipped"]}
+
+
+def test_purge_writes_variants_with_keepers_then_deletes(cfg: dict[str, Any], tmp_path: Path,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    qroot = make_variant_tree(cfg)
+    bl.run_command(cfg, "purge-quarantine", False, bl.command_params("purge-quarantine", VARIANT_PARAMS))
+
+    rows = variant_rows(cfg)
+    assert set(rows) == {"duplicate", "replaced-calibre", "unzipped"}
+    assert rows["duplicate"]["variant_path"] == "duplicate/A/x.epub"
+    assert rows["duplicate"]["keeper"] == "A/x.epub"
+    assert rows["duplicate"]["words"] == 7  # из dup_members
+    assert rows["replaced-calibre"]["keeper"] == "B/y.epub"
+    assert rows["replaced-calibre"]["title"] == "Электронная книга"
+    assert rows["unzipped"]["variant_path"] == "unzipped/C/z.fb2.zip"
+    assert rows["unzipped"]["keeper"] == "C/z.fb2"  # распакованная книга — путь без .zip
+    assert rows["unzipped"]["fmt"] == "fb2"  # zip разобран как однокнижный архив
+    assert rows["unzipped"]["title"] == "Зелёная книга"
+    assert json.loads(rows["unzipped"]["meta"])["fmt"] == "fb2"
+    assert all(len(row["sha1"]) == 40 for row in rows.values())
+    assert all(row["removed"] is not None for row in rows.values())
+    assert not (qroot / "duplicate").exists()
+    assert not (qroot / "replaced-calibre").exists()
+    assert not (qroot / "unzipped").exists()
+
+
+def test_purge_keeps_files_when_variant_write_fails(cfg: dict[str, Any], tmp_path: Path,
+                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    qroot = make_variant_tree(cfg)
+    monkeypatch.setattr(bl, "VARIANT_INSERT", "INSERT INTO no_such_table VALUES (?)")
+    with pytest.raises(sqlite3.Error):
+        bl.run_command(cfg, "purge-quarantine", False, bl.command_params("purge-quarantine", VARIANT_PARAMS))
+    assert (qroot / "duplicate" / "A" / "x.epub").is_file()
+    assert (qroot / "unzipped" / "C" / "z.fb2.zip").is_file()
+    assert not (tmp_path / "reports").exists()  # отчёт не пишется до успешной записи вариантов
+    assert variant_rows(cfg) == {}
+
+
+def test_purge_dry_run_counts_variants_without_writing(cfg: dict[str, Any], tmp_path: Path,
+                                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    qroot = make_variant_tree(cfg)
+    stats = bl.run_command(cfg, "purge-quarantine", True, bl.command_params("purge-quarantine", VARIANT_PARAMS))
+    assert stats["variants"] == 3 and stats["variants_with_keeper"] == 3
+    assert (qroot / "duplicate" / "A" / "x.epub").is_file()
+    assert variant_rows(cfg) == {}
+
+
+def test_variant_card_shows_variants_of_kept_book(cfg: dict[str, Any], tmp_path: Path,
+                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    make_variant_tree(cfg)
+    bl.run_command(cfg, "purge-quarantine", False, bl.command_params("purge-quarantine", VARIANT_PARAMS))
+    for web in _serving(cfg, monkeypatch):
+        status, _headers, body = fetch(f"{web}/book/{book_id(cfg, 'C/z.fb2')}")
+        text = body.decode("utf-8")
+        assert status == 200
+        assert "<h3>Варианты</h3>" in text
+        assert "zip-архив" in text and "Зелёная книга" in text
+        status, _headers, body = fetch(f"{web}/book/{book_id(cfg, 'A/x.epub')}")
+        assert "дубль" in body.decode("utf-8")
