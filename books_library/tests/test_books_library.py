@@ -124,6 +124,7 @@ def make_cfg(tmp_path: Path, books: Path, port: int = 8090) -> dict[str, Any]:
         "port": port,
         "quarantine_dir": str(tmp_path / "quarantine"),
         "workers": 2,
+        "text_cache_dir": "",  # кэш текста выключен: тесты не пишут в /var/cache
     }
     config.write_text(json.dumps(settings), encoding="utf-8")
     return bl.load_config(config)
@@ -285,6 +286,14 @@ def test_load_config_rejects_unknown_key(tmp_path: Path) -> None:
 def test_load_config_rejects_port_out_of_range(tmp_path: Path) -> None:
     path = tmp_path / "books_library.json"
     path.write_text('{"port": 70000}', encoding="utf-8")
+
+    with pytest.raises(bl.ConfigError):
+        bl.load_config(path)
+
+
+def test_load_config_rejects_text_cache_mb_out_of_range(tmp_path: Path) -> None:
+    path = tmp_path / "books_library.json"
+    path.write_text('{"text_cache_mb": -1}', encoding="utf-8")
 
     with pytest.raises(bl.ConfigError):
         bl.load_config(path)
@@ -768,6 +777,82 @@ def test_cache_key_changes_with_size_and_mtime() -> None:
     assert bl.cache_key(cache_row(7, 100, 1_700_000_001.5)) != base
 
 
+# ---- кэш текста dedup -----------------------------------------------------------------------------
+
+@pytest.fixture
+def tcache(tmp_path: Path) -> Iterator[Any]:
+    directory = tmp_path / "text_cache"
+    directory.mkdir()
+    cache = bl.TextCache.open({"text_cache_dir": str(directory), "text_cache_mb": 10})
+    assert cache is not None
+    yield cache
+    cache.close()
+
+
+def test_text_cache_get_by_path_checks_size_and_mtime(tcache: Any) -> None:
+    tcache.put("Иванов/книга.txt", 10, 1000.0, "txt", "Текст книги")
+    tcache.put("Иванов/пусто.txt", 0, 5.0, "txt", "")
+
+    assert tcache.get("Иванов/книга.txt", 10, 1000.0, "txt") == "Текст книги"
+    assert tcache.get("Иванов/пусто.txt", 0, 5.0, "txt") == ""  # пустой текст тоже кэшируется
+    assert tcache.get("Иванов/книга.txt", 11, 1000.0, "txt") is None  # размер изменился
+    assert tcache.get("Иванов/книга.txt", 10, 1000.5, "txt") is None  # mtime изменился
+    assert tcache.get("Иванов/книга.txt", 10, 1000.0, "fb2") is None  # формат другой
+
+
+def test_text_cache_finds_renamed_file_and_moves_path(tcache: Any) -> None:
+    tcache.put("Иванов/старое.txt", 10, 1000.0, "txt", "текст")
+
+    assert tcache.get("Иванов/новое.txt", 10, 1000.0, "txt") == "текст"
+    assert [row[0] for row in tcache.conn.execute("SELECT path FROM texts")] == ["Иванов/новое.txt"]
+
+
+def test_text_cache_two_candidates_give_none(tcache: Any) -> None:
+    tcache.put("а.txt", 10, 1000.0, "txt", "один")
+    tcache.put("б.txt", 10, 1000.0, "txt", "два")
+
+    assert tcache.get("в.txt", 10, 1000.0, "txt") is None
+
+
+def test_text_cache_prune_removes_least_recently_used(tcache: Any) -> None:
+    # Случайный hex сжимается примерно вдвое: три записи ≈ 1.8 МБ, при пределе 1 МБ остаётся самая свежая.
+    for name, used in (("старая.txt", 1000.0), ("средняя.txt", 2000.0), ("новая.txt", 3000.0)):
+        tcache.put(name, 1, 1.0, "txt", os.urandom(600_000).hex())
+        tcache.conn.execute("UPDATE texts SET used = ? WHERE path = ?", (used, name))
+
+    tcache.prune(1)
+
+    assert [row[0] for row in tcache.conn.execute("SELECT path FROM texts")] == ["новая.txt"]
+
+
+def test_text_cache_open_is_none_without_directory(tmp_path: Path) -> None:
+    assert bl.TextCache.open({"text_cache_dir": str(tmp_path / "нет"), "text_cache_mb": 10}) is None
+    assert bl.TextCache.open({"text_cache_dir": "", "text_cache_mb": 10}) is None
+    assert not (tmp_path / "нет").exists()  # каталог не создаётся
+
+
+def test_dedup_dry_run_second_pass_hits_text_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "dups"
+    folder = root / "Иванов Иван"
+    folder.mkdir(parents=True)
+    text = " ".join(f"слово{i}" for i in range(300))  # больше DEDUP_MIN_WORDS, чтобы копия стала дублем
+    (folder / "Заметки.txt").write_text(text, encoding="utf-8")
+    (folder / "Заметки_1.txt").write_text(text, encoding="utf-8")
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    cfg = make_cfg(tmp_path, root)
+    cache_dir = tmp_path / "text_cache"
+    cache_dir.mkdir()
+    cfg["text_cache_dir"] = str(cache_dir)
+
+    first = bl.dedup(cfg, dry_run=True, out=lambda _line: None)
+    second = bl.dedup(cfg, dry_run=True, out=lambda _line: None)
+
+    assert first["groups"] == 1
+    assert first["text_cache_miss"] == 2
+    assert second["text_cache_hit"] == 2
+    assert (folder / "Заметки.txt").is_file() and (folder / "Заметки_1.txt").is_file()  # dry-run ничего не переносит
+
+
 # ---- просмотр прочих форматов в веб-интерфейсе ---------------------------------------------------
 
 @pytest.fixture
@@ -1044,6 +1129,53 @@ def test_api_unknown_parameter_is_bad_request(web: str, api_env: None) -> None:
     assert "bogus" in body["error"]
 
 
+def insert_dup_group(conn: sqlite3.Connection, key: str, status: str) -> int:
+    """Группа дублей с двумя оставленными книгами (для страницы и действий)."""
+    gid = conn.execute("INSERT INTO dup_groups(key, status, created) VALUES (?,?,?)", (key, status, 1.0)).lastrowid
+    for path, fmt in ((FB2_REL, "fb2"), (TXT_REL, "txt")):
+        conn.execute("INSERT INTO dup_members(group_id, path, fmt, size, words, coverage, role, keeper, quarantine) "
+                     "VALUES (?,?,?,?,?,?,?,?,?)", (gid, path, fmt, 1, 300, 0.99, "kept", "", ""))
+    return gid
+
+
+def test_dup_resolve_marks_group_and_keeps_files(scanned: dict[str, Any], api_env: None) -> None:
+    with closing(bl.connect(scanned["db_path"])) as conn, conn:
+        gid = insert_dup_group(conn, "Решить без файлов", "similar")
+
+    message = bl.dup_action(scanned, gid, "resolve")
+
+    assert message == "Группа помечена решённой, файлы не менялись."
+    with closing(bl.connect(scanned["db_path"])) as conn:
+        assert conn.execute("SELECT status FROM dup_groups WHERE id=?", (gid,)).fetchone()[0] == "resolved"
+    assert (Path(scanned["books_dir"]) / FB2_REL).is_file()
+
+
+def test_dup_resolve_unknown_group_is_refused(scanned: dict[str, Any], api_env: None) -> None:
+    with pytest.raises(ValueError):
+        bl.dup_action(scanned, 999999, "resolve")
+
+
+def test_dups_page_hides_resolved_until_checkbox(web: str, api_env: None, scanned: dict[str, Any]) -> None:
+    with closing(bl.connect(scanned["db_path"])) as conn, conn:
+        insert_dup_group(conn, "Группа похожая", "similar")
+        insert_dup_group(conn, "Группа решённая", "resolved")
+
+    status, _headers, body = fetch(f"{web}/dups?status=similar")
+    text = body.decode("utf-8")
+
+    assert status == 200
+    assert "Группа похожая" in text
+    assert "Группа решённая" not in text
+    assert "Решено</button>" in text
+
+    _status, _headers, body = fetch(f"{web}/dups?status=similar&resolved=1")
+    text = body.decode("utf-8")
+
+    assert "Группа похожая" in text
+    assert "Группа решённая" in text
+    assert "checked>" in text
+
+
 def test_command_params_rejects_out_of_range_toc_depth() -> None:
     with pytest.raises(bl.ConfigError):
         bl.command_params("convert", {"toc_depth": 9})
@@ -1157,3 +1289,1019 @@ def test_zip_books_wraps_txt_and_removes_source(tmp_path: Path, monkeypatch: pyt
     with zipfile.ZipFile(root / "a.txt.zip") as archive:
         assert archive.namelist() == ["a.txt"]
         assert archive.read("a.txt") == data
+
+
+# ---- unzip-books: распаковка однокнижных zip обратно (решение: книги хранятся распакованными) ----
+
+@pytest.fixture
+def unzip_relinks(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+    """Пары переноса путей (relink) без базы: собираются для проверки."""
+    pairs: list[tuple[str, str]] = []
+
+    def fake_relink(db_path: str, moved: list[tuple[str, str]]) -> int:
+        pairs.extend(moved)
+        return len(moved)
+
+    monkeypatch.setattr(bl, "relink", fake_relink)
+    return pairs
+
+
+@pytest.fixture
+def unzip_cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unzip_relinks: list[tuple[str, str]]) -> dict[str, Any]:
+    root = tmp_path / "unzip"
+    root.mkdir()
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    return make_cfg(tmp_path, root)
+
+
+def make_multi(path: Path) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("a.txt", b"one")
+        archive.writestr("b.txt", b"two")
+
+
+def test_unzip_dry_run_changes_nothing(unzip_cfg: dict[str, Any], unzip_relinks: list[tuple[str, str]]) -> None:
+    root = Path(unzip_cfg["books_dir"])
+    make_archive(root / "a.txt.zip", "a.txt", TXT_TEXT.encode("utf-8"))
+
+    stats = bl.unzip_books(unzip_cfg, dry_run=True)
+
+    assert stats["extracted"] == 1
+    assert (root / "a.txt.zip").is_file()
+    assert not (root / "a.txt").exists()
+    assert not (Path(unzip_cfg["quarantine_dir"]) / "unzipped").exists()
+    assert unzip_relinks == []
+
+
+def test_unzip_txt_archive_becomes_plain_file(unzip_cfg: dict[str, Any], unzip_relinks: list[tuple[str, str]]) -> None:
+    root = Path(unzip_cfg["books_dir"])
+    data = TXT_TEXT.encode("utf-8")
+    make_archive(root / "a.txt.zip", "a.txt", data)
+    os.utime(root / "a.txt.zip", (1_600_000_000, 1_600_000_000))
+
+    stats = bl.unzip_books(unzip_cfg)
+
+    assert stats["extracted"] == 1
+    assert (root / "a.txt").read_bytes() == data
+    assert int((root / "a.txt").stat().st_mtime) == 1_600_000_000
+    assert not (root / "a.txt.zip").exists()
+    assert (Path(unzip_cfg["quarantine_dir"]) / "unzipped" / "a.txt.zip").is_file()
+    assert ("a.txt.zip", "a.txt") in unzip_relinks
+
+
+def test_unzip_multi_file_archive_untouched(unzip_cfg: dict[str, Any]) -> None:
+    root = Path(unzip_cfg["books_dir"])
+    make_multi(root / "pack.txt.zip")
+
+    stats = bl.unzip_books(unzip_cfg)
+
+    assert stats["multi"] == 1
+    assert (root / "pack.txt.zip").is_file()
+    assert not (root / "a.txt").exists()
+
+
+def test_unzip_identical_target_is_twin_archive_goes_to_quarantine(
+        unzip_cfg: dict[str, Any], unzip_relinks: list[tuple[str, str]]) -> None:
+    root = Path(unzip_cfg["books_dir"])
+    data = TXT_TEXT.encode("utf-8")
+    make_archive(root / "a.txt.zip", "a.txt", data)
+    (root / "a.txt").write_bytes(data)
+
+    stats = bl.unzip_books(unzip_cfg)
+
+    assert stats["twin"] == 1
+    assert "extracted" not in stats
+    assert sorted(p.name for p in root.iterdir()) == ["a.txt"]
+    assert (Path(unzip_cfg["quarantine_dir"]) / "unzipped" / "a.txt.zip").is_file()
+    assert ("a.txt.zip", "a.txt") in unzip_relinks
+
+
+def test_unzip_different_target_gets_numeric_suffix(unzip_cfg: dict[str, Any]) -> None:
+    root = Path(unzip_cfg["books_dir"])
+    data = TXT_TEXT.encode("utf-8")
+    make_archive(root / "a.txt.zip", "a.txt", data)
+    (root / "a.txt").write_bytes(b"other")
+
+    stats = bl.unzip_books(unzip_cfg)
+
+    assert stats["conflict"] == 1
+    assert (root / "a.txt").read_bytes() == b"other"
+    assert (root / "a_1.txt").read_bytes() == data
+
+
+def test_unzip_entry_path_cannot_leave_folder(unzip_cfg: dict[str, Any]) -> None:
+    root = Path(unzip_cfg["books_dir"])
+    make_archive(root / "t.txt.zip", "../evil.txt", b"abc")  # имя цели берётся из архива, путь записи отбрасывается
+    make_archive(root / "x.zip", "../evil2.txt", b"def")  # без вложенного расширения — basename записи
+
+    bl.unzip_books(unzip_cfg)
+
+    assert (root / "t.txt").read_bytes() == b"abc"
+    assert (root / "evil2.txt").read_bytes() == b"def"
+    assert not (root.parent / "evil.txt").exists()
+    assert not (root.parent / "evil2.txt").exists()
+
+
+# ---- сборники книг (схема v4: book_collections, VIEW collections) -----------------------------
+
+def insert_book(conn: sqlite3.Connection, path: str) -> None:
+    """Строка books по пути; раздел и сборник — как при разборе пути в scan."""
+    section, collection = bl.path_collection(path)
+    conn.execute("INSERT INTO books(path, size, mtime, fmt, title, added, section, collection) VALUES (?,?,?,?,?,?,?,?)",
+                 (path, 1, 1.0, "epub", path.rsplit("/", 1)[-1], 1.0, section, collection))
+
+
+def insert_duplicate(conn: sqlite3.Connection, path: str, keeper: str) -> None:
+    """Удалённая копия в карантин: одна группа дублей на каждую копию."""
+    gid = conn.execute("INSERT INTO dup_groups(key, status, created) VALUES (?,?,?)", (path, "auto", 1.0)).lastrowid
+    conn.execute("INSERT INTO dup_members(group_id, path, fmt, size, words, coverage, role, keeper, quarantine) "
+                 "VALUES (?,?,?,?,?,?,?,?,?)", (gid, path, "epub", 1, 300, 0.99, "duplicate", keeper, ""))
+
+
+@pytest.fixture
+def coll_db(tmp_path: Path) -> str:
+    db = str(tmp_path / "coll.db")
+    bl.migrate_database(db, out=lambda _line: None)
+    with closing(bl.connect(db)) as conn, conn:
+        for path in ("_Сборники/Серия X/a.epub", "Автор/b.epub", "Автор/c.txt.zip"):
+            insert_book(conn, path)
+        insert_duplicate(conn, "_Сборники/Серия Y/b.epub", "Автор/b.epub")
+        insert_duplicate(conn, "_Сборники/Серия Y/c.txt", "Автор/c.txt")  # keeper упакован в zip-books
+        insert_duplicate(conn, "_Сборники/Серия Z/d.epub", "Нет/d.epub")  # keeper пропал совсем
+    return db
+
+
+def test_migration_v4_creates_book_collections_and_view(tmp_path: Path) -> None:
+    empty = str(tmp_path / "empty.db")
+    old = str(tmp_path / "v3.db")
+    with closing(sqlite3.connect(old)) as conn:
+        for number, sql in enumerate(bl.MIGRATIONS[:3], start=1):
+            conn.executescript(f"BEGIN;{sql};PRAGMA user_version={number};COMMIT;")
+
+    assert bl.migrate_database(empty, out=lambda _line: None) == 4
+    assert bl.migrate_database(old, out=lambda _line: None) == 4
+
+    for path in (empty, old):
+        with closing(bl.connect(path)) as conn:
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+            names = {row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE name IN ('book_collections', 'collections')")}
+            assert names == {"book_collections", "collections"}
+
+
+def test_rebuild_collections_folder_dedup_zip_and_unresolved(coll_db: str) -> None:
+    with closing(bl.connect(coll_db)) as conn, conn:
+        counts = bl.rebuild_collections(conn)
+        rows = {tuple(row) for row in conn.execute("SELECT path, section, collection, source, orig_path FROM book_collections")}
+        books_in_series_y = conn.execute("SELECT books FROM collections WHERE collection='Серия Y'").fetchone()[0]
+
+    section = bl.section_name("_Сборники")
+    assert counts == {"folder": 1, "dedup": 2, "unresolved": 1}
+    assert rows == {
+        ("_Сборники/Серия X/a.epub", section, "Серия X", "folder", "_Сборники/Серия X/a.epub"),
+        ("Автор/b.epub", section, "Серия Y", "dedup", "_Сборники/Серия Y/b.epub"),
+        ("Автор/c.txt.zip", section, "Серия Y", "dedup", "_Сборники/Серия Y/c.txt"),
+    }
+    assert books_in_series_y == 2
+
+
+def test_relink_moves_collection_rows_and_keeper(coll_db: str) -> None:
+    with closing(bl.connect(coll_db)) as conn, conn:
+        bl.rebuild_collections(conn)
+
+    bl.relink(coll_db, [("Автор/b.epub", "Автор/b2.epub")])
+
+    with closing(bl.connect(coll_db)) as conn:
+        paths = {row[0] for row in conn.execute("SELECT path FROM book_collections")}
+        keeper = conn.execute("SELECT keeper FROM dup_members WHERE path=?", ("_Сборники/Серия Y/b.epub",)).fetchone()[0]
+    assert "Автор/b2.epub" in paths
+    assert "Автор/b.epub" not in paths
+    assert keeper == "Автор/b2.epub"
+
+
+def test_collection_filter_finds_keeper_from_other_section(
+        tmp_path: Path, api_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "books"
+    (root / "Автор").mkdir(parents=True)
+    make_epub(root / "Автор" / "b.epub")
+    cfg = make_cfg(tmp_path, root)
+    bl.scan(cfg)
+    with closing(bl.connect(cfg["db_path"])) as conn, conn:
+        insert_duplicate(conn, "_Сборники/Серия Y/b.epub", "Автор/b.epub")
+        bl.rebuild_collections(conn)
+
+    server = _serving(cfg, monkeypatch)
+    base = next(server)
+    try:
+        status, body = api_call(f"{base}/api/books?collection={quote('Серия Y')}&section={quote(bl.section_name('_Сборники'))}")
+    finally:
+        server.close()
+
+    assert status == 200
+    assert body["total"] == 1
+    assert body["items"][0]["path"] == "Автор/b.epub"
+    assert body["items"][0]["collections"] == [{"section": bl.section_name("_Сборники"), "collection": "Серия Y"}]
+
+
+def test_collections_view_counts_only_books_in_catalog_and_rebuild_keeps_rows(coll_db: str) -> None:
+    with closing(bl.connect(coll_db)) as conn, conn:
+        bl.rebuild_collections(conn)
+        conn.execute("DELETE FROM books WHERE path=?", ("Автор/c.txt.zip",))
+        bl.rebuild_collections(conn)  # повторная пересборка только дополняет: строка для удалённой книги остаётся
+        kept = conn.execute("SELECT count(*) FROM book_collections WHERE path=?", ("Автор/c.txt.zip",)).fetchone()[0]
+        books_in_series_y = conn.execute("SELECT books FROM collections WHERE collection='Серия Y'").fetchone()[0]
+
+    assert kept == 1
+    assert books_in_series_y == 1
+
+
+def test_rebuild_keeps_collection_of_book_moved_by_relink(coll_db: str) -> None:
+    old, new = "_Сборники/Серия X/a.epub", "Иванов/a.epub"
+    with closing(bl.connect(coll_db)) as conn, conn:
+        bl.rebuild_collections(conn)
+    bl.relink(coll_db, [(old, new)])
+    with closing(bl.connect(coll_db)) as conn, conn:
+        conn.execute("DELETE FROM books WHERE path=?", (old,))
+        insert_book(conn, new)  # файл переехал: в books уже без сборника
+        bl.rebuild_collections(conn)
+        rows = {tuple(row) for row in conn.execute(
+            "SELECT path, section, collection, source, orig_path FROM book_collections WHERE path=?", (new,))}
+
+    assert rows == {(new, bl.section_name("_Сборники"), "Серия X", "folder", old)}
+
+
+def test_author_key_rejects_placeholders_and_digits() -> None:
+    assert bl.author_key("Ёлкин Пётр") == frozenset({"елкин", "петр"})
+    assert bl.author_key("Пётр Елкин") == bl.author_key("Ёлкин Пётр")
+    for junk in ("", "Unknown", "Неизвестный автор", "esimych", "Автор 2", "А", "Один Два Три Четыре Пять Шесть", "-"):
+        assert bl.author_key(junk) is None, junk
+
+
+def test_pick_folder_exact_parent_subset_new() -> None:
+    key = bl.author_key("Иван Иванов")
+    assert bl.pick_folder("Иван Иванов", key, "", {key: "Иванов Иван"}) == ("Иванов Иван", "exact")
+    petr = bl.author_key("Пётр Петров")
+    assert bl.pick_folder("Пётр Петров", petr, "Петров Пётр", {}) == ("Петров Пётр", "parent")
+    patronymic = bl.author_key("Павел Сергеевич Рототаев")
+    assert bl.pick_folder("Павел Сергеевич Рототаев", patronymic, "Рототаев Павел", {}) == ("Рототаев Павел", "parent")
+    assert bl.author_key("Составитель Андрей Синицын Коллектив Авторов") is None
+    author = "Иван Петрович Сидоров"
+    one = {bl.author_key("Сидоров Иван"): "Сидоров Иван"}
+    assert bl.pick_folder(author, bl.author_key(author), "", one) == ("Сидоров Иван", "subset")
+    two = {bl.author_key("Сидоров Иван"): "Сидоров Иван", bl.author_key("Сидоров Петрович"): "Сидоров Петрович"}
+    assert bl.pick_folder(author, bl.author_key(author), "", two) == ("Сидоров Иван Петрович", "new")
+    assert bl.pick_folder("Иван", bl.author_key("Иван"), "", {}) == ("Иван", "new")
+
+
+def test_person_name_accepts_people_and_rejects_titles_and_genres() -> None:
+    for person in ("Толстой Лев Николаевич", "де Сервантес Мигель", "д'Артаньян Шарль", "Бонч-Бруевич Владимир",
+                   "Толкин Дж. Р. Р.", "Кадыр-заде Салам", "АЛЬТШУЛЛЕР Г. С", "Хью Дэфид аб"):
+        assert bl.person_name(person), person
+    for junk in ("драконов Охота на", "эпос Японский", "вБИТПЫЙО оЙЛПМБК", "автора без", "Tritsch by Bernhard",
+                 "Рафел Н и", "Р‘СЂР°СѓРЅ Р¤СЂРµРґРµСЂРёРє"):
+        assert not bl.person_name(junk), junk
+
+
+def test_pick_folder_not_person_creates_no_folder() -> None:
+    assert bl.pick_folder("Охота на драконов", frozenset({"охота", "на", "драконов"}), "", {}) == ("", "not-person")
+
+
+def unpack_cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Каталог: автор «Иванов Иван» (папка есть), раздел сборников с двумя книгами одного имени, книгой без автора
+    и пустой папкой."""
+    root = tmp_path / "unpack_books"
+    (root / "Иванов Иван").mkdir(parents=True)
+    (root / "_Сборники" / "Серия X").mkdir(parents=True)
+    (root / "_Сборники" / "Серия Y").mkdir(parents=True)
+    (root / "_Сборники" / "Пустая").mkdir()
+    (root / "_Сборники" / "Серия X" / "Иван Иванов - Книга.fb2").write_bytes(make_fb2("Книга", "Иван", "Иванов"))
+    (root / "_Сборники" / "Серия Y" / "Иван Иванов - Книга.fb2").write_bytes(make_fb2("Книга", "Иван", "Иванов"))
+    (root / "_Сборники" / "Серия X" / "Заметки.txt").write_text("Текст без автора.\n", encoding="utf-8")
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    cfg = make_cfg(tmp_path, root)
+    bl.scan(cfg)
+    return cfg
+
+
+def test_unpack_collections_moves_books_relinks_and_removes_empty_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = unpack_cfg(tmp_path, monkeypatch)
+    root = Path(cfg["books_dir"])
+    with closing(bl.connect(cfg["db_path"])) as conn, conn:
+        conn.execute("INSERT INTO marks(path, status, updated) VALUES (?,?,?)",
+                     ("_Сборники/Серия X/Иван Иванов - Книга.fb2", "done", 1.0))
+
+    stats = bl.unpack_collections(cfg)
+
+    assert stats["moved"] == 2
+    assert stats["into_existing"] == 2
+    assert stats["conflicts"] == 1
+    assert stats["no_author"] == 1
+    assert stats["removed_dirs"] == 2  # «Серия Y» опустела, «Пустая» была пустой; «Серия X» с заметкой остаётся
+    assert (root / "Иванов Иван" / "Иван Иванов - Книга.fb2").is_file()
+    assert (root / "Иванов Иван" / "Иван Иванов - Книга_1.fb2").is_file()
+    assert (root / "_Сборники" / "Серия X" / "Заметки.txt").is_file()
+    assert not (root / "_Сборники" / "Серия Y").exists()
+    assert not (root / "_Сборники" / "Пустая").exists()
+    assert (root / "_Сборники").is_dir()
+    with closing(bl.connect(cfg["db_path"])) as conn:
+        collection = dict(conn.execute("SELECT path, collection FROM book_collections WHERE source='folder'").fetchall())
+        marks = [r[0] for r in conn.execute("SELECT path FROM marks")]
+    assert collection["Иванов Иван/Иван Иванов - Книга.fb2"] == "Серия X"
+    assert collection["Иванов Иван/Иван Иванов - Книга_1.fb2"] == "Серия Y"
+    assert marks == ["Иванов Иван/Иван Иванов - Книга.fb2"]
+
+
+def test_unpack_collections_dry_run_changes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = unpack_cfg(tmp_path, monkeypatch)
+    root = Path(cfg["books_dir"])
+    with closing(bl.connect(cfg["db_path"])) as conn:
+        before = conn.execute("SELECT count(*) FROM book_collections").fetchone()[0]
+
+    stats = bl.unpack_collections(cfg, dry_run=True, out=lambda _line: None)
+
+    assert stats["moved"] == 2
+    assert stats["removed_dirs"] == 2
+    assert (root / "_Сборники" / "Серия X" / "Иван Иванов - Книга.fb2").is_file()
+    assert (root / "_Сборники" / "Серия Y").is_dir()
+    assert not (root / "Иванов Иван" / "Иван Иванов - Книга.fb2").exists()
+    with closing(bl.connect(cfg["db_path"])) as conn:
+        assert conn.execute("SELECT count(*) FROM book_collections").fetchone()[0] == before
+
+
+def sort_cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Каталог: автор «Иванов Иван Иванович» (папка есть), служебные папки «_» с книгами, у которых автор берётся из
+    имени файла, текста или папки; книга без автора."""
+    root = tmp_path / "sort_books"
+    (root / "Иванов Иван Иванович").mkdir(parents=True)
+    (root / "Иванов Иван Иванович" / "Старая.fb2").write_bytes(make_fb2("Старая", "Иван", "Иванов"))
+    (root / "_documentation").mkdir()
+    (root / "_documentation" / "Иванов Иван.-.Заметка.txt").write_text("Заметка.\n", encoding="utf-8")
+    (root / "_разобрать").mkdir()
+    (root / "_разобрать" / "Лесные заметки.txt").write_text("Иван Иванов. Лесные заметки\n\nТекст.\n", encoding="utf-8")
+    (root / "_разобрать" / "Пустой.txt").write_text("Текст без автора.\n", encoding="utf-8")
+    (root / "_Журналы" / "Иванов Иван Иванович").mkdir(parents=True)
+    (root / "_Журналы" / "Иванов Иван Иванович" / "Номер 1.txt").write_text("Номер.\n", encoding="utf-8")
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    cfg = make_cfg(tmp_path, root)
+    bl.scan(cfg)
+    return cfg
+
+
+def test_sort_underscore_takes_author_from_filename_text_and_folder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = sort_cfg(tmp_path, monkeypatch)
+    root = Path(cfg["books_dir"])
+
+    stats = bl.sort_underscore(cfg, out=lambda _line: None)
+
+    assert stats["moved"] == 3
+    assert stats["source_filename"] == 1
+    assert stats["source_text"] == 1
+    assert stats["source_folder"] == 1
+    assert stats["no_author"] == 1
+    assert (root / "Иванов Иван Иванович" / "Иванов Иван.-.Заметка.txt").is_file()
+    assert (root / "Иванов Иван Иванович" / "Лесные заметки.txt").is_file()
+    assert (root / "Иванов Иван Иванович" / "Номер 1.txt").is_file()
+    assert (root / "_разобрать" / "Пустой.txt").is_file()
+    assert not (root / "_Журналы" / "Иванов Иван Иванович").exists()
+
+
+def test_sort_underscore_dry_run_respects_limit_and_changes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = sort_cfg(tmp_path, monkeypatch)
+    root = Path(cfg["books_dir"])
+
+    stats = bl.sort_underscore(cfg, dry_run=True, limit=1, out=lambda _line: None)
+
+    assert stats["moved"] == 1
+    assert (root / "_documentation" / "Иванов Иван.-.Заметка.txt").is_file()
+    assert (root / "_разобрать" / "Лесные заметки.txt").is_file()
+
+
+def test_filename_author_separators_and_limits() -> None:
+    assert bl.filename_author("Иванов И.О. - Книга") == "Иванов И.О."
+    assert bl.filename_author("Иванов_Иван_-_Книга") == "Иванов Иван"
+    assert bl.filename_author("Иванов Иван.-.Книга") == "Иванов Иван"
+    assert bl.filename_author("Книга без автора") == ""
+    assert bl.filename_author("Глава 2 - Книга") == ""
+
+
+# ---- merge-authors: склейка «Фамилия Имя» + «Фамилия Имя Отчество» ---------------------------------------
+
+def merge_cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, files: dict[str, str | bytes]) -> dict[str, Any]:
+    """Каталог с файлами (относительные пути → содержимое), журналы — во временном каталоге, затем scan."""
+    root = tmp_path / "merge_books"
+    for rel, data in files.items():
+        target = root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(data, bytes):
+            target.write_bytes(data)
+        else:
+            target.write_text(data, encoding="utf-8")
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    cfg = make_cfg(tmp_path, root)
+    bl.scan(cfg)
+    return cfg
+
+
+def test_merge_moves_short_folder_into_full_and_relinks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "Иванов Иван/a.txt": "А.\n", "Иванов Иван/sub/b.txt": "Б.\n",
+        "Иванов Иван Петрович/a.txt": "Другой.\n", "Иванов Иван Петрович/c.txt": "В.\n",
+    })
+    root = Path(cfg["books_dir"])
+    with closing(bl.connect(cfg["db_path"])) as conn, conn:
+        conn.execute("INSERT INTO marks(path, status, updated) VALUES (?,?,?)", ("Иванов Иван/a.txt", "done", 1.0))
+
+    stats = bl.merge_authors(cfg)
+
+    full = root / "Иванов Иван Петрович"
+    assert stats["merged"] == 1
+    assert stats["conflicts"] == 1
+    assert stats["moved"] == 2
+    assert not (root / "Иванов Иван").exists()
+    assert (full / "a.txt").read_text(encoding="utf-8") == "Другой.\n"
+    assert (full / "a_1.txt").read_text(encoding="utf-8") == "А.\n"
+    assert (full / "sub" / "b.txt").is_file()
+    assert (full / "c.txt").is_file()
+    with closing(bl.connect(cfg["db_path"])) as conn:
+        marks = [r[0] for r in conn.execute("SELECT path FROM marks")]
+    assert marks == ["Иванов Иван Петрович/a_1.txt"]
+
+
+def test_merge_renames_folder_by_patronymic_from_book_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "Сидоров Пётр/Книга.fb2": make_fb2("Книга", "Пётр Ильич", "Сидоров"),  # автор в метаданных: «Сидоров Пётр Ильич»
+    })
+    root = Path(cfg["books_dir"])
+
+    stats = bl.merge_authors(cfg)
+
+    assert stats["renamed"] == 1
+    assert not (root / "Сидоров Пётр").exists()
+    assert (root / "Сидоров Пётр Ильич" / "Книга.fb2").is_file()
+
+
+def test_merge_ambiguous_patronymics_change_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "Петров Пётр/a.txt": "А.\n",
+        "Петров Пётр Иванович/b.txt": "Б.\n",
+        "Петров Пётр Сергеевич/c.txt": "В.\n",
+    })
+    root = Path(cfg["books_dir"])
+
+    stats = bl.merge_authors(cfg)
+
+    assert stats["ambiguous"] == 1
+    assert stats["merged"] == 0
+    assert (root / "Петров Пётр" / "a.txt").is_file()
+    assert (root / "Петров Пётр Иванович" / "b.txt").is_file()
+    assert (root / "Петров Пётр Сергеевич" / "c.txt").is_file()
+
+
+def test_merge_initial_is_not_a_full_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "Петров Иван/a.txt": "А.\n",
+        "Петров Иван В/b.txt": "Б.\n",
+    })
+    root = Path(cfg["books_dir"])
+
+    stats = bl.merge_authors(cfg)
+
+    assert stats["merged"] == 0
+    assert stats["renamed"] == 0
+    assert (root / "Петров Иван" / "a.txt").is_file()
+    assert (root / "Петров Иван В" / "b.txt").is_file()
+
+
+def test_merge_dry_run_changes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "Иванов Иван/a.txt": "А.\n",
+        "Иванов Иван Петрович/c.txt": "В.\n",
+    })
+    root = Path(cfg["books_dir"])
+    with closing(bl.connect(cfg["db_path"])) as conn, conn:
+        conn.execute("INSERT INTO marks(path, status, updated) VALUES (?,?,?)", ("Иванов Иван/a.txt", "done", 1.0))
+
+    stats = bl.merge_authors(cfg, dry_run=True, out=lambda _line: None)
+
+    assert stats["moved"] == 1
+    assert (root / "Иванов Иван" / "a.txt").is_file()
+    assert not (root / "Иванов Иван Петрович" / "a.txt").exists()
+    with closing(bl.connect(cfg["db_path"])) as conn:
+        assert [r[0] for r in conn.execute("SELECT path FROM marks")] == ["Иванов Иван/a.txt"]
+
+
+def test_unzip_keeps_double_dot_inside_name(unzip_cfg: dict[str, Any]) -> None:
+    root = Path(unzip_cfg["books_dir"])
+    make_archive(root / "Смолски С..djvu.zip", "Смолски С..djvu", b"djvu-data")
+
+    bl.unzip_books(unzip_cfg)
+
+    assert (root / "Смолски С..djvu").read_bytes() == b"djvu-data"
+    assert not (Path(unzip_cfg["quarantine_dir"]) / "rejected-name").exists()
+
+
+# ---- dedup-folders, author-variants, соавторские копии --------------------------------------------
+
+def folder_text(words: int, tag: str) -> str:
+    """Текст из слов tag0, tag1…: разные теги дают тексты без общих шинглов."""
+    return " ".join(f"{tag}{i}" for i in range(words))
+
+
+def write_txt(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def db_rows(cfg: dict[str, Any], sql: str) -> list[tuple[Any, ...]]:
+    with closing(bl.connect(cfg["db_path"], readonly=True)) as conn:
+        return [tuple(row) for row in conn.execute(sql).fetchall()]
+
+
+@pytest.fixture
+def authors_cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    root = tmp_path / "authors"
+    root.mkdir()
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    return make_cfg(tmp_path, root)
+
+
+def test_dedup_folders_dry_run_changes_nothing(authors_cfg: dict[str, Any]) -> None:
+    folder = Path(authors_cfg["books_dir"]) / "Иванов Иван Иванович"
+    write_txt(folder / "Тёмный лес.txt", folder_text(300, "слово"))
+    write_txt(folder / "Temny les.txt", folder_text(300, "слово"))
+
+    result = bl.dedup_folders(authors_cfg, dry_run=True, out=lambda _line: None)
+
+    assert result["duplicate"] == 1
+    assert (folder / "Temny les.txt").is_file()
+    assert not Path(authors_cfg["quarantine_dir"]).exists()
+    assert not Path(authors_cfg["db_path"]).exists()
+
+
+def test_dedup_folders_copy_goes_to_quarantine_and_group_is_written(authors_cfg: dict[str, Any]) -> None:
+    folder = Path(authors_cfg["books_dir"]) / "Иванов Иван Иванович"
+    write_txt(folder / "Тёмный лес.txt", folder_text(300, "слово"))
+    write_txt(folder / "Temny les.txt", folder_text(300, "слово"))
+    write_txt(folder / "Заметки.txt", folder_text(300, "иное"))
+
+    result = bl.dedup_folders(authors_cfg, out=lambda _line: None)
+
+    assert result["duplicate"] == 1
+    assert (folder / "Тёмный лес.txt").is_file() and (folder / "Заметки.txt").is_file()
+    assert not (folder / "Temny les.txt").exists()
+    assert (Path(authors_cfg["quarantine_dir"]) / "duplicate" / "Иванов Иван Иванович" / "Temny les.txt").is_file()
+    assert db_rows(authors_cfg, "SELECT key, status FROM dup_groups") == [("folder:Иванов Иван Иванович", "auto")]
+    members = db_rows(authors_cfg, "SELECT path, role, keeper FROM dup_members ORDER BY path")
+    assert len(members) == 3
+    assert ("Иванов Иван Иванович/Temny les.txt", "duplicate", "Иванов Иван Иванович/Тёмный лес.txt") in members
+
+
+def test_dedup_folders_keeps_fuller_copy(authors_cfg: dict[str, Any]) -> None:
+    folder = Path(authors_cfg["books_dir"]) / "Иванов Иван Иванович"
+    write_txt(folder / "Тёмный лес.txt", folder_text(300, "слово"))
+    write_txt(folder / "Тёмный лес (полная).txt", folder_text(390, "слово"))
+
+    result = bl.dedup_folders(authors_cfg, out=lambda _line: None)
+
+    assert result["duplicate"] == 1
+    assert (folder / "Тёмный лес (полная).txt").is_file()
+    assert not (folder / "Тёмный лес.txt").exists()
+
+
+def test_dedup_folders_renames_translit_keeper_and_relinks(authors_cfg: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    folder = Path(authors_cfg["books_dir"]) / "Иванов Иван Иванович"
+    folder.mkdir(parents=True)
+    text = folder_text(300, "слово")
+    (folder / "Temny.fb2").write_bytes(make_fb2("Тёмный лес", "Иван", "Иванов", body=f"<p>{text}</p>"))
+    write_txt(folder / "Тёмный лес.txt", f"Глава 1 {text}")
+    pairs: list[tuple[str, str]] = []
+
+    def fake_relink(db_path: str, moved: list[tuple[str, str]]) -> int:
+        pairs.extend(moved)
+        return len(moved)
+
+    monkeypatch.setattr(bl, "relink", fake_relink)
+    result = bl.dedup_folders(authors_cfg, out=lambda _line: None)
+
+    assert result["duplicate"] == 1 and result["renamed"] == 1
+    assert not (folder / "Temny.fb2").exists()
+    assert (folder / "Тёмный лес.fb2").is_file()
+    assert (Path(authors_cfg["quarantine_dir"]) / "duplicate" / "Иванов Иван Иванович" / "Тёмный лес.txt").is_file()
+    assert ("Иванов Иван Иванович/Temny.fb2", "Иванов Иван Иванович/Тёмный лес.fb2") in pairs
+    assert ("Иванов Иван Иванович/Тёмный лес.txt", "Иванов Иван Иванович/Тёмный лес.fb2") in pairs
+
+
+def test_dedup_folders_similar_copy_gets_own_group(authors_cfg: dict[str, Any]) -> None:
+    folder = Path(authors_cfg["books_dir"]) / "Иванов Иван Иванович"
+    original = folder_text(4000, "слово")
+    # 3600 слов общих, 400 новых: доля общих шинглов около 0.9 — «похожая» (85–97 %)
+    partly = " ".join(original.split()[:3600] + [f"новое{i}" for i in range(400)])
+    write_txt(folder / "Лес.txt", original)
+    write_txt(folder / "Лес_2.txt", partly)
+
+    result = bl.dedup_folders(authors_cfg, out=lambda _line: None)
+
+    assert result.get("duplicate", 0) == 0 and result["similar"] == 1
+    assert (folder / "Лес_2.txt").is_file()
+    assert db_rows(authors_cfg, "SELECT key, status FROM dup_groups") == [("folder:Иванов Иван Иванович/Лес_2.txt", "similar")]
+    assert sorted(db_rows(authors_cfg, "SELECT role FROM dup_members")) == [("kept",), ("kept",)]
+
+
+def test_dedup_folders_skips_section_and_too_large_folder(authors_cfg: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    root = Path(authors_cfg["books_dir"])
+    write_txt(root / "_Раздел" / "A.txt", folder_text(300, "слово"))
+    write_txt(root / "_Раздел" / "B.txt", folder_text(300, "слово"))
+    monkeypatch.setattr(bl, "DEDUP_FOLDER_MAX", 2)
+    for name in ("A.txt", "B.txt", "C.txt"):
+        write_txt(root / "Иванов Иван Иванович" / name, folder_text(300, "слово"))
+
+    result = bl.dedup_folders(authors_cfg, out=lambda _line: None)
+
+    assert result.get("duplicate", 0) == 0 and result["folder-too-large"] == 1
+    assert (root / "_Раздел" / "B.txt").is_file() and (root / "Иванов Иван Иванович" / "C.txt").is_file()
+
+
+def test_dedup_folders_rerun_keeps_normal_dedup_groups(authors_cfg: dict[str, Any]) -> None:
+    folder = Path(authors_cfg["books_dir"]) / "Иванов Иван Иванович"
+    write_txt(folder / "Тёмный лес.txt", folder_text(300, "слово"))
+    write_txt(folder / "Temny les.txt", folder_text(300, "слово"))
+    bl.dedup_folders(authors_cfg, out=lambda _line: None)
+    with closing(bl.connect(authors_cfg["db_path"])) as conn, conn:
+        conn.execute("INSERT INTO dup_groups(key, status, created) VALUES ('Сидоров Сергей/Книга.fb2', 'similar', 1.0)")
+
+    bl.dedup_folders(authors_cfg, out=lambda _line: None)
+
+    groups = db_rows(authors_cfg, "SELECT key, status FROM dup_groups ORDER BY key")
+    assert ("Сидоров Сергей/Книга.fb2", "similar") in groups
+    assert groups.count(("folder:Иванов Иван Иванович", "auto")) == 1
+
+
+def coauthor_fb2() -> bytes:
+    """fb2 с двумя авторами в метаданных: «Иванов Иван» и «Петров Пётр» (как папки двух соавторов)."""
+    book = make_fb2("Тёмный лес", "Иван", "Иванов", body=f"<p>{folder_text(300, 'слово')}</p>")
+    second = "<author><first-name>Пётр</first-name><last-name>Петров</last-name></author>"
+    return book.replace(b"</author>", ("</author>" + second).encode("utf-8"), 1)
+
+
+def test_dedup_coauthor_copy_is_not_a_duplicate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "dups"
+    book = coauthor_fb2()
+    (root / "Иванов Иван").mkdir(parents=True)
+    (root / "Петров Пётр").mkdir()
+    (root / "Иванов Иван" / "Книга.fb2").write_bytes(book)
+    (root / "Петров Пётр" / "Книга.fb2").write_bytes(book)
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    cfg = make_cfg(tmp_path, root)
+
+    stats = bl.dedup(cfg, out=lambda _line: None)
+
+    assert stats["coauthor-copy"] == 1 and stats["groups"] == 0
+    assert (root / "Иванов Иван" / "Книга.fb2").is_file() and (root / "Петров Пётр" / "Книга.fb2").is_file()
+
+
+def test_dedup_same_folder_copy_is_still_duplicate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "dups"
+    book = coauthor_fb2()
+    (root / "Иванов Иван").mkdir(parents=True)
+    (root / "Петров Пётр").mkdir()
+    (root / "Иванов Иван" / "Книга.fb2").write_bytes(book)
+    (root / "Иванов Иван" / "Книга копия.fb2").write_bytes(book)
+    (root / "Петров Пётр" / "Книга.fb2").write_bytes(book)
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    cfg = make_cfg(tmp_path, root)
+
+    stats = bl.dedup(cfg, out=lambda _line: None)
+
+    assert stats["coauthor-copy"] == 1 and stats["duplicate"] == 1
+    assert len(list((Path(cfg["quarantine_dir"]) / "duplicate" / "Иванов Иван").iterdir())) == 1
+    assert (root / "Петров Пётр" / "Книга.fb2").is_file()
+    assert len(list((root / "Иванов Иван").iterdir())) == 1
+
+
+def test_author_variants_empty_folder_is_removed(authors_cfg: dict[str, Any]) -> None:
+    root = Path(authors_cfg["books_dir"])
+    (root / "Ivanov Ivan" / "пусто").mkdir(parents=True)
+    write_txt(root / "Иванов Иван" / "Тёмный лес.txt", TXT_TEXT)
+
+    dry = bl.author_variants(authors_cfg, dry_run=True, out=lambda _line: None)
+
+    assert dry["emptied"] == 1 and (root / "Ivanov Ivan").is_dir()
+    bl.author_variants(authors_cfg, out=lambda _line: None)
+    assert not (root / "Ivanov Ivan").exists()
+    assert db_rows(authors_cfg, "SELECT a, b, status, target FROM author_variants") == [
+        ("Ivanov Ivan", "Иванов Иван", "merged", "Иванов Иван")]
+
+
+def test_author_variants_common_merges_into_full_name(authors_cfg: dict[str, Any]) -> None:
+    root = Path(authors_cfg["books_dir"])
+    write_txt(root / "Petrov Petr" / "Тёмный лес.txt", TXT_TEXT)
+    write_txt(root / "Петров Пётр Иванович" / "Тёмный лес.txt", TXT_TEXT)
+    bl.scan(authors_cfg)
+
+    result = bl.author_variants(authors_cfg, out=lambda _line: None)
+
+    assert result["merged"] == 1 and result["conflicts"] == 1
+    assert not (root / "Petrov Petr").exists()
+    target = root / "Петров Пётр Иванович"
+    assert (target / "Тёмный лес.txt").is_file() and (target / "Тёмный лес_1.txt").is_file()
+    assert db_rows(authors_cfg, "SELECT status, target FROM author_variants") == [("merged", "Петров Пётр Иванович")]
+
+
+def test_author_variants_dry_run_and_different_are_not_recomputed(authors_cfg: dict[str, Any]) -> None:
+    root = Path(authors_cfg["books_dir"])
+    write_txt(root / "Smirnov Ivan" / "Лес.txt", TXT_TEXT)
+    write_txt(root / "Смирнова Иван" / "Озеро.txt", TXT_TEXT)
+    lines: list[str] = []
+
+    dry = bl.author_variants(authors_cfg, dry_run=True, out=lines.append)
+
+    assert dry["merged"] == 0 and (root / "Smirnov Ivan").is_dir() and not Path(authors_cfg["db_path"]).exists()
+    bl.author_variants(authors_cfg, out=lambda _line: None)
+    assert db_rows(authors_cfg, "SELECT tier, status FROM author_variants") == [("manual", "pending")]
+    assert "Разные" in bl.variant_action(authors_cfg, "Смирнова Иван", "Smirnov Ivan", "different")
+    lines.clear()
+    bl.author_variants(authors_cfg, out=lines.append)
+    assert lines[0].startswith("author-variants: пар 0 ")
+    assert db_rows(authors_cfg, "SELECT tier, status FROM author_variants") == [("manual", "different")]
+
+
+def test_author_variants_web_different_button_saves_status(web: str, scanned: dict[str, Any]) -> None:
+    root = Path(scanned["books_dir"])
+    write_txt(root / "Smirnov Ivan" / "Лес.txt", TXT_TEXT)
+    write_txt(root / "Смирнова Иван" / "Озеро.txt", TXT_TEXT)
+    bl.author_variants(scanned, out=lambda _line: None)
+
+    form = f"a={quote('Smirnov Ivan')}&b={quote('Смирнова Иван')}&action=different".encode("ascii")
+    status, headers, _body = fetch(f"{web}/authors/variant", data=form, headers={"Origin": web})
+
+    assert status == 303
+    assert headers.get("Location") == "/authors?variants=1"
+    assert db_rows(scanned, "SELECT status FROM author_variants") == [("different",)]
+    status, _headers, body = fetch(f"{web}/authors?variants=1")
+    assert status == 200 and "Варианты написания".encode("utf-8") in body
+
+
+def test_author_variants_coauthor_folder_is_distributed_by_copy(authors_cfg: dict[str, Any]) -> None:
+    root = Path(authors_cfg["books_dir"])
+    write_txt(root / "Громыко Ольга" / "Другая.txt", folder_text(50, "иное"))
+    write_txt(root / "Громыко Ольга, Уланов Андрей" / "Книга.txt", TXT_TEXT)
+
+    bl.author_variants(authors_cfg, out=lambda _line: None)
+
+    assert not (root / "Громыко Ольга, Уланов Андрей").exists()
+    first, second = root / "Громыко Ольга" / "Книга.txt", root / "Уланов Андрей" / "Книга.txt"
+    assert first.read_bytes() == second.read_bytes() == TXT_TEXT.encode("utf-8")
+    assert not os.path.samefile(first, second)  # настоящая копия, не ссылка
+    assert db_rows(authors_cfg, "SELECT status, target FROM author_variants") == [("merged", "Громыко Ольга")]
+
+
+def test_unpack_collections_coauthor_book_is_copied_to_second_author(authors_cfg: dict[str, Any]) -> None:
+    root = Path(authors_cfg["books_dir"])
+    name = "Иванов Иван, Петров Пётр - Книга.txt"
+    write_txt(root / "_Сборники" / "Сборник" / name, TXT_TEXT)
+    (root / "Иванов Иван").mkdir()
+    (root / "Петров Пётр").mkdir()
+    bl.scan(authors_cfg)
+
+    stats = bl.unpack_collections(authors_cfg, out=lambda _line: None)
+
+    first, second = root / "Иванов Иван" / name, root / "Петров Пётр" / name
+    assert first.read_bytes() == second.read_bytes() == TXT_TEXT.encode("utf-8")
+    assert not os.path.samefile(first, second)
+    assert stats["copied"] == 1
+    assert not (root / "_Сборники" / "Сборник" / name).exists()
+
+
+# ----------------------------------------------------------------------
+# Собственный конвертер fb2 → EPUB 3 и режим reconvert-fb2 (синтетические данные)
+# ----------------------------------------------------------------------
+
+RICH_FB2 = """<?xml version="1.0" encoding="utf-8"?>
+<FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0" xmlns:l="http://www.w3.org/1999/xlink">
+<description><title-info>
+<genre>sf_fantasy</genre>
+<author><first-name>Иван</first-name><last-name>Иванов</last-name></author>
+<translator><first-name>Пётр</first-name><last-name>Петров</last-name></translator>
+<book-title>Тёмный лес</book-title>
+<annotation><p>Первая строка аннотации.</p></annotation>
+<coverpage><image l:href="#cover.png"/></coverpage>
+<lang>ru</lang>
+<sequence name="Лесная сага" number="2"/>
+</title-info>
+<document-info><id>doc-42</id></document-info>
+<publish-info><publisher>Лес</publisher><isbn>978-5-00000-000-0</isbn></publish-info>
+</description>
+<body>
+<title><p>Тёмный лес</p></title>
+<section id="ch-a">
+<title><p>Глава один</p></title>
+<p>Текст со <emphasis>словом</emphasis> и сноской<a l:href="#n1" type="note">1</a>.</p>
+<p>Ссылка на вторую главу: <a l:href="#ch-b">дальше</a>.</p>
+<image l:href="#pic.png"/>
+<poem><stanza><v>Строка первая</v><v>Строка вторая</v></stanza></poem>
+</section>
+<section id="ch-b">
+<title><p>Глава</p><p>два</p></title>
+<p>Вторая глава, повтор сноски<a l:href="#n1" type="note">1</a> и ещё<a l:href="#n2" type="note">2</a>.</p>
+</section>
+</body>
+<body name="notes">
+<section id="n1"><title><p>1</p></title><p>Текст сноски первой.</p></section>
+<section id="n2"><title><p>2</p></title><p>Сноска без ссылки, всё равно текст.</p></section>
+<section id="n3"><title><p>3</p></title><p>Никем не упомянутая сноска.</p></section>
+</body>
+<binary id="cover.png" content-type="image/png">{png}</binary>
+<binary id="pic.png" content-type="image/png">{png}</binary>
+<binary id="bad.jpg" content-type="image/jpeg">!!не base64!!</binary>
+</FictionBook>
+"""
+
+
+def rich_fb2() -> bytes:
+    """fb2 с обложкой, серией, двумя главами, сноской, стихом, картинкой и служебным телом сносок."""
+    png = base64.b64encode(PNG_BYTES).decode("ascii")
+    return RICH_FB2.replace("{png}", png).encode("utf-8")
+
+
+def read_epub(path: Path) -> dict[str, bytes]:
+    with zipfile.ZipFile(path) as archive:
+        return {name: archive.read(name) for name in archive.namelist()}
+
+
+def test_fb2_to_epub3_packaging(tmp_path: Path) -> None:
+    out = tmp_path / "book.epub"
+    bl.fb2_to_epub3(rich_fb2(), out)
+    with zipfile.ZipFile(out) as archive:
+        first = archive.infolist()[0]
+        assert first.filename == "mimetype"
+        assert first.compress_type == zipfile.ZIP_STORED
+        assert archive.read("mimetype") == b"application/epub+zip"
+    files = read_epub(out)
+    opf = files["OEBPS/content.opf"].decode("utf-8")
+    assert 'version="3.0"' in opf
+    assert 'properties="cover-image"' in opf
+    assert 'property="belongs-to-collection"' in opf
+    assert 'name="calibre:series_index"' in opf
+    assert 'refines="#creator1" property="role" scheme="marc:relators">aut' in opf
+    assert 'scheme="marc:relators">trl' in opf
+    assert b'epub:type="toc"' in files["OEBPS/nav.xhtml"]
+    assert b'epub:type="landmarks"' in files["OEBPS/nav.xhtml"]
+    assert b"<navMap>" in files["OEBPS/toc.ncx"]
+    assert "OEBPS/img/001.png" in files
+    assert "OEBPS/text/cover.xhtml" in files
+
+
+def test_footnote_is_aside_in_chapter_where_first_referenced(tmp_path: Path) -> None:
+    out = tmp_path / "book.epub"
+    bl.fb2_to_epub3(rich_fb2(), out)
+    files = read_epub(out)
+    first = files["OEBPS/text/ch001.xhtml"].decode("utf-8")
+    assert 'epub:type="noteref"' in first
+    assert 'aside epub:type="footnote"' in first and 'id="n1"' in first
+    assert 'role="doc-backlink"' in first
+    second = files["OEBPS/text/ch002.xhtml"].decode("utf-8")
+    assert 'href="ch001.xhtml#n1"' in second  # повторная ссылка ведёт в файл сноски
+    assert 'id="ref-n1-2"' in second
+
+
+def test_note_without_reference_goes_to_notes_xhtml(tmp_path: Path) -> None:
+    out = tmp_path / "book.epub"
+    bl.fb2_to_epub3(rich_fb2(), out)
+    files = read_epub(out)
+    notes = files["OEBPS/text/notes.xhtml"].decode("utf-8")
+    assert 'id="n3"' in notes and "Никем не упомянутая сноска." in notes
+    assert files["OEBPS/text/ch002.xhtml"].decode("utf-8").count('aside epub:type="footnote"') == 0
+
+
+def test_own_epub_passes_text_loss_check(tmp_path: Path) -> None:
+    raw = rich_fb2()
+    out = tmp_path / "book.epub"
+    bl.fb2_to_epub3(raw, out)
+    assert bl.verify_book(out, "epub") is None
+    assert bl.epub_text_loss(raw, out) is None
+
+
+def test_fb2_with_entity_declaration_is_rejected() -> None:
+    data = b'<?xml version="1.0" encoding="utf-8"?><!DOCTYPE FictionBook [<!ENTITY x "boom">]>' + rich_fb2()
+    with pytest.raises(ValueError):
+        bl.fb2_to_epub3(data, Path("unused.epub"))
+
+
+def test_broken_fb2_xml_is_value_error(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        bl.fb2_to_epub3(b"<FictionBook><description>", tmp_path / "x.epub")
+
+
+def test_reconvert_match_takes_single_candidate_and_resolves_by_stem() -> None:
+    index = {
+        "темный лес": [("иванов", "Иванов - Тёмный лес", Path("/q/a.fb2")),
+                       ("иванов", "Иванов - Тёмный лес (другое издание)", Path("/q/b.fb2"))],
+        "другая": [("петров", "Петров - Другая", Path("/q/c.fb2"))],
+    }
+    assert bl.reconvert_match("другая", "петр петров", "Петров - Другая", index) == (Path("/q/c.fb2"), "")
+    # два кандидата с одним автором: выбирает тот, чей стем совпадает с epub без суффикса _N
+    assert bl.reconvert_match("темный лес", "иван иванов", "Иванов - Тёмный лес_1", index) == (Path("/q/a.fb2"), "")
+    found, reason = bl.reconvert_match("темный лес", "иван иванов", "Иванов - Другой стем", index)
+    assert found is None and reason.startswith("неоднозначно")
+    assert bl.reconvert_match("нет такой", "кто-то", "x", index)[0] is None
+
+
+def test_command_params_reconvert_needs_out_with_sample() -> None:
+    with pytest.raises(bl.ConfigError):
+        bl.command_params("reconvert-fb2", {"sample": 3})
+    with pytest.raises(bl.ConfigError):
+        bl.command_params("reconvert-fb2", {"out": "/tmp/x"})
+    params = bl.command_params("reconvert-fb2", {"sample": 2, "out": "/tmp/x"})
+    assert params["sample"] == 2 and params["limit"] == 0 and params["epubcheck"] is False
+
+
+# ----------------------------------------------------------------------
+# Вторая попытка разбора, ссылки без хоста, <p> в ячейках, тело с названием, счёт слов без <head>
+# ----------------------------------------------------------------------
+
+
+def _fb2_doc(bodies: str) -> bytes:
+    """Минимальная fb2 с заданными телами (разметка передаётся как есть, в том числе испорченная)."""
+    text = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0" xmlns:l="http://www.w3.org/1999/xlink">'
+        "<description><title-info>"
+        "<genre>sf_fantasy</genre>"
+        "<author><first-name>Иван</first-name><last-name>Иванов</last-name></author>"
+        "<book-title>Книга</book-title>"
+        "<lang>ru</lang>"
+        "</title-info></description>"
+        f"{bodies}"
+        "</FictionBook>"
+    )
+    return text.encode("utf-8")
+
+
+def _epub_text(tmp_path: Path, bodies: str) -> str:
+    """Весь текст глав собранного fb2_to_epub3 EPUB (все файлы OEBPS/text)."""
+    out = tmp_path / "book.epub"
+    bl.fb2_to_epub3(_fb2_doc(bodies), out)
+    files = read_epub(out)
+    return "".join(data.decode("utf-8") for name, data in files.items()
+                   if name.startswith("OEBPS/text/") and name.endswith(".xhtml"))
+
+
+def test_valid_url_rejects_hostless_spaced_and_broken_urls() -> None:
+    assert bl._valid_url("http:///") is False
+    assert bl._valid_url("http://a b") is False
+    assert bl._valid_url("http://[::1") is False
+
+
+def test_valid_url_accepts_https_with_host() -> None:
+    assert bl._valid_url("https://ya.ru/x") is True
+
+
+def test_fb2_link_without_host_becomes_plain_text(tmp_path: Path) -> None:
+    text = _epub_text(tmp_path, '<body><section><title><p>Глава 1</p></title>'
+                                '<p>Смотри <a l:href="http:///">текст</a> здесь.</p></section></body>')
+    assert "текст" in text
+    assert 'href="http:///' not in text
+
+
+def test_table_cell_paragraphs_are_joined_with_br(tmp_path: Path) -> None:
+    text = _epub_text(tmp_path, '<body><section><title><p>Глава 1</p></title>'
+                                "<table><tr><td><p>enum a;</p><p>class b{</p></td></tr></table>"
+                                "</section></body>")
+    assert "enum a;<br/>class b{" in text
+    assert "enum a;class b{" not in text
+
+
+def test_repair_fb2_control_char_bare_amp_and_entities(tmp_path: Path) -> None:
+    # \x15 и голый «&» делают XML неразборчивым: первая попытка падает, вторая — с починкой
+    text = _epub_text(tmp_path, "<body><section><title><p>Глава 1</p></title>"
+                                "<p>Кот\x15 сидит. Harper & Brothers&nbsp;издали.</p>"
+                                "</section></body>")
+    assert "Harper &amp; Brothers" in text
+    assert "Кот сидит." in text
+
+
+def test_fb2_with_entity_and_control_char_is_still_rejected(tmp_path: Path) -> None:
+    data = b'<?xml version="1.0" encoding="utf-8"?><!DOCTYPE FictionBook [<!ENTITY x "boom">]>' + _fb2_doc(
+        "<body><section><p>Кот\x15</p></section></body>")
+    with pytest.raises(ValueError):
+        bl.fb2_to_epub3(data, tmp_path / "x.epub")
+
+
+def test_first_named_body_is_main_and_note_body_is_footnote(tmp_path: Path) -> None:
+    text = _epub_text(tmp_path,
+                      '<body name="Название книги"><section id="ch1"><title><p>Глава 1</p></title>'
+                      '<p>Основной текст книги.<a l:href="#n1" type="note">1</a></p></section></body>'
+                      '<body name="notes"><section id="n1"><title><p>1</p></title>'
+                      "<p>Текст сноски.</p></section></body>")
+    assert "Основной текст книги." in text
+    assert 'aside epub:type="footnote"' in text
+    assert "Текст сноски." in text
+    for chunk in text.split("<aside")[1:]:
+        assert "Основной" not in chunk.split("</aside>")[0]
+
+
+def test_epub_head_is_not_counted_as_words() -> None:
+    markup = "<html><head><title>Раз два</title></head><body>три</body></html>"
+    stripped = bl.EPUB_HEAD.sub(" ", markup)
+    assert "Раз" not in stripped
+    assert bl.count_words(bl.markup_plain(stripped)) == 1

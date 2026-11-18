@@ -7,6 +7,7 @@
   fix-encoding    — вылечить кодировку: fb2 с заявленной не UTF-8 при тексте в UTF-8, txt в cp1251 → UTF-8;
   unpack-fb2zip   — извлечь .fb2 из *.fb2.zip рядом с архивом;
   convert         — DOC/DOCX/RTF/ODT/MHT → EPUB (или FB2) через pandoc/LibreOffice;
+  reconvert-fb2   — calibre-epub из fb2 пересобрать собственным конвертером fb2 → EPUB 3 (с --dry-run и --sample);
   --migrate-db    — только миграции схемы БД;
   -n, --dry-run   — ничего не менять: показать план (для scan — что будет добавлено,
                     обновлено и удалено из каталога; для serve — адрес и пути).
@@ -25,6 +26,7 @@ import binascii
 import codecs
 import email
 import fcntl
+import hashlib
 import hmac
 import html
 import io
@@ -42,12 +44,16 @@ import tempfile
 import threading
 import time
 import unicodedata
+import uuid
+import xml.etree.ElementTree as ET
 import zipfile
 import zlib
+from collections import deque
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import ExitStack, closing, contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from difflib import SequenceMatcher
 from email import policy as email_policy
 from email.utils import parseaddr
 from html.parser import HTMLParser
@@ -79,10 +85,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "page_size": 50,
     "convert_timeout": 300,
     "cache_mb": 4096,
+    # Кэш извлечённого текста для dedup (восстановимый, на быстром диске): пустая строка в text_cache_dir — кэш выключен;
+    # text_cache_mb — предел сжатых данных, МБ (0 — кэш выключен). Каталог создаёт администратор, движок его не создаёт.
+    "text_cache_dir": "/var/cache/books_library",
+    "text_cache_mb": 20000,
     # Карантин служебных режимов: вместо удаления файлы переносятся сюда (<причина>/<путь в каталоге книг>).
     "quarantine_dir": "/mnt/copy/Books-removed",
     "workers": 12,
-    "auth": {"user": "", "password": "", "password_env": "BOOKS_LIBRARY_PASSWORD"},
+    # Потоки unzip-books: распаковка пишет на диск, а HDD SMR при параллельной записи сильно замедляется.
+    "unzip_workers": 2,
+    "auth":{"user": "", "password": "", "password_env": "BOOKS_LIBRARY_PASSWORD"},
 }
 
 # Каталоги, которые не обходятся: служебные Syncthing/ОС и ресурсы сохранённых HTML-страниц.
@@ -228,8 +240,44 @@ MIGRATIONS: list[str] = [
     CREATE TABLE meta_overrides(path TEXT PRIMARY KEY, title TEXT, authors TEXT, series TEXT, series_no INTEGER, genres TEXT, year TEXT, lang TEXT, annotation TEXT, updated REAL NOT NULL);
     CREATE TABLE edit_log(id INTEGER PRIMARY KEY, path TEXT NOT NULL, new_path TEXT NOT NULL DEFAULT '', fields TEXT NOT NULL, backup TEXT NOT NULL DEFAULT '', created REAL NOT NULL);
     """,
+    # v4: сборники книги. folder — книга лежит в папке сборника; dedup — копия из сборника ушла в карантин как дубль,
+    # принадлежность перешла к оставленной книге (keeper). VIEW collections — сборники со счётчиками книг.
+    """
+    CREATE TABLE book_collections(
+        path TEXT NOT NULL,          -- путь книги в библиотеке (как books.path)
+        section TEXT NOT NULL,
+        collection TEXT NOT NULL,
+        source TEXT NOT NULL,        -- 'folder' (лежит в папке сборника) или 'dedup' (копия из сборника ушла в карантин как дубль)
+        orig_path TEXT NOT NULL,     -- путь файла в сборнике (для folder = path; для dedup = путь удалённой копии)
+        PRIMARY KEY(path, section, collection, orig_path)
+    ) WITHOUT ROWID;
+    CREATE INDEX book_collections_coll ON book_collections(section, collection);
+    CREATE VIEW collections AS
+        SELECT bc.section, bc.collection, count(DISTINCT bc.path) AS books
+        FROM book_collections bc JOIN books b ON b.path = bc.path
+        GROUP BY bc.section, bc.collection;
+    -- keeper, переименованные позже упаковкой zip-books (name.ext -> name.ext.zip):
+    UPDATE dup_members SET keeper = keeper || '.zip'
+        WHERE keeper <> '' AND keeper NOT IN (SELECT path FROM books) AND keeper || '.zip' IN (SELECT path FROM books);
+    UPDATE OR IGNORE dup_members SET path = path || '.zip'
+        WHERE role = 'kept' AND path NOT IN (SELECT path FROM books) AND path || '.zip' IN (SELECT path FROM books);
+    """,
+    # v5: варианты написания одного автора (папки «Ivanov Ivan» и «Иванов Иван»). Решения пользователя постоянны.
+    """
+    CREATE TABLE author_variants(
+        a TEXT NOT NULL,                          -- папка верхнего уровня, a < b
+        b TEXT NOT NULL,
+        tier TEXT NOT NULL,                       -- empty | common | manual
+        status TEXT NOT NULL DEFAULT 'pending',   -- pending | merged | different
+        target TEXT NOT NULL DEFAULT '',          -- папка, в которую склеено (для merged)
+        updated REAL NOT NULL,
+        PRIMARY KEY(a, b)
+    ) WITHOUT ROWID;
+    """,
 ]
 DB_LATEST = len(MIGRATIONS)
+# Первая схема с book_collections и VIEW collections: новые запросы к ним — только при user_version >= этого значения.
+SCHEMA_COLLECTIONS = 4
 
 
 class ConfigError(Exception):
@@ -270,12 +318,18 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
             else:
                 cfg[key] = value
     for key, low, high in (("port", 1, 65535), ("scan_workers", 1, 64), ("reader_max_mb", 1, 1024), ("page_size", 10, 500),
-                            ("convert_timeout", 10, 3600), ("cache_mb", 100, 1_000_000), ("workers", 1, 64)):
+                            ("convert_timeout", 10, 3600), ("cache_mb", 100, 1_000_000), ("workers", 1, 64),
+                            ("unzip_workers", 1, 64), ("text_cache_mb", 0, 10_000_000)):
         if not isinstance(cfg[key], int) or isinstance(cfg[key], bool) or not low <= cfg[key] <= high:
             raise ConfigError(f"{key} должен быть целым от {low} до {high}")
     for key in ("books_dir", "db_path", "host", "quarantine_dir"):
         if not isinstance(cfg[key], str) or not cfg[key]:
             raise ConfigError(f"{key} должен быть непустой строкой")
+    if not isinstance(cfg["text_cache_dir"], str):
+        raise ConfigError("text_cache_dir должен быть строкой (пустая — кэш выключен)")
+    if cfg["text_cache_dir"]:
+        text_dir = Path(cfg["text_cache_dir"]).expanduser()
+        cfg["text_cache_dir"] = str(text_dir if text_dir.is_absolute() else PROJECT_DIR / text_dir)
     db_path = Path(cfg["db_path"]).expanduser()
     cfg["db_path"] = str(db_path if db_path.is_absolute() else PROJECT_DIR / db_path)
     cfg["books_dir"] = str(Path(cfg["books_dir"]).expanduser())
@@ -649,6 +703,14 @@ def section_name(folder: str) -> str:
     return SECTION_NAMES.get(name, name[:1].upper() + name[1:])
 
 
+def path_collection(rel: str) -> tuple[str, str]:
+    """Раздел и сборник по пути: «_Раздел/_Сборник/книга» → (раздел, сборник); сборника нет — сборник ''."""
+    parts = PurePosixPath(rel).parts
+    if len(parts) > 1 and parts[0].startswith("_"):
+        return section_name(parts[0]), (parts[1].lstrip("_").strip() if len(parts) > 2 else "")
+    return "", ""
+
+
 def path_meta(rel: str) -> dict[str, Any]:
     """Метаданные по пути.
 
@@ -663,8 +725,7 @@ def path_meta(rel: str) -> dict[str, Any]:
     left, sep, right = title.partition(" - ")
     named = bool(sep and right.strip() and left.strip() and not re.search(r"\d", left) and len(left.split()) <= 4)
     if len(parts) > 1 and parts[0].startswith("_"):
-        meta["section"] = section_name(parts[0])
-        meta["collection"] = parts[1].lstrip("_").strip() if len(parts) > 2 else ""
+        meta["section"], meta["collection"] = path_collection(rel)
         if named:
             meta.update(title=right.strip(), authors=[a.strip() for a in left.split(",") if a.strip()])
     elif len(parts) > 1 and not parts[0].startswith("."):
@@ -857,6 +918,8 @@ def scan(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str], None] 
                         f"осталось ~{eta / 60:.1f} мин", "progress")
                     last_report = now
         with conn:
+            if conn.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_COLLECTIONS:
+                report_collections(rebuild_collections(conn), out)
             conn.execute("INSERT OR REPLACE INTO meta VALUES ('last_scan', ?)", (datetime.now().isoformat(timespec="seconds"),))
         conn.execute("PRAGMA optimize")
     stats["parse_errors"] = parse_errors
@@ -1328,7 +1391,7 @@ def convert_documents(cfg: dict[str, Any], dry_run: bool = False, path: str | No
 
 # Причины карантина: <quarantine_dir>/<причина>/<путь в каталоге книг>. Карантин не индексируется.
 QUARANTINE_REASONS = ("replaced", "duplicate", "edited", "rejected-convert", "rejected-zip", "rejected-encoding",
-                      "rejected-name")
+                      "rejected-name", "unzipped", "replaced-calibre")
 # Уже сжатые форматы кладутся в zip без сжатия: deflate их не уменьшит, только потратит процессор.
 STORED_EXTENSIONS = {"pdf", "djvu", "chm", "docx", "odt", "mobi", "azw", "azw3", "epub", "mp3", "jpg", "jpeg", "png",
                      "gif", "webp"}
@@ -1339,6 +1402,9 @@ FORMAT_RANK = {"epub": 0, "fb2": 1, "txt": 2, "pdf": 3, "djvu": 4}
 DEDUP_MIN_WORDS = 200
 DEDUP_COVERAGE = 0.97
 DEDUP_GROUP_MAX = 16
+DEDUP_SIMILAR = 0.85  # dedup-folders: доля шинглов от оставленных, с которой книга «похожая» (решает человек)
+DEDUP_FOLDER_MAX = 3000  # dedup-folders: книг в папке автора больше — папка пропускается (folder-too-large)
+FOLDER_SAMPLE = 4  # dedup-folders: единая выборка шинглов (остаток по модулю 4) для всех книг папки
 # «Полу-cp866»: заглавные кириллицы cp866 (0x80–0x9F) прочитаны как cp1251, строчные верны («‘тейнбек „жон»).
 SEMI_CP866 = {bytes([b]).decode("cp1251"): bytes([b]).decode("cp866") for b in range(0x80, 0xA0) if b != 0x98}
 _SEMI = re.escape("".join(SEMI_CP866))
@@ -1486,13 +1552,27 @@ def count_words(text: str) -> int:
     return len(re.findall(r"[^\W_]+", text))
 
 
+EPUB_HEAD = re.compile(r"<head[\s>].*?</head>", re.S | re.I)
+
+
+def markup_plain(markup: str) -> str:
+    """Текст разметки без тегов. Ссылки &#1090; и мягкие переносы раскрываются/убираются, иначе каждая буква-код — отдельное «слово»."""
+    return html.unescape(re.sub(r"<[^>]*>", " ", markup)).replace("\xad", "")
+
+
+def epub_word_count(epub: Path) -> int:
+    """Слов в тексте глав epub (spine) без разметки и без <head>: <title> и CSS в каждом файле — не текст книги."""
+    with zipfile.ZipFile(epub) as archive:
+        return count_words(" ".join(markup_plain(EPUB_HEAD.sub(" ", decode_xml(zip_read(archive, p))))
+                                    for p in Epub(archive).spine()))
+
+
 def epub_text_loss(fb2_raw: bytes, epub: Path) -> str | None:
     """Проверка, что текст не потерян: в epub не меньше 80 % слов тела fb2 (без бинарных вложений)."""
     text = decode_xml(fb2_raw)
     start, end = text.find("<body"), text.find("<binary")
-    fb2_words = count_words(re.sub(r"<[^>]*>", " ", text[max(start, 0):end if end > start else None]))
-    with zipfile.ZipFile(epub) as archive:
-        epub_words = count_words(" ".join(re.sub(r"<[^>]*>", " ", decode_xml(zip_read(archive, p))) for p in Epub(archive).spine()))
+    fb2_words = count_words(markup_plain(text[max(start, 0):end if end > start else None]))
+    epub_words = epub_word_count(epub)
     if fb2_words >= 50 and epub_words < 0.8 * fb2_words:
         return f"в epub {epub_words} слов из {fb2_words} в fb2"
     return None
@@ -1512,25 +1592,66 @@ def relink(db_path: str, pairs: list[tuple[str, str]]) -> int:
     if not pairs or not Path(db_path).is_file():
         return 0
     with closing(connect(db_path)) as conn, conn:
-        if conn.execute("PRAGMA user_version").fetchone()[0] < 1:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version < 1:
             return 0
         for old, new in pairs:
             conn.execute("UPDATE OR IGNORE marks SET path=? WHERE path=?", (new, old))
             conn.execute("UPDATE OR IGNORE shelf_items SET path=? WHERE path=?", (new, old))
             conn.execute("DELETE FROM shelf_items WHERE path=?", (old,))
+            if version >= SCHEMA_COLLECTIONS:
+                conn.execute("UPDATE OR IGNORE book_collections SET path=? WHERE path=?", (new, old))
+                conn.execute("DELETE FROM book_collections WHERE path=?", (old,))
+                conn.execute("UPDATE dup_members SET keeper=? WHERE keeper=?", (new, old))
+                conn.execute("UPDATE OR IGNORE dup_members SET path=? WHERE path=? AND role='kept'", (new, old))
     return len(pairs)
+
+
+def rebuild_collections(conn: sqlite3.Connection) -> dict[str, int]:
+    """Дополняет book_collections (схема v4) в транзакции вызывающего: строки не удаляются и не переписываются —
+    принадлежность книги к сборнику переживает перенос файла из папки сборника (его путь переносит relink).
+    folder — книги из папок сборников; dedup — копии из сборников, ушедшие в карантин как дубли: принадлежность
+    переходит к оставленной книге (keeper), с учётом переименования keeper в name.ext.zip. Без книги — keeper не
+    найден ни как путь, ни как .zip."""
+    counts = {"folder": conn.execute("INSERT OR IGNORE INTO book_collections SELECT path, section, collection, 'folder', path "
+                                     "FROM books WHERE collection <> ''").rowcount, "dedup": 0, "unresolved": 0}
+    known = {row[0] for row in conn.execute("SELECT path FROM books")}
+    for path, keeper in conn.execute("SELECT path, keeper FROM dup_members WHERE role='duplicate' AND keeper <> ''").fetchall():
+        section, collection = path_collection(path)
+        if not collection:
+            continue
+        if keeper in known:
+            target = keeper
+        elif keeper + ".zip" in known:
+            target = keeper + ".zip"
+        else:
+            counts["unresolved"] += 1
+            continue
+        counts["dedup"] += conn.execute("INSERT OR IGNORE INTO book_collections VALUES (?,?,?,'dedup',?)",
+                                        (target, section, collection, path)).rowcount
+    return counts
+
+
+def report_collections(counts: dict[str, int], out: Callable[[str], None]) -> None:
+    """Итог пересборки сборников: строка в вывод и событие журнала."""
+    line = f"сборники: folder {counts['folder']}, dedup {counts['dedup']}, без книги {counts['unresolved']}"
+    out(line)
+    say(line, "collections", detail=json.dumps(counts, ensure_ascii=False))
 
 
 DUP_STATUS_NAMES = {"similar": "Похожие (ручное решение)", "auto": "Удалены автоматически", "resolved": "Решённые"}
 DUP_PAGE_SIZE = 50
 
 
-def dup_groups_page(conn: sqlite3.Connection, status: str, page: int, size: int) -> tuple[int, list[dict[str, Any]]]:
-    """Группы дублей одного статуса с участниками (веб и API). Путь карантина наружу не отдаётся вызывающими."""
-    total = conn.execute("SELECT count(*) FROM dup_groups WHERE status=?", (status,)).fetchone()[0]
+def dup_groups_page(conn: sqlite3.Connection, status: str, page: int, size: int,
+                    statuses: tuple[str, ...] | None = None) -> tuple[int, list[dict[str, Any]]]:
+    """Группы дублей с участниками (веб и API): статус status или любой из statuses. Путь карантина наружу не отдаётся вызывающими."""
+    wanted = statuses or (status,)
+    marks = ",".join("?" * len(wanted))  # только знаки «?», значения передаются параметрами
+    total = conn.execute(f"SELECT count(*) FROM dup_groups WHERE status IN ({marks})", wanted).fetchone()[0]
     groups: list[dict[str, Any]] = []
-    for group in conn.execute("SELECT id, key, status, created FROM dup_groups WHERE status=? ORDER BY id LIMIT ? OFFSET ?",
-                              (status, size, (page - 1) * size)).fetchall():
+    for group in conn.execute(f"SELECT id, key, status, created FROM dup_groups WHERE status IN ({marks}) ORDER BY id LIMIT ? OFFSET ?",
+                              (*wanted, size, (page - 1) * size)).fetchall():
         members = []
         for member in conn.execute("SELECT path, fmt, size, words, coverage, role, quarantine FROM dup_members "
                                    "WHERE group_id=? ORDER BY role DESC, path", (group["id"],)).fetchall():
@@ -1556,6 +1677,12 @@ def dup_action(cfg: dict[str, Any], group_id: int, action: str, path: str = "") 
                 raise ValueError("группа дублей не найдена")
         say(f"группа {group_id}: оставлены все файлы", "dup_action", detail=f"keep-both group={group_id}")
         return "Все файлы группы оставлены, группа помечена решённой."
+    if action == "resolve":
+        with closing(connect(cfg["db_path"])) as conn, conn:
+            if conn.execute("UPDATE dup_groups SET status='resolved' WHERE id=?", (group_id,)).rowcount == 0:
+                raise ValueError("группа дублей не найдена")
+        say(f"группа {group_id}: помечена решённой", "dup_action", detail=f"resolve group={group_id}")
+        return "Группа помечена решённой, файлы не менялись."
     if action == "quarantine":
         with closing(connect(cfg["db_path"])) as conn:
             kept = [r[0] for r in conn.execute("SELECT path FROM dup_members WHERE group_id=? AND role='kept' ORDER BY path",
@@ -2189,7 +2316,8 @@ class NightRun:
     def finish(self, extra: dict[str, Any] | None = None) -> dict[str, Any]:
         self.journal.close()
         if not self.dry_run:
-            self.stats["relinked"] = relink(self.cfg["db_path"], self.relinks)
+            # накопительно: unzip-books переносит отметки пачками во время прогона, хвост — здесь
+            self.stats["relinked"] = self.stats.get("relinked", 0) + relink(self.cfg["db_path"], self.relinks)
         report = write_report(f"{self.kind}{'-dry-run' if self.dry_run else ''}",
                               {"target": str(self.target), "dry_run": self.dry_run, "stats": self.stats,
                                "journal": str(self.journal_path), **(extra or {})})
@@ -2343,6 +2471,763 @@ def fix_encoding(cfg: dict[str, Any], dry_run: bool = False, path: str | None = 
 
 
 # ----------------------------------------------------------------------
+# fb2 → EPUB 3 собственным конвертером (только stdlib): сноски во всплывающих окнах, серии, обложка
+# ----------------------------------------------------------------------
+
+# Раздел крупнее этого (символов разметки) делится по вложенным разделам: читалки плохо листают огромные файлы.
+FB2_CHAPTER_MAX = 300_000
+# DOCTYPE с ENTITY в начале файла отвергается: внутренние сущности fb2 не нужны, а XXE и «взрыв» сущностей — риск.
+FB2_ENTITY_HEAD = 4096
+EPUB_NOTES_FILE = "notes.xhtml"
+EPUB_IMAGE_TYPES = {"jpg": "image/jpeg", "png": "image/png", "gif": "image/gif", "webp": "image/webp"}
+# Строчные элементы fb2 и их XHTML-эквиваленты; прочие неизвестные теги разворачиваются, текст сохраняется.
+INLINE_WRAP = {"emphasis": "em", "strong": "strong", "strikethrough": "s", "sub": "sub", "sup": "sup", "code": "code",
+               "style": "span"}
+EPUB_CONTAINER = ('<?xml version="1.0" encoding="utf-8"?>\n'
+                  '<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+                  '<rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>'
+                  "</rootfiles></container>\n")
+# Сдержанный стиль: размеры и шрифты задаёт читалка (только em и проценты), хрупкого позиционирования нет.
+EPUB_CSS = """@charset "UTF-8";
+p{margin:0;text-indent:1.5em;text-align:justify;hyphens:auto;-epub-hyphens:auto;-webkit-hyphens:auto}
+h1,h2,h3,h4,h5,h6{text-align:center;text-indent:0;hyphens:none;-epub-hyphens:none;-webkit-hyphens:none;
+margin:1.2em 0 .6em;font-weight:bold;page-break-after:avoid;break-after:avoid}
+h1{page-break-before:always;break-before:page}
+p.subtitle{text-align:center;text-indent:0;font-weight:bold}
+p.empty-line{text-indent:0;margin:0}
+blockquote.epigraph{margin:1em 0 1em 40%;font-style:italic}
+blockquote.cite{margin:1em 2em;font-style:italic}
+p.text-author,p.date{text-align:right;text-indent:0;font-style:italic}
+div.poem{margin:1em 0 1em 3em}
+div.stanza{margin:.8em 0}
+div.poem-title{text-align:left;text-indent:0;font-weight:bold;margin:.5em 0}
+p.v{text-indent:0;margin:0}
+div.annotation{font-size:.95em;margin:1em 0}
+div.annotation p{text-indent:0}
+aside.footnote{font-size:.9em;margin:.6em 0}
+aside.footnote p{text-indent:0}
+p.footnote-title{font-weight:bold;text-indent:0}
+p.backlink{text-indent:0;text-align:right}
+.noteref{vertical-align:super;font-size:.75em;line-height:0;text-decoration:none}
+div.image{text-align:center;text-indent:0;margin:1em 0}
+img{max-width:100%}
+.cover-wrap{text-align:center}
+img.cover-img{display:block;margin:0 auto;max-width:100%;max-height:100vh;height:auto}
+table{border-collapse:collapse;margin:1em auto}
+td,th{padding:.2em .4em;vertical-align:top}
+code{font-family:monospace}
+"""
+
+
+def _local(tag: str) -> str:
+    """Имя тега или атрибута без пространства имён."""
+    return tag.rpartition("}")[2]
+
+
+def _attr(elem: ET.Element | None, name: str) -> str:
+    """Значение атрибута по локальному имени (l:href, xml:lang и обычные атрибуты); пусто, если нет."""
+    if elem is None:
+        return ""
+    for key, value in elem.attrib.items():
+        if _local(key) == name:
+            return value
+    return ""
+
+
+def _kids(elem: ET.Element | None, name: str) -> list[ET.Element]:
+    """Дочерние элементы с таким локальным именем."""
+    return [] if elem is None else [child for child in elem if _local(child.tag) == name]
+
+
+def _first(elem: ET.Element | None, name: str) -> ET.Element | None:
+    """Первый дочерний элемент с таким именем или None."""
+    found = _kids(elem, name)
+    return found[0] if found else None
+
+
+def _text(elem: ET.Element | None) -> str:
+    """Весь текст элемента одной строкой (пробелы схлопнуты) — для подписей, заголовков и описания."""
+    return "" if elem is None else " ".join("".join(elem.itertext()).split())
+
+
+def _valid_url(href: str) -> bool:
+    """Внешняя ссылка годится для EPUB, только если у неё есть хост и нет пробелов (иначе epubcheck: RSC-020)."""
+    try:
+        return bool(urlsplit(href).hostname) and not any(ch.isspace() for ch in href)
+    except ValueError:
+        return False
+
+
+def _esc(value: str) -> str:
+    """Экранирование для текста и атрибутов XML/XHTML."""
+    return html.escape(value, quote=True)
+
+
+def _year(text: str) -> str:
+    match = re.search(r"\b(1\d{3}|20\d{2})\b", text)
+    return match.group(1) if match else ""
+
+
+def _image_ext(data: bytes) -> str | None:
+    """Формат растра по сигнатуре (атрибут content-type не доверяем). SVG не принимается: в нём бывают скрипты."""
+    if data.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+def _person(elem: ET.Element) -> tuple[str, str]:
+    """Автор или переводчик: имя для dc:creator («Имя Отчество Фамилия») и сортировка («Фамилия, Имя Отчество»)."""
+    first, middle, last = (_text(_first(elem, key)) for key in ("first-name", "middle-name", "last-name"))
+    name = " ".join(part for part in (first, middle, last) if part) or _text(_first(elem, "nickname"))
+    given = " ".join(part for part in (first, middle) if part)
+    filed = ", ".join(part for part in (last, given) if part) or name
+    return name, filed
+
+
+FB2_NOTE_BODIES = {"notes", "comments", "footnotes", "примечания", "сноски", "комментарии"}
+XML_BAD_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
+XML_AMP = re.compile(r"&(#\d+;|#x[0-9a-fA-F]+;|[A-Za-z][A-Za-z0-9]*;)?")
+XML_ENTITIES = {"amp;", "lt;", "gt;", "quot;", "apos;"}
+
+
+def _repair_fb2(text: str) -> str:
+    """Чинит текст fb2 для второй попытки разбора: убирает запрещённые в XML символы, лишнее перед <?xml,
+    голый «&» экранирует, HTML-сущности (&nbsp; и т. п.) раскрывает. Разметку не трогает."""
+    def amp(match: re.Match[str]) -> str:
+        ref = match.group(1)
+        if ref is None:
+            return "&amp;"
+        if ref.startswith("#") or ref in XML_ENTITIES:
+            return match.group(0)
+        value = html.unescape("&" + ref)
+        return _esc(value) if value != "&" + ref else "&amp;" + ref
+    return XML_AMP.sub(amp, XML_BAD_CHARS.sub("", text.lstrip("\ufeff \t\r\n")))
+
+
+def _parse_fb2(data: bytes) -> ET.Element:
+    """Разбирает fb2 без внешних сущностей. Неразборчивый XML и DOCTYPE с ENTITY — ValueError (вызывающий откатится)."""
+    text = decode_xml(data)
+    if re.search(r"<!ENTITY", text[:FB2_ENTITY_HEAD], re.IGNORECASE):
+        raise ValueError("DOCTYPE с ENTITY отклонён")
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as error:
+        try:  # частые огрехи fb2, которые терпит Calibre: управляющие символы, голый «&», HTML-сущности
+            root = ET.fromstring(_repair_fb2(text))
+        except ET.ParseError:
+            raise ValueError(f"fb2 не разбирается: {error}") from error
+    if _local(root.tag) != "FictionBook":
+        raise ValueError("корень не FictionBook")
+    return root
+
+
+class _Pass:
+    """Итоги одного прохода разметки: ссылки на сноски в порядке документа, файлы якорей, первые подписи ссылок."""
+
+    def __init__(self) -> None:
+        self.refs: list[str] = []
+        self.anchors: dict[str, str] = {}
+        self.counts: dict[str, int] = {}
+        self.labels: dict[str, str] = {}
+
+
+class _Unit:
+    """Файл главы: узел (раздел или хвост тела), глубина заголовков и разделы, вынесенные в свои файлы."""
+
+    def __init__(self, nodes: list[ET.Element], skip: set[ET.Element], depth: int) -> None:
+        self.nodes = nodes
+        self.skip = skip
+        self.depth = depth
+        self.name = ""
+
+
+class _Renderer:
+    """XHTML из узлов fb2 для одного файла. Ссылки на сноски и разделы берутся из книги (homes, locs) после проходов."""
+
+    def __init__(self, book: _Fb2Book, state: _Pass, file: str, skip: set[ET.Element] | None = None) -> None:
+        self.book = book
+        self.state = state
+        self.file = file
+        self.skip = skip or set()
+
+    def ident(self, node: ET.Element) -> str:
+        """Атрибут id, если у элемента есть якорь книги; запоминает, в каком файле он выведен."""
+        anchor = self.book.anchor.get(node)
+        if not anchor:
+            return ""
+        self.state.anchors[anchor] = self.file
+        return f' id="{_esc(anchor)}"'
+
+    def block(self, node: ET.Element, depth: int, out: list[str]) -> None:
+        """Блочный элемент. depth — уровень заголовков (глубина раздела)."""
+        tag = _local(node.tag)
+        if tag == "section":
+            if node in self.skip:
+                return
+            out.append(f"<section{self.ident(node)}>")
+            self.blocks(node, depth, out)
+            out.append("</section>")
+        elif tag == "title":
+            level = min(depth, 6)
+            out.append(f"<h{level}{self.ident(node)}>{self.lines(node)}</h{level}>")
+        elif tag == "p":
+            out.append(f"<p{self.ident(node)}>{self.inline(node)}</p>")
+        elif tag == "subtitle":
+            out.append(f'<p class="subtitle"{self.ident(node)}>{self.inline(node)}</p>')
+        elif tag == "empty-line":
+            out.append('<p class="empty-line">&#160;</p>')
+        elif tag == "text-author":
+            out.append(f'<p class="text-author"{self.ident(node)}>{self.inline(node)}</p>')
+        elif tag == "date":
+            out.append(f'<p class="date"{self.ident(node)}>{self.inline(node)}</p>')
+        elif tag == "v":
+            out.append(f'<p class="v"{self.ident(node)}>{self.inline(node)}</p>')
+        elif tag in ("epigraph", "cite"):
+            out.append(f'<blockquote class="{tag}"{self.ident(node)}>')
+            self.blocks(node, depth, out)
+            out.append("</blockquote>")
+        elif tag in ("poem", "stanza"):
+            out.append(f'<div class="{tag}"{self.ident(node)}>')
+            self.blocks(node, depth, out, title_class="poem-title")
+            out.append("</div>")
+        elif tag == "annotation":
+            out.append(f"<div class=\"annotation\"{self.ident(node)}>")
+            self.blocks(node, depth, out)
+            out.append("</div>")
+        elif tag == "table":
+            self.table(node, out)
+        elif tag == "image":
+            picture = self.image_tag(node)
+            if picture:
+                out.append(f'<div class="image">{picture}</div>')
+        elif tag == "a" or tag in INLINE_WRAP:
+            out.append(f"<p>{self.inline_node(node)}</p>")
+        else:
+            self.blocks(node, depth, out)
+
+    def blocks(self, parent: ET.Element, depth: int, out: list[str], title_class: str = "",
+               skip_title: bool = False) -> None:
+        """Дочерние блоки родителя; текст между блоками (не в абзацах) оборачивается в <p>."""
+        if parent.text and parent.text.strip():
+            out.append(f"<p>{_esc(parent.text.strip())}</p>")
+        for child in parent:
+            tag = _local(child.tag)
+            if tag == "title" and (skip_title or title_class):
+                if title_class:
+                    out.append(f'<div class="{title_class}">{self.lines(child)}</div>')
+            else:
+                self.block(child, depth + 1 if tag == "section" else depth, out)
+            if child.tail and child.tail.strip():
+                out.append(f"<p>{_esc(child.tail.strip())}</p>")
+
+    def lines(self, node: ET.Element) -> str:
+        """Заголовок: строки из <p> через <br/>, иначе весь текст."""
+        paragraphs = _kids(node, "p")
+        if not paragraphs:
+            return self.inline(node)
+        return "<br/>".join(self.inline(paragraph) for paragraph in paragraphs)
+
+    def inline(self, node: ET.Element) -> str:
+        """Строчное содержимое элемента с его текстом и хвостами дочерних элементов."""
+        parts = [_esc(node.text or "")]
+        for child in node:
+            parts.append(self.inline_node(child))
+            parts.append(_esc(child.tail or ""))
+        return "".join(parts)
+
+    def inline_node(self, node: ET.Element) -> str:
+        tag = _local(node.tag)
+        if tag == "a":
+            return self.link(node)
+        if tag == "image":
+            return self.image_tag(node)
+        wrap = INLINE_WRAP.get(tag)
+        if wrap:
+            return f"<{wrap}>{self.inline(node)}</{wrap}>"
+        return self.inline(node)
+
+    def link(self, node: ET.Element) -> str:
+        """Ссылка: сноска — всплывающая ссылка; внутренняя — на файл цели; http(s) — как есть; прочее — только текст."""
+        href = _attr(node, "href").strip()
+        if href.startswith("#"):
+            target = href[1:]
+            if target in self.book.notes:
+                return self.noteref(node, target)
+            loc = self.book.locs.get(target)
+            if loc is not None:
+                prefix = "" if loc == self.file else loc
+                return f'<a href="{_esc(prefix + "#" + target)}">{self.inline(node)}</a>'
+            return self.inline(node)
+        if href.lower().startswith(("http://", "https://")) and _valid_url(href):
+            return f'<a href="{_esc(href)}">{self.inline(node)}</a>'
+        return self.inline(node)
+
+    def noteref(self, node: ET.Element, note: str) -> str:
+        """Ссылка на сноску; первая ссылка на сноску получает id ref-<id>, повторные — ref-<id>-<номер>."""
+        state = self.state
+        state.refs.append(note)
+        count = state.counts.get(note, 0) + 1
+        state.counts[note] = count
+        state.labels.setdefault(note, _text(node))
+        ref_id = f"ref-{note}" if count == 1 else f"ref-{note}-{count}"
+        home = self.book.homes.get(note, self.file)
+        prefix = "" if home == self.file else home
+        text = self.inline(node) or "*"
+        return (f'<a epub:type="noteref" role="doc-noteref" class="noteref" href="{_esc(prefix + "#" + note)}" '
+                f'id="{_esc(ref_id)}"><sup>{text}</sup></a>')
+
+    def aside(self, note: str, out: list[str]) -> None:
+        """Сноска целиком: <aside epub:type="footnote"> с текстом и обратной ссылкой; заголовок, совпадающий со ссылкой, опускается."""
+        section = self.book.notes[note]
+        self.state.anchors[note] = self.file
+        out.append(f'<aside epub:type="footnote" role="doc-footnote" id="{_esc(note)}" class="footnote">')
+        label = self.state.labels.get(note)
+        for child in _kids(section, "title"):
+            if label is None or _text(child) != label:
+                out.append(f'<p class="footnote-title">{self.lines(child)}</p>')
+        self.blocks(section, 2, out, skip_title=True)
+        if note in self.book.referenced:
+            home = self.book.homes.get(note, self.file)
+            prefix = "" if home == self.file else home
+            out.append(f'<p class="backlink"><a href="{_esc(prefix + "#ref-" + note)}" role="doc-backlink">↩</a></p>')
+        out.append("</aside>")
+
+    def table(self, node: ET.Element, out: list[str]) -> None:
+        out.append(f"<table{self.ident(node)}>")
+        for row in _kids(node, "tr"):
+            out.append(f"<tr{self.ident(row)}>")
+            for cell in row:
+                tag = _local(cell.tag)
+                if tag not in ("td", "th"):
+                    continue
+                attrs = [f' {name}="{value}"' for name in ("colspan", "rowspan")
+                         if (value := _attr(cell, name)).isdigit()]
+                align = _attr(cell, "align")
+                if align in ("left", "right", "center", "justify"):
+                    attrs.append(f' align="{align}"')
+                paras = [child for child in cell if _local(child.tag) == "p"]
+                # Нестандартные <p> внутри ячейки (листинги кода) — строки через <br/>, иначе слова склеиваются
+                body = "<br/>".join(self.inline(child) for child in paras) if paras else self.inline(cell)
+                out.append(f"<{tag}{self.ident(cell)}{''.join(attrs)}>{body}</{tag}>")
+            out.append("</tr>")
+        out.append("</table>")
+
+    def image_tag(self, node: ET.Element) -> str:
+        """<img> для картинки из <binary>; битая или отсутствующая картинка заменяется своим alt-текстом."""
+        name = self.book.image_name(_attr(node, "href"))
+        alt = _attr(node, "alt")
+        if name is None:
+            return f'<span class="image-missing">{_esc(alt)}</span>' if alt else ""
+        return f'<img{self.ident(node)} src="../img/{name}" alt="{_esc(alt)}"/>'
+
+
+class _Fb2Book:
+    """Книга fb2: описание, картинки, тела и план файлов EPUB (главы, сноски, вынесенные разделы)."""
+
+    def __init__(self, root: ET.Element) -> None:
+        self.root = root
+        desc = _first(root, "description")
+        self.ti = _first(desc, "title-info")
+        publish = _first(desc, "publish-info")
+        self.doc_id = _text(_first(_first(desc, "document-info"), "id"))
+        ti = self.ti
+        self.title = _text(_first(ti, "book-title")) or "Без названия"
+        self.authors = [person for person in (_person(a) for a in _kids(ti, "author")) if person[0]]
+        self.translators = [person for person in (_person(a) for a in _kids(ti, "translator")) if person[0]]
+        self.genres = [genre for genre in (_text(g) for g in _kids(ti, "genre")) if genre]
+        self.lang = _text(_first(ti, "lang")) or "ru"
+        annotation = _first(ti, "annotation")
+        self.annotation = [text for text in (_text(p) for p in annotation.iter() if _local(p.tag) == "p") if text] \
+            if annotation is not None else []
+        if annotation is not None and not self.annotation and _text(annotation):
+            self.annotation = [_text(annotation)]
+        date_el = _first(ti, "date")
+        self.year = _year(f"{_attr(date_el, 'value')} {_text(date_el)}") if date_el is not None else ""
+        self.year = self.year or _year(_text(_first(publish, "year")))
+        self.publisher = _text(_first(publish, "publisher"))
+        self.isbn = re.sub(r"[\s-]", "", _text(_first(publish, "isbn")))
+        seq = _first(ti, "sequence")
+        self.series = _attr(seq, "name").strip()
+        number = re.match(r"\d+", _attr(seq, "number").strip())
+        self.series_no = number.group(0) if number else ""
+        self.images: dict[str, str] = {}
+        self.image_data: list[tuple[str, bytes]] = []
+        self._load_images()
+        cover_img = _first(_first(ti, "coverpage"), "image")
+        self.cover_name = self.image_name(_attr(cover_img, "href"))
+        bodies = _kids(root, "body")
+        self.main = [body for body in bodies if not _attr(body, "name")]
+        if not self.main and bodies and _attr(bodies[0], "name").strip().lower() not in FB2_NOTE_BODIES:
+            self.main = [bodies[0]]  # первое тело с name="<название книги>" — основное (частый вариант fb2)
+        if not self.main:
+            raise ValueError("нет основного тела книги")
+        self.anchor: dict[ET.Element, str] = {}
+        self._assign_anchors()
+        self.notes: dict[str, ET.Element] = {}
+        note_nodes: set[ET.Element] = set()
+        for body in bodies:
+            if body in self.main:
+                continue
+            for child in body:
+                anchor = self.anchor.get(child)
+                if _local(child.tag) == "section" and anchor:
+                    self.notes[anchor] = child
+                    note_nodes.add(child)
+        self.rest = [child for body in bodies if body not in self.main for child in body if child not in note_nodes]
+        self.referenced: set[str] = set()
+        self.homes: dict[str, str] = {}
+        self.locs: dict[str, str] = {}
+
+    def _load_images(self) -> None:
+        """Картинки из <binary>: base64 и сигнатура; неизвестное и битое пропускается."""
+        for node in _kids(self.root, "binary"):
+            ident = node.get("id") or ""
+            try:
+                data = base64.b64decode("".join((node.text or "").split()), validate=True)
+            except (binascii.Error, ValueError):
+                continue
+            ext = _image_ext(data)
+            if not ident or ext is None or ident in self.images:
+                continue
+            name = f"{len(self.image_data) + 1:03d}.{ext}"
+            self.images[ident] = name
+            self.image_data.append((name, data))
+
+    def image_name(self, href: str) -> str | None:
+        """Имя файла картинки по ссылке #id или None (внешние и неизвестные ссылки)."""
+        href = href.strip()
+        return self.images.get(href[1:]) if href.startswith("#") else None
+
+    def _assign_anchors(self) -> None:
+        """Якоря: id элементов (первое вхождение, без повторов); у разделов без id — сгенерированный sN."""
+        seen: set[str] = set()
+        for node in self.root.iter():
+            ident = node.get("id")
+            if ident and ident not in seen:
+                seen.add(ident)
+                self.anchor[node] = ident
+        counter = 0
+        for node in self.root.iter():
+            if _local(node.tag) == "section" and node not in self.anchor:
+                while True:
+                    counter += 1
+                    candidate = f"s{counter}"
+                    if candidate not in seen:
+                        break
+                seen.add(candidate)
+                self.anchor[node] = candidate
+
+    def _plan_section(self, node: ET.Element, depth: int, units: list[_Unit]) -> None:
+        """Раздел — файл целиком; крупнее FB2_CHAPTER_MAX с вложенными разделами — голова файлом и каждый вложенный раздел своим."""
+        children = _kids(node, "section")
+        if not children or len(ET.tostring(node, encoding="unicode")) <= FB2_CHAPTER_MAX:
+            units.append(_Unit([node], set(), depth))
+            return
+        units.append(_Unit([node], set(children), depth))
+        for child in children:
+            self._plan_section(child, depth + 1, units)
+
+    def _plan(self) -> list[_Unit]:
+        units: list[_Unit] = []
+        for body in self.main:
+            pending: list[ET.Element] = []
+            for node in body:
+                if _local(node.tag) == "section":
+                    if pending:
+                        units.append(_Unit(pending, set(), 1))
+                        pending = []
+                    self._plan_section(node, 1, units)
+                else:
+                    pending.append(node)
+            if pending:
+                units.append(_Unit(pending, set(), 1))
+        for index, unit in enumerate(units, 1):
+            unit.name = f"ch{index:03d}.xhtml"
+        return units
+
+    def _unit_title(self, unit: _Unit) -> str:
+        first = unit.nodes[0]
+        if _local(first.tag) == "section":
+            return _text(_first(first, "title")) or "Раздел"
+        return _text(_first(first, "title")) or self.title
+
+    def _home(self, file_refs: list[tuple[str, list[str]]],
+              note_refs: dict[str, list[str]]) -> tuple[dict[str, str], dict[str, list[str]]]:
+        """Файл, где выводится каждая сноска: первая ссылка в порядке документа (тело, затем сноски на этом месте).
+
+        Сноски, на которые нет ссылок, и разделы служебных тел — в notes.xhtml (он последний).
+        """
+        homes: dict[str, str] = {}
+        placed: dict[str, list[str]] = {}
+        for name, refs in file_refs:
+            placed[name] = []
+            queue = deque(refs)
+            while queue:
+                note = queue.popleft()
+                if note in self.notes and note not in homes:
+                    homes[note] = name
+                    placed[name].append(note)
+                    queue.extend(note_refs.get(note, []))
+        placed.setdefault(EPUB_NOTES_FILE, [])
+        for note in self.notes:
+            if note not in homes:
+                homes[note] = EPUB_NOTES_FILE
+                placed[EPUB_NOTES_FILE].append(note)
+        return homes, placed
+
+    def build(self) -> tuple[list[tuple[str, str, str]], dict[str, list[str]]]:
+        """Тексты файлов: [(имя, заголовок, XHTML)] в порядке spine без обложки и страницы книги."""
+        units = self._plan()
+        anchors: dict[str, str] = {}
+        file_refs: list[tuple[str, list[str]]] = []
+        for unit in units:  # проход 1: ссылки и якоря глав
+            state = _Pass()
+            renderer = _Renderer(self, state, unit.name, unit.skip)
+            for node in unit.nodes:
+                renderer.block(node, unit.depth, [])
+            anchors.update(state.anchors)
+            file_refs.append((unit.name, state.refs))
+        state = _Pass()
+        renderer = _Renderer(self, state, EPUB_NOTES_FILE)
+        for node in self.rest:
+            renderer.block(node, 1, [])
+        anchors.update(state.anchors)
+        file_refs.append((EPUB_NOTES_FILE, state.refs))
+        note_refs: dict[str, list[str]] = {}  # проход 2: содержимое каждой сноски
+        note_anchors: dict[str, dict[str, str]] = {}
+        for note in self.notes:
+            state = _Pass()
+            _Renderer(self, state, "").aside(note, [])
+            note_refs[note] = state.refs
+            note_anchors[note] = state.anchors
+        self.homes, placed = self._home(file_refs, note_refs)
+        self.referenced = {note for _name, refs in file_refs for note in refs}
+        self.referenced.update(note for refs in note_refs.values() for note in refs)
+        self.locs = anchors
+        for note, found in note_anchors.items():
+            for anchor in found:
+                self.locs[anchor] = self.homes[note]
+            self.locs[note] = self.homes[note]
+        final = _Pass()  # проход 3: окончательная разметка с известными файлами сносок и якорей
+        texts: list[tuple[str, str, str]] = []
+        for unit in units:
+            renderer = _Renderer(self, final, unit.name, unit.skip)
+            out: list[str] = []
+            for node in unit.nodes:
+                renderer.block(node, unit.depth, out)
+            for note in placed.get(unit.name, []):
+                renderer.aside(note, out)
+            texts.append((unit.name, self._unit_title(unit), "".join(out)))
+        renderer = _Renderer(self, final, EPUB_NOTES_FILE)
+        out = []
+        for node in self.rest:
+            renderer.block(node, 1, out)
+        for note in placed.get(EPUB_NOTES_FILE, []):
+            renderer.block(self.notes[note], 1, out)
+        if out:
+            texts.append((EPUB_NOTES_FILE, "Примечания", "".join(out)))
+        return texts, placed
+
+    def nav_items(self, container: ET.Element) -> list[tuple[str, str, list[Any]]]:
+        """Оглавление: (название, href относительно OEBPS, вложенные пункты) по разделам контейнера."""
+        items: list[tuple[str, str, list[Any]]] = []
+        for node in _kids(container, "section"):
+            anchor = self.anchor.get(node, "")
+            loc = self.locs.get(anchor)
+            if loc is None:
+                continue
+            items.append((_text(_first(node, "title")) or "Раздел", f"text/{loc}#{anchor}", self.nav_items(node)))
+        return items
+
+    def title_body(self) -> str:
+        """Страница книги: название, авторы, перевод, серия, аннотация."""
+        parts = [f"<h1>{_esc(self.title)}</h1>"]
+        parts += [f'<p class="author">{_esc(name)}</p>' for name, _filed in self.authors]
+        parts += [f'<p class="translator">Перевод: {_esc(name)}</p>' for name, _filed in self.translators]
+        if self.series:
+            number = f", № {self.series_no}" if self.series_no else ""
+            parts.append(f'<p class="series">Серия: {_esc(self.series)}{_esc(number)}</p>')
+        if self.annotation:
+            parts.append('<div class="annotation">' + "".join(f"<p>{_esc(p)}</p>" for p in self.annotation) + "</div>")
+        return "".join(parts)
+
+
+def _page(title: str, lang: str, body: str, css: str = "../css/book.css", body_class: str = "") -> str:
+    """Документ XHTML: DOCTYPE, пространство epub, lang и xml:lang, заголовок и ссылка на таблицу стилей."""
+    attrs = f' class="{_esc(body_class)}"' if body_class else ""
+    code = _esc(lang)
+    return ('<?xml version="1.0" encoding="utf-8"?>\n<!DOCTYPE html>\n'
+            '<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" '
+            f'lang="{code}" xml:lang="{code}"><head><meta charset="utf-8"/><title>{_esc(title)}</title>'
+            f'<link rel="stylesheet" type="text/css" href="{css}"/></head><body{attrs}>{body}</body></html>\n')
+
+
+def _nav_list(items: list[tuple[str, str, list[Any]]]) -> str:
+    if not items:
+        return ""
+    return "<ol>" + "".join(f'<li><a href="{_esc(href)}">{_esc(title)}</a>{_nav_list(children)}</li>'
+                            for title, href, children in items) + "</ol>"
+
+
+def _ncx_points(items: list[tuple[str, str, list[Any]]], counter: list[int]) -> str:
+    parts = []
+    for title, href, children in items:
+        counter[0] += 1
+        number = counter[0]
+        inner = _ncx_points(children, counter)
+        parts.append(f'<navPoint id="np{number}" playOrder="{number}"><navLabel><text>{_esc(title)}</text></navLabel>'
+                     f'<content src="{_esc(href)}"/>{inner}</navPoint>')
+    return "".join(parts)
+
+
+def _nav_depth(items: list[tuple[str, str, list[Any]]]) -> int:
+    return max((1 + _nav_depth(children) for _title, _href, children in items), default=0)
+
+
+def fb2_to_epub3(data: bytes, out: Path) -> None:
+    """Пишет EPUB 3 из fb2 (данные уже прошли ensure_fb2_namespace). Неразборчивый fb2 — ValueError: откат на Calibre.
+
+    Главы — файлы text/chNNN.xhtml; сноски — всплывающие <aside epub:type="footnote"> в файле первой ссылки и
+    обычный текст в notes.xhtml; NCX для читалок EPUB 2. Текст не меняется, только экранируется.
+    """
+    book = _Fb2Book(_parse_fb2(data))
+    texts, _placed = book.build()
+    lang = book.lang
+    pages: list[tuple[str, str, str]] = []  # (путь в OEBPS, идентификатор в манифесте, XHTML)
+    if book.cover_name:
+        cover_body = f'<div class="cover-wrap"><img src="../img/{book.cover_name}" alt="Обложка" class="cover-img"/></div>'
+        pages.append(("text/cover.xhtml", "cover", _page("Обложка", lang, cover_body, body_class="cover")))
+    pages.append(("text/title.xhtml", "title-page", _page(book.title, lang, book.title_body())))
+    for name, title, body in texts:
+        pages.append((f"text/{name}", name.rpartition(".")[0], _page(title, lang, body)))
+    top = [item for body in book.main for item in book.nav_items(body)]
+    chapters = [(name, title) for name, title, _body in texts if name.startswith("ch")]
+    if not top and chapters:
+        top = [(chapters[0][1], f"text/{chapters[0][0]}", [])]
+    if any(name == EPUB_NOTES_FILE for name, _title, _body in texts):
+        top.append(("Примечания", f"text/{EPUB_NOTES_FILE}", []))
+    landmarks = []
+    if book.cover_name:
+        landmarks.append('<li><a epub:type="cover" href="text/cover.xhtml">Обложка</a></li>')
+    if chapters:
+        landmarks.append(f'<li><a epub:type="bodymatter" href="text/{chapters[0][0]}">{_esc(book.title)}</a></li>')
+    nav_body = (f'<nav epub:type="toc" id="toc"><h1>Оглавление</h1>{_nav_list(top)}</nav>'
+                f'<nav epub:type="landmarks" id="landmarks" hidden=""><ol>{"".join(landmarks)}</ol></nav>')
+    nav_page = _page("Оглавление", lang, nav_body, css="css/book.css")
+    counter = [0]
+    ncx_points = _ncx_points(top, counter)
+    ident = book.doc_id or "urn:uuid:" + str(uuid.uuid5(uuid.NAMESPACE_URL,
+                                                       hashlib.sha1(data, usedforsecurity=False).hexdigest()))
+    ncx = ('<?xml version="1.0" encoding="utf-8"?>\n'
+           '<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">'
+           f'<head><meta name="dtb:uid" content="{_esc(ident)}"/><meta name="dtb:depth" content="{_nav_depth(top)}"/>'
+           '<meta name="dtb:totalPageCount" content="0"/><meta name="dtb:maxPageNumber" content="0"/></head>'
+           f"<docTitle><text>{_esc(book.title)}</text></docTitle><navMap>{ncx_points}</navMap></ncx>\n")
+    modified = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    manifest = ['<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>',
+                '<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>',
+                '<item id="css" href="css/book.css" media-type="text/css"/>']
+    spine = []
+    for path, item_id, _xhtml in pages:
+        manifest.append(f'<item id="{item_id}" href="{path}" media-type="application/xhtml+xml"/>')
+        linear = ' linear="yes"' if item_id == "cover" else ""
+        spine.append(f'<itemref idref="{item_id}"{linear}/>')
+    for name, _payload in book.image_data:
+        media = EPUB_IMAGE_TYPES[name.rpartition(".")[2]]
+        if name == book.cover_name:
+            manifest.append(f'<item id="cover-image" href="img/{name}" media-type="{media}" properties="cover-image"/>')
+        else:
+            item_id = "img-" + name.rpartition(".")[0]
+            manifest.append(f'<item id="{item_id}" href="img/{name}" media-type="{media}"/>')
+    creators, translators = [], []
+    for number, (name, filed) in enumerate(book.authors, 1):
+        creators.append(f'<dc:creator id="creator{number}">{_esc(name)}</dc:creator>'
+                        f'<meta refines="#creator{number}" property="file-as">{_esc(filed)}</meta>'
+                        f'<meta refines="#creator{number}" property="role" scheme="marc:relators">aut</meta>')
+    for number, (name, filed) in enumerate(book.translators, 1):
+        translators.append(f'<dc:contributor id="translator{number}">{_esc(name)}</dc:contributor>'
+                           f'<meta refines="#translator{number}" property="file-as">{_esc(filed)}</meta>'
+                           f'<meta refines="#translator{number}" property="role" scheme="marc:relators">trl</meta>')
+    meta = [f'<dc:identifier id="pub-id">{_esc(ident)}</dc:identifier>']
+    if book.isbn:
+        meta.append(f"<dc:identifier>urn:isbn:{_esc(book.isbn)}</dc:identifier>")
+    meta.append(f'<dc:title id="book-title">{_esc(book.title)}</dc:title>')
+    meta.append(f"<dc:language>{_esc(lang)}</dc:language>")
+    meta += creators + translators
+    meta += [f"<dc:subject>{_esc(genre_name(genre))}</dc:subject>" for genre in book.genres]
+    if book.publisher:
+        meta.append(f"<dc:publisher>{_esc(book.publisher)}</dc:publisher>")
+    if book.year:
+        meta.append(f"<dc:date>{_esc(book.year)}</dc:date>")
+    if book.annotation:
+        meta.append(f"<dc:description>{_esc(chr(10).join(book.annotation))}</dc:description>")
+    if book.series:
+        meta.append(f'<meta property="belongs-to-collection" id="c1">{_esc(book.series)}</meta>')
+        meta.append('<meta refines="#c1" property="collection-type">series</meta>')
+        meta.append(f'<meta name="calibre:series" content="{_esc(book.series)}"/>')
+        if book.series_no:
+            meta.append(f'<meta refines="#c1" property="group-position">{_esc(book.series_no)}</meta>')
+            meta.append(f'<meta name="calibre:series_index" content="{_esc(book.series_no)}"/>')
+    meta.append(f'<meta property="dcterms:modified">{modified}</meta>')
+    if book.cover_name:
+        meta.append('<meta name="cover" content="cover-image"/>')
+    opf = ('<?xml version="1.0" encoding="utf-8"?>\n'
+           f'<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="pub-id" xml:lang="{_esc(lang)}">'
+           '<metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/">'
+           + "".join(meta) + "</metadata><manifest>" + "".join(manifest) + "</manifest>"
+           '<spine toc="ncx">' + "".join(spine) + "</spine></package>\n")
+    files: list[tuple[str, bytes]] = [("META-INF/container.xml", EPUB_CONTAINER.encode("utf-8")),
+                                      ("OEBPS/content.opf", opf.encode("utf-8")),
+                                      ("OEBPS/nav.xhtml", nav_page.encode("utf-8")),
+                                      ("OEBPS/toc.ncx", ncx.encode("utf-8")),
+                                      ("OEBPS/css/book.css", EPUB_CSS.encode("utf-8"))]
+    files += [(f"OEBPS/{path}", xhtml.encode("utf-8")) for path, _item, xhtml in pages]
+    files += [(f"OEBPS/img/{name}", payload) for name, payload in book.image_data]
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("mimetype", b"application/epub+zip", compress_type=zipfile.ZIP_STORED)
+        for name, payload in files:
+            archive.writestr(name, payload)
+
+
+def fb2_own_epub(data: bytes, produced: Path) -> str | None:
+    """Собственный конвертер и его проверки: None — epub годен, иначе причина (откат на Calibre)."""
+    try:
+        fb2_to_epub3(data, produced)
+        return verify_book(produced, "epub") or epub_text_loss(data, produced)
+    except ValueError as error:
+        return f"fb2epub3: {error}"
+    except (OSError, KeyError, zipfile.BadZipFile, EOFError) as error:
+        return f"fb2epub3: {type(error).__name__}: {error}"
+
+
+def calibre_fb2_problem(data: bytes, staged: Path, produced: Path, tmp: Path, timeout: int) -> str | None:
+    """Calibre (ebook-convert) для fb2 и проверка результата; None — epub годен, иначе причина."""
+    if not shutil.which("ebook-convert"):
+        return "ebook-convert: не найден (Calibre)"
+    try:
+        done = subprocess.run(["ebook-convert", str(staged), str(produced)], capture_output=True, env=calibre_env(tmp),
+                              cwd=tmp, timeout=timeout, check=False, stdin=subprocess.DEVNULL)
+        if done.returncode != 0 and b"SplitError" in done.stderr:  # одна огромная глава: без нарезки на файлы
+            done = subprocess.run(["ebook-convert", str(staged), str(produced), "--flow-size", "0"],
+                                  capture_output=True, env=calibre_env(tmp), cwd=tmp, timeout=timeout,
+                                  check=False, stdin=subprocess.DEVNULL)
+        problem = None if done.returncode == 0 and produced.is_file() else \
+            f"ebook-convert: {done.stderr.decode('utf-8', errors='replace')[-300:] or done.returncode}"
+    except subprocess.TimeoutExpired:
+        return f"ebook-convert: тайм-аут {timeout} с"
+    try:
+        return problem or verify_book(produced, "epub") or epub_text_loss(data, produced)
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile, EOFError) as error:
+        return f"проверка epub: {type(error).__name__}: {error}"
+
+
+# ----------------------------------------------------------------------
 # convert fb2 → epub (Calibre), в т. ч. fb2 внутри однокнижного zip
 # ----------------------------------------------------------------------
 
@@ -2350,9 +3235,8 @@ def convert_fb2(cfg: dict[str, Any], dry_run: bool = False, path: str | None = N
                 out: Callable[[str], None] = print) -> dict[str, Any]:
     """fb2 и однокнижный zip с fb2 → name.epub рядом (имя как у fb2), проверка verify_book, исходник — в карантин
     replaced/. Рядом уже есть epub с тем же нормализованным именем — исходник сразу в replaced/ без конвертации.
-    Сбой Calibre или проверки — исходник в rejected-convert/."""
-    if not dry_run and not shutil.which("ebook-convert"):
-        raise ConfigError("не найден ebook-convert (Calibre)")
+    Сначала собственный конвертер fb2_to_epub3; при его ошибке или провале проверок — Calibre. Поле engine в журнале:
+    fb2epub3 или calibre. Сбой обоих или проверки — исходник в rejected-convert/."""
     run = NightRun(cfg, "convert-fb2", dry_run, path, out)
     timeout = cfg["convert_timeout"]
 
@@ -2400,19 +3284,14 @@ def convert_fb2(cfg: dict[str, Any], dry_run: bool = False, path: str | None = N
                 data = src.read_bytes()
             data = ensure_fb2_namespace(data)
             staged.write_bytes(data)
-            try:
-                done = subprocess.run(["ebook-convert", str(staged), str(produced)], capture_output=True, env=calibre_env(tmp),
-                                      cwd=tmp, timeout=timeout, check=False, stdin=subprocess.DEVNULL)
-                problem = None if done.returncode == 0 and produced.is_file() else \
-                    f"ebook-convert: {done.stderr.decode('utf-8', errors='replace')[-300:] or done.returncode}"
-            except subprocess.TimeoutExpired:
-                problem = f"ebook-convert: тайм-аут {timeout} с"
-            try:
-                problem = problem or verify_book(produced, "epub") or epub_text_loss(data, produced)
-            except (OSError, ValueError, KeyError, zipfile.BadZipFile, EOFError) as error:
-                problem = f"проверка epub: {type(error).__name__}: {error}"
+            engine = "fb2epub3"
+            problem = fb2_own_epub(data, produced)
             if problem:
-                run.quarantine(src, "rejected-convert", reason=problem)
+                produced.unlink(missing_ok=True)
+                engine = "calibre"
+                problem = calibre_fb2_problem(data, staged, produced, tmp, timeout)
+            if problem:
+                run.quarantine(src, "rejected-convert", reason=problem, engine=engine)
                 return
             fd, tmp_out = tempfile.mkstemp(prefix=".convert.", suffix=".tmp", dir=src.parent)
             os.close(fd)
@@ -2424,11 +3303,293 @@ def convert_fb2(cfg: dict[str, Any], dry_run: bool = False, path: str | None = N
                 os.replace(tmp_out, result)
             finally:
                 Path(tmp_out).unlink(missing_ok=True)
-        run.quarantine(src, "replaced", reason="заменён проверенным epub", keeper=str(result))
+        run.quarantine(src, "replaced", reason="заменён проверенным epub", keeper=str(result), engine=engine)
         run.moved(src, result)
 
     errors: list[str] = []
     parallel(tasks(), one, workers or cfg["workers"], run)
+    return run.finish({"walk_errors": errors[:200]})
+
+
+# ----------------------------------------------------------------------
+# reconvert-fb2: epub, которые ночью собрал Calibre из fb2, пересобираются собственным конвертером
+# ----------------------------------------------------------------------
+
+# Окно даты calibre:timestamp (локальная дата): ночные прогоны 16–18 ноября 2026 года.
+RECONVERT_FROM = date(2026, 11, 16)
+RECONVERT_TO = date(2026, 11, 18)
+# Новый epub не должен терять больше 2 % слов относительно calibre-epub.
+RECONVERT_WORDS_RATIO = 0.98
+# Для сопоставления с fb2 читается только описание: первые 64 КБ файла.
+FB2_SOURCE_HEAD = 64 * 1024
+SOURCE_LIMIT = 256 * 1024 * 1024
+
+
+def epub_opf_facts(epub: Path) -> dict[str, Any]:
+    """Признаки из OPF epub (читается только он): метка calibre в dc:contributor opf:role="bkp", дата
+    calibre:timestamp, название и первый автор."""
+    with zipfile.ZipFile(epub) as archive:
+        opf = Epub(archive).opf
+    calibre = any(re.search(r'\bopf:role\s*=\s*"bkp"', attrs) and strip_tags(body).startswith("calibre")
+                  for attrs, body in re.findall(r"<dc:contributor\b([^>]*)>(.*?)</dc:contributor>", opf, re.S))
+    stamp = None
+    for tag in re.findall(r"<(?:\w+:)?meta\b([^>]*)>", opf):
+        attrs = parse_attrs(tag)
+        if attrs.get("name") == "calibre:timestamp":
+            try:
+                stamp = datetime.fromisoformat(attrs.get("content", "")).astimezone().date()
+            except ValueError:
+                stamp = None
+    return {"calibre": calibre, "date": stamp, "title": xml_tag("title", opf), "creator": xml_tag("creator", opf)}
+
+
+def fb2_source_head(path: Path) -> bytes:
+    """Начало fb2 — из файла или из единственной записи однокнижного zip."""
+    if path.name.lower().endswith(".zip"):
+        with zipfile.ZipFile(path) as archive:
+            info = single_member(archive)
+            if info is None or member_ext(info) != "fb2":
+                raise ValueError("zip без единственного fb2")
+            with archive.open(info) as handle:
+                return handle.read(FB2_SOURCE_HEAD)
+    with path.open("rb") as handle:
+        return handle.read(FB2_SOURCE_HEAD)
+
+
+def fb2_match_key(head: bytes) -> tuple[str, str] | None:
+    """Ключ книги из описания fb2: (norm_key названия, norm_key фамилии первого автора) или None."""
+    text = decode_xml(head)
+    info = re.search(r"<(?:\w+:)?title-info\b.*", text, re.S)
+    if info is None:
+        return None
+    title = norm_key(xml_tag("book-title", info.group(0)))
+    first = re.search(r"<(?:\w+:)?author\b[^>]*>(.*?)</(?:\w+:)?author>", info.group(0), re.S)
+    if first is None or not title:
+        return None
+    surname = norm_key(xml_tag("last-name", first.group(1)) or xml_tag("nickname", first.group(1)))
+    return (title, surname) if surname else None
+
+
+def fb2_source_index(folder: Path, titles: set[str], workers: int, errors: list[str]) -> dict[str, list[tuple[str, str, Path]]]:
+    """Индекс fb2 карантина replaced/ по названию: [(фамилия, стем имени файла, путь)]. Читается только описание."""
+    index: dict[str, list[tuple[str, str, Path]]] = {}
+    lock = threading.Lock()
+
+    def one(item: tuple[Path, int]) -> None:
+        path = item[0]
+        try:
+            key = fb2_match_key(fb2_source_head(path))
+        except (OSError, ValueError, KeyError, zipfile.BadZipFile, EOFError) as error:
+            errors.append(f"{path}: {type(error).__name__}: {error}")
+            return
+        if key is None or key[0] not in titles:
+            return
+        with lock:
+            index.setdefault(key[0], []).append((key[1], split_name(path.name)[0], path))
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(one, walk_files(folder, (".fb2", ".fb2.zip"), errors)))
+    return index
+
+
+def _strip_number(stem: str) -> str:
+    """Стем без суффикса _N, который дают имена копий (name_1.epub)."""
+    return re.sub(r"_\d+$", "", stem)
+
+
+def reconvert_match(title: str, creator: str, stem: str,
+                    index: dict[str, list[tuple[str, str, Path]]]) -> tuple[Path | None, str]:
+    """Один fb2 для calibre-epub: по названию и фамилии; при нескольких — тот, чей стем совпадает. (путь, '') или (None, причина)."""
+    names = f" {creator} "
+    pool = [entry for entry in index.get(title, []) if f" {entry[0]} " in names]
+    if not pool:
+        return None, "нет fb2 с таким названием и автором"
+    if len(pool) == 1:
+        return pool[0][2], ""
+    want = norm_key(_strip_number(stem))
+    exact = [path for _surname, fb_stem, path in pool if norm_key(_strip_number(fb_stem)) == want]
+    if len(exact) == 1:
+        return exact[0], ""
+    return None, f"неоднозначно: {len(pool)} кандидатов"
+
+
+def source_bytes(path: Path) -> bytes:
+    """Полный fb2 (или единственная запись однокнижного zip) с пределом размера."""
+    return fb2_bytes(path, "fb2.zip" if path.name.lower().endswith(".zip") else "fb2", SOURCE_LIMIT)
+
+
+def epubcheck_problem(path: Path) -> str | None:
+    """Выборочная проверка epubcheck (опция --epubcheck): None — ошибок ERROR/FATAL нет, иначе причина."""
+    tool = shutil.which("epubcheck")
+    if tool is None:
+        raise ConfigError("epubcheck не найден")
+    done = subprocess.run([tool, str(path)], capture_output=True, text=True, timeout=600, check=False,
+                          stdin=subprocess.DEVNULL)
+    lines = [line for line in (done.stdout + done.stderr).splitlines() if "ERROR(" in line or "FATAL(" in line]
+    if lines or done.returncode != 0:
+        return f"epubcheck: {lines[0] if lines else done.returncode}"
+    return None
+
+
+def reconvert_build(full: Path, source: Path, work: Path, check: bool) -> tuple[Path | None, str]:
+    """Собирает epub собственным конвертером во временный файл в work и проверяет его.
+    Возвращает (путь к готовому epub, '') или (None, причина): старый calibre-epub остаётся."""
+    produced = Path(_temp_name(work))
+    try:
+        data = ensure_fb2_namespace(source_bytes(source))
+        try:
+            fb2_to_epub3(data, produced)
+        except ValueError as error:
+            return _discard(produced, f"fb2epub3: {error}")
+        problem = verify_book(produced, "epub") or epub_text_loss(data, produced)
+        if problem is None:
+            new_words, old_words = epub_word_count(produced), epub_word_count(full)
+            if new_words < RECONVERT_WORDS_RATIO * old_words:
+                problem = f"слов {new_words} из {old_words} у calibre-epub"
+        if problem is None and check:
+            problem = epubcheck_problem(produced)
+        if problem is not None:
+            return _discard(produced, problem)
+        return produced, ""
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile, EOFError) as error:
+        return _discard(produced, f"проверка: {type(error).__name__}: {error}")
+
+
+def _temp_name(directory: Path) -> str:
+    fd, name = tempfile.mkstemp(prefix="reconvert-", suffix=".epub", dir=directory)
+    os.close(fd)
+    return name
+
+
+def _discard(produced: Path, reason: str) -> tuple[None, str]:
+    produced.unlink(missing_ok=True)
+    return None, reason
+
+
+def swap_epub(run: NightRun, full: Path, produced: Path) -> None:
+    """Атомарная замена: новый epub копируется рядом с книгой, старый уходит в replaced-calibre/, затем os.replace.
+    Путь книги не меняется, relink не нужен."""
+    staged = Path(_temp_name(full.parent))
+    try:
+        shutil.copyfile(produced, staged)
+        os.chmod(staged, 0o644)
+        old = run.quarantine(full, "replaced-calibre", reason="заменён epub собственного конвертера", engine="fb2epub3")
+        try:
+            os.replace(staged, full)
+        except OSError:
+            shutil.move(old, full)
+            raise
+    finally:
+        staged.unlink(missing_ok=True)
+
+
+def reconvert_sample_pick(matches: list[tuple[dict[str, Any], Path]], count: int) -> list[tuple[dict[str, Any], Path]]:
+    """Выборка для проверки глазами: сначала книги со сносками (type="note" в fb2), затем прочие."""
+    with_notes: list[tuple[dict[str, Any], Path]] = []
+    plain: list[tuple[dict[str, Any], Path]] = []
+    for item in matches[:3000]:
+        if len(with_notes) >= count:
+            break
+        raw = source_bytes(item[1])
+        (with_notes if b'type="note"' in raw or b"type='note'" in raw else plain).append(item)
+    return (with_notes + plain)[:count]
+
+
+def reconvert_fb2(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None, workers: int | None = None,
+                  limit: int = 0, sample: int = 0, out_dir: str | None = None, epubcheck: bool = False,
+                  out: Callable[[str], None] = print) -> dict[str, Any]:
+    """Пересобирает calibre-epub из fb2 собственным конвертером. Выбор: fmt='epub' в БД и calibre:timestamp в окне дат;
+    fb2 ищется в карантине replaced/. Ровно один кандидат — он; иначе — по стему имени; иначе unmatched.
+
+    dry-run — только сопоставление. --sample N --out DIR — N книг в DIR без замены в библиотеке.
+    Боевой запуск: сборка в text_cache_dir/reconvert, проверки, затем замена под общей блокировкой.
+    """
+    db_path = Path(cfg["db_path"])
+    if not db_path.is_file():
+        raise ConfigError(f"нет базы данных {db_path}")
+    if epubcheck and not shutil.which("epubcheck"):
+        raise ConfigError("epubcheck не найден: опция --epubcheck недоступна")
+    run = NightRun(cfg, "reconvert-fb2", dry_run, path, out)
+    try:
+        prefix = "" if run.target == run.root else run.target.relative_to(run.root).as_posix() + "/"
+    except ValueError as error:
+        raise ConfigError("reconvert-fb2: путь должен лежать внутри каталога книг") from error
+    with closing(connect(cfg["db_path"], readonly=True)) as conn:
+        rows = sorted(row[0] for row in conn.execute("SELECT path FROM books WHERE fmt = 'epub'") if row[0].startswith(prefix))
+    workers = workers or cfg["workers"]
+    candidates: list[dict[str, Any]] = []
+    lock = threading.Lock()
+
+    def scan(rel: str) -> None:
+        full = run.root / rel
+        facts = epub_opf_facts(full)
+        if not facts["calibre"]:
+            run.count("not-calibre")
+            return
+        stamp = facts["date"]
+        if stamp is None or not RECONVERT_FROM <= stamp <= RECONVERT_TO:
+            run.count("out-of-window")
+            return
+        with lock:
+            candidates.append({"rel": rel, "full": full, "title": norm_key(facts["title"]),
+                               "creator": norm_key(facts["creator"]), "stem": split_name(rel)[0]})
+
+    parallel(iter(rows), scan, workers, run)
+    errors: list[str] = []
+    index = fb2_source_index(run.qroot / "replaced", {c["title"] for c in candidates}, workers, errors) if candidates else {}
+    matches: list[tuple[dict[str, Any], Path]] = []
+    for cand in sorted(candidates, key=lambda c: c["rel"]):
+        source, reason = reconvert_match(cand["title"], cand["creator"], cand["stem"], index)
+        if source is None:
+            run.record("unmatched", cand["full"], reason=reason)
+            if reason.startswith("неоднозначно"):
+                run.count("ambiguous")
+            continue
+        run.record("matched", cand["full"], source=str(source))
+        matches.append((cand, source))
+    if limit:
+        matches = matches[:limit]
+    if dry_run:
+        return run.finish({"walk_errors": errors[:200]})
+    work = Path(cfg["text_cache_dir"]) / "reconvert" if cfg["text_cache_dir"] else None
+    if work is None:
+        raise ConfigError("reconvert-fb2 нужен text_cache_dir: сборка идёт на быстром диске")
+    work.mkdir(parents=True, exist_ok=True)
+    if sample:
+        if not out_dir:
+            raise ConfigError("--sample требует --out")
+        target = Path(out_dir).expanduser()
+        if target.resolve().is_relative_to(run.root.resolve()):
+            raise ConfigError("--out не должен лежать в каталоге книг: выборка не индексируется")
+        target.mkdir(parents=True, exist_ok=True)
+        chosen = reconvert_sample_pick(matches, sample)
+
+        def sample_one(item: tuple[dict[str, Any], Path]) -> None:
+            cand, source = item
+            produced, problem = reconvert_build(cand["full"], source, work, epubcheck)
+            if produced is None:
+                run.record("sample-rejected", cand["full"], reason=problem)
+                return
+            dest = unique_path(target, f"{cand['stem']}.epub", set())
+            shutil.move(produced, dest)
+            run.record("sample", cand["full"], to=str(dest), source=str(source), notes=b'type="note"' in source_bytes(source),
+                       old_size=cand["full"].stat().st_size, new_size=dest.stat().st_size)
+
+        parallel(iter(chosen), sample_one, workers, run)
+        return run.finish({"sample_dir": str(target), "walk_errors": errors[:200]})
+
+    def replace_one(item: tuple[dict[str, Any], Path]) -> None:
+        cand, source = item
+        produced, problem = reconvert_build(cand["full"], source, work, epubcheck)
+        if produced is None:
+            run.record("kept-calibre", cand["full"], reason=problem, source=str(source))
+            return
+        try:
+            swap_epub(run, cand["full"], produced)
+        finally:
+            produced.unlink(missing_ok=True)
+
+    parallel(iter(matches), replace_one, workers, run)
     return run.finish({"walk_errors": errors[:200]})
 
 
@@ -2471,6 +3632,104 @@ def book_text(cfg: dict[str, Any], full: Path, fmt: str, tmp: Path) -> str:
     return ""
 
 
+# Кэш текста для dedup: восстановимые данные в text_cache_dir (по умолчанию /var/cache/books_library). Хэши шинглов
+# зависят от PYTHONHASHSEED и не кэшируются: кэшируется только извлечённый текст.
+TEXT_CACHE_NAME = "text_cache.db"
+TEXT_CACHE_MTIME_TOLERANCE = 1e-3
+
+
+class TextCache:
+    """Текст книги по ключу: путь относительно books_dir, размер, mtime и формат. Если файл переименован или перенесён
+    без изменения содержимого, запись находится по размеру, mtime и формату и получает новый путь. Ошибки SQLite не
+    останавливают dedup: промах кэша — обычная работа. Соединение общее для потоков, все обращения — под замком."""
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self.conn = conn
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def open(cfg: dict[str, Any]) -> TextCache | None:
+        """None — кэш выключен (каталог не задан, text_cache_mb = 0, каталога нет или он не доступен для записи)."""
+        directory = cfg["text_cache_dir"]
+        if not directory or cfg["text_cache_mb"] == 0:
+            return None
+        path = Path(directory)
+        # Каталог создаёт администратор (права 0700): движок его не создаёт.
+        if not path.is_dir() or not os.access(path, os.W_OK):
+            say(f"кэш текста выключен: {path} не существует или нет прав на запись", "text_cache_off", logging.WARNING)
+            return None
+        try:
+            # isolation_level=None: каждая команда — отдельная транзакция, явные BEGIN/COMMIT не нужны.
+            conn = sqlite3.connect(path / TEXT_CACHE_NAME, timeout=10, isolation_level=None, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("CREATE TABLE IF NOT EXISTS texts (path TEXT PRIMARY KEY, size INTEGER NOT NULL, "
+                         "mtime REAL NOT NULL, fmt TEXT NOT NULL, data BLOB NOT NULL, used REAL NOT NULL)")
+            conn.execute("CREATE INDEX IF NOT EXISTS texts_size_mtime_fmt ON texts (size, mtime, fmt)")
+        except sqlite3.Error as error:
+            say(f"кэш текста выключен: {path}: {error}", "text_cache_off", logging.WARNING)
+            return None
+        return TextCache(conn)
+
+    def get(self, rel: str, size: int, mtime: float, fmt: str) -> str | None:
+        """Текст из кэша или None. Запись без совпадения по пути берётся, только если её единственная по размеру,
+        mtime и формату (два кандидата — промах: не угадываем, какой файл был переименован)."""
+        window = (mtime - TEXT_CACHE_MTIME_TOLERANCE, mtime + TEXT_CACHE_MTIME_TOLERANCE)
+        try:
+            with self.lock:
+                row = self.conn.execute(
+                    "SELECT rowid, data FROM texts WHERE path = ? AND size = ? AND mtime BETWEEN ? AND ? AND fmt = ?",
+                    (rel, size, *window, fmt)).fetchone()
+                if row is None:
+                    found = self.conn.execute(
+                        "SELECT rowid, data FROM texts WHERE size = ? AND mtime BETWEEN ? AND ? AND fmt = ?",
+                        (size, *window, fmt)).fetchall()
+                    if len(found) != 1:
+                        return None
+                    row = found[0]
+                try:
+                    text = zlib.decompress(row[1]).decode("utf-8")
+                except (zlib.error, UnicodeDecodeError):
+                    self.conn.execute("DELETE FROM texts WHERE rowid = ?", (row[0],))
+                    return None
+                self.conn.execute("UPDATE OR REPLACE texts SET path = ?, used = ? WHERE rowid = ?", (rel, time.time(), row[0]))
+                return text
+        except sqlite3.Error as error:
+            say(f"кэш текста: чтение не удалось: {error}", "text_cache_error", logging.WARNING)
+            return None
+
+    def put(self, rel: str, size: int, mtime: float, fmt: str, text: str) -> None:
+        """Сохраняет текст, в том числе пустой: «текста нет» у скана — дорогой результат, который тоже нужно помнить."""
+        data = zlib.compress(text.encode("utf-8", errors="replace"), 1)
+        try:
+            with self.lock:
+                self.conn.execute("INSERT OR REPLACE INTO texts (path, size, mtime, fmt, data, used) VALUES (?, ?, ?, ?, ?, ?)",
+                                  (rel, size, mtime, fmt, data, time.time()))
+        except sqlite3.Error as error:
+            say(f"кэш текста: запись не удалась: {error}", "text_cache_error", logging.WARNING)
+
+    def prune(self, limit_mb: int) -> None:
+        """Сверх предела удаляет самые давно использованные записи. VACUUM не делается: освобождённые страницы
+        переиспользуются самой базой; WAL усекается чекпоинтом."""
+        limit = limit_mb * 1024 * 1024
+        try:
+            with self.lock:
+                total = self.conn.execute("SELECT COALESCE(SUM(length(data)), 0) FROM texts").fetchone()[0]
+                if total > limit:
+                    for rowid, size in self.conn.execute(
+                            "SELECT rowid, length(data) FROM texts ORDER BY used, rowid").fetchall():
+                        if total <= limit:
+                            break
+                        self.conn.execute("DELETE FROM texts WHERE rowid = ?", (rowid,))
+                        total -= size
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error as error:
+            say(f"кэш текста: очистка не удалась: {error}", "text_cache_error", logging.WARNING)
+
+    def close(self) -> None:
+        with self.lock:
+            self.conn.close()
+
+
 def shingles(text: str) -> tuple[int, set[int], bool]:
     """Число слов и хэши шинглов по 5 слов. У длинных текстов — выборка хэшей с остатком 0 по модулю 4: фильтр один
     для всех файлов, поэтому доля «шинглы младшего в старшем» оценивается без смещения, а памяти вчетверо меньше."""
@@ -2480,6 +3739,45 @@ def shingles(text: str) -> tuple[int, set[int], bool]:
     if sampled:
         hashes = {h for h in hashes if h % 4 == 0}
     return len(words), hashes, sampled
+
+
+def is_author_folder(folder: str, authors: list[str]) -> bool:
+    """Папка верхнего уровня — папка одного из авторов книги: ключи равны или одно ФИО ⊆/⊇ другому (≥ 2 общих слова)."""
+    folder_key = author_key(folder)
+    if folder_key is None:
+        return False
+    for author in authors:
+        key = author_key(author)
+        if key is not None and (folder_key == key or (len(folder_key & key) >= 2 and (folder_key <= key or folder_key >= key))):
+            return True
+    return False
+
+
+def coauthor_copy(first: dict[str, Any], second: dict[str, Any]) -> bool:
+    """Копии одной книги в папках разных авторов книги (книга нескольких авторов) — соавторские, а не дубли:
+    у каждой копии папка верхнего уровня — папка одного из авторов из метаданных. Внутри одной папки — не соавторские."""
+    top_first, top_second = first["path"].split("/", 1)[0], second["path"].split("/", 1)[0]
+    authors = list(first["authors"]) + list(second["authors"])
+    return (top_first != top_second and is_author_folder(top_first, authors) and is_author_folder(top_second, authors))
+
+
+def known_books(cfg: dict[str, Any]) -> dict[str, sqlite3.Row]:
+    """Строки библиотеки по пути для dedup и dedup-folders: метаданные не разбираются заново, если файл не менялся."""
+    known: dict[str, sqlite3.Row] = {}
+    if Path(cfg["db_path"]).is_file():
+        with closing(connect(cfg["db_path"], readonly=True)) as conn:
+            if conn.execute("PRAGMA user_version").fetchone()[0] >= 1:
+                known = {r["path"]: r for r in conn.execute("SELECT path, size, mtime, fmt, title, authors FROM books")}
+    return known
+
+
+def item_meta(root: Path, known: dict[str, sqlite3.Row], item: tuple[str, int, float]) -> dict[str, Any]:
+    """Метаданные файла для сравнения: из библиотеки, если размер и mtime совпадают, иначе — разбор файла."""
+    rel, size, mtime = item
+    row = known.get(rel)
+    if row and row["size"] == size and row["mtime"] == mtime and row["fmt"] != "fb2.zip":
+        return {"fmt": row["fmt"], "title": row["title"], "authors": [a for a in row["authors"].split("; ") if a]}
+    return read_book_meta(root, rel)
 
 
 def dedup(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None, workers: int | None = None,
@@ -2493,25 +3791,14 @@ def dedup(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None, w
     if not run.target.resolve().is_relative_to(root.resolve()):
         raise ConfigError("dedup: --path должен быть внутри каталога книг")
     errors: list[str] = []
-    known: dict[str, sqlite3.Row] = {}
-    if Path(cfg["db_path"]).is_file():
-        with closing(connect(cfg["db_path"], readonly=True)) as conn:
-            if conn.execute("PRAGMA user_version").fetchone()[0] >= 1:
-                known = {r["path"]: r for r in conn.execute("SELECT path, size, mtime, fmt, title, authors FROM books")}
+    known = known_books(cfg)
     files = [(rel, size, mtime) for rel, size, mtime in iter_book_files(run.target, errors)]
     prefix = run.rel(run.target)
     prefix = "" if prefix in ("", ".") else prefix + "/"
     files = [(prefix + rel, size, mtime) for rel, size, mtime in files]
 
-    def meta_of(item: tuple[str, int, float]) -> dict[str, Any]:
-        rel, size, mtime = item
-        row = known.get(rel)
-        if row and row["size"] == size and row["mtime"] == mtime and row["fmt"] != "fb2.zip":
-            return {"fmt": row["fmt"], "title": row["title"], "authors": [a for a in row["authors"].split("; ") if a]}
-        return read_book_meta(root, rel)
-
     with ThreadPoolExecutor(max_workers=workers or cfg["workers"]) as pool:
-        metas = list(pool.map(meta_of, files, chunksize=64))
+        metas = list(pool.map(lambda item: item_meta(root, known, item), files, chunksize=64))
     say(f"dedup: метаданные {len(files)} файлов собраны", "progress")
     parent = list(range(len(files)))
 
@@ -2525,7 +3812,8 @@ def dedup(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None, w
     for index, ((rel, _size, _mtime), meta) in enumerate(zip(files, metas, strict=True)):
         if meta["fmt"] == "zip":
             continue  # многофайловый архив — не книга для сравнения
-        keys = [f"n:{PurePosixPath(rel).parent}/{norm_key(split_name(rel)[0])}"]
+        # суффикс _1, _2… от unique_path (конфликт имён при переносе) не мешает найти кандидата; решает сравнение текста
+        keys = [f"n:{PurePosixPath(rel).parent}/{norm_key(re.sub(r'_\d+$', '', split_name(rel)[0]))}"]
         title = norm_key(meta.get("title", ""))
         authors = " ".join(sorted(norm_key(" ".join(meta.get("authors", []))).split()))
         if authors and re.search(r"[^\W\d_]", title):
@@ -2542,6 +3830,8 @@ def dedup(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None, w
     candidates = [g for g in groups.values() if len(g) > 1]
     say(f"dedup: групп-кандидатов {len(candidates)}", "progress")
     results: list[dict[str, Any]] = []
+    # Кэш открывается один раз на прогон и не меняет библиотеку, поэтому работает и в dry-run.
+    cache = TextCache.open(cfg)
 
     def one(group: list[int]) -> None:
         if len(group) > DEDUP_GROUP_MAX:
@@ -2550,15 +3840,32 @@ def dedup(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None, w
         members = []
         with tempfile.TemporaryDirectory(prefix="books_library-dedup-") as tmp_name:
             for index in group:
-                rel, size, _mtime = files[index]
+                rel, size, mtime = files[index]
                 fmt = metas[index]["fmt"]
                 try:
-                    words, shingle_set, sampled = shingles(book_text(cfg, root / rel, fmt, Path(tmp_name)))
+                    text = cache.get(rel, size, mtime, fmt) if cache is not None else None
+                    if text is None:
+                        text = book_text(cfg, root / rel, fmt, Path(tmp_name))
+                        if cache is not None:
+                            cache.put(rel, size, mtime, fmt, text)
+                            run.count("text_cache_miss")
+                    else:
+                        run.count("text_cache_hit")
+                    words, shingle_set, sampled = shingles(text)
                 except (OSError, ValueError, KeyError, zipfile.BadZipFile, EOFError, subprocess.TimeoutExpired) as error:
                     words, shingle_set, sampled = 0, set(), False
                     run.record("no-text", rel, reason=f"{type(error).__name__}: {error}")
-                members.append({"path": rel, "fmt": fmt, "size": size, "words": words, "sh": shingle_set, "sampled": sampled})
+                members.append({"path": rel, "fmt": fmt, "size": size, "words": words, "sh": shingle_set, "sampled": sampled,
+                                "authors": metas[index]["authors"]})
         members.sort(key=lambda m: (FORMAT_RANK.get(m["fmt"], 5), -m["words"], -m["size"]))
+        # копии одной книги в папках её соавторов — не дубли: в группу не входят (счётчик coauthor-copy)
+        unique_members: list[dict[str, Any]] = []
+        for member in members:
+            if any(coauthor_copy(member, other) for other in unique_members):
+                run.count("coauthor-copy")
+                continue
+            unique_members.append(member)
+        members = unique_members
         kept: list[dict[str, Any]] = []
         for member in members:
             best, keeper = 0.0, None
@@ -2588,12 +3895,21 @@ def dedup(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None, w
         with run.lock:
             results.append({"key": min(files[i][0] for i in group), "status": status, "members": members})
 
-    parallel(iter(candidates), one, workers or cfg["workers"], run)
+    try:
+        parallel(iter(candidates), one, workers or cfg["workers"], run)
+    finally:
+        if cache is not None:
+            cache.prune(cfg["text_cache_mb"])
+            cache.close()
+            say(f"dedup: кэш текста: попаданий {run.stats.get('text_cache_hit', 0)}, "
+                f"промахов {run.stats.get('text_cache_miss', 0)}", "progress")
     if not dry_run and results:
         migrate_database(cfg["db_path"], out=out)
         with closing(connect(cfg["db_path"])) as conn, conn:
             resolved = {r[0] for r in conn.execute("SELECT key FROM dup_groups WHERE status='resolved'")}
-            conn.execute("DELETE FROM dup_groups WHERE status <> 'resolved'")
+            # заменяются только «похожие»: «удалены автоматически» — история прошлых прогонов (кнопка «Восстановить»)
+            # группы dedup-folders (key folder:…) заменяет только свой режим; обычный dedup их не удаляет
+            conn.execute("DELETE FROM dup_groups WHERE status = 'similar' AND key NOT LIKE 'folder:%'")
             for group in results:
                 if group["status"] == "similar" and group["key"] in resolved:
                     continue
@@ -2604,7 +3920,253 @@ def dedup(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None, w
                                    m["quarantine"]) for m in group["members"]])
     run.stats["groups"] = len(results)
     run.stats["similar_groups"] = sum(g["status"] == "similar" for g in results)
-    return run.finish({"walk_errors": errors[:200], "groups": results})
+    result = run.finish({"walk_errors": errors[:200], "groups": results})
+    # После finish: relink уже перенёс пути дублей на оставленные книги; пересборка приводит таблицу к итоговому виду.
+    if not dry_run and Path(cfg["db_path"]).is_file():
+        with closing(connect(cfg["db_path"])) as conn, conn:
+            if conn.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_COLLECTIONS:
+                report_collections(rebuild_collections(conn), out)
+    return result
+
+
+# ----------------------------------------------------------------------
+# dedup-folders: дубли внутри папки автора (папка верхнего уровня «Фамилия Имя Отчество»), каждая папка независимо.
+# Правила: дубль — книга, почти полностью (≥ 97 % шинглов) уже есть у оставленной, с ≥ 200 словами; похожая — 85–97 %.
+
+
+def free_name(directory: Path, name: str, leaving: set[Path], taken: set[Path]) -> Path:
+    """Свободное имя рядом: name, затем name_1… . Файл, уходящий в карантин (leaving), занятым не считается: в dry-run
+    дубль ещё на месте, и план совпадает с боевым запуском. taken — имена, уже запланированные в этом прогоне."""
+    stem, dot, ext = name.rpartition(".")
+    base, suffix = (stem, dot + ext) if stem else (name, "")
+    candidate, number = directory / name, 1
+    while (candidate.exists() and candidate not in leaving) or candidate in taken:
+        candidate = directory / f"{base}_{number}{suffix}"
+        number += 1
+    taken.add(candidate)
+    return candidate
+
+
+def group_member(item: dict[str, Any], role: str, keeper: str = "", quarantine: str = "",
+                 coverage: float | None = None) -> dict[str, Any]:
+    """Участник группы для dup_members; путь — итоговый (после переименования оставленного файла)."""
+    return {"path": item["final"], "fmt": item["fmt"], "size": item["size"], "words": item["words"],
+            "coverage": coverage, "role": role, "keeper": keeper, "quarantine": quarantine}
+
+
+def text_item(cfg: dict[str, Any], root: Path, cache: TextCache | None, known: dict[str, sqlite3.Row], run: NightRun,
+              item: tuple[str, int, float]) -> dict[str, Any] | None:
+    """Текст и шинглы одного файла папки (вызывается параллельно). Многофайловый zip — None: это не книга."""
+    rel, size, mtime = item
+    fmt = split_name(rel)[1]
+    words, shingle_set, reason = 0, set(), ""
+    try:
+        fmt = item_meta(root, known, item)["fmt"]
+        if fmt == "zip":
+            return None
+        text = cache.get(rel, size, mtime, fmt) if cache is not None else None
+        if text is None:
+            with tempfile.TemporaryDirectory(prefix="books_library-dedup-folders-") as tmp_name:
+                text = book_text(cfg, root / rel, fmt, Path(tmp_name))
+            if cache is not None:
+                cache.put(rel, size, mtime, fmt, text)
+                run.count("text_cache_miss")
+        else:
+            run.count("text_cache_hit")
+        words, hashes, _sampled = shingles(text)
+        shingle_set = {h for h in hashes if h % FOLDER_SAMPLE == 0}
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile, EOFError, subprocess.TimeoutExpired) as error:
+        reason = f"{type(error).__name__}: {error}"
+    except Exception as error:  # noqa: BLE001 — правило: режим не останавливается из-за одного файла
+        run.record("failed", rel, reason=f"{type(error).__name__}: {error}")
+    run.tick()
+    return {"path": rel, "fmt": fmt, "size": size, "words": words, "s": shingle_set, "reason": reason,
+            "role": "kept", "coverage": None, "keeper": "", "quarantine": ""}
+
+
+def mark_roles(texts: list[dict[str, Any]]) -> None:
+    """Жадный проход по значимости (формат → кириллическое имя → больше слов → путь). Книга — дубль, если ≥ 97 % её
+    шинглов уже есть у оставленных и похожих и в ней ≥ 200 слов; похожая — от 85 % до 97 %; иначе оставлена. Без текста
+    оставлена и в сравнении не участвует. У дубля и похожего keeper — оставленный с наибольшей долей общих шинглов."""
+    texts.sort(key=lambda t: (FORMAT_RANK.get(t["fmt"], 5), not CYRILLIC.search(split_name(t["path"])[0]),
+                              -t["words"], t["path"]))
+    union: set[int] = set()
+    kept: list[dict[str, Any]] = []
+    for item in texts:
+        s = item["s"]
+        if not s:
+            kept.append(item)
+            continue
+        cov = len(s & union) / len(s)
+        item["coverage"] = round(cov, 4)
+        if cov >= DEDUP_COVERAGE and item["words"] >= DEDUP_MIN_WORDS:
+            role = "duplicate"
+        elif DEDUP_SIMILAR <= cov < DEDUP_COVERAGE:
+            role = "similar"
+        else:
+            role = "kept"
+        # пересечения считаются только для дубля и похожего: для оставленных это квадратичная работа по папке
+        scored = [(len(s & k["s"]), k) for k in kept if k["s"]] if role != "kept" else []
+        if not scored:
+            kept.append(item)
+            union |= s
+            continue
+        item.update(role=role, keeper=max(scored, key=lambda pair: pair[0])[1]["path"])
+        if role == "similar":
+            union |= s
+
+
+def keeper_renames(texts: list[dict[str, Any]]) -> dict[str, str]:
+    """Оставленный файл с транслитным именем получает кириллическое имя своего дубля (у которого больше всего слов):
+    stem дубля + расширение оставленного, вместе с .zip однокнижного архива. Возвращает: старый путь → новое имя."""
+    renames: dict[str, str] = {}
+    for keeper in texts:
+        if keeper["role"] != "kept" or CYRILLIC.search(split_name(keeper["path"])[0]):
+            continue
+        copies = [t for t in texts if t["role"] == "duplicate" and t["keeper"] == keeper["path"]
+                  and CYRILLIC.search(split_name(t["path"])[0])]
+        if not copies:
+            continue
+        best = min(copies, key=lambda t: (-t["words"], t["path"]))
+        name = PurePosixPath(keeper["path"]).name
+        stem = split_name(keeper["path"])[0]
+        new_name = split_name(best["path"])[0] + name[len(stem):]
+        if name_ok(new_name):
+            renames[keeper["path"]] = new_name
+    return renames
+
+
+def dedup_folder(run: NightRun, folder_rel: str, texts: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
+    """Решения по одной папке автора: дубли — в карантин, оставленный с транслитным именем — переименовывается.
+    Возвращает группы для dup_groups и пары переноса путей (старый → новый) для relink."""
+    mark_roles(texts)
+    for item in texts:
+        if not item["s"]:
+            run.record("no-text", item["path"], reason=item["reason"] or "текста нет")
+        elif item["role"] == "similar":
+            run.record("similar", item["path"], keeper=item["keeper"], coverage=item["coverage"])
+    for item in texts:
+        if item["role"] != "duplicate":
+            continue
+        try:
+            dest = run.quarantine(run.root / item["path"], "duplicate", keeper=item["keeper"], coverage=item["coverage"])
+        except OSError as error:
+            run.record("failed", item["path"], reason=f"карантин: {error}")
+            item["role"] = "kept"  # файл остался на месте: его связи и группа не меняются
+            continue
+        item["quarantine"] = str(dest)
+    leaving = {run.root / t["path"] for t in texts if t["role"] == "duplicate"}
+    taken: set[Path] = set()
+    moves: dict[str, str] = {}
+    for old, new_name in keeper_renames(texts).items():
+        full = run.root / old
+        target = free_name(full.parent, new_name, leaving, taken)
+        try:
+            if not run.dry_run:
+                os.rename(full, target)
+        except OSError as error:
+            run.record("failed", old, reason=f"переименование: {error}")
+            continue
+        run.record("renamed", old, to=str(target))
+        moves[old] = run.rel(target)
+    for item in texts:
+        item["final"] = moves.get(item["path"], item["path"])
+        item["keeper_final"] = moves.get(item["keeper"], item["keeper"])
+    pairs = [(item["path"], item["keeper_final"]) for item in texts if item["role"] == "duplicate"]
+    pairs += list(moves.items())
+    groups: list[dict[str, Any]] = []
+    if any(t["role"] == "duplicate" for t in texts):
+        members = []
+        for t in texts:
+            if t["role"] == "duplicate":
+                members.append(group_member(t, "duplicate", t["keeper_final"], t["quarantine"], t["coverage"]))
+            elif t["role"] == "kept":
+                members.append(group_member(t, "kept"))
+        groups.append({"key": f"folder:{folder_rel}", "status": "auto", "members": members})
+    by_path = {t["path"]: t for t in texts if t["role"] == "kept"}
+    for t in texts:
+        if t["role"] == "similar":
+            groups.append({"key": f"folder:{t['path']}", "status": "similar",
+                           "members": [group_member(t, "kept", coverage=t["coverage"]),
+                                       group_member(by_path[t["keeper"]], "kept")]})
+    return groups, pairs
+
+
+def dedup_folders(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None, workers: int | None = None,
+                  out: Callable[[str], None] = print) -> dict[str, Any]:
+    """Дубли внутри каждой папки автора: папки верхнего уровня книг независимо, «_…» и «.…» пропускаются; с --path —
+    только указанная папка. Правила — в mark_roles и dedup_folder. Дубли уходят в карантин duplicate/, связи переносятся
+    на оставленную книгу. Группы — в dup_groups: auto по папке с дублями, similar по каждой похожей книге. Папка больше
+    DEDUP_FOLDER_MAX книг пропускается. Группы обычного dedup не трогаются."""
+    run = NightRun(cfg, "dedup-folders", dry_run, path, out)
+    root = run.root
+    if not run.target.resolve().is_relative_to(root.resolve()):
+        raise ConfigError("dedup-folders: --path должен быть внутри каталога книг")
+    if run.target.resolve() == root.resolve():
+        with os.scandir(root) as entries:
+            names = sorted(e.name for e in entries if e.is_dir(follow_symlinks=False)
+                           and not e.name.startswith(("_", ".")) and e.name not in SKIP_DIRS)
+        folders = [root / name for name in names]
+    else:
+        if run.target.name.startswith(("_", ".")):
+            raise ConfigError("dedup-folders: --path — папка автора, а не раздел «_…» или служебная папка")
+        folders = [run.target]
+    known = known_books(cfg)
+    cache = TextCache.open(cfg)  # один раз на прогон; кэш восстановим и работает в dry-run, как у dedup
+    errors: list[str] = []
+    results: list[dict[str, Any]] = []
+    folders_done = files_total = 0
+    try:
+        with ThreadPoolExecutor(max_workers=workers or cfg["workers"]) as pool:
+            for folder in folders:
+                folder_rel = run.rel(folder)
+                books = [(f"{folder_rel}/{rel}", size, mtime) for rel, size, mtime in iter_book_files(folder, errors)]
+                if not books:
+                    continue
+                if len(books) > DEDUP_FOLDER_MAX:
+                    run.record("folder-too-large", folder_rel, files=len(books))
+                    continue
+                texts = [t for t in pool.map(lambda item: text_item(cfg, root, cache, known, run, item), books)
+                         if t is not None]
+                folders_done += 1
+                files_total += len(books)
+                say(f"dedup-folders: {folder_rel}: книг {len(texts)}", "progress")
+                groups, pairs = dedup_folder(run, folder_rel, texts)
+                if pairs and not dry_run:
+                    run.stats["relinked"] = run.stats.get("relinked", 0) + relink(cfg["db_path"], pairs)
+                results.extend(groups)
+    finally:
+        if cache is not None:
+            cache.prune(cfg["text_cache_mb"])
+            cache.close()
+    if not dry_run:
+        migrate_database(cfg["db_path"], out=out)
+        with closing(connect(cfg["db_path"])) as conn, conn:
+            resolved = {r[0] for r in conn.execute("SELECT key FROM dup_groups WHERE status='resolved'")}
+            # заменяются только similar-группы папок; auto-группы папок и группы обычного dedup — история, не трогаются
+            conn.execute("DELETE FROM dup_groups WHERE status = 'similar' AND key LIKE 'folder:%'")
+            for group in results:
+                if group["status"] == "similar" and group["key"] in resolved:
+                    continue
+                gid = conn.execute("INSERT INTO dup_groups(key, status, created) VALUES (?,?,?)",
+                                   (group["key"], group["status"], time.time())).lastrowid
+                conn.executemany("INSERT OR IGNORE INTO dup_members VALUES (?,?,?,?,?,?,?,?,?)",
+                                 [(gid, m["path"], m["fmt"], m["size"], m["words"], m["coverage"], m["role"], m["keeper"],
+                                   m["quarantine"]) for m in group["members"]])
+    run.stats["groups"] = len(results)
+    run.stats["similar_groups"] = sum(g["status"] == "similar" for g in results)
+    result = run.finish({"walk_errors": errors[:200], "groups": results})
+    if not dry_run and Path(cfg["db_path"]).is_file():
+        with closing(connect(cfg["db_path"])) as conn, conn:
+            if conn.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_COLLECTIONS:
+                report_collections(rebuild_collections(conn), out)
+    s = run.stats
+    out(f"dedup-folders: папок {folders_done}, файлов {files_total}, дублей {s.get('duplicate', 0)}, "
+        f"похожих {s.get('similar', 0)}, без текста {s.get('no-text', 0)}, слишком больших папок {s.get('folder-too-large', 0)}, "
+        f"переименовано {s.get('renamed', 0)}; кэш текста: попаданий {s.get('text_cache_hit', 0)}, "
+        f"промахов {s.get('text_cache_miss', 0)}")
+    out("подсказка: запустите scan — каталог книг обновит пути перенесённых и переименованных файлов")
+    return result
 
 
 # ----------------------------------------------------------------------
@@ -2695,7 +4257,1092 @@ def zip_books(cfg: dict[str, Any], dry_run: bool = False, path: str | None = Non
     return run.finish({"walk_errors": errors[:200]})
 
 
-FILE_CHANGING = ("fix-encoding", "unpack-fb2zip", "convert", "dedup", "zip-books")
+# ----------------------------------------------------------------------
+# unzip-books: однокнижный name.ext.zip → name.ext (обратный zip-books; решение 17.11.2026: книги хранятся распакованными)
+# ----------------------------------------------------------------------
+
+UNZIP_CHUNK = 4 * 1024 * 1024  # блок потоковой распаковки и хеширования
+UNZIP_RATIO_MIN_SIZE = 1024 * 1024  # степень сжатия проверяется для записей больше 1 МБ (как в read_member)
+UNZIP_BAD_NAME = re.compile(r"[/\\\x00]")  # разделители путей и NUL в имени распакованного файла
+
+
+def unzip_name(archive: Path, info: zipfile.ZipInfo) -> str:
+    """Имя книги: name.ext.zip → name.ext, если ext совпадает с форматом записи; иначе — basename имени записи."""
+    stem = archive.name[:-len(".zip")]
+    inner_stem, dot, inner_ext = stem.rpartition(".")
+    if dot and inner_stem and inner_ext.lower() == member_ext(info):
+        return stem
+    return PurePosixPath(info.filename.replace("\\", "/")).name
+
+
+def unzip_name_ok(name: str) -> bool:
+    """Имя без путей (косая и обратная черта, NUL), не «.» и не «..», допустимое для NTFS/Syncthing. «..» внутри имени
+    («Смолски С..djvu») — не обход пути: имя берётся basename'ом записи. Иначе архив уходит в rejected-name."""
+    return name not in ("", ".", "..") and not UNZIP_BAD_NAME.search(name) and name_ok(name)
+
+
+def same_content(archive: Path, info: zipfile.ZipInfo, dest: Path) -> bool:
+    """Двойник: тот же размер и SHA-256 у распакованного потока записи и у существующего файла."""
+    if not dest.is_file() or dest.stat().st_size != info.file_size:
+        return False
+    member_hash, file_hash = hashlib.sha256(), hashlib.sha256()
+    with zipfile.ZipFile(archive) as zf, zf.open(info) as source:
+        while chunk := source.read(UNZIP_CHUNK):  # zipfile проверяет CRC записи по её концу
+            member_hash.update(chunk)
+    with dest.open("rb") as handle:
+        while chunk := handle.read(UNZIP_CHUNK):
+            file_hash.update(chunk)
+    return member_hash.digest() == file_hash.digest()
+
+
+def unzip_extract(run: NightRun, archive: Path, info: zipfile.ZipInfo, name: str) -> Path:
+    """Потоковая распаковка записи во временный файл рядом с архивом: размер сверяется, CRC — при чтении zipfile.
+    Свободное имя (name, затем name_1…) выбирается под блокировкой прогона. При любой ошибке временный файл удаляется."""
+    st = archive.stat()
+    fd, tmp_name = tempfile.mkstemp(prefix=".unzip-books.", suffix=".tmp", dir=archive.parent)
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        with zipfile.ZipFile(archive) as zf, zf.open(info) as source, tmp.open("wb") as sink:
+            shutil.copyfileobj(source, sink, UNZIP_CHUNK)
+        if tmp.stat().st_size != info.file_size:
+            raise ValueError(f"распаковано {tmp.stat().st_size} байт вместо {info.file_size}")
+        os.chmod(tmp, st.st_mode & 0o666)
+        os.utime(tmp, (st.st_atime, st.st_mtime))  # дата книги — дата архива (zip-books записывал её в архив)
+        with run.lock:
+            target = unique_path(archive.parent, name, set())
+            os.replace(tmp, target)
+        return target
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def unzip_books(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None, workers: int | None = None,
+                out: Callable[[str], None] = print) -> dict[str, Any]:
+    """Распаковка однокнижных zip: name.ext.zip → name.ext рядом. Архив уходит в карантин unzipped/ (не удаляется).
+    Двойник (тот же размер и SHA-256) — только архив в карантин. Многофайловые zip не трогаются; битые и с
+    подозрительной степенью сжатия — в rejected-zip/, недопустимые имена — в rejected-name/."""
+    run = NightRun(cfg, "unzip-books", dry_run, path, out)
+
+    def flush_relinks() -> None:
+        """Перенос отметок пачками по RELINK_BATCH: при обрыве прогона расхождение с базой не больше пачки."""
+        with run.lock:
+            if len(run.relinks) < RELINK_BATCH:
+                return
+            pairs, run.relinks = run.relinks, []
+        moved = relink(cfg["db_path"], pairs)
+        with run.lock:
+            run.stats["relinked"] = run.stats.get("relinked", 0) + moved
+
+    def one(item: tuple[Path, int]) -> None:
+        archive, _size = item
+        try:
+            with zipfile.ZipFile(archive) as zf:
+                info = single_member(zf)
+        except (zipfile.BadZipFile, EOFError, OSError, ValueError) as error:
+            run.quarantine(archive, "rejected-zip", reason=f"{type(error).__name__}: {error}")
+            return
+        if info is None:
+            run.count("multi")  # многофайловый или вложенный архив — не трогаем
+            return
+        if info.file_size > UNZIP_RATIO_MIN_SIZE and info.file_size > ZIP_MAX_RATIO * max(info.compress_size, 1):
+            run.quarantine(archive, "rejected-zip", reason="подозрительная степень сжатия (zip-бомба?)")
+            return
+        name = unzip_name(archive, info)
+        if not unzip_name_ok(name):
+            run.quarantine(archive, "rejected-name", reason=f"имя {name!r} недопустимо")
+            return
+        dest = archive.parent / name
+        if dest.exists() and same_content(archive, info, dest):
+            run.record("twin", archive, to=str(dest))
+            target = dest
+        else:
+            target = unique_path(archive.parent, name, set()) if dry_run else unzip_extract(run, archive, info, name)
+            if target.name != name:
+                run.count("conflict")  # имя занято другим содержимым: книга — с суффиксом _N
+            run.record("extracted", archive, to=str(target))
+        run.quarantine(archive, "unzipped", book=str(target))
+        if not dry_run:
+            run.moved(archive, target)
+            flush_relinks()
+
+    errors: list[str] = []
+    parallel(walk_files(run.target, (".zip",), errors), one, workers or cfg["unzip_workers"], run)
+    stats = run.stats
+    line = (f"unzip-books: {'будет ' if dry_run else ''}распаковано {stats.get('extracted', 0)}, "
+            f"двойников {stats.get('twin', 0)}, конфликтов имён {stats.get('conflict', 0)}, "
+            f"многофайловых не тронуто {stats.get('multi', 0)}, в rejected-zip {stats.get('rejected-zip', 0)}, "
+            f"ошибок {stats.get('failed', 0)}")
+    out(line)
+    out("дальше: запустите scan — каталог книг обновит пути; архивы остаются в карантине unzipped/")
+    return run.finish({"summary": line, "walk_errors": errors[:200]})
+
+
+# ----------------------------------------------------------------------
+# unpack-collections и sort-underscore: книги из раздела сборников / служебных папок «_» — в папки авторов (только CLI; в веб и API не выведены)
+# ----------------------------------------------------------------------
+
+CLI_COMMANDS = ("unpack-collections", "merge-authors", "sort-underscore")
+COLLECTIONS_SECTION = "Сборники"  # section_name папки «_…» каталога книг: раздел сборников
+RELINK_BATCH = 1000  # пар переноса на один relink: при сбое связи и файлы расходятся не больше чем на пачку
+FOLDER_NAME_MAX = 120
+FOLDER_BAD_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+AUTHOR_STOP = frozenset({"unknown", "неизвестен", "неизвестный", "неизвестный автор", "автор неизвестен",
+                         "без автора", "автор неустановлен", "неустановленный автор",
+                         "esimych", "anonymous", "аноним"})  # заглушки вместо автора (уже нормализованные)
+# слово в имени — это составитель, коллектив или жанр/название, а не автор: книга остаётся в сборнике
+AUTHOR_COLLECTIVE = frozenset({"коллектив", "составитель", "составители", "авторов", "сборник", "антология", "редактор",
+                               "сборники", "эпос", "сказания", "фольклор", "литература", "литературы", "тексты",
+                               "саги", "газета", "журнал"})
+# частицы фамилий, могут быть со строчной буквы: «де Сервантес», «фон Миллер», «van Gogh»
+AUTHOR_PARTICLES = frozenset({"де", "фон", "ван", "да", "ди", "дю", "дель", "ла", "ле", "на", "эль", "аль", "ибн", "бен",
+                              "аб", "ап", "ал", "ад", "оглы",
+                              "van", "von", "de", "du", "da", "di", "del", "la", "le", "el", "al", "bin", "ibn"})
+PERSON_APOSTROPHES = ("'", "’")
+PERSON_PREFIX_LETTERS = frozenset({"д", "л", "о", "o", "d", "l"})  # «д'Артаньян», «О'Нил»
+
+
+def author_norm(text: str) -> str:
+    """Сравнение имён: casefold, ё→е, только буквы, цифры, пробелы и дефис; пустые токены отброшены."""
+    kept = "".join(ch for ch in text.casefold().replace("ё", "е") if ch.isalnum() or ch.isspace() or ch == "-")
+    return " ".join(token for token in kept.split() if any(ch.isalnum() for ch in token))
+
+
+def author_key(name: str) -> frozenset[str] | None:
+    """Ключ автора или папки — набор слов. None — не имя автора: пусто, цифры, больше 5 слов, одно слово
+    короче 2 символов или заглушка из AUTHOR_STOP."""
+    norm = author_norm(name)
+    words = norm.split()
+    if not words or any(ch.isdigit() for ch in norm) or len(words) > 5 or norm in AUTHOR_STOP \
+            or AUTHOR_COLLECTIVE.intersection(words):
+        return None
+    if len(words) == 1 and len(words[0]) < 2:
+        return None
+    return frozenset(words)
+
+
+def person_name(name: str) -> bool:
+    """Похоже на имя человека, а не на название или жанр: каждое слово, кроме частиц AUTHOR_PARTICLES и приставок
+    «д'»/«л'»/«o'», начинается с заглавной буквы; слово целиком заглавными — годно при любой длине; в смешанном
+    регистре заглавных после первой буквы не больше половины (КОИ8-кракозябры вида «вБИТПЫЙО» отвергаются).
+    Проверяется часть слова до первого дефиса. Слова без букв (инициалы с точкой и т. п.) пропускаются.
+    Инициалы («А.», «Р») — годны. Нет ни одного проверенного слова — False."""
+    checked = False
+    for word in name.split():
+        part = word.split("-", 1)[0]
+        if len(part) > 2 and part[1] in PERSON_APOSTROPHES and part[0].casefold() in PERSON_PREFIX_LETTERS:
+            part = part[2:]
+        if part.casefold() in AUTHOR_PARTICLES:
+            continue
+        letters = [ch for ch in part if ch.isalpha()]
+        if not letters:
+            continue
+        if not letters[0].isupper():
+            return False
+        checked = True
+        if part.isupper():
+            continue
+        rest = letters[1:]
+        if sum(ch.isupper() for ch in rest) * 2 > len(rest):
+            return False
+    return checked
+
+
+def folder_name(name: str) -> str:
+    """Имя папки для Windows и Syncthing: без запрещённых и управляющих символов, без пробелов и точек по краям,
+    не длиннее FOLDER_NAME_MAX. Пустой результат — имени нет."""
+    return FOLDER_BAD_CHARS.sub("", name).strip(" .")[:FOLDER_NAME_MAX].strip(" .")
+
+
+def collections_section(root: Path) -> Path:
+    """Папка раздела сборников в каталоге книг: section_name папки «_…» равен COLLECTIONS_SECTION."""
+    for entry in sorted(root.iterdir()):
+        if entry.is_dir() and entry.name.startswith("_") and section_name(entry.name) == COLLECTIONS_SECTION:
+            return entry
+    raise ConfigError(f"раздел сборников «{COLLECTIONS_SECTION}» не найден в {root}")
+
+
+def author_index(root: Path) -> dict[frozenset[str], str]:
+    """Папки авторов верхнего уровня: {ключ: имя}. Папки «_…» и «.…» не входят; при совпадении ключей — первая по сортировке."""
+    with os.scandir(root) as entries:
+        names = sorted(entry.name for entry in entries if entry.is_dir(follow_symlinks=False))
+    index: dict[frozenset[str], str] = {}
+    for name in names:
+        key = None if name.startswith(("_", ".")) else author_key(name)
+        if key is not None:
+            index.setdefault(key, name)
+    return index
+
+
+def pick_folder(author: str, key: frozenset[str], parent: str, index: dict[frozenset[str], str]) -> tuple[str, str]:
+    """Папка автора и способ выбора: exact — точный ключ; parent — папка, где лежит файл, названа как автор;
+    subset — ровно одна папка с пересечением ≥ 2 слов и ключом ⊆ или ⊇; иначе new — «Фамилия Имя Отчество»
+    (последнее слово автора первым). Пустое имя у new — имени нет.
+    not-person — метаданные не похожи на имя человека (название, жанр, кракозябры): имени нет, папку не создавать."""
+    if key in index:
+        return index[key], "exact"
+    parent_key = author_key(parent) if parent else None
+    if parent_key is not None and folder_name(parent) and (
+            parent_key == key or (len(parent_key & key) >= 2 and (parent_key <= key or parent_key >= key))):
+        return folder_name(parent), "parent"  # в т. ч. «Фамилия Имя» у автора с отчеством
+    close = [name for known, name in index.items() if len(known & key) >= 2 and (known <= key or known >= key)]
+    if len(close) == 1:
+        return close[0], "subset"
+    if not person_name(author):
+        return "", "not-person"
+    words = author.split()
+    return folder_name(" ".join([words[-1], *words[:-1]])), "new"
+
+
+def remove_empty_dirs(section: Path, gone: set[str], dry_run: bool) -> int:
+    """Пустые папки раздела снизу вверх: только os.rmdir (без rmtree); сам раздел не трогается. gone — файлы,
+    которые перенесёт прогон: в dry-run они ещё на диске, но папка с ними будет пустой."""
+    removable: set[str] = set()
+    for current, dirs, files in os.walk(section, topdown=False):
+        if current == str(section):
+            continue
+        if any(os.path.join(current, name) not in gone for name in files) or \
+                any(os.path.join(current, name) not in removable for name in dirs):
+            continue
+        if not dry_run:
+            try:
+                os.rmdir(current)
+            except OSError:
+                continue
+        removable.add(current)
+    return len(removable)
+
+
+def journal_row(run: NightRun, row: dict[str, Any]) -> None:
+    """Строка журнала прогона: по полям from/to перенос откатывается; пишется по ходу, с flush."""
+    with run.lock:
+        run.journal.write(json.dumps(row, ensure_ascii=False) + "\n")
+        run.journal.flush()
+
+
+SORT_SOURCES = ("meta", "folder", "filename", "text")  # sort-underscore: источники автора по убыванию надёжности
+EXAMPLES_PER_SOURCE = 30  # примеров каждого источника в итоге dry-run и в отчёте
+TEXT_HEAD_CHARS = 2048  # начало текста для поиска автора без метаданных (около 2 КБ)
+FILENAME_SPLIT = re.compile(r"^(.+?)(?: - |_-_|\.-\.)(.+)$")  # «Автор - Название», «Автор_-_Название», «Автор.-.Название»
+TEXT_NAME_LINE = re.compile(r"^\s*([А-ЯЁ][а-яё]+(?:[ \t]+[А-ЯЁ][а-яё]+){1,2})\.[ \t]+\S")  # «Имя Фамилия. Название»
+TEXT_CAPS_LINE = re.compile(r"^\s*([А-ЯЁ]{2,}(?:[ \t]+[А-ЯЁ]{2,}){1,2})\s*$")  # «ИМЯ ФАМИЛИЯ» + название следующей строкой
+
+
+def is_initials(name: str) -> bool:
+    """«Фамилия И.О.» или «Фамилия И»: после первого слова — только однобуквенные инициалы."""
+    tokens = [token for token in re.split(r"[\s.]+", name) if token]
+    return len(tokens) >= 2 and all(len(token) == 1 for token in tokens[1:])
+
+
+def existing_folder(key: frozenset[str], index: dict[frozenset[str], str]) -> str:
+    """Папка автора, которая уже лежит в корне: точный ключ или единственная с пересечением ≥ 2 слов и ключом ⊆/⊇.
+    Иначе ''. Новые папки не создаются."""
+    if key in index:
+        return index[key]
+    close = [name for known, name in index.items() if len(known & key) >= 2 and (known <= key or known >= key)]
+    return close[0] if len(close) == 1 else ""
+
+
+def initials_folder(name: str, index: dict[frozenset[str], str]) -> str:
+    """«Фамилия И.О.» → единственная существующая папка с той же фамилией и начальными буквами имени и отчества."""
+    tokens = [token for token in re.split(r"[\s.]+", name) if token]
+    surname = author_norm(tokens[0])
+    initials = [author_norm(token) for token in tokens[1:]]
+    found: set[str] = set()
+    for folder in index.values():
+        words = author_words(folder)
+        if words[:1] == [surname] and len(words) > len(initials) and \
+                all(word.startswith(initial) for word, initial in zip(words[1:], initials)):
+            found.add(folder)
+    return found.pop() if len(found) == 1 else ""
+
+
+def folder_for_name(name: str, index: dict[frozenset[str], str]) -> str:
+    """Существующая папка автора для имени из пути или файла: инициалы — по буквам, полное имя — по ключу."""
+    if is_initials(name):
+        return initials_folder(name, index)
+    key = author_key(name)
+    return existing_folder(key, index) if key is not None else ""
+
+
+def filename_author(stem: str) -> str:
+    """Автор из имени файла «Фамилия И.О. - Название», «Фамилия_-_Название», «Фамилия.-.Название»; иначе ''."""
+    match = FILENAME_SPLIT.match(stem)
+    if match is None:
+        return ""
+    left = match.group(1).replace("_", " ").strip()
+    if not match.group(2).strip() or re.search(r"\d", left) or len(left.split()) > 4:
+        return ""
+    return left
+
+
+def text_author(head: str, index: dict[frozenset[str], str]) -> tuple[str, str]:
+    """Автор из начала текста: «Имя Фамилия. Название» или «ИМЯ ФАМИЛИЯ» (название — следующей строкой).
+    Возвращает (папка, имя) первого кандидата, совпавшего с существующей папкой; иначе ('', '')."""
+    lines = [line for line in head.splitlines() if line.strip()][:40]
+    for position, line in enumerate(lines):
+        candidate = TEXT_NAME_LINE.match(line) or (TEXT_CAPS_LINE.match(line) if position + 1 < len(lines) else None)
+        if candidate is None:
+            continue
+        folder = folder_for_name(candidate.group(1), index)
+        if folder:
+            return folder, candidate.group(1)
+    return "", ""
+
+
+def text_head(cfg: dict[str, Any], full: Path, fmt: str) -> str:
+    """Начало текста книги (TEXT_HEAD_CHARS символов); однокнижный zip читается через book_text."""
+    with tempfile.TemporaryDirectory(prefix="books_library-sort-underscore-") as tmp_name:
+        return book_text(cfg, full, fmt, Path(tmp_name))[:TEXT_HEAD_CHARS]
+
+
+def unpack_collections(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None,
+                       out: Callable[[str], None] = print, *, kind: str = "unpack-collections",
+                       roots: list[Path] | None = None, sources: tuple[str, ...] = ("meta",),
+                       limit: int | None = None) -> dict[str, Any]:
+    """Книги раздела «Сборники» — в папки авторов по первому автору (см. pick_folder). Файлы, которых нет в books,
+    не трогаются; книги без автора остаются на месте. Перенос — os.rename в пределах тома (без копирования); связи
+    переносятся relink пачками по RELINK_BATCH во время прогона. Боевой запуск сначала пересобирает сборники,
+    чтобы folder-строки существовали до переноса. Пустые папки удаляются снизу вверх.
+    roots и sources — режим sort-underscore: корни (служебные папки «_…») и источники автора из SORT_SOURCES.
+    Источники, кроме meta, принимаются только при совпадении с уже существующей папкой автора (новые не создаются)."""
+    root = Path(cfg["books_dir"])
+    if roots is None:
+        section = collections_section(root)
+        scope = target_dir(cfg, path) if path else section
+        if not scope.resolve().is_relative_to(section.resolve()):
+            raise ConfigError("unpack-collections: --path должен быть внутри раздела сборников")
+        scopes, trees = [scope], [section]
+    else:
+        scopes, trees = roots, roots
+    db_path = cfg["db_path"]
+    if not Path(db_path).is_file():
+        raise ConfigError(f"база не создана: {db_path} (сначала scan)")
+    with closing(connect(db_path, readonly=True)) as conn:
+        if conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_COLLECTIONS:
+            raise ConfigError(f"{kind}: нужна схема v{SCHEMA_COLLECTIONS} (сначала scan)")
+    run = NightRun(cfg, kind, dry_run, path, out)
+    if not dry_run:
+        with closing(connect(db_path)) as conn, conn:
+            report_collections(rebuild_collections(conn), out)
+    with closing(connect(db_path, readonly=True)) as conn:
+        books = {row["path"]: row for row in conn.execute("SELECT path, size, authors, fmt FROM books")}
+    prefixes = [scope.relative_to(root).as_posix() + "/" for scope in scopes]
+    candidates = sorted(rel for rel in books if any(rel.startswith(prefix) for prefix in prefixes))
+    if limit is not None:
+        candidates = candidates[:limit]
+    errors: list[str] = []
+    for scope, prefix in zip(scopes, prefixes):
+        for rel, _size, _mtime in iter_book_files(scope, errors):
+            if prefix + rel not in books:
+                run.count("not_book")
+    pre_dirs = {entry.name for entry in root.iterdir() if entry.is_dir()}
+    index = author_index(root)
+    created: set[str] = set()
+    taken: set[Path] = set()
+    planned_gone: set[str] = set()
+    pending: list[tuple[str, str]] = []
+    breakdown: dict[str, dict[str, int]] = {}  # раздел → источник → число переносов
+    examples: dict[str, list[str]] = {source: [] for source in sources}
+
+    def folder_of(author: str) -> str:
+        """Папка автора по тем же правилам, что у первого автора книги; новая папка попадает в индекс."""
+        key = author_key(author)
+        folder = pick_folder(author, key, "", index)[0] if key is not None else ""
+        if folder and author_key(folder) is not None:
+            index.setdefault(author_key(folder), folder)
+        return folder
+
+    def note_moved(rel_src: str, dst_rel: str, label: str, source: str, who: str) -> None:
+        """Счётчики по разделу и источнику; примеры — по EXAMPLES_PER_SOURCE на источник."""
+        run.count("moved")
+        run.count(f"source_{source}")
+        counts = breakdown.setdefault(label, {})
+        counts[source] = counts.get(source, 0) + 1
+        if len(examples[source]) < EXAMPLES_PER_SOURCE:
+            examples[source].append(f"{rel_src} → {dst_rel} [{who}]")
+
+    for rel in candidates:
+        src = root / rel
+        top = root / PurePosixPath(rel).parts[0]
+        label = section_name(top.name)
+        authors = [name.strip() for name in books[rel]["authors"].split("; ") if name.strip()]
+        author = books[rel]["authors"].split("; ")[0].strip()
+        key = author_key(author) if author else None
+        parent = "" if src.parent == top or src.parent.name.startswith(("_", ".")) else src.parent.name
+        folder, match, source, found_by, name, failure = "", "", "", "", "", ""
+        if "meta" in sources and key is not None:
+            if is_initials(author):  # «Фамилия И.О.»: только существующая папка, новую «И.О. Фамилия» не создавать
+                folder, match = initials_folder(author, index), "initials"
+            else:
+                folder, match = pick_folder(author, key, parent, index)
+                # sort-underscore: новая папка — только по встроенным метаданным fb2/epub; автор pdf/djvu/txt
+                # из имени файла («Элитариум - …») принимается лишь для уже существующей папки
+                if kind == "sort-underscore" and match == "new" and books[rel]["fmt"] not in ("fb2", "epub"):
+                    folder, match = "", ""
+            if folder:
+                source, found_by = "meta", author
+        if not folder and "folder" in sources and parent:
+            folder = folder_for_name(parent, index)
+            if folder:
+                source, found_by, match = "folder", parent, "existing"
+        if not folder and "filename" in sources:
+            name = filename_author(split_name(rel)[0])
+            folder = folder_for_name(name, index) if name else ""
+            if folder:
+                source, found_by, match = "filename", name, "existing"
+        if not folder and "text" in sources and books[rel]["fmt"] in ("txt", "fb2"):
+            try:
+                folder, name = text_author(text_head(cfg, src, books[rel]["fmt"]), index)
+            except (OSError, ValueError, KeyError, zipfile.BadZipFile, EOFError, subprocess.TimeoutExpired) as error:
+                failure = f"{type(error).__name__}: {error}"
+            if folder:
+                source, found_by, match = "text", name, "existing"
+        if not folder:
+            run.count("no_author")
+            journal_row(run, {"from": rel, "path": rel, "to": "", "author": author, "folder": "", "match": "",
+                              "source": "", "status": "no-author", "error": failure})
+            continue
+        co_authors = authors[1:] if source == "meta" else []  # книга нескольких авторов: у каждого следующего — копия
+        fkey = author_key(folder)
+        if fkey is not None:
+            index.setdefault(fkey, folder)
+        if folder in pre_dirs:
+            run.count("into_existing")
+        elif folder not in created:
+            created.add(folder)
+            run.count("new_folders")
+        directory = root / folder
+        dest = unique_path(directory, src.name, taken)
+        if dest.name != src.name:
+            run.count("conflicts")
+        dst_rel = dest.relative_to(root).as_posix()
+        base = {"from": rel, "path": rel, "to": dst_rel, "author": found_by or author, "folder": folder,
+                "match": match, "source": source}
+        if dry_run:
+            planned_gone.add(str(src))
+            note_moved(rel, dst_rel, label, source, found_by or author)
+            journal_row(run, {**base, "status": "dry", "error": ""})
+            if co_authors:
+                copy_coauthors(run, root, dest, co_authors, folder_of, taken, dry_run=True, source=source)
+            continue
+        try:
+            size = src.stat().st_size
+            directory.mkdir(parents=True, exist_ok=True)
+            os.rename(src, dest)
+        except OSError as error:  # в т. ч. EXDEV: другой том — не копируем, а пишем ошибку
+            run.count("errors")
+            journal_row(run, {**base, "status": "error", "error": str(error)})
+            continue
+        pending.append((rel, dst_rel))  # файл уже на новом месте: связи переносятся при любом исходе проверки
+        if len(pending) >= RELINK_BATCH:
+            relink(db_path, pending)
+            pending.clear()
+        try:
+            intact = dest.is_file() and dest.stat().st_size == size
+        except OSError:
+            intact = False
+        if intact:
+            note_moved(rel, dst_rel, label, source, found_by or author)
+            journal_row(run, {**base, "status": "moved", "error": ""})
+            if co_authors:
+                copy_coauthors(run, root, dest, co_authors, folder_of, taken, dry_run=False, source=source)
+        else:
+            run.count("errors")
+            journal_row(run, {**base, "status": "error", "error": "размер после переноса не совпал"})
+    if pending:
+        relink(db_path, pending)
+    removed = 0
+    for tree in trees:
+        removed += remove_empty_dirs(tree, planned_gone, dry_run)
+    run.stats["removed_dirs"] = removed
+    s = run.stats
+    done = "будет" if dry_run else ""
+    line = (f"{kind}: {done + ' ' if done else ''}перенесено {s.get('moved', 0)} "
+            f"(в существующие папки {s.get('into_existing', 0)}, новых папок {s.get('new_folders', 0)}), "
+            f"нет автора {s.get('no_author', 0)}, не книги {s.get('not_book', 0)}, копий соавторам {s.get('copied', 0)}, "
+            f"ошибки {s.get('errors', 0)}, "
+            f"конфликтов имён {s.get('conflicts', 0)}, {'будет удалено' if dry_run else 'удалено'} пустых папок "
+            f"{s['removed_dirs']}")
+    if len(sources) > 1:
+        line += ", по источникам: " + ", ".join(f"{source} {s.get('source_' + source, 0)}" for source in sources)
+    out(line)
+    say(line, kind.replace("-", "_"), detail=json.dumps({k: v for k, v in s.items() if k != "checked"}, ensure_ascii=False))
+    if dry_run and len(sources) > 1:
+        for label in sorted(breakdown):
+            out(f"[dry-run] раздел «{label}»: " + ", ".join(
+                f"{source} {count}" for source, count in sorted(breakdown[label].items())))
+        for source in sources:
+            out(f"[dry-run] примеры «{source}» ({len(examples[source])}):")
+            for example in examples[source]:
+                out(f"  {example}")
+    if not dry_run:
+        out("дальше: запустите scan — каталог books обновит пути книг; перенос откатывается по журналу (from/to)")
+    return run.finish({"summary": line, "by_section": breakdown, "examples": examples})
+
+
+def sort_underscore(cfg: dict[str, Any], dry_run: bool = False, limit: int | None = None,
+                    out: Callable[[str], None] = print) -> dict[str, Any]:
+    """Программа максимум: книги из всех служебных папок «_…» каталога книг — в папки авторов, у которых автор
+    определён (SORT_SOURCES); без автора остаются на месте. Журнал reports/sort-underscore-*.jsonl: path, to, source,
+    author; копии соавторам — отдельные строки status copy с путём копии. Откат — по журналу (from/to)."""
+    root = Path(cfg["books_dir"])
+    roots = sorted(entry for entry in root.iterdir() if entry.is_dir(follow_symlinks=False) and entry.name.startswith("_"))
+    if not roots:
+        raise ConfigError(f"служебных папок «_…» нет в {root}")
+    return unpack_collections(cfg, dry_run, None, out, kind="sort-underscore", roots=roots, sources=SORT_SOURCES,
+                              limit=limit)
+
+
+# ----------------------------------------------------------------------
+# merge-authors: «Фамилия Имя» + «Фамилия Имя Отчество» → одна папка «Фамилия Имя Отчество» (только CLI)
+# ----------------------------------------------------------------------
+
+
+
+def author_words(name: str) -> list[str]:
+    """Слова имени в нормализованном виде; порядок сохраняется — он важен для сравнения папок."""
+    return author_norm(name).split()
+
+
+def full_candidates(short: str, names: list[str]) -> list[str]:
+    """Папки «Фамилия Имя Отчество» для короткой «Фамилия Имя»: первые два слова совпадают по порядку,
+    третье — не инициал (длина ≥ 3)."""
+    short_words = author_words(short)
+    found = []
+    for name in names:
+        words = author_words(name)
+        if len(words) == 3 and words[:2] == short_words and len(words[2]) >= 3:
+            found.append(name)
+    return sorted(found)
+
+
+def patronymic_full(author: str, short_words: list[str]) -> str | None:
+    """Полное имя «Фамилия Имя Отчество» по автору книги: три слова, среди них оба слова короткой папки. Порядок —
+    как в метаданных (фамилия первая) либо «последнее слово первым» (Иван Петрович Сидоров → Сидоров Иван Петрович).
+    Результат должен начинаться с слов короткой папки и иметь отчество длиной ≥ 3; иначе None."""
+    raw = author.split()
+    words = author_words(author)
+    if len(raw) != 3 or len(words) != 3 or not set(short_words) <= set(words):
+        return None
+    for ordered in (raw, [raw[-1], *raw[:-1]]):
+        name = folder_name(" ".join(ordered))
+        full_words = author_words(name)
+        if len(full_words) == 3 and full_words[:2] == short_words and len(full_words[2]) >= 3:
+            return name
+    return None
+
+
+def books_under(db_path: str, folder: str) -> list[sqlite3.Row]:
+    """Строки books внутри папки верхнего уровня; LIKE с экранированием % и _ (параметризованно)."""
+    if not Path(db_path).is_file():
+        return []
+    pattern = re.sub(r"([\\%_])", r"\\\1", folder) + "/%"
+    with closing(connect(db_path, readonly=True)) as conn:
+        return conn.execute("SELECT path, authors FROM books WHERE path LIKE ? ESCAPE '\\'", (pattern,)).fetchall()
+
+
+def flush_relinks(db_path: str, pending: list[tuple[str, str]], force: bool = False) -> None:
+    """Связи переносятся пачками по RELINK_BATCH во время прогона, хвост — при force."""
+    if pending and (force or len(pending) >= RELINK_BATCH):
+        relink(db_path, pending)
+        pending.clear()
+
+
+def merge_folder(run: NightRun, db_path: str, root: Path, short: str, full: str, candidates: list[str],
+                 known: set[str], taken: set[Path], pending: list[tuple[str, str]]) -> None:
+    """Склейка: файлы и подпапки «короткой» папки — в «полную» (с тем же относительным путём, при конфликте имени —
+    unique_path); затем пустые папки короткой удаляются снизу вверх. Остатки не удаляются, а записываются ошибкой."""
+    dry_run = run.dry_run
+    src_top, dst_top = root / short, root / full
+    moved = 0
+    for current, dirs, files in os.walk(src_top):
+        target = dst_top / Path(current).relative_to(src_top)
+        if not dry_run and not target.is_dir():
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+            except OSError as error:
+                run.count("errors")
+                journal_row(run, {"action": "error", "short": short, "full": full, "from": current, "error": str(error)})
+                dirs[:] = []
+                continue
+        for name in files:
+            src = Path(current) / name
+            dest = unique_path(target, name, taken)
+            if dest.name != name:
+                run.count("conflicts")
+            src_rel = src.relative_to(root).as_posix()
+            dst_rel = dest.relative_to(root).as_posix()
+            if dry_run:
+                run.count("moved")
+                moved += 1
+                journal_row(run, {"action": "move", "from": src_rel, "to": dst_rel, "status": "dry"})
+                continue
+            try:
+                os.rename(src, dest)
+            except OSError as error:  # в т. ч. EXDEV: копирования нет, файл остаётся на месте
+                run.count("errors")
+                journal_row(run, {"action": "error", "short": short, "full": full, "from": src_rel, "error": str(error)})
+                continue
+            run.count("moved")
+            moved += 1
+            journal_row(run, {"action": "move", "from": src_rel, "to": dst_rel})
+            if src_rel in known:
+                pending.append((src_rel, dst_rel))
+                flush_relinks(db_path, pending)
+    status = "dry" if dry_run else "done"
+    if not dry_run:
+        for current, _dirs, _files in os.walk(src_top, topdown=False):
+            try:
+                os.rmdir(current)
+            except OSError:
+                pass
+        if src_top.exists():
+            run.count("errors")
+            status = "partial"
+            journal_row(run, {"action": "error", "short": short, "full": full,
+                              "error": "папка не пуста после переноса — не удалена"})
+        else:
+            run.count("merged")
+    else:
+        run.count("merged")
+    journal_row(run, {"action": "merge", "short": short, "full": full, "candidates": candidates, "moved": moved,
+                      "status": status, "error": ""})
+
+
+def merge_authors(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str], None] = print) -> dict[str, Any]:
+    """Правило: «Фамилия Имя» и «Фамилия Имя Отчество» в одном каталоге — всё из короткой в полную; если полной нет,
+    отчество берётся из метаданных книг короткой папки и папка переименовывается. Неоднозначное (несколько полных
+    или несколько отчеств) не трогается. Связи переносятся relink по ходу прогона; журнал — построчно (откат)."""
+    root = Path(cfg["books_dir"])
+    db_path = cfg["db_path"]
+    run = NightRun(cfg, "merge-authors", dry_run, None, out)
+    with os.scandir(root) as entries:
+        names = sorted(e.name for e in entries if e.is_dir(follow_symlinks=False) and not e.name.startswith(("_", ".")))
+    pending: list[tuple[str, str]] = []
+    taken: set[Path] = set()
+    for short in [n for n in names if len(author_words(n)) == 2]:
+        if not (root / short).is_dir():
+            continue
+        candidates = full_candidates(short, names)
+        if len(candidates) > 1:
+            run.count("ambiguous")
+            journal_row(run, {"action": "ambiguous", "short": short, "full": "", "candidates": candidates, "moved": 0,
+                              "status": "skip", "error": ""})
+            continue
+        rows = books_under(db_path, short)
+        if candidates:
+            full, action = candidates[0], "merge"
+        else:
+            fulls: dict[str, str] = {}
+            for row in rows:
+                for author in row["authors"].split("; "):
+                    name = patronymic_full(author.strip(), author_words(short))
+                    if name:
+                        fulls.setdefault(author_norm(name), name)
+            if not fulls:
+                run.count("no_patronymic")  # только счётчик: журнал не раздувается
+                continue
+            if len(fulls) > 1:
+                run.count("ambiguous")
+                journal_row(run, {"action": "ambiguous", "short": short, "full": "", "candidates": sorted(fulls.values()),
+                                  "moved": 0, "status": "skip", "error": ""})
+                continue
+            full = next(iter(fulls.values()))
+            action = "merge" if (root / full).is_dir() else "rename"
+            candidates = [full]
+        known = {row["path"] for row in rows}
+        if action == "merge":
+            merge_folder(run, db_path, root, short, full, candidates, known, taken, pending)
+            continue
+        if dry_run:
+            run.count("renamed")
+            journal_row(run, {"action": "rename", "short": short, "full": full, "candidates": candidates, "moved": 0,
+                              "status": "dry", "error": ""})
+            continue
+        try:
+            os.rename(root / short, root / full)
+        except OSError as error:
+            run.count("errors")
+            journal_row(run, {"action": "error", "short": short, "full": full, "error": str(error)})
+            continue
+        run.count("renamed")
+        pending.extend((path, full + path[len(short):]) for path, _authors in rows)
+        flush_relinks(db_path, pending)
+        journal_row(run, {"action": "rename", "short": short, "full": full, "candidates": candidates, "moved": 0,
+                          "status": "done", "error": ""})
+    flush_relinks(db_path, pending, force=True)
+    s = run.stats
+    prefix = "будет " if dry_run else ""
+    line = (f"merge-authors: {prefix}склеено папок {s.get('merged', 0)}, {prefix}переименовано {s.get('renamed', 0)}, "
+            f"{prefix}перенесено файлов {s.get('moved', 0)}, конфликтов имён {s.get('conflicts', 0)}, "
+            f"неоднозначных {s.get('ambiguous', 0)}, ошибок {s.get('errors', 0)}")
+    out(line)
+    say(line, "merge_authors", detail=json.dumps({k: v for k, v in s.items() if k != "checked"}, ensure_ascii=False))
+    if not dry_run:
+        out("дальше: запустите scan — каталог books обновит пути книг; откат — по журналу (move, rename)")
+    return run.finish({"summary": line})
+
+
+# ----------------------------------------------------------------------
+# author-variants: одна папка автора под разным написанием (Ivanov Ivan и Иванов Иван)
+# ----------------------------------------------------------------------
+
+VARIANT_SCHEMA = 5  # первая схема с author_variants
+VARIANT_TIER_NAMES = {"empty": "пустая папка", "common": "общие книги", "manual": "вручную"}
+VARIANT_STATUS_NAMES = {"pending": "ожидает решения", "merged": "склеено", "different": "разные авторы"}
+VARIANT_PAGE_SIZE = 50
+VARIANT_TRANSLIT = str.maketrans({
+    "a": "а", "b": "б", "v": "в", "g": "г", "d": "д", "e": "е", "z": "з", "i": "и", "y": "ы", "k": "к", "l": "л",
+    "m": "м", "n": "н", "o": "о", "p": "п", "r": "р", "s": "с", "t": "т", "u": "у", "f": "ф", "h": "х", "c": "к",
+    "j": "дж", "w": "в", "x": "кс", "q": "к"})
+
+
+def variant_norm(word: str) -> str:
+    """Фонетическая нормализация фамилии для поиска кандидатов: транслит латиницы в кириллицу, ё/е, й/и, двойные буквы,
+    гласные-близнецы. Только подсказка: склеивает всегда пользователь или режим по явному правилу."""
+    word = word.casefold().replace("ё", "е").replace("э", "е").replace("й", "и").replace("ъ", "").replace("ь", "")
+    for latin, cyr in (("sch", "щ"), ("sh", "ш"), ("ch", "ч"), ("zh", "ж"), ("kh", "х"), ("ts", "ц"), ("yu", "ю"),
+                       ("ya", "я")):
+        word = word.replace(latin, cyr)
+    word = re.sub(r"(.)\1", r"\1", word.translate(VARIANT_TRANSLIT))
+    return word.replace("ю", "у").replace("я", "а").replace("ы", "и")
+
+
+def folder_titles(db_path: str, folders: set[str]) -> dict[str, set[str]]:
+    """Нормализованные названия книг по папке верхнего уровня (из books). Без базы или без схемы — пусто."""
+    titles: dict[str, set[str]] = {}
+    if not Path(db_path).is_file():
+        return titles
+    with closing(connect(db_path, readonly=True)) as conn:
+        if conn.execute("PRAGMA user_version").fetchone()[0] < 1:
+            return titles
+        for row in conn.execute("SELECT path, title FROM books"):
+            folder = row["path"].split("/", 1)[0]
+            name = author_norm(row["title"] or "")
+            if folder in folders and name:
+                titles.setdefault(folder, set()).add(name)
+    return titles
+
+
+def folder_book_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """Число книг по папке верхнего уровня (для вкладки «Авторы»)."""
+    counts: dict[str, int] = {}
+    for (path,) in conn.execute("SELECT path FROM books"):
+        folder = path.split("/", 1)[0]
+        counts[folder] = counts.get(folder, 0) + 1
+    return counts
+
+
+def variant_candidates(root: Path, db_path: str) -> list[dict[str, Any]]:
+    """Пары папок верхнего уровня, которые могут быть одним автором: одинаковое второе слово по первым трём буквам и
+    близкая фамилия (variant_norm, отношение ≥ 0.85). Пары, различающиеся только отчеством при равных первых двух
+    словах, — дело merge-authors и сюда не попадают. tier: empty — в одной из папок нет файлов; common — у пары есть
+    общее название книги; manual — иначе."""
+    with os.scandir(root) as entries:
+        names = sorted(e.name for e in entries if e.is_dir(follow_symlinks=False) and not e.name.startswith(("_", ".")))
+    keys: dict[str, tuple[str, str]] = {}
+    for name in names:
+        words = name.split()
+        if len(words) >= 2:
+            keys[name] = (variant_norm(words[0]), variant_norm(words[1])[:3])
+    by_initial: dict[str, list[str]] = {}
+    for name, (_surname, initial) in keys.items():
+        by_initial.setdefault(initial, []).append(name)
+    pairs: set[tuple[str, str]] = set()
+    for group in by_initial.values():
+        for index, a in enumerate(group):
+            for b in group[index + 1:]:
+                sa, sb = keys[a][0], keys[b][0]
+                if not (sa == sb or (len(sa) > 3 and SequenceMatcher(None, sa, sb).ratio() >= 0.85)):
+                    continue
+                if a.split()[:2] == b.split()[:2]:
+                    continue  # отличие только отчеством — merge-authors
+                pairs.add((a, b) if a < b else (b, a))
+    involved = {name for pair in pairs for name in pair}
+    files = {name: sum(len(found) for _d, _s, found in os.walk(root / name)) for name in involved}
+    titles = folder_titles(db_path, involved)
+    result: list[dict[str, Any]] = []
+    for a, b in sorted(pairs):
+        common = any(x == y or (min(len(x), len(y)) > 8 and (x in y or y in x))
+                     for x in titles.get(a, set()) for y in titles.get(b, set()))
+        tier = "empty" if not files[a] or not files[b] else "common" if common else "manual"
+        result.append({"a": a, "b": b, "tier": tier, "files": {a: files[a], b: files[b]}})
+    return result
+
+
+def variant_statuses(db_path: str) -> dict[tuple[str, str], str]:
+    """Статусы известных пар (pending | merged | different); без базы или схемы v5 — пусто."""
+    if not Path(db_path).is_file():
+        return {}
+    with closing(connect(db_path, readonly=True)) as conn:
+        if conn.execute("PRAGMA user_version").fetchone()[0] < VARIANT_SCHEMA:
+            return {}
+        return {(row["a"], row["b"]): row["status"] for row in conn.execute("SELECT a, b, status FROM author_variants")}
+
+
+def variants_pending(conn: sqlite3.Connection) -> int:
+    """Пар, ожидающих решения; до схемы v5 таблицы нет — 0."""
+    if conn.execute("PRAGMA user_version").fetchone()[0] < VARIANT_SCHEMA:
+        return 0
+    return conn.execute("SELECT count(*) FROM author_variants WHERE status='pending'").fetchone()[0]
+
+
+def store_variants(db_path: str, candidates: list[dict[str, Any]]) -> None:
+    """Пары — в author_variants: новые получают pending, у pending обновляется tier, pending, которых больше нет,
+    удаляются. merged и different не перезаписываются: решения пользователя постоянны."""
+    keys = {(c["a"], c["b"]) for c in candidates}
+    now = time.time()
+    with closing(connect(db_path)) as conn, conn:
+        stale = [(row["a"], row["b"]) for row in conn.execute(
+            "SELECT a, b FROM author_variants WHERE status='pending'").fetchall() if (row["a"], row["b"]) not in keys]
+        conn.executemany("DELETE FROM author_variants WHERE a=? AND b=? AND status='pending'", stale)
+        conn.executemany("INSERT INTO author_variants(a, b, tier, status, target, updated) VALUES (?,?,?,'pending','',?) "
+                         "ON CONFLICT(a, b) DO UPDATE SET tier=excluded.tier, updated=excluded.updated "
+                         "WHERE author_variants.status='pending'",
+                         [(c["a"], c["b"], c["tier"], now) for c in candidates])
+
+
+def set_variant(db_path: str, a: str, b: str, status: str, target: str = "") -> None:
+    """Статус пары и папка, в которую склеено (для merged)."""
+    with closing(connect(db_path)) as conn, conn:
+        conn.execute("UPDATE author_variants SET status=?, target=?, updated=? WHERE a=? AND b=?",
+                     (status, target, time.time(), a, b))
+
+
+def variant_target(a: str, b: str, files: dict[str, int]) -> tuple[str, str]:
+    """(источник, цель) для склейки: цель — папка с полным ФИО (больше слов), затем с большим числом файлов, затем по имени."""
+    source, target = sorted((a, b), key=lambda n: (-len(author_words(n)), -files[n], n))
+    return source, target
+
+
+COAUTHOR_SEPARATOR = re.compile(r",\s*|\s+и\s+|\s*&\s*")  # «Громыко Ольга, Уланов Андрей», «… и …», «…&…»
+
+
+def coauthor_parts(name: str) -> list[str]:
+    """Соавторы по имени папки: меньше двух частей — не соавторская запись (пустой список)."""
+    parts = [part.strip() for part in COAUTHOR_SEPARATOR.split(name) if part.strip()]
+    return parts if len(parts) >= 2 else []
+
+
+def copy_coauthors(run: NightRun, root: Path, dest: Path, authors: list[str], folder_for: Callable[[str], str],
+                   taken: set[Path], dry_run: bool, source: str = "") -> None:
+    """Книга нескольких авторов: файл уже у первого автора, у каждого следующего — настоящая копия под тем же именем в его
+    папке (folder_for — та же логика выбора папки, что у первого). Копия пишется во временный файл в той же папке, размер
+    сверяется, затем os.replace на свободное имя. Сбой — временный файл удаляется, ошибка в журнале: книга остаётся
+    только у первого автора."""
+    origin = dest.relative_to(root).as_posix()
+    for author in authors:
+        folder = folder_for(author)
+        if not folder:
+            run.count("errors")
+            journal_row(run, {"from": origin, "path": origin, "to": "", "author": author, "source": source,
+                              "status": "no-folder", "error": ""})
+            continue
+        target = unique_path(root / folder, dest.name, taken)  # имя резервируется сразу
+        copy_rel = target.relative_to(root).as_posix()
+        base = {"from": origin, "path": copy_rel, "to": copy_rel, "author": author, "folder": folder,
+                "source": source}
+        if dry_run:
+            run.count("copied")
+            journal_row(run, {**base, "status": "dry-copy", "error": ""})
+            continue
+        tmp: Path | None = None
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(prefix=".coauthor.", suffix=".tmp", dir=target.parent)
+            os.close(fd)
+            tmp = Path(tmp_name)
+            shutil.copyfile(dest, tmp)
+            shutil.copystat(dest, tmp)
+            if tmp.stat().st_size != dest.stat().st_size:
+                raise ValueError("копия не совпала по размеру")
+            os.replace(tmp, target)
+            tmp = None
+        except (OSError, ValueError) as error:
+            run.count("errors")
+            journal_row(run, {**base, "status": "error", "error": f"копия: {error}"})
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
+            continue
+        run.count("copied")
+        journal_row(run, {**base, "status": "copy", "error": ""})
+
+
+def distribute_coauthor(run: NightRun, root: Path, name: str, taken: set[Path], pending: list[tuple[str, str]]) -> bool:
+    """Соавторская папка «А, Б»: её файлы — в папку первого автора (существующую по ключу или новую с именем части),
+    остальным — настоящие копии (copy_coauthors). Пустую папку удаляет; подпапки или сбой — папка остаётся. Переносы
+    пишутся в pending для relink. True — папка разобрана и удалена."""
+    folder = root / name
+    parts = coauthor_parts(name)
+    index = author_index(root)
+
+    def folder_for(author: str) -> str:
+        key = author_key(author)
+        if key is None:
+            return ""
+        found = index.get(key) or folder_name(author)
+        index.setdefault(key, found)
+        return found
+
+    try:
+        entries = sorted(folder.iterdir())
+    except OSError as error:
+        run.count("errors")
+        journal_row(run, {"action": "error", "folder": name, "error": str(error)})
+        return False
+    if any(entry.is_dir() for entry in entries):
+        run.count("errors")
+        journal_row(run, {"action": "error", "folder": name, "error": "есть подпапки: соавторская папка не тронута"})
+        return False
+    for src in entries:
+        first = folder_for(parts[0])
+        if not first:
+            run.count("errors")
+            journal_row(run, {"action": "error", "folder": name, "error": f"автор без папки: {parts[0]}"})
+            return False
+        dest = unique_path(root / first, src.name, taken)
+        source = src.relative_to(root).as_posix()
+        try:
+            (root / first).mkdir(parents=True, exist_ok=True)
+            os.rename(src, dest)
+        except OSError as error:
+            run.count("errors")
+            journal_row(run, {"from": source, "to": "", "status": "error", "error": str(error)})
+            continue
+        run.count("moved")
+        pending.append((source, dest.relative_to(root).as_posix()))
+        journal_row(run, {"from": source, "to": dest.relative_to(root).as_posix(), "status": "move", "error": ""})
+        copy_coauthors(run, root, dest, parts[1:], folder_for, taken, dry_run=False)
+    try:
+        os.rmdir(folder)
+    except OSError as error:
+        run.count("errors")
+        journal_row(run, {"action": "error", "folder": name, "error": f"не удалена: {error}"})
+        return False
+    run.count("coauthor_folders")
+    journal_row(run, {"action": "rmdir", "folder": name, "status": "done", "error": ""})
+    return True
+
+
+def remove_empty_folder(run: NightRun, folder: Path) -> bool:
+    """Удаляет папку без файлов (только пустые подкаталоги) снизу вверх. True — удалена."""
+    for current, _dirs, _files in os.walk(folder, topdown=False):
+        try:
+            os.rmdir(current)
+        except OSError as error:
+            run.count("errors")
+            journal_row(run, {"action": "error", "folder": folder.name, "error": str(error)})
+            return False
+    run.count("emptied")
+    journal_row(run, {"action": "rmdir", "folder": folder.name, "status": "done", "error": ""})
+    return True
+
+
+def author_variants(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str], None] = print) -> dict[str, Any]:
+    """Пары «одно ФИО — разное написание» (variant_candidates). Пустая папка без файлов удаляется, пара — склеена.
+    Общие книги склеиваются в папку с полным ФИО через merge_folder (как merge-authors). Пары manual остаются в очереди
+    на решение во вкладке «Авторы». Решённые пары не пересчитываются. Папка, уже ушедшая в другую пару в этом прогоне,
+    пропускается. Журнал построчно: откат по move и rmdir."""
+    root = Path(cfg["books_dir"])
+    db_path = cfg["db_path"]
+    run = NightRun(cfg, "author-variants", dry_run, None, out)
+    candidates = variant_candidates(root, db_path)
+    statuses = variant_statuses(db_path)
+    todo = [c for c in candidates if statuses.get((c["a"], c["b"]), "pending") == "pending"]
+    if not dry_run:
+        migrate_database(db_path, out=out)
+        store_variants(db_path, candidates)
+    tiers = {tier: sum(c["tier"] == tier for c in todo) for tier in VARIANT_TIER_NAMES}
+    gone: set[str] = set()
+    taken: set[Path] = set()
+    pending: list[tuple[str, str]] = []
+    for cand in todo:
+        a, b, tier = cand["a"], cand["b"], cand["tier"]
+        if a in gone or b in gone or not (root / a).is_dir() or not (root / b).is_dir():
+            run.count("skipped")
+            continue
+        coauthor = next((name for name in (a, b) if coauthor_parts(name)), "")
+        if coauthor:  # соавторская папка: её книги — в папки обоих авторов, независимо от tier
+            if dry_run:
+                run.count("coauthor")
+            elif distribute_coauthor(run, root, coauthor, taken, pending):
+                set_variant(db_path, a, b, "merged", b if coauthor == a else a)
+            gone.add(coauthor)
+            continue
+        if tier == "manual":
+            continue
+        if tier == "empty":
+            empty = [n for n in (a, b) if not cand["files"][n]]
+            if len(empty) != 1:  # обе без файлов — решает пользователь
+                run.count("skipped")
+                continue
+            target = b if empty[0] == a else a
+            if dry_run:
+                run.count("emptied")
+            elif not remove_empty_folder(run, root / empty[0]):
+                continue
+            gone.add(empty[0])
+            if not dry_run:
+                set_variant(db_path, a, b, "merged", target)
+            continue
+        source, target = variant_target(a, b, cand["files"])
+        known = {row["path"] for row in books_under(db_path, source)}
+        merge_folder(run, db_path, root, source, target, [target], known, taken, pending)
+        gone.add(source)
+        if not dry_run and not (root / source).exists():
+            set_variant(db_path, a, b, "merged", target)
+    flush_relinks(db_path, pending, force=True)
+    s = run.stats
+    prefix = "будет " if dry_run else ""
+    line = (f"author-variants: пар {len(todo)} (пустых {tiers['empty']}, общих {tiers['common']}, "
+            f"вручную {tiers['manual']}); {prefix}склеено {s.get('merged', 0)}, {prefix}удалено пустых {s.get('emptied', 0)}, "
+            f"перенесено файлов {s.get('moved', 0)}, конфликтов имён {s.get('conflicts', 0)}, ошибок {s.get('errors', 0)}")
+    out(line)
+    say(line, "author_variants", detail=json.dumps({k: v for k, v in s.items() if k != "checked"}, ensure_ascii=False))
+    if not dry_run:
+        out("дальше: запустите scan — каталог books обновит пути книг; откат — по журналу (move, rmdir)")
+    return run.finish({"summary": line})
+
+
+def variant_action(cfg: dict[str, Any], a: str, b: str, action: str) -> str:
+    """Решение по паре вариантов: общая логика веба и API. Склейка идёт под scan_lock (ScanBusyError — занято).
+    Ошибки для пользователя — ValueError."""
+    lo, hi = sorted((a, b))
+    if lo == hi or action not in ("merge-into-a", "merge-into-b", "different"):
+        raise ValueError("нужны две разные папки и action: merge-into-a, merge-into-b или different")
+    db_path = cfg["db_path"]
+    statuses = variant_statuses(db_path)
+    if (lo, hi) not in statuses:
+        raise ValueError("пара вариантов не найдена")
+    if statuses[(lo, hi)] != "pending":
+        raise ValueError("пара уже решена")
+    if action == "different":
+        set_variant(db_path, lo, hi, "different")
+        say(f"варианты автора: «{lo}» и «{hi}» — разные авторы", "variant_action")
+        return "Разные авторы: пара больше не предлагается."
+    target = a if action == "merge-into-a" else b
+    source = hi if target == lo else lo
+    root = Path(cfg["books_dir"])
+    if not (root / source).is_dir() or not (root / target).is_dir():
+        raise ValueError("одной из папок уже нет: пара будет пересчитана при следующем прогоне")
+    with scan_lock():
+        run = NightRun(cfg, "author-variants", False, None, lambda _line: None)
+        pending: list[tuple[str, str]] = []
+        known = {row["path"] for row in books_under(db_path, source)}
+        merge_folder(run, db_path, root, source, target, [target], known, set(), pending)
+        flush_relinks(db_path, pending, force=True)
+        run.finish()
+    if (root / source).exists():
+        raise ValueError(f"папка «{source}» не пуста после переноса: см. журнал прогона")
+    set_variant(db_path, lo, hi, "merged", target)
+    return (f"склеено в «{target}»: перенесено файлов {run.stats.get('moved', 0)}, "
+            f"конфликтов имён {run.stats.get('conflicts', 0)}")
+
+
+FILE_CHANGING = ("fix-encoding", "unpack-fb2zip", "convert", "dedup", "dedup-folders", "zip-books", "unzip-books",
+                 "author-variants", "reconvert-fb2")
 COMMANDS = ("scan", "migrate", *FILE_CHANGING)
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
@@ -2704,13 +5351,16 @@ JOB_OUTPUT_LINES = 2000
 
 def command_params(command: str, raw: dict[str, Any]) -> dict[str, Any]:
     """Проверяет и нормализует параметры режима (общие для CLI и API). Неизвестные ключи — ошибка."""
-    if command not in COMMANDS:
+    if command not in (*COMMANDS, *CLI_COMMANDS):
         raise ConfigError(f"неизвестная команда {command!r}; допустимо: {', '.join(COMMANDS)}")
     allowed = {
         "scan": set(), "migrate": set(), "fix-encoding": {"path", "only"}, "unpack-fb2zip": {"path", "max_mb"},
         "convert": {"path", "only", "to", "overwrite", "skip_newer", "exclude", "author", "title_mode", "toc", "toc_depth",
                     "delete_source", "workers"},
-        "dedup": {"path", "workers"}, "zip-books": {"path", "workers"},
+        "dedup": {"path", "workers"}, "dedup-folders": {"path", "workers"}, "zip-books": {"path", "workers"},
+        "unzip-books": {"path", "workers"}, "unpack-collections": {"path"}, "merge-authors": set(),
+        "author-variants": set(), "sort-underscore": {"limit"},
+        "reconvert-fb2": {"path", "workers", "limit", "sample", "out", "epubcheck"},
     }[command]
     unknown = set(raw) - allowed
     if unknown:
@@ -2731,10 +5381,26 @@ def command_params(command: str, raw: dict[str, Any]) -> dict[str, Any]:
         if params["workers"] is not None and (not isinstance(params["workers"], int) or isinstance(params["workers"], bool)
                                               or not 1 <= params["workers"] <= 64):
             raise ConfigError("workers: целое 1..64")
+    if "limit" in allowed:
+        limit = raw.get("limit")
+        if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000000):
+            raise ConfigError("limit: целое 1..1000000")
+        params["limit"] = limit
     if command == "unpack-fb2zip":
         params["max_mb"] = raw.get("max_mb", 200)
         if not isinstance(params["max_mb"], int) or isinstance(params["max_mb"], bool) or not 1 <= params["max_mb"] <= 4096:
             raise ConfigError("max_mb: целое 1..4096")
+    if command == "reconvert-fb2":
+        params.update(epubcheck=raw.get("epubcheck", False), out=raw.get("out") or None)
+        for key, high in (("limit", 1_000_000), ("sample", 10_000)):
+            value = raw.get(key, 0) or 0
+            if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= high:
+                raise ConfigError(f"{key}: целое 0..{high}")
+            params[key] = value
+        if not isinstance(params["epubcheck"], bool) or not (params["out"] is None or isinstance(params["out"], str)):
+            raise ConfigError("epubcheck — логическое значение, out — строка пути")
+        if bool(params["sample"]) != bool(params["out"]):
+            raise ConfigError("--sample и --out задаются вместе")
     if command == "convert":
         params.update(to=raw.get("to", "epub"), title_mode=raw.get("title_mode", "auto"), toc_depth=raw.get("toc_depth", 3),
                       author=raw.get("author", ""), exclude=raw.get("exclude", []))
@@ -2767,8 +5433,23 @@ def run_command(cfg: dict[str, Any], command: str, dry_run: bool, params: dict[s
             return unpack_fb2zip(cfg, dry_run, params["path"], params["max_mb"], out=out)
         if command == "dedup":
             return dedup(cfg, dry_run, params["path"], params["workers"], out=out)
+        if command == "dedup-folders":
+            return dedup_folders(cfg, dry_run, params["path"], params["workers"], out=out)
+        if command == "author-variants":
+            return author_variants(cfg, dry_run, out=out)
         if command == "zip-books":
             return zip_books(cfg, dry_run, params["path"], params["workers"], out=out)
+        if command == "unzip-books":
+            return unzip_books(cfg, dry_run, params["path"], params["workers"], out=out)
+        if command == "unpack-collections":
+            return unpack_collections(cfg, dry_run, params["path"], out=out)
+        if command == "sort-underscore":
+            return sort_underscore(cfg, dry_run, params["limit"], out=out)
+        if command == "merge-authors":
+            return merge_authors(cfg, dry_run, out=out)
+        if command == "reconvert-fb2":
+            return reconvert_fb2(cfg, dry_run, params["path"], params["workers"], params["limit"], params["sample"],
+                                 params["out"], params["epubcheck"], out=out)
         if params["only"] == "fb2":
             return convert_fb2(cfg, dry_run, params["path"], params["workers"], out=out)
         return convert_documents(cfg, dry_run, params["path"], out=out,
@@ -2791,6 +5472,8 @@ def start_job(cfg: dict[str, Any], command: str, dry_run: bool, raw: dict[str, A
     """Фоновое задание. Боевой запуск режима, меняющего файлы книг, требует confirm — id успешного dry-run
     того же режима с теми же параметрами (правило проекта: сначала dry-run, затем боевой запуск)."""
     params = command_params(command, raw)
+    if command in CLI_COMMANDS:
+        raise ConfigError(f"{command}: режим доступен только из командной строки")
     if command in FILE_CHANGING and not dry_run:
         with JOBS_LOCK:
             proof = JOBS.get(confirm)
@@ -3217,7 +5900,39 @@ def set_shelves(conn: sqlite3.Connection, path: str, shelf_ids: list[int]) -> No
     conn.executemany("INSERT OR IGNORE INTO shelf_items SELECT id, ? FROM shelves WHERE id=?", [(path, sid) for sid in shelf_ids])
 
 
-def book_json(row: sqlite3.Row) -> dict[str, Any]:
+def book_collections(conn: sqlite3.Connection, paths: list[str]) -> dict[str, list[tuple[str, str]]]:
+    """Все сборники книг по путям из book_collections: {путь: [(раздел, сборник), …]}. До схемы v4 таблицы нет — пусто."""
+    found: dict[str, list[tuple[str, str]]] = {}
+    unique = list(dict.fromkeys(paths))
+    if not unique or conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_COLLECTIONS:
+        return found
+    for start in range(0, len(unique), 500):
+        chunk = unique[start:start + 500]
+        marks = ",".join("?" * len(chunk))
+        for path, section, collection in conn.execute(
+                f"SELECT DISTINCT path, section, collection FROM book_collections WHERE path IN ({marks}) "
+                "ORDER BY path, section, collection", chunk):
+            found.setdefault(path, []).append((section, collection))
+    return found
+
+
+def section_counts(conn: sqlite3.Connection, order: str) -> list[sqlite3.Row]:
+    """Разделы и сборники с числом книг: сборники — из VIEW collections (схема v4), книги без сборника — из books."""
+    if conn.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_COLLECTIONS:
+        source = ("SELECT section, collection, books AS n FROM collections UNION ALL "
+                  "SELECT section, '', count(*) FROM books WHERE collection='' GROUP BY section")
+    else:
+        source = "SELECT section, collection, count(*) AS n FROM books GROUP BY section, collection"
+    return conn.execute(f"SELECT section, collection, n FROM ({source}) ORDER BY {order}").fetchall()
+
+
+def collection_tag(section: str, collection: str) -> str:
+    """Тег-ссылка на сборник: поиск по разделу и сборнику, по папкам."""
+    return (f'<a class="tag" href="/?section={quote(section)}&collection={quote(collection)}&sort=path">'
+            f'{e(collection)}</a>')
+
+
+def book_json(row: sqlite3.Row, pairs: list[tuple[str, str]] | None = None) -> dict[str, Any]:
     data = {k: row[k] for k in row.keys() if k not in ("mtime",)}  # noqa: SIM118 — у sqlite3.Row нет __iter__ по ключам
     data["path"] = display_path(row["path"], row["fmt"])
     data["authors"] = [a for a in row["authors"].split("; ") if a]
@@ -3227,6 +5942,7 @@ def book_json(row: sqlite3.Row) -> dict[str, Any]:
                      "cover": f"/cover/{row['id']}" if row["cover"] else None}
     if is_wrapped(row["path"], row["fmt"]):
         data["links"]["raw"] = f"/api/books/{row['id']}/file"  # исходный однокнижный архив — только через API
+    data["collections"] = [{"section": s, "collection": c} for s, c in pairs or []]
     return data
 
 
@@ -3241,15 +5957,17 @@ API_HELP = {
     "POST /api/shelves": "{name} — создать полку",
     "POST /api/shelves/<id>/delete": "удалить полку (книги не трогаются)",
     "GET /api/jobs, GET /api/jobs/<id>": "фоновые задания: состояние, вывод плана, результат",
-    "POST /api/jobs": "{command: scan|migrate|fix-encoding|unpack-fb2zip|convert|dedup|zip-books, dry_run: true (по умолчанию), "
+    "POST /api/jobs": "{command: scan|migrate|fix-encoding|unpack-fb2zip|convert|dedup|dedup-folders|zip-books|unzip-books|"
+                      "author-variants, dry_run: true (по умолчанию), "
                       "confirm: <id успешного dry-run с теми же параметрами> — обязателен для боевого запуска fix-encoding/unpack-fb2zip/"
-                      "convert/dedup/zip-books, "
+                      "convert/dedup/dedup-folders/zip-books/unzip-books/author-variants, "
                       "параметры режима: path, only (для convert — fb2 и источники), workers, max_mb, to, overwrite, skip_newer, exclude, "
                       "author, title_mode, toc, "
                       "toc_depth, delete_source}",
     "GET /api/dups": "группы дублей: status=similar|auto|resolved (по умолчанию similar), page (по 50); "
                      "в members путь для показа — path, для действий — key_path",
-    "POST /api/dups/<id>": "{action: keep-both|quarantine|restore, path: key_path участника} — решение по группе",
+    "POST /api/dups/<id>": "{action: keep-both|resolve|quarantine|restore, path: key_path участника} — решение по группе "
+                           "(resolve — только пометить решённой, path не нужен)",
     "POST /api/progress": "позиция чтения (форма id, ch, p) — используется читалкой",
     "POST /api/books/<id>/edit": "{title, authors[], series, series_no, genres[], year, lang, annotation, rename?: bool} — "
                                  "правка метаданных; epub/fb2 переписываются в файле (прежняя версия в карантине edited/), "
@@ -3257,6 +5975,8 @@ API_HELP = {
     "GET /api/fix": "проблемные метаданные: reason=semi|garbage|title|author, page (по 100); в items: id, path, title, "
                     "authors, reasons, suggestion {title, authors} | null",
     "POST /api/authors/rename": "{old, new} — переименовать автора во всех его книгах (слияние с существующим)",
+    "GET /api/authors?variants=1": "варианты написания папок автора: status=pending|merged|different (по умолчанию pending)",
+    "POST /api/authors": "{a, b, action: merge-into-a|merge-into-b|different} — решение по паре вариантов; склейка под блокировкой",
 }
 
 
@@ -3443,13 +6163,25 @@ class Handler(BaseHTTPRequestHandler):
         filters = {
             "author": "b.id IN (SELECT book_id FROM book_authors WHERE name=?)",
             "genre": "b.id IN (SELECT book_id FROM book_genres WHERE name=?)",
-            "series": "b.series=?", "fmt": "b.fmt=?", "section": "b.section=?", "collection": "b.collection=?", "lang": "b.lang=?", "status": "m.status=?",
+            "series": "b.series=?", "fmt": "b.fmt=?", "lang": "b.lang=?", "status": "m.status=?",
             "shelf": "b.path IN (SELECT path FROM shelf_items WHERE shelf_id=?)",
         }
         for key, clause in filters.items():
             if params.get(key):
                 where.append(clause)
                 args.append(params[key])
+        section, collection = params.get("section", ""), params.get("collection", "")
+        if collection and conn.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_COLLECTIONS:
+            # сборник — по book_collections: книга-keeper из другого раздела тоже попадает в свой сборник
+            where.append("b.path IN (SELECT path FROM book_collections WHERE collection=? AND (?='' OR section=?))")
+            args.extend([collection, section, section])
+        else:
+            if section:
+                where.append("b.section=?")
+                args.append(section)
+            if collection:
+                where.append("b.collection=?")
+                args.append(collection)
         if params.get("fav"):
             where.append("m.favorite=1")
         if params.get("dir"):
@@ -3462,6 +6194,8 @@ class Handler(BaseHTTPRequestHandler):
         return total, rows
 
     def book_list(self, rows: list[sqlite3.Row]) -> str:
+        with closing(self.db()) as conn:  # сборники всех книг страницы — одним запросом
+            colls = book_collections(conn, [row["path"] for row in rows])
         items = []
         for row in rows:
             cover = (f'<img class="cv" src="/cover/{row["id"]}" alt="" loading="lazy">' if row["cover"]
@@ -3472,7 +6206,8 @@ class Handler(BaseHTTPRequestHandler):
             marks = (" ★" if row["favorite"] else "") + (f' <span class="tag">{e(STATUSES.get(row["status"], ""))}</span>'
                                                          if row["status"] else "")
             items.append(f'<li>{cover}<div><a href="/book/{row["id"]}"><b>{e(row["title"])}</b></a>{marks}<br>'
-                         f'{authors}{series}<br><span class="tag">{e(row["fmt"])}</span>{self.section_tag(row)}<span class="mut">'
+                         f'{authors}{series}<br><span class="tag">{e(row["fmt"])}</span>'
+                         f'{self.section_tag(row, colls.get(row["path"]))}<span class="mut">'
                          f'{e(row["year"])} {human_size(row["size"])}</span></div></li>')
         return f'<ul class="list">{"".join(items)}</ul>' if items else "<p>Ничего не найдено.</p>"
 
@@ -3524,8 +6259,9 @@ class Handler(BaseHTTPRequestHandler):
         self.page(params.get("q") or "Поиск", form + active + rename + self.pager(total, page, size, params) + self.book_list(rows)
                   + self.pager(total, page, size, params))
 
-    def grouped(self, title: str, sql: str, link: Callable[[str], str], label: Callable[[str], str] = str) -> None:
-        """Списки авторов и серий: по первой букве и по подстроке."""
+    def grouped(self, title: str, sql: str, link: Callable[[str], str], label: Callable[[str], str] = str,
+                prefix: str = "") -> None:
+        """Списки авторов и серий: по первой букве и по подстроке. prefix — строка над списком (ссылка на варианты)."""
         letter, needle = self.query.get("l", ""), self.query.get("q", "").strip()
         with closing(self.db()) as conn:
             letters = [r[0] for r in conn.execute(f"SELECT DISTINCT substr(k, 1, 1) FROM ({sql}) WHERE k <> '' ORDER BY 1")]
@@ -3536,31 +6272,81 @@ class Handler(BaseHTTPRequestHandler):
                 rows = conn.execute(f"SELECT k, c FROM ({sql}) WHERE substr(k, 1, 1)=? ORDER BY k", (letter,)).fetchall()
         bar = " ".join(f'<a href="?l={quote(x)}">{"<b>" + e(x) + "</b>" if x == letter and not needle else e(x)}</a>' for x in letters)
         items = "".join(f'<a href="{link(r[0])}">{e(label(r[0]))} <span class="mut">{r[1]}</span></a>' for r in rows)
-        self.page(title, f'<h2>{title}</h2><form class="s"><input name="q" value="{e(needle)}" placeholder="Найти">'
+        self.page(title, f'<h2>{title}</h2>{prefix}<form class="s"><input name="q" value="{e(needle)}" placeholder="Найти">'
                          f'<button>Найти</button></form><p class="letters">{bar}</p><div class="cols">{items}</div>')
 
     def view_authors(self, _parts: list[str]) -> None:
-        self.grouped("Авторы", "SELECT name AS k, count(*) AS c FROM book_authors GROUP BY name", lambda a: f"/?author={quote(a)}")
+        if self.query.get("variants") == "1":
+            self.view_variants()
+            return
+        with closing(self.db()) as conn:
+            pending = variants_pending(conn)
+        link = f'<p><a href="/authors?variants=1">Варианты написания: ожидают решения {pending}</a></p>'
+        self.grouped("Авторы", "SELECT name AS k, count(*) AS c FROM book_authors GROUP BY name",
+                     lambda a: f"/?author={quote(a)}", prefix=link)
+
+    def view_variants(self) -> None:
+        """Пары папок одного автора с разным написанием: решения «Склеить в …», «Разные авторы» (POST /authors/variant)."""
+        show_resolved = self.query.get("resolved") == "1"
+        statuses = ("pending", "merged", "different") if show_resolved else ("pending",)
+        page = max(int(self.query["page"]), 1) if self.query.get("page", "").isdigit() else 1
+        marks = ",".join("?" * len(statuses))
+        with closing(self.db()) as conn:
+            if conn.execute("PRAGMA user_version").fetchone()[0] < VARIANT_SCHEMA:
+                total, rows, books = 0, [], {}
+            else:
+                total = conn.execute(f"SELECT count(*) FROM author_variants WHERE status IN ({marks})", statuses).fetchone()[0]
+                rows = conn.execute(
+                    f"SELECT a, b, tier, status, target FROM author_variants WHERE status IN ({marks}) "
+                    "ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, a, b LIMIT ? OFFSET ?",
+                    (*statuses, VARIANT_PAGE_SIZE, (page - 1) * VARIANT_PAGE_SIZE)).fetchall()
+                books = folder_book_counts(conn)
+
+        def folder_link(name: str) -> str:
+            return f'<a href="/?dir={quote(name)}">{e(name)}</a> <span class="mut">книг {books.get(name, 0)}</span>'
+
+        def button(a: str, b: str, action: str, label: str) -> str:
+            return (f'<form class="s" method="post" action="/authors/variant"><input type="hidden" name="a" value="{e(a)}">'
+                    f'<input type="hidden" name="b" value="{e(b)}"><input type="hidden" name="action" value="{action}">'
+                    f'<button>{e(label)}</button></form>')
+
+        items = []
+        for row in rows:
+            a, b = row["a"], row["b"]
+            if row["status"] == "pending":
+                actions = (button(a, b, "merge-into-a", f"Склеить в «{a}»") + button(a, b, "merge-into-b", f"Склеить в «{b}»")
+                           + button(a, b, "different", "Разные авторы"))
+            else:
+                actions = e(VARIANT_STATUS_NAMES[row["status"]] + (f": {row['target']}" if row["target"] else ""))
+            items.append(f'<tr><td>{folder_link(a)}</td><td>{folder_link(b)}</td>'
+                         f'<td>{e(VARIANT_TIER_NAMES.get(row["tier"], row["tier"]))}</td><td>{actions}</td></tr>')
+        checked = " checked" if show_resolved else ""
+        heading = ('<h2>Варианты написания авторов</h2><form class="s" method="get" action="/authors">'
+                   '<input type="hidden" name="variants" value="1"><label><input type="checkbox" name="resolved" value="1"'
+                   f'{checked}> Решённые</label> <button>Показать</button></form>')
+        table = ("<table><tr><th>Папка</th><th>Папка</th><th>Вид</th><th>Действия</th></tr>" + "".join(items) + "</table>"
+                 if items else "<p>Вариантов нет. Их ищет режим author-variants (ночная обработка).</p>")
+        params = {"variants": "1"}
+        if show_resolved:
+            params["resolved"] = "1"
+        self.page("Варианты написания авторов", f"{heading}{table}{self.pager(total, page, VARIANT_PAGE_SIZE, params)}")
 
     def view_series(self, _parts: list[str]) -> None:
         self.grouped("Серии", "SELECT series AS k, count(*) AS c FROM books WHERE series <> '' GROUP BY series",
                      lambda s: f"/?series={quote(s)}&sort=series")
 
     @staticmethod
-    def section_tag(row: sqlite3.Row) -> str:
-        if not row["section"]:
-            return ""
-        link = f'/?section={quote(row["section"])}'
-        tag = f'<a class="tag" href="{link}">{e(row["section"])}</a>'
-        if row["collection"]:
-            tag += f'<a class="tag" href="{link}&collection={quote(row["collection"])}&sort=path">{e(row["collection"])}</a>'
-        return tag
+    def section_tag(row: sqlite3.Row, pairs: list[tuple[str, str]] | None = None) -> str:
+        """Теги раздела книги и всех её сборников; pairs — из book_collections (None — прежний вид по books)."""
+        tag = f'<a class="tag" href="/?section={quote(row["section"])}">{e(row["section"])}</a>' if row["section"] else ""
+        if pairs is None:
+            pairs = [(row["section"], row["collection"])] if row["collection"] else []
+        return tag + "".join(collection_tag(s, c) for s, c in pairs if c)
 
     def view_sections(self, _parts: list[str]) -> None:
         """Разделы (папки «_…») с коллекциями: журналы, сборники, документация, неразобранное."""
         with closing(self.db()) as conn:
-            rows = conn.execute("SELECT section, collection, count(*) FROM books GROUP BY section, collection "
-                                "ORDER BY section = '', section, collection").fetchall()
+            rows = section_counts(conn, "section = '', section, collection")
         blocks: dict[str, list[tuple[str, int]]] = {}
         for section, collection, count in rows:
             blocks.setdefault(section, []).append((collection, count))
@@ -3665,11 +6451,14 @@ class Handler(BaseHTTPRequestHandler):
                 same = conn.execute("SELECT b.*, m.status, m.rating, m.favorite FROM books b LEFT JOIN marks m ON m.path=b.path "
                                     "WHERE b.series=? AND b.id<>? ORDER BY b.series_no, b.title LIMIT 50",
                                     (book["series"], book["id"])).fetchall()
+            colls = book_collections(conn, [book["path"]]).get(book["path"], [])
         bid = book["id"]
         authors = ", ".join(f'<a href="/?author={quote(a)}">{e(a)}</a>' for a in book["authors"].split("; ") if a) or "—"
         genres = " ".join(f'<a class="tag" href="/?genre={quote(g)}">{e(genre_name(g))}</a>' for g in book["genres"].split("; ") if g)
         series = (f'<p>Серия: <a href="/?series={quote(book["series"])}&sort=series">{e(book["series"])}</a>'
                   f'{" #" + str(book["series_no"]) if book["series_no"] else ""}</p>') if book["series"] else ""
+        collections = "".join(collection_tag(s, c) for s, c in colls if c)
+        series += f'<p>Сборники: {collections}</p>' if collections else ""
         if book["fmt"] == "pdf":
             actions = [f'<a href="/file/{bid}?inline=1"><b>Открыть PDF</b></a>']
         elif book["fmt"] == "zip":
@@ -3867,6 +6656,18 @@ class Handler(BaseHTTPRequestHandler):
         self.redirect(f"/fix?reason={reason}" if reason else "/fix")
 
     def post_authors(self, parts: list[str]) -> None:
+        if parts == ["variant"]:
+            form = {k: v[-1] for k, v in self.form.items()}
+            try:
+                variant_action(self.cfg, form.get("a", ""), form.get("b", ""), form.get("action", ""))
+            except ValueError as error:
+                self.error_page(HTTPStatus.BAD_REQUEST, str(error))
+                return
+            except ScanBusyError:
+                self.error_page(HTTPStatus.CONFLICT, "Идёт обработка библиотеки, повторите позже")
+                return
+            self.redirect("/authors?variants=1")
+            return
         if parts != ["rename"]:
             self.error_page(HTTPStatus.NOT_FOUND, "Страница не найдена")
             return
@@ -3888,18 +6689,30 @@ class Handler(BaseHTTPRequestHandler):
         if status not in DUP_STATUS_NAMES:
             status = "similar"
         page = max(int(self.query["page"]), 1) if self.query.get("page", "").isdigit() else 1
+        show_resolved = self.query.get("resolved") == "1" and status != "resolved"
+        statuses = (status, "resolved") if show_resolved else (status,)
         with closing(self.db()) as conn:
             counts = dict(conn.execute("SELECT status, count(*) FROM dup_groups GROUP BY status").fetchall())
-            total, groups = dup_groups_page(conn, status, page, DUP_PAGE_SIZE)
+            total, groups = dup_groups_page(conn, status, page, DUP_PAGE_SIZE, statuses)
         tabs = []
         for key, label in DUP_STATUS_NAMES.items():
+            if key == "resolved":
+                continue  # решённые показываются галочкой «Решённые» рядом с заголовком
             text = f"{label}: {counts.get(key, 0)}"
             tabs.append(f"<b>{e(text)}</b>" if key == status else f'<a href="/dups?status={key}">{e(text)}</a>')
+        heading = "<h2>Дубликаты</h2>"
+        if status != "resolved":
+            checked = " checked" if show_resolved else ""
+            heading = ('<form id="dup-resolved" method="get" action="/dups" hidden>'
+                       f'<input type="hidden" name="status" value="{e(status)}"></form>'
+                       f'<h2>Дубликаты <label><input form="dup-resolved" type="checkbox" name="resolved" value="1"{checked}>'
+                       f" Решённые: {counts.get('resolved', 0)}</label> <button form=\"dup-resolved\">Показать</button></h2>")
+        keep_resolved = '<input type="hidden" name="resolved" value="1">' if show_resolved else ""
 
         def button(gid: int, action: str, path: str, label: str) -> str:
             return (f'<form class="s" method="post" action="/dups/{gid}"><input type="hidden" name="action" value="{action}">'
                     f'<input type="hidden" name="path" value="{e(path)}"><input type="hidden" name="back_status" '
-                    f'value="{e(status)}"><button>{e(label)}</button></form>')
+                    f'value="{e(status)}">{keep_resolved}<button>{e(label)}</button></form>')
 
         blocks = []
         for group in groups:
@@ -3924,14 +6737,18 @@ class Handler(BaseHTTPRequestHandler):
                 rows.append(f'<tr><td><span title="{e(shown)}">{e(PurePosixPath(shown).name)}</span></td>'
                             f'<td>{e(m["fmt"])}</td><td>{human_size(m["size"])}</td><td>{m["words"]}</td>'
                             f'<td>{coverage}</td><td>{role}</td><td>{links}</td><td>{actions}</td></tr>')
-            head = button(gid, "keep-both", "", "Оставить все") if group["status"] == "similar" else ""
+            keep = button(gid, "keep-both", "", "Оставить все") if group["status"] == "similar" else ""
+            head = (f'<div style="display:flex;flex-wrap:wrap;gap:.4rem">{keep}{button(gid, "resolve", "", "Решено")}</div>'
+                    if group["status"] in ("similar", "auto") else "")  # кнопки в одном ряду
             blocks.append(f'<section class="dup"><h3>{e(group["key"])} <span class="tag">'
                           f'{e(DUP_STATUS_NAMES.get(group["status"], group["status"]))}</span></h3>{head}'
                           f'<table><tr><th>Файл</th><th>Формат</th><th>Размер</th><th>Слов</th><th>Покрытие</th>'
                           f'<th>Роль</th><th>Ссылки</th><th>Действия</th></tr>{"".join(rows)}</table></section>')
-        listing = "".join(blocks) or "<p>Групп нет. Дубликаты ищет режим dedup (ночная обработка).</p>"
+        listing = "".join(blocks) or "<p>Групп нет. Дубликаты ищут режимы dedup и dedup-folders (ночная обработка).</p>"
         params = {"status": status}
-        self.page("Дубликаты", f"<h2>Дубликаты</h2><p>{' · '.join(tabs)}</p>{listing}"
+        if show_resolved:
+            params["resolved"] = "1"
+        self.page("Дубликаты", f"{heading}<p>{' · '.join(tabs)}</p>{listing}"
                                f"{self.pager(total, page, DUP_PAGE_SIZE, params)}")
 
     def post_dups(self, parts: list[str]) -> None:
@@ -3950,7 +6767,8 @@ class Handler(BaseHTTPRequestHandler):
         except ScanBusyError:
             self.error_page(HTTPStatus.CONFLICT, "Идёт обработка библиотеки, повторите позже")
             return
-        self.redirect(f"/dups?status={back}")
+        keep_resolved = "&resolved=1" if form.get("resolved") == "1" else ""
+        self.redirect(f"/dups?status={back}{keep_resolved}")
 
     def post_shelves(self, _parts: list[str]) -> None:
         form = {k: v[-1] for k, v in self.form.items()}
@@ -4015,14 +6833,26 @@ class Handler(BaseHTTPRequestHandler):
                                     (book["path"],)).fetchone()
                 shelves = conn.execute("SELECT s.id, s.name FROM shelves s JOIN shelf_items i ON i.shelf_id=s.id WHERE i.path=?",
                                        (book["path"],)).fetchall()
-                self.send_json({**book_json(book), "mark": dict(mark) if mark else None, "shelves": [dict(x) for x in shelves]})
+                colls = book_collections(conn, [book["path"]])
+                self.send_json({**book_json(book, colls.get(book["path"])), "mark": dict(mark) if mark else None,
+                                "shelves": [dict(x) for x in shelves]})
             elif name == "books":
                 params = {k: v for k, v in self.query.items() if k not in ("page", "per_page") and v}
                 page = max(int(self.query["page"]), 1) if self.query.get("page", "").isdigit() else 1
                 size = min(max(int(self.query["per_page"]), 1), 500) if self.query.get("per_page", "").isdigit() \
                     else self.cfg["page_size"]
                 total, rows = self.search_rows(conn, params, size, (page - 1) * size)
-                self.send_json({"total": total, "page": page, "per_page": size, "items": [book_json(r) for r in rows]})
+                colls = book_collections(conn, [r["path"] for r in rows])
+                self.send_json({"total": total, "page": page, "per_page": size,
+                                "items": [book_json(r, colls.get(r["path"])) for r in rows]})
+            elif name == "authors" and self.query.get("variants") == "1":
+                status = self.query.get("status", "pending")
+                if status not in VARIANT_STATUS_NAMES:
+                    self.send_json({"error": "status: pending, merged или different"}, HTTPStatus.BAD_REQUEST)
+                    return
+                rows = conn.execute("SELECT a, b, tier, status, target FROM author_variants WHERE status = ? "
+                                    "ORDER BY a, b LIMIT 1000", (status,)).fetchall()
+                self.send_json({"items": [dict(row) for row in rows]})
             elif name in ("authors", "series"):
                 sql = ("SELECT name AS k, count(*) AS c FROM book_authors GROUP BY name" if name == "authors" else
                        "SELECT series AS k, count(*) AS c FROM books WHERE series <> '' GROUP BY series")
@@ -4038,7 +6868,7 @@ class Handler(BaseHTTPRequestHandler):
                 rows = conn.execute("SELECT name, count(*) FROM book_genres GROUP BY name ORDER BY count(*) DESC")
                 self.send_json([{"code": r[0], "name": genre_name(r[0]), "count": r[1]} for r in rows])
             elif name == "sections":
-                rows = conn.execute("SELECT section, collection, count(*) FROM books GROUP BY section, collection ORDER BY 1, 2")
+                rows = section_counts(conn, "1, 2")
                 self.send_json([{"section": r[0] or FICTION_SECTION, "section_key": r[0], "collection": r[1], "count": r[2]}
                                 for r in rows])
             elif name == "shelves":
@@ -4047,8 +6877,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json([dict(r) for r in rows])
             elif name == "recent":
                 rows = conn.execute("SELECT b.* FROM marks m JOIN books b ON b.path=m.path WHERE m.opened IS NOT NULL "
-                                    "ORDER BY m.opened DESC LIMIT 100")
-                self.send_json([book_json(r) for r in rows])
+                                    "ORDER BY m.opened DESC LIMIT 100").fetchall()
+                colls = book_collections(conn, [r["path"] for r in rows])
+                self.send_json([book_json(r, colls.get(r["path"])) for r in rows])
             elif name == "stats":
                 total = conn.execute("SELECT count(*), coalesce(sum(size), 0) FROM books").fetchone()
                 fmts = conn.execute("SELECT fmt, count(*), sum(size) FROM books GROUP BY fmt ORDER BY 2 DESC").fetchall()
@@ -4104,7 +6935,14 @@ class Handler(BaseHTTPRequestHandler):
                 message = edit_book(self.cfg, int(parts[1]), fields, rename=rename)
                 with closing(self.db()) as conn:
                     row = conn.execute("SELECT * FROM books WHERE id=?", (int(parts[1]),)).fetchone()
-                self.send_json({"ok": True, "message": message, "book": book_json(row)})
+                    colls = book_collections(conn, [row["path"]])
+                self.send_json({"ok": True, "message": message, "book": book_json(row, colls.get(row["path"]))})
+                return
+            if name == "authors" and len(parts) == 1:
+                a, b, action = body.get("a", ""), body.get("b", ""), body.get("action", "")
+                if not all(isinstance(value, str) for value in (a, b, action)):
+                    raise ValueError("a, b и action — строки")
+                self.send_json({"ok": True, "message": variant_action(self.cfg, a, b, action)})
                 return
             if name == "authors" and len(parts) == 2 and parts[1] == "rename":
                 old, new = body.get("old", ""), body.get("new", "")
@@ -4454,13 +7292,18 @@ def serve(cfg: dict[str, Any], dry_run: bool = False) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Лёгкая веб-библиотека книг: каталог в SQLite и интерфейс в браузере.")
-    parser.add_argument("command", nargs="?", choices=("serve", "scan", *FILE_CHANGING), default="serve",
-                        help="serve (по умолчанию), scan, fix-encoding, unpack-fb2zip, convert, dedup или zip-books")
+    parser.add_argument("command", nargs="?", choices=("serve", "scan", *FILE_CHANGING, *CLI_COMMANDS), default="serve",
+                        help="serve (по умолчанию), scan, fix-encoding, unpack-fb2zip, convert, reconvert-fb2, dedup, dedup-folders, "
+                             "zip-books, unzip-books, unpack-collections, merge-authors, sort-underscore или author-variants")
     parser.add_argument("-p", "--path", help="fix-encoding/unpack-fb2zip/convert: каталог (по умолчанию каталог книг)")
     parser.add_argument("--only", default="all",
                         help="fix-encoding: all|fb2|txt; convert: all|fb2|doc|docx|rtf|odt|mht|mhtml (fb2 — в epub через Calibre)")
-    parser.add_argument("--workers", type=int, help="convert --only fb2, dedup, zip-books: потоков (по умолчанию workers из конфига)")
+    parser.add_argument("--workers", type=int,
+                        help="convert --only fb2, dedup, dedup-folders, zip-books: потоков (по умолчанию workers из конфига); "
+                             "unzip-books: потоков (по умолчанию unzip_workers)")
     parser.add_argument("--max-mb", type=int, default=200, help="unpack-fb2zip: предел размера записи, МБ")
+    parser.add_argument("--limit", type=int,
+                        help="sort-underscore: не больше N книг; reconvert-fb2: не больше N сопоставленных книг")
     parser.add_argument("--to", choices=("epub", "fb2"), default="epub", help="convert: формат результата (по умолчанию epub)")
     parser.add_argument("--overwrite", action="store_true", help="convert: перезаписывать существующий результат")
     parser.add_argument("--skip-newer", action="store_true", help="convert: с --overwrite не трогать результат новее исходника")
@@ -4471,11 +7314,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--toc-depth", type=int, default=3, help="convert: глубина оглавления")
     parser.add_argument("--delete-source", action="store_true",
                         help="convert: удалить исходник после проверки результата (с JSON-отчётом)")
+    parser.add_argument("--sample", type=int, default=0,
+                        help="reconvert-fb2: N книг в --out для проверки глазами; библиотека не меняется")
+    parser.add_argument("--out", help="reconvert-fb2 с --sample: каталог выборки (вне каталога книг)")
+    parser.add_argument("--epubcheck", action="store_true",
+                        help="reconvert-fb2: проверять каждый новый epub утилитой epubcheck (медленно, выборочно)")
     parser.add_argument("-n", "--dry-run", action="store_true", help="ничего не менять, показать план")
     parser.add_argument("--migrate-db", action="store_true", help="только миграции схемы БД")
     parser.add_argument("--config", type=Path, default=CONFIG_PATH, help="путь к books_library.json")
     args = parser.parse_args(argv)
     setup_logging()
+    if args.limit is not None and args.command not in ("sort-underscore", "reconvert-fb2"):
+        parser.error("--limit применяется только к sort-underscore и reconvert-fb2")
     try:
         cfg = load_config(args.config)
         if args.migrate_db or args.command != "serve":
@@ -4485,8 +7335,17 @@ def main(argv: list[str] | None = None) -> int:
                 raw = {"path": args.path, "only": args.only}
             if command == "unpack-fb2zip":
                 raw = {"path": args.path, "max_mb": args.max_mb}
-            elif command in ("dedup", "zip-books"):
+            elif command == "reconvert-fb2":
+                raw = {"path": args.path, "workers": args.workers, "limit": args.limit, "sample": args.sample,
+                       "out": args.out, "epubcheck": args.epubcheck}
+            elif command in ("dedup", "dedup-folders", "zip-books", "unzip-books"):
                 raw = {"path": args.path, "workers": args.workers}
+            elif command == "unpack-collections":
+                raw = {"path": args.path}
+            elif command == "sort-underscore":
+                raw = {"limit": args.limit}
+            elif command == "author-variants":
+                raw = {}
             elif command == "convert" and args.only == "fb2":
                 raw.update(workers=args.workers)
             elif command == "convert":

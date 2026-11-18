@@ -1,5 +1,5 @@
 [Unit]
-Description=Библиотека книг: ночная обработка и индексация /mnt/copy/Books (books_library.py scan, fix-encoding, convert, dedup, zip-books, scan)
+Description=Библиотека книг: ночная обработка и индексация /mnt/copy/Books (scan, fix-encoding, convert, unpack-collections, merge-authors, author-variants, dedup, dedup-folders, scan)
 Documentation=file://@MYTASKS_DIR@/books_library/README.md
 # Одновременный запуск scan и кнопки «Пересканировать» исключён блокировкой движка (код 3 — не повторять).
 StartLimitIntervalSec=2h
@@ -14,8 +14,11 @@ TimeoutStartSec=infinity
 ExecStart=/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py scan
 ExecStart=-/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py fix-encoding
 ExecStart=-/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py convert --only fb2
+ExecStart=-/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py unpack-collections
+ExecStart=-/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py merge-authors
+ExecStart=-/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py author-variants
 ExecStart=-/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py dedup
-ExecStart=-/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py zip-books
+ExecStart=-/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py dedup-folders
 ExecStart=/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py scan
 # Конфигурация (2) и уже идущее сканирование (3) повтором не лечатся.
 RestartPreventExitStatus=2 3
@@ -24,14 +27,15 @@ Nice=10
 IOSchedulingClass=idle
 MemoryMax=8G
 
-# Ограничения: файлы книг меняют только служебные режимы (fix-encoding, convert, dedup, zip-books); удаляемое и
-# заменяемое уходит в карантин /mnt/copy/Books-removed, а не удаляется. Запись — в каталог библиотеки (БД), логи,
-# каталог книг и карантин.
+# Ограничения: файлы книг меняют только служебные режимы (fix-encoding, convert, unpack-collections, merge-authors,
+# author-variants, dedup, dedup-folders); удаляемое и заменяемое уходит в карантин /mnt/copy/Books-removed, а не
+# удаляется; папки авторов склеиваются и переименовываются без карантина (журнал прогона — для отката). Запись — в каталог библиотеки (БД), логи,
+# каталог книг, карантин и кэш текста dedup (/var/cache/books_library, «-» — не ошибка, если каталога нет).
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=@MYTASKS_DIR@/books_library @MYTASKS_DIR@/logs -/mnt/copy/Books -/mnt/copy/Books-removed
+ReadWritePaths=@MYTASKS_DIR@/books_library @MYTASKS_DIR@/logs -/mnt/copy/Books -/mnt/copy/Books-removed -/var/cache/books_library
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=yes
 RestrictRealtime=yes
