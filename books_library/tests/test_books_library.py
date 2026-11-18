@@ -1952,6 +1952,101 @@ def test_text_author_name_alone_forms() -> None:
     assert bl.text_author("Джон СТЕЙНБЕК\nЗаблудившийся автобус\n", index) == ("", "")
 
 
+def write_epub_chapters(path: Path, chapters: list[str]) -> None:
+    """EPUB без метаданных автора: главы — тела <body> в порядке spine."""
+    container = (
+        '<?xml version="1.0"?>'
+        '<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+        '<rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>'
+        "</container>"
+    )
+    manifest = "".join(f'<item id="c{i}" href="ch{i}.xhtml" media-type="application/xhtml+xml"/>'
+                       for i in range(len(chapters)))
+    spine = "".join(f'<itemref idref="c{i}"/>' for i in range(len(chapters)))
+    opf = ('<?xml version="1.0" encoding="utf-8"?>'
+           '<package xmlns="http://www.idpf.org/2007/opf" version="3.0">'
+           '<metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Роман</dc:title></metadata>'
+           f"<manifest>{manifest}</manifest><spine>{spine}</spine></package>")
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("mimetype", "application/epub+zip")
+        archive.writestr("META-INF/container.xml", container)
+        archive.writestr("OEBPS/content.opf", opf)
+        for i, body in enumerate(chapters):
+            archive.writestr(f"OEBPS/ch{i}.xhtml", '<?xml version="1.0" encoding="utf-8"?>'
+                             f'<html xmlns="http://www.w3.org/1999/xhtml"><body>{body}</body></html>')
+
+
+def test_serial_filename_folder_needs_exactly_one_folder_with_surname() -> None:
+    index = {frozenset({"кейт", "дэвид"}): "Кейт Дэвид", frozenset({"андерсон", "кевин"}): "Андерсон Кевин",
+             frozenset({"андерсон", "пол"}): "Андерсон Пол", frozenset({"фёдоров", "иван"}): "Фёдоров Иван"}
+    assert bl.serial_filename_folder("Война Роботов 01(шагающая Смерть 1)кейт", index) == "Кейт Дэвид"
+    # две папки с фамилией «Андерсон» — не угадываем
+    assert bl.serial_filename_folder("Звездные Войны 002(проклятье Ситхов)андерсон", index) == ""
+    # ё→е при сравнении
+    assert bl.serial_filename_folder("Вселенная 3(тень)федоров", index) == "Фёдоров Иван"
+    # папки с такой фамилией нет
+    assert bl.serial_filename_folder("Война Роботов 11(естественный  Отбор)стакпол", index) == ""
+    # фамилия должна быть строчными после «)»
+    assert bl.serial_filename_folder("Книга (часть)Кейт", index) == ""
+    assert bl.serial_filename_folder("Книга без скобок", index) == ""
+
+
+def test_folder_author_number_coauthors_and_initials() -> None:
+    index = {frozenset({"уэйс", "михаил"}): "Уэйс Михаил", frozenset({"сальваторе", "роберт"}): "Сальваторе Роберт"}
+    assert bl.folder_author_name("1. М.Уэйс и Т.Хикмен") == "Уэйс М."
+    assert bl.folder_author_name("2) Р.Сальваторе") == "Сальваторе Р."
+    assert bl.folder_author_name("3) Иван Иванов & Пётр Петров") == "Иван Иванов"
+    assert bl.folder_author_name("Иван Иванов") == "Иван Иванов"
+    assert bl.folder_for_name(bl.folder_author_name("1. М.Уэйс и Т.Хикмен"), index) == "Уэйс Михаил"
+    assert bl.folder_for_name(bl.folder_author_name("2) Р.Сальваторе"), index) == "Сальваторе Роберт"
+    assert bl.folder_for_name(bl.folder_author_name("1. Д.Кейт"), index) == ""
+
+
+def test_epub_head_reads_only_leading_chapters(tmp_path: Path) -> None:
+    path = tmp_path / "Роман.epub"
+    write_epub_chapters(path, ["<p>Станислав Лем</p>\n<p>КАК МИКРОМИЛ</p>\n", "<p>ВТОРАЯ ГЛАВА</p>\n"])
+    head = bl.epub_head(path, 10)
+    assert "Станислав Лем" in head
+    assert "ВТОРАЯ" not in head
+    assert "ВТОРАЯ" in bl.epub_head(path, 10 ** 6)
+
+
+def test_sort_underscore_serial_numbered_folder_and_epub_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "sort_books"
+    for folder in ("Кейт Дэвид", "Андерсон Кевин", "Андерсон Пол", "Фёдоров Иван", "Уэйс Михаил",
+                   "Сальваторе Роберт", "Лем Станислав"):
+        (root / folder).mkdir(parents=True)
+    serial = root / "_Серии"
+    serial.mkdir()
+    (serial / "Война Роботов 01(шагающая Смерть 1)кейт.txt").write_text("Текст.\n", encoding="utf-8")
+    (serial / "Война Роботов 11(естественный  Отбор)кейт.txt").write_text("Текст.\n", encoding="utf-8")
+    (serial / "Звездные Войны 002(проклятье Ситхов)андерсон.txt").write_text("Текст.\n", encoding="utf-8")
+    (serial / "Вселенная 3(тень)федоров.txt").write_text("Текст.\n", encoding="utf-8")
+    (root / "_разобрать" / "1. М.Уэйс и Т.Хикмен").mkdir(parents=True)
+    (root / "_разобрать" / "1. М.Уэйс и Т.Хикмен" / "Книга.txt").write_text("Текст.\n", encoding="utf-8")
+    (root / "_разобрать" / "2) Р.Сальваторе").mkdir(parents=True)
+    (root / "_разобрать" / "2) Р.Сальваторе" / "Другая.txt").write_text("Текст.\n", encoding="utf-8")
+    write_epub_chapters(root / "_разобрать" / "Роман.epub", ["<p>Станислав Лем</p>\n<p>КАК МИКРОМИЛ</p>\n"])
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    cfg = make_cfg(tmp_path, root)
+    bl.scan(cfg)
+
+    stats = bl.sort_underscore(cfg, out=lambda _line: None)
+
+    assert stats["moved"] == 6
+    assert stats["source_filename"] == 3
+    assert stats["source_folder"] == 2
+    assert stats["source_text"] == 1
+    assert stats["no_author"] == 1
+    assert (root / "Кейт Дэвид" / "Война Роботов 01(шагающая Смерть 1)кейт.txt").is_file()
+    assert (root / "Кейт Дэвид" / "Война Роботов 11(естественный  Отбор)кейт.txt").is_file()
+    assert (root / "Фёдоров Иван" / "Вселенная 3(тень)федоров.txt").is_file()
+    assert (root / "Уэйс Михаил" / "Книга.txt").is_file()
+    assert (root / "Сальваторе Роберт" / "Другая.txt").is_file()
+    assert (root / "Лем Станислав" / "Роман.epub").is_file()
+    assert (serial / "Звездные Войны 002(проклятье Ситхов)андерсон.txt").is_file()
+
+
 # ---- merge-authors: склейка «Фамилия Имя» + «Фамилия Имя Отчество» ---------------------------------------
 
 def merge_cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, files: dict[str, str | bytes]) -> dict[str, Any]:

@@ -5368,6 +5368,11 @@ TEXT_NAME_ALONE = re.compile(rf"^\s*({TEXT_WORD}(?:[ \t]+{TEXT_WORD}){{1,2}})\.?
 TEXT_INITIALS_ALONE = re.compile(r"^\s*((?:[А-ЯЁ]\.\s*){1,2})([А-ЯЁ][а-яё]+|[А-ЯЁ]{2,})\.?\s*$")  # «И. О. Фамилия»
 TEXT_SURNAME_INITIALS = re.compile(r"^\s*([А-ЯЁ][а-яё]+|[А-ЯЁ]{2,})\s+((?:[А-ЯЁ]\.\s*){1,2})\s*$")  # «Фамилия И. О.»
 TEXT_ALONE_LINES = 5
+TEXT_SOURCE_FORMATS = ("txt", "fb2", "epub")  # форматы, из которых sort-underscore берёт автора из текста
+SERIAL_AUTHOR = re.compile(r"\)\s*([а-яёa-z]+)\s*$")  # «Война Роботов 01(подзаголовок)кейт» — фамилия строчными после «)»
+FOLDER_NUMBER = re.compile(r"^\d+[.)]\s*")  # номер в начале папки: «1. », «2) »
+FOLDER_COAUTHORS = re.compile(r"\s+и\s+|\s*[,&]\s*")  # соавторы в папке: «… и …», «,», «&»
+FOLDER_INITIALS = re.compile(r"^((?:[А-ЯЁ]\.)+)([А-ЯЁ][а-яё]+)$")  # «М.Уэйс», «М.Н.Загоскин»
 
 
 def is_initials(name: str) -> bool:
@@ -5418,6 +5423,24 @@ def filename_author(stem: str) -> str:
     return left
 
 
+def serial_filename_folder(stem: str, index: dict[frozenset[str], str]) -> str:
+    """Папка автора для выпуска серии «Война Роботов 01(шагающая Смерть 1)кейт»: фамилия строчными после последней «)».
+    Принимается, только если среди папок верхнего уровня ровно одна с такой фамилией (ё→е); иначе ''."""
+    match = SERIAL_AUTHOR.search(stem)
+    if match is None:
+        return ""
+    surname = author_norm(match.group(1))
+    found = [folder for folder in index.values() if author_words(folder)[:1] == [surname]]
+    return found[0] if len(found) == 1 else ""
+
+
+def folder_author_name(folder: str) -> str:
+    """Имя автора из папки «1. М.Уэйс и Т.Хикмен» или «2) Р.Сальваторе»: без номера, первый автор; «М.Уэйс» → «Уэйс М.»."""
+    first = FOLDER_COAUTHORS.split(FOLDER_NUMBER.sub("", folder, count=1), maxsplit=1)[0].strip()
+    match = FOLDER_INITIALS.match(first)
+    return f"{match.group(2)} {''.join(match.group(1).split())}" if match is not None else first
+
+
 def alone_name(line: str) -> str:
     """Имя из строки-одиночки: «Имя Фамилия», «ФАМИЛИЯ ИМЯ», «И. О. Фамилия» → «Фамилия И.О.», «Фамилия И. О.» → «Фамилия И.О.»
     (форма для folder_for_name). Не имя — ''."""
@@ -5459,8 +5482,24 @@ def text_author(head: str, index: dict[frozenset[str], str]) -> tuple[str, str]:
     return "", ""
 
 
+def epub_head(full: Path, limit: int) -> str:
+    """Начало epub: главы spine по порядку, пока не набрано limit символов — книга целиком не читается."""
+    parts: list[str] = []
+    size = 0
+    with zipfile.ZipFile(full) as archive:
+        for path in Epub(archive).spine():
+            chunk = re.sub(r"<[^>]*>", " ", decode_xml(zip_read(archive, path)))
+            parts.append(chunk)
+            size += len(chunk)
+            if size >= limit:
+                break
+    return "\n".join(parts)  # строки сохраняются: имя-строка ищется по строкам (text_names)
+
+
 def text_head(cfg: dict[str, Any], full: Path, fmt: str) -> str:
-    """Начало текста книги (TEXT_HEAD_CHARS символов); однокнижный zip читается через book_text."""
+    """Начало текста книги (TEXT_HEAD_CHARS символов). Прямой epub — по главам до лимита; однокнижный zip — через book_text."""
+    if fmt == "epub" and not full.name.lower().endswith(".zip"):
+        return epub_head(full, TEXT_HEAD_CHARS)[:TEXT_HEAD_CHARS]
     with tempfile.TemporaryDirectory(prefix="books_library-sort-underscore-") as tmp_name:
         return book_text(cfg, full, fmt, Path(tmp_name))[:TEXT_HEAD_CHARS]
 
@@ -5507,6 +5546,7 @@ def unpack_collections(cfg: dict[str, Any], dry_run: bool = False, path: str | N
                 run.count("not_book")
     pre_dirs = {entry.name for entry in root.iterdir() if entry.is_dir()}
     index = author_index(root)
+    text_cache = TextCache.open(cfg) if "text" in sources else None  # сначала кэш текста dedup, затем чтение книги
     created: set[str] = set()
     taken: set[Path] = set()
     planned_gone: set[str] = set()
@@ -5552,17 +5592,24 @@ def unpack_collections(cfg: dict[str, Any], dry_run: bool = False, path: str | N
             if folder:
                 source, found_by = "meta", author
         if not folder and "folder" in sources and parent:
-            folder = folder_for_name(parent, index)
+            folder = folder_for_name(folder_author_name(parent), index)
             if folder:
                 source, found_by, match = "folder", parent, "existing"
         if not folder and "filename" in sources:
-            name = filename_author(split_name(rel)[0])
+            base_name = split_name(rel)[0]
+            name = filename_author(base_name)
             folder = folder_for_name(name, index) if name else ""
             if folder:
                 source, found_by, match = "filename", name, "existing"
-        if not folder and "text" in sources and books[rel]["fmt"] in ("txt", "fb2"):
+            else:
+                folder = serial_filename_folder(base_name, index)
+                if folder:
+                    source, found_by, match = "filename", folder, "existing"
+        if not folder and "text" in sources and books[rel]["fmt"] in TEXT_SOURCE_FORMATS:
             try:
-                folder, name = text_author(text_head(cfg, src, books[rel]["fmt"]), index)
+                cached = text_cache.get(rel, books[rel]["size"], src.stat().st_mtime, books[rel]["fmt"]) if text_cache else None
+                head = cached[:TEXT_HEAD_CHARS] if cached is not None else text_head(cfg, src, books[rel]["fmt"])
+                folder, name = text_author(head, index)
             except (OSError, ValueError, KeyError, zipfile.BadZipFile, EOFError, subprocess.TimeoutExpired) as error:
                 failure = f"{type(error).__name__}: {error}"
             if folder:
