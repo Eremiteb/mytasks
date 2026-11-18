@@ -2428,3 +2428,19 @@ def test_epub_head_is_not_counted_as_words() -> None:
     stripped = bl.EPUB_HEAD.sub(" ", markup)
     assert "Раз" not in stripped
     assert bl.count_words(bl.markup_plain(stripped)) == 1
+
+
+class _CapsNameCache:
+    """Кэш текста с одной строкой «РЫЖКОВ ИГОРЬ АЛЕКСЕЕВИЧ» в начале книги."""
+
+    def get(self, rel: str, size: int, mtime: float, fmt: str) -> str:
+        return "РЫЖКОВ ИГОРЬ АЛЕКСЕЕВИЧ\nНазвание\n"
+
+
+def test_text_patronymics_caps_name_is_title_cased(tmp_path: Path) -> None:
+    folder = tmp_path / "Рыжков Игорь"
+    folder.mkdir()
+    (folder / "a.txt").write_text("текст книги\n", encoding="utf-8")
+    rows = [{"path": "Рыжков Игорь/a.txt"}]
+    assert bl.text_patronymics(_CapsNameCache(), tmp_path, rows,
+                               bl.author_words("Рыжков Игорь")) == ["Рыжков Игорь Алексеевич"]

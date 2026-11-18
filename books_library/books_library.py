@@ -4915,6 +4915,8 @@ def text_patronymics(cache: TextCache, root: Path, rows: list[sqlite3.Row], shor
             words = line.removesuffix(".").split()
             if len(words) != 3 or not all(HEAD_WORD_RE.fullmatch(word) for word in words):
                 continue
+            # «ТОЛСТОЙ ЛЕВ НИКОЛАЕВИЧ» — в имя папки с заглавной буквы: «Толстой Лев Николаевич»
+            words = ["-".join(part.capitalize() for part in word.split("-")) if word.isupper() else word for word in words]
             name = patronymic_full(" ".join(words), short_words)
             if name and is_patronymic(name):
                 found.append(name)
