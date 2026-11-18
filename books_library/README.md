@@ -182,6 +182,13 @@ fb2 и однокнижный zip с fb2 → `name.epub` рядом (то же �
 `collection-type` `set` (`id="edition1"`); издательская серия — не `belongs-to-collection`, а
 `<meta name="books_library:publisher-series">` и `books_library:publisher-series-index` (номер), чтобы не спутаться с
 авторской серией. `Epub.details` при скане читает их в `book_meta` и `book_collections` (`publisher-series`).
+Серии: все `sequence` описания переносятся — первая как `belongs-to-collection` (`collection-type` `series`) и `calibre:series`,
+вторая и далее — `belongs-to-collection` (`id="c2"`, `c3`, …) с `collection-type` `series` и `group-position`.
+При скане (схема v6) первая серия EPUB или fb2 — `books.series`/`series_no`, остальные — `book_meta` `series_extra`
+«имя #номер». Серия по папке: имя файла `N. Название`, папка `Серия (110,124)` (в разделах — подпапка сборника,
+для книг из сборников — `orig_path`) → `book_meta` `series_folder` и `books.series`, только если серия из описания пуста.
+Служебные значения (`SERIES_STOP`: рассказы, повести, сборник, сборники, стихи, роман, без серии, антология…) серией
+не считаются: `books.series` пуст, значение — в `book_meta` `series_raw`. Пересчёт у существующих книг — `scan --reparse`.
 Картинки из `<binary>` определяются по сигнатуре (JPEG, PNG, GIF, WebP); SVG не принимается, битые пропускаются.
 
 **Сноски.** Ссылка на сноску (`type="note"` или ссылка на раздел тел `notes`/`comments`) становится

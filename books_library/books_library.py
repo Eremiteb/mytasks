@@ -108,6 +108,12 @@ BOOK_EXTENSIONS = {
 # Заглушки вместо автора, названия или жанра: такие значения не заменяют данные из пути.
 PLACEHOLDERS = {"неизвестный", "неизвестен", "неизвестный автор", "автор неизвестен", "unknown", "unknown author",
                 "unrecognised", "unrecognized", "без названия", "untitled"}
+# Служебные значения вместо серии (сравнение по author_norm): жанр или метка — не серия, а series_raw.
+SERIES_STOP = {"рассказы", "повести", "сборник", "сборники", "стихи", "стихотворения", "роман", "романы",
+               "без серии", "вне серий", "антология"}
+FOLDER_SERIES_TAIL = re.compile(r"\s*\(\s*\d+(?:\s*[,;]\s*\d+)*\s*\)\s*$")  # хвост папки: «Серия (110,124)»
+FOLDER_SERIES_NUMBER = re.compile(r"^\d{1,3}\.\s+")  # ведущий «N. » в имени папки
+FILE_SERIES_NUMBER = re.compile(r"^(\d{1,3})[.\s_-]+")  # номер книги в серии — в начале имени файла
 # Сколько байт начала fb2 читается при сканировании: описание книги всегда в начале файла.
 FB2_HEAD_BYTES = 512 * 1024
 # Предел размера одного служебного файла внутри EPUB/ZIP (защита от zip-бомб).
@@ -545,6 +551,56 @@ def xml_tag(name: str, source: str) -> str:
     return strip_tags(match.group(1)) if match else ""
 
 
+def series_stop(name: str) -> bool:
+    """Служебное значение вместо серии (SERIES_STOP): не серия, а жанр или метка."""
+    return author_norm(name) in SERIES_STOP
+
+
+def series_pair(name: str, number: str = "") -> tuple[str, str]:
+    """Дополнительная серия книги для book_meta: «имя #номер»; служебное значение — в series_raw."""
+    if series_stop(name):
+        return "series_raw", name
+    return "series_extra", f"{name} #{number}" if number else name
+
+
+def folder_series(rel: str) -> tuple[str, int] | None:
+    """Серия по папке: «Двойной Герой (110,124)/2. Книга.epub» → («Двойной Герой», 2). Папка автора верхнего уровня
+    серией не считается. В разделах серия — подпапка сборника (последний сегмент subsection), в _разобрать — сама папка."""
+    parts = PurePosixPath(rel).parts
+    number = FILE_SERIES_NUMBER.match(parts[-1]) if len(parts) > 1 else None
+    if not number:
+        return None
+    if parts[0].startswith("_"):
+        folder = parts[-2] if parts[0] == "_разобрать" and len(parts) >= 3 else subsection_of(rel).rpartition("/")[2]
+    elif len(parts) >= 3:
+        folder = parts[-2]
+    else:
+        return None
+    name = FOLDER_SERIES_NUMBER.sub("", FOLDER_SERIES_TAIL.sub("", folder)).strip()
+    return (name, int(number.group(1))) if name else None
+
+
+def series_fields(found: dict[str, Any], rel: str, orig: str) -> None:
+    """Серии поверх разбора файла. Служебная серия из описания — в series_raw, books.series пуст. Серия по папке
+    (путь книги, а при его отсутствии — orig_path сборника) — book_meta series_folder и books.series, если он пуст.
+    meta_overrides применяются позже и имеют приоритет."""
+    kv = found.setdefault("kv", [])
+    primary = found.get("series", "")
+    if primary and series_stop(primary):
+        kv.append(("series_raw", primary))
+        found["series"], found["series_no"] = "", None
+    folder = folder_series(rel) or (folder_series(orig) if orig else None)
+    if not folder:
+        return
+    name, number = folder
+    if series_stop(name):
+        kv.append(("series_raw", name))
+        return
+    kv.append(("series_folder", f"{name} #{number}"))
+    if not found.get("series"):
+        found["series"], found["series_no"] = name, number
+
+
 def fb2_meta(raw: bytes) -> dict[str, Any]:
     """Описание книги из title-info fb2 (регулярными выражениями: многие файлы — не валидный XML)."""
     text = decode_xml(raw)
@@ -615,7 +671,7 @@ def fb2_details(text: str, info: str, title: str) -> tuple[list[tuple[str, Any]]
         attrs = parse_attrs(seq)
         name, number = attrs.get("name", "").strip(), attrs.get("number", "").strip()
         if name:
-            pairs.append(("series_extra", f"{name} #{number}" if number else name))
+            pairs.append(series_pair(name, number))
     cover = re.search(r"<(?:\w+:)?image\b[^>]*?href\s*=\s*[\"']#?([^\"']+)", info)
     if cover:
         pairs.append(("coverpage", cover.group(1)))
@@ -732,6 +788,9 @@ class Epub:
                 number = re.match(r"\d+", attrs.get("content", ""))
                 meta["series_no"] = int(number.group(0)) if number else None
         meta["kv"], meta["sets"] = self.details()
+        if self.series:
+            number = re.match(r"\d+", self.series[0][1])
+            meta["series"], meta["series_no"] = self.series[0][0], (int(number.group(0)) if number else None)
         return meta
 
     def details(self) -> tuple[list[tuple[str, Any]], list[tuple[str, str]]]:
@@ -758,6 +817,7 @@ class Epub:
             pairs.append((roles.get(role, "contributor"), strip_tags(body)))
         refines: dict[str, dict[str, str]] = {}
         collections: list[tuple[str, str]] = []
+        self.series: list[tuple[str, str]] = []  # belongs-to-collection типа series: (название, group-position) по порядку
         series: list[list[str]] = []  # [название, номер] издательской серии; номер относится к последней серии
         for attrs_text, body in re.findall(r"<(?:\w+:)?meta\b([^>]*?)(?:/>|>(.*?)</(?:\w+:)?meta\s*>)", self.opf, re.S):
             attrs = parse_attrs(attrs_text)
@@ -781,6 +841,9 @@ class Epub:
                       ("group_position", props.get("group-position", ""))]
             if ctype == "set" and name:
                 sets.append(("set", name))
+            if ctype == "series" and name:
+                self.series.append((name, props.get("group-position", "")))
+        pairs += [series_pair(name, position) for name, position in self.series[1:]]  # первая — books.series
         for name, number in series:  # издательская серия, записанная конвертером fb2_to_epub3 (как fb2_details)
             if name:
                 pairs += [("publisher_series", name), ("publisher_series_no", number)]
@@ -885,7 +948,7 @@ def path_meta(rel: str) -> dict[str, Any]:
 
 
 def read_book_meta(root: Path, rel: str, size: int = 0, mtime: float = 0.0,
-                   cache: TextCache | None = None, detail: bool = False) -> dict[str, Any]:
+                   cache: TextCache | None = None, detail: bool = False, orig: str = "") -> dict[str, Any]:
     """Метаданные одной книги; при любой ошибке разбора — данные по пути (книга остаётся в каталоге).
     detail (только scan) — дополнительно pdf, djvu, mobi/azw, docx/odt, txt и число слов из cache, если текст книги
     уже в кэше dedup (без извлечения). Остальные вызовы (dedup, веб) разбирают прежний набор форматов."""
@@ -920,6 +983,7 @@ def read_book_meta(root: Path, rel: str, size: int = 0, mtime: float = 0.0,
         for key, value in found.pop("fill", {}).items():
             if value and not meta.get(key):
                 meta[key] = value
+        series_fields(found, rel, orig)
         if detail and cache is not None:
             text = cache.get(rel, size, mtime, meta["fmt"])
             if text:
@@ -1068,11 +1132,13 @@ def scan(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str], None] 
                 conn.execute(f"DELETE FROM books WHERE path IN ({marks})", chunk)
                 conn.execute(f"DELETE FROM book_meta WHERE path IN ({marks})", chunk)
                 conn.execute(f"DELETE FROM book_collections WHERE source='meta' AND path IN ({marks})", chunk)
+        moved = dict(conn.execute("SELECT path, orig_path FROM book_collections WHERE path <> orig_path"))
         with ThreadPoolExecutor(max_workers=cfg["scan_workers"]) as pool:
             for start in range(0, len(todo), 500):
                 batch = todo[start:start + 500]
                 metas = list(pool.map(
-                    lambda item: read_book_meta(root, item[0], item[1], item[2], text_cache, detail=True), batch))
+                    lambda item: read_book_meta(root, item[0], item[1], item[2], text_cache, detail=True,
+                                                orig=moved.get(item[0], "")), batch))
                 with conn:
                     for (rel, size, mtime), meta in zip(batch, metas, strict=True):
                         if "error" in meta:
@@ -3729,6 +3795,12 @@ class _Fb2Book:
         self.series = _attr(seq, "name").strip()
         number = re.match(r"\d+", _attr(seq, "number").strip())
         self.series_no = number.group(0) if number else ""
+        self.series_extra: list[tuple[str, str]] = []  # вторая и далее серии title-info: (название, номер)
+        for extra in _kids(ti, "sequence")[1:]:
+            extra_name = _attr(extra, "name").strip()
+            extra_no = re.match(r"\d+", _attr(extra, "number").strip())
+            if extra_name:
+                self.series_extra.append((extra_name, extra_no.group(0) if extra_no else ""))
         self.images: dict[str, str] = {}
         self.image_data: list[tuple[str, bytes]] = []
         self._load_images()
@@ -4047,6 +4119,11 @@ def fb2_to_epub3(data: bytes, out: Path) -> None:
         if book.series_no:
             meta.append(f'<meta refines="#c1" property="group-position">{_esc(book.series_no)}</meta>')
             meta.append(f'<meta name="calibre:series_index" content="{_esc(book.series_no)}"/>')
+    for number, (extra_name, position) in enumerate(book.series_extra, 2):
+        meta.append(f'<meta property="belongs-to-collection" id="c{number}">{_esc(extra_name)}</meta>')
+        meta.append(f'<meta refines="#c{number}" property="collection-type">series</meta>')
+        if position:
+            meta.append(f'<meta refines="#c{number}" property="group-position">{_esc(position)}</meta>')
     if book.book_name and author_norm(book.book_name) != author_norm(book.title):
         meta.append(f'<meta property="belongs-to-collection" id="edition1">{_esc(book.book_name)}</meta>')
         meta.append('<meta refines="#edition1" property="collection-type">set</meta>')

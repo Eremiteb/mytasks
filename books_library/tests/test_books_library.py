@@ -3710,3 +3710,65 @@ def test_purge_quarantine_params_and_api_refusal(cfg: dict[str, Any]) -> None:
     assert bl.command_params("purge-quarantine", {"reasons": ["duplicate", "duplicate"]}) == {"reasons": ["duplicate"]}
     with pytest.raises(bl.ConfigError):
         bl.start_job(cfg, "purge-quarantine", False, {"reasons": ["duplicate"]})
+
+
+def make_fb2_series(sequences: str) -> bytes:
+    """fb2 без издательских данных с заданными sequence в title-info."""
+    text = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0">'
+        "<description><title-info><genre>sf</genre>"
+        "<author><first-name>Иван</first-name><last-name>Иванов</last-name></author>"
+        f"<book-title>Книга</book-title><lang>ru</lang>{sequences}"
+        "</title-info></description>"
+        "<body><section><p>Текст.</p></section></body></FictionBook>"
+    )
+    return text.encode("utf-8")
+
+
+def test_fb2_two_series_go_to_epub_and_book_meta(tmp_path: Path) -> None:
+    epub = tmp_path / "two.epub"
+    bl.fb2_to_epub3(make_fb2_series('<sequence name="Первая" number="2"/><sequence name="Вторая" number="5"/>'), epub)
+    with zipfile.ZipFile(epub) as archive:
+        opf = archive.read("OEBPS/content.opf").decode("utf-8")
+    assert '<meta property="belongs-to-collection" id="c2">Вторая</meta>' in opf
+    assert '<meta refines="#c2" property="group-position">5</meta>' in opf
+    root = tmp_path / "books"
+    (root / "Иванов Иван").mkdir(parents=True)
+    rel = "Иванов Иван/Две серии.epub"
+    (root / rel).write_bytes(epub.read_bytes())
+    cfg = make_cfg(tmp_path, root)
+    bl.scan(cfg)
+
+    row = book_rows(cfg)[rel]
+    assert row["series"] == "Первая"
+    assert row["series_no"] == 2
+    assert ("series_extra", "Вторая #5") in meta_pairs(cfg, rel)
+
+
+def test_series_from_folder_and_stop_words(tmp_path: Path) -> None:
+    assert bl.folder_series("Иванов Иван/Двойной Герой (110,124)/2. Книга.epub") == ("Двойной Герой", 2)
+    assert bl.folder_series("_Сборники/Сборник/Двойной Герой (562,810)/2. Книга.epub") == ("Двойной Герой", 2)
+    assert bl.folder_series("Иванов Иван/2. Книга.epub") is None
+    assert bl.folder_series("Иванов Иван/Двойной Герой/Книга.epub") is None
+
+    root = tmp_path / "books"
+    (root / "Иванов Иван" / "Двойной Герой (110,124)").mkdir(parents=True)
+    (root / "Иванов Иван" / "Рассказы").mkdir()
+    folder_rel = "Иванов Иван/Двойной Герой (110,124)/2. Книга.fb2"
+    (root / folder_rel).write_bytes(make_fb2_series(""))
+    stop_folder_rel = "Иванов Иван/Рассказы/3. Ещё.fb2"
+    (root / stop_folder_rel).write_bytes(make_fb2_series(""))
+    stop_desc_rel = "Иванов Иван/Сборный.fb2"
+    (root / stop_desc_rel).write_bytes(make_fb2_series('<sequence name="Рассказы" number="1"/>'))
+    cfg = make_cfg(tmp_path, root)
+    bl.scan(cfg)
+
+    rows = book_rows(cfg)
+    assert rows[folder_rel]["series"] == "Двойной Герой"
+    assert rows[folder_rel]["series_no"] == 2
+    assert ("series_folder", "Двойной Герой #2") in meta_pairs(cfg, folder_rel)
+    assert rows[stop_folder_rel]["series"] == ""
+    assert ("series_raw", "Рассказы") in meta_pairs(cfg, stop_folder_rel)
+    assert rows[stop_desc_rel]["series"] == ""
+    assert ("series_raw", "Рассказы") in meta_pairs(cfg, stop_desc_rel)
