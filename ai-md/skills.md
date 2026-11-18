@@ -11,7 +11,7 @@
 
 ## Навыки и хуки проекта (установщик)
 
-- `model-routing` — выбор модели под шаг. Источник `agent-skills/model-routing/`. Ставится в `~/.claude/skills` и `~/.agents/skills`. Хуки: проверка меток шагов плана и напоминание перед каждым запросом (Claude Code, Codex, Gemini CLI).
+- `model-routing` — выбор модели под шаг. Источник `agent-skills/model-routing/`. Ставится в `~/.claude/skills` и `~/.agents/skills`. Хуки: проверка меток шагов плана и напоминание перед каждым запросом (`remind.py`: model-routing, а также загрузка `best-practices` и `infosec` до правок; Claude Code, Codex, Gemini CLI).
 - `best-practices` — лучшие практики инженерии. Источник `agent-skills/best-practices/`. Ставится в `~/.claude/skills` и `~/.agents/skills` на всех устройствах установщика.
 - `infosec` (с `reference.md`) — информационная безопасность. Источник `agent-skills/infosec/`. Ставится туда же.
 - `music-library-merge` — слияние папок библиотеки `/mnt/copy/Music`. Источник `agent-skills/music-library-merge/`. Ставится туда же.
