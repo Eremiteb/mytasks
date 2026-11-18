@@ -8,6 +8,7 @@ import json
 import os
 import sqlite3
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -977,6 +978,7 @@ def view_cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     converted = tmp_path / "converted.epub"
     make_epub(converted)
     cfg = make_cfg(tmp_path, root)
+    monkeypatch.setattr(bl, "djvu_meta", lambda path: {})  # djvused не вызывается: файл синтетический
     bl.scan(cfg)
     monkeypatch.setattr(bl, "djvu_page_count", lambda path, timeout: 3)
     monkeypatch.setattr(bl, "djvu_page_text", lambda path, page, timeout: "текст")
@@ -1545,12 +1547,12 @@ def test_migration_v4_creates_book_collections_and_view(tmp_path: Path) -> None:
         for number, sql in enumerate(bl.MIGRATIONS[:3], start=1):
             conn.executescript(f"BEGIN;{sql};PRAGMA user_version={number};COMMIT;")
 
-    assert bl.migrate_database(empty, out=lambda _line: None) == 4
-    assert bl.migrate_database(old, out=lambda _line: None) == 4
+    assert bl.migrate_database(empty, out=lambda _line: None) == bl.DB_LATEST
+    assert bl.migrate_database(old, out=lambda _line: None) == bl.DB_LATEST
 
     for path in (empty, old):
         with closing(bl.connect(path)) as conn:
-            assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == bl.DB_LATEST
             names = {row[0] for row in conn.execute(
                 "SELECT name FROM sqlite_master WHERE name IN ('book_collections', 'collections')")}
             assert names == {"book_collections", "collections"}
@@ -1607,7 +1609,8 @@ def test_collection_filter_finds_keeper_from_other_section(
     assert status == 200
     assert body["total"] == 1
     assert body["items"][0]["path"] == "Автор/b.epub"
-    assert body["items"][0]["collections"] == [{"section": bl.section_name("_Сборники"), "collection": "Серия Y"}]
+    assert body["items"][0]["collections"] == [{"section": bl.section_name("_Сборники"), "collection": "Серия Y",
+                                                "subsection": "", "kind": "dedup", "source": "dedup"}]
 
 
 def test_collections_view_counts_only_books_in_catalog_and_rebuild_keeps_rows(coll_db: str) -> None:
@@ -2816,3 +2819,324 @@ def test_command_params_merge_folder_and_strip_suffix() -> None:
         bl.command_params("merge-folder", {"from": [], "to": "B"})
     with pytest.raises(bl.ConfigError):
         bl.command_params("fix-misplaced", {"path": "x"})
+
+
+# ---- (в) схема v6: book_meta, подразделы сборников, сборники из метаданных --------------------
+
+def make_fb2_full() -> bytes:
+    """fb2 с переводчиком, второй серией, издательскими данными, custom-info и серией издательства."""
+    text = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0">'
+        "<description><title-info><genre>sf</genre>"
+        "<author><first-name>Иван</first-name><last-name>Иванов</last-name><nickname>ivan</nickname></author>"
+        "<translator><first-name>Пётр</first-name><last-name>Петров</last-name></translator>"
+        "<book-title>Тёмный лес</book-title><keywords>лес, тьма</keywords>"
+        '<date value="1999">1999</date><lang>ru</lang><src-lang>en</src-lang>'
+        '<sequence name="Серия А" number="2"/><sequence name="Серия Б" number="5"/>'
+        "</title-info>"
+        "<publish-info><book-name>Тёмный лес (издание)</book-name><publisher>Издатель</publisher>"
+        '<year>2005</year><isbn>9785000000001</isbn><sequence name="Издательская" number="7"/></publish-info>'
+        '<custom-info info-type="ISBN-ALT">X1</custom-info>'
+        "</description><body><section><p>Текст.</p></section></body></FictionBook>"
+    )
+    return text.encode("utf-8")
+
+
+def make_epub_opf(path: Path, metadata: str) -> None:
+    """EPUB 3 с произвольным содержимым metadata (элементы dc:* и meta внутри <metadata>)."""
+    container = (
+        '<?xml version="1.0"?>'
+        '<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+        '<rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>'
+        "</container>"
+    )
+    opf = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<package xmlns="http://www.idpf.org/2007/opf" version="3.0">'
+        '<metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">'
+        f"<dc:title>Электронная книга</dc:title><dc:creator>Сидоров Сергей</dc:creator>{metadata}"
+        "</metadata>"
+        '<manifest><item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/></manifest>'
+        '<spine><itemref idref="c1"/></spine>'
+        "</package>"
+    )
+    chapter = '<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml"><body><p>Глава</p></body></html>'
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("mimetype", "application/epub+zip")
+        archive.writestr("META-INF/container.xml", container)
+        archive.writestr("OEBPS/content.opf", opf)
+        archive.writestr("OEBPS/ch1.xhtml", chapter)
+
+
+def meta_pairs(cfg: dict[str, Any], rel: str) -> set[tuple[str, str]]:
+    with closing(bl.connect(cfg["db_path"])) as conn:
+        return {(row[0], row[1]) for row in conn.execute("SELECT key, value FROM book_meta WHERE path=?", (rel,))}
+
+
+def meta_collections(cfg: dict[str, Any], rel: str) -> set[tuple[str, str]]:
+    with closing(bl.connect(cfg["db_path"])) as conn:
+        return {(row[0], row[1]) for row in conn.execute(
+            "SELECT kind, collection FROM book_collections WHERE path=? AND source='meta'", (rel,))}
+
+
+def test_fb2_details_go_to_book_meta_and_meta_collections(tmp_path: Path) -> None:
+    root = tmp_path / "books"
+    (root / "Иванов Иван").mkdir(parents=True)
+    rel = "Иванов Иван/Издание.fb2"
+    (root / rel).write_bytes(make_fb2_full())
+    cfg = make_cfg(tmp_path, root)
+    bl.scan(cfg)
+
+    pairs = meta_pairs(cfg, rel)
+    assert ("author_full", "Иванов Иван; ник: ivan") in pairs
+    assert ("translator", "Петров Пётр") in pairs
+    assert ("publisher", "Издатель") in pairs
+    assert ("publisher_series_no", "7") in pairs
+    assert ("series_extra", "Серия Б #5") in pairs
+    assert ("custom:ISBN-ALT", "X1") in pairs
+    assert meta_collections(cfg, rel) == {("edition", "Тёмный лес (издание)"), ("publisher-series", "Издательская")}
+
+
+def test_epub_belongs_to_collection_set_becomes_meta_collection(tmp_path: Path) -> None:
+    root = tmp_path / "books"
+    (root / "Сидоров Сергей").mkdir(parents=True)
+    rel = "Сидоров Сергей/Серийная.epub"
+    make_epub_opf(root / rel, (
+        '<meta property="belongs-to-collection" id="c01">Серия Эпуб</meta>'
+        '<meta refines="#c01" property="collection-type">set</meta>'
+        '<meta refines="#c01" property="group-position">3</meta>'
+        "<dc:publisher>Издательство</dc:publisher>"
+        '<dc:identifier opf:scheme="ISBN">9785000000002</dc:identifier>'
+        '<dc:contributor opf:role="trl">Смирнов А.</dc:contributor>'
+    ))
+    cfg = make_cfg(tmp_path, root)
+    bl.scan(cfg)
+
+    assert meta_collections(cfg, rel) == {("set", "Серия Эпуб")}
+    pairs = meta_pairs(cfg, rel)
+    assert ("translator", "Смирнов А.") in pairs
+    assert ("isbn", "9785000000002") in pairs
+    assert ("group_position", "3") in pairs
+    assert ("epub_version", "3.0") in pairs
+
+
+def test_subsection_from_orig_path_and_v6_backfill(tmp_path: Path) -> None:
+    rel = "_Сборники/Библиотека Мошкова/Мошков часть 4/LIB/trnslsf/x.txt"
+    db = str(tmp_path / "v5.db")
+    section, collection = bl.path_collection(rel)
+    with closing(sqlite3.connect(db)) as conn:
+        for number, sql in enumerate(bl.MIGRATIONS[:5], start=1):
+            conn.executescript(f"BEGIN;{sql};PRAGMA user_version={number};COMMIT;")
+        conn.execute("INSERT INTO books(path, size, mtime, fmt, title, added, section, collection) VALUES (?,?,?,?,?,?,?,?)",
+                     (rel, 1, 1.0, "txt", "x", 1.0, section, collection))
+        conn.execute("INSERT INTO book_collections(path, section, collection, source, orig_path) VALUES (?,?,?,?,?)",
+                     (rel, section, collection, "folder", rel))
+        conn.commit()
+
+    assert bl.migrate_database(db, out=lambda _line: None) == bl.DB_LATEST
+    with closing(bl.connect(db)) as conn, conn:
+        bl.rebuild_collections(conn)
+        row = conn.execute("SELECT subsection, kind FROM book_collections WHERE path=?", (rel,)).fetchone()
+    assert tuple(row) == ("Мошков часть 4/LIB/trnslsf", "folder")
+
+
+def test_relink_moves_book_meta(tmp_path: Path) -> None:
+    db = str(tmp_path / "meta.db")
+    bl.migrate_database(db, out=lambda _line: None)
+    with closing(bl.connect(db)) as conn, conn:
+        conn.execute("INSERT INTO book_meta VALUES (?,?,?)", ("Автор/a.epub", "publisher", "Издатель"))
+
+    bl.relink(db, [("Автор/a.epub", "Автор/a2.epub")])
+
+    with closing(bl.connect(db)) as conn:
+        rows = [tuple(row) for row in conn.execute("SELECT path, key, value FROM book_meta")]
+    assert rows == [("Автор/a2.epub", "publisher", "Издатель")]
+
+
+def test_pdf_meta_uses_pdfinfo_output_and_fills_only_real_title(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pdf = tmp_path / "Автор - Книга.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+    output = ("Title:          Настоящее название\nAuthor:         Автор Иванов\nSubject:        Тема книги\n"
+              "Pages:          12\nPage size:      595 x 842 pts (A4)\n")
+    calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout=output.encode("utf-8"), stderr=b"")
+
+    monkeypatch.setattr(bl.subprocess, "run", fake_run)
+    meta = bl.pdf_meta(pdf, "Автор - Книга")
+
+    assert calls[0][:3] == ["pdfinfo", "-enc", "UTF-8"]
+    assert meta["title"] == "Настоящее название"
+    assert meta["fill"] == {"authors": ["Автор Иванов"], "annotation": "Тема книги"}
+    assert ("pages", "12") in meta["kv"]
+    assert ("pdf:page_size", "595 x 842 pts (A4)") in meta["kv"]
+
+
+def test_real_title_rejects_file_name_and_word_template() -> None:
+    assert bl.real_title("Microsoft Word - Глава 1", "Книга") == ""
+    assert bl.real_title("Книга.pdf", "Книга") == ""
+    assert bl.real_title("Тёмный лес", "Иванов - Тёмный лес") == "Тёмный лес"
+
+
+def test_djvu_meta_parses_print_meta_and_pages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    output = '(metadata\n    (title "Скан \\"Т\\"")\n    (year "1990")\n)\n12\n'
+
+    def fake_run(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        assert args[:3] == ["djvused", "-e", "print-meta; n"]
+        return subprocess.CompletedProcess(args, 0, stdout=output.encode("utf-8"), stderr=b"")
+
+    monkeypatch.setattr(bl.subprocess, "run", fake_run)
+    meta = bl.djvu_meta(tmp_path / "scan.djvu")
+
+    assert ("djvu:title", 'Скан "Т"') in meta["kv"]
+    assert ("djvu:year", "1990") in meta["kv"]
+    assert ("pages", "12") in meta["kv"]
+
+
+def make_mobi(title: bytes, author: bytes, updated: bytes | None = None) -> bytes:
+    """Минимальный PalmDB с одной записью MOBI и EXTH (100 — автор, 503 — обновлённое название); без текста книги."""
+    records = [(100, author)] + ([(503, updated)] if updated else [])
+    body = b"".join(struct.pack(">II", kind, len(data) + 8) + data for kind, data in records)
+    exth = b"EXTH" + struct.pack(">II", len(body) + 12, len(records)) + body
+    mobi = bytearray(232)
+    mobi[0:4] = b"MOBI"
+    struct.pack_into(">I", mobi, 4, 232)
+    struct.pack_into(">I", mobi, 12, 65001)
+    struct.pack_into(">I", mobi, 128, 0x40)
+    struct.pack_into(">II", mobi, 84, 16 + 232 + len(exth), len(title))
+    record0 = bytes(16) + bytes(mobi) + exth + title
+    palm = bytearray(78)
+    palm[60:68] = b"BOOKMOBI"
+    struct.pack_into(">H", palm, 76, 1)
+    return bytes(palm) + struct.pack(">II", 86, 0) + record0
+
+
+def test_mobi_exth_and_full_title(tmp_path: Path) -> None:
+    plain = tmp_path / "plain.mobi"
+    plain.write_bytes(make_mobi("Полное название".encode(), "Автор Авторов".encode()))
+    meta = bl.other_meta(plain, "mobi", "Файл")
+    assert meta["title"] == "Полное название"
+    assert ("author", "Автор Авторов") in meta["kv"]
+    assert meta["fill"] == {"authors": ["Автор Авторов"]}
+
+    updated = tmp_path / "updated.mobi"
+    updated.write_bytes(make_mobi("Старое".encode(), "Автор".encode(), "Обновлённое".encode()))
+    assert bl.other_meta(updated, "mobi", "Файл")["title"] == "Обновлённое"
+
+
+def test_scan_reparse_rereads_every_book(cfg: dict[str, Any]) -> None:
+    first = bl.scan(cfg)
+    again = bl.scan(cfg, reparse=True)
+    assert first["files"] == again["files"]
+    assert again["changed"] == again["files"]
+    assert again["new"] == 0
+
+
+def test_scan_reparse_is_a_checked_parameter() -> None:
+    assert bl.command_params("scan", {"reparse": True}) == {"reparse": True}
+    assert bl.command_params("scan", {}) == {"reparse": False}
+    with pytest.raises(bl.ConfigError):
+        bl.command_params("scan", {"reparse": "yes"})
+
+
+# ---- (ж) веб v6: сведения, подразделы сборников, сборники из метаданных ------------------------
+
+CARD_REL = "_Сборники/Библиотека Мошкова/Мошков часть 4/LIB/Тёмный лес.fb2"
+CARD_OTHER_REL = "_Сборники/Библиотека Мошкова/Другой/Вторая.fb2"
+
+
+@pytest.fixture
+def card_cfg(tmp_path: Path) -> dict[str, Any]:
+    """Книга в подразделе сборника с метаданными fb2 и книга в другом подразделе того же сборника."""
+    root = tmp_path / "card_books"
+    (root / CARD_REL).parent.mkdir(parents=True)
+    (root / CARD_REL).write_bytes(make_fb2_full())
+    (root / CARD_OTHER_REL).parent.mkdir(parents=True)
+    (root / CARD_OTHER_REL).write_bytes(make_fb2("Вторая", "Пётр", "Сидоров"))
+    cfg = make_cfg(tmp_path, root)
+    bl.scan(cfg)
+    with closing(bl.connect(cfg["db_path"])) as conn, conn:
+        bl.rebuild_collections(conn)
+    return cfg
+
+
+@pytest.fixture
+def card_web(card_cfg: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
+    yield from _serving(card_cfg, monkeypatch)
+
+
+def test_card_shows_details_subsection_and_meta_collections(card_web: str, card_cfg: dict[str, Any]) -> None:
+    status, _headers, body = fetch(f"{card_web}/book/{book_id(card_cfg, CARD_REL)}")
+    text = body.decode("utf-8")
+
+    assert status == 200
+    assert "<h3>Сведения</h3>" in text
+    assert "<th>Переводчик</th><td>Петров Пётр</td>" in text
+    assert "<th>ISBN</th><td>9785000000001</td>" in text
+    assert "Библиотека Мошкова / Мошков часть 4 / LIB" in text
+    assert "Из метаданных" in text
+    assert "издательская серия: Издательская" in text
+    assert "издание: Тёмный лес (издание)" in text
+
+
+def test_api_book_details_and_collections(card_web: str, card_cfg: dict[str, Any]) -> None:
+    status, body = api_call(f"{card_web}/api/books/{book_id(card_cfg, CARD_REL)}")
+
+    assert status == 200
+    details = {item["key"]: item for item in body["details"]}
+    assert details["translator"] == {"key": "translator", "label": "Переводчик", "values": ["Петров Пётр"]}
+    assert details["isbn"]["label"] == "ISBN"
+    folder = [c for c in body["collections"] if c["source"] == "folder"]
+    assert folder == [{"section": bl.section_name("_Сборники"), "collection": "Библиотека Мошкова",
+                       "subsection": "Мошков часть 4/LIB", "kind": "folder", "source": "folder"}]
+    assert {c["kind"] for c in body["collections"] if c["source"] == "meta"} == {"edition", "publisher-series"}
+
+
+def test_collection_filter_by_subsection(card_web: str, card_cfg: dict[str, Any]) -> None:
+    base = f"{card_web}/api/books?collection={quote('Библиотека Мошкова')}&section={quote(bl.section_name('_Сборники'))}"
+
+    _status, body = api_call(base)
+    assert body["total"] == 2
+
+    _status, body = api_call(f"{base}&subsection={quote('Мошков часть 4/LIB', safe='')}")
+    assert body["total"] == 1
+    assert "Мошков часть 4" in body["items"][0]["path"]
+
+    _status, body = api_call(f"{base}&subsection={quote('Другой', safe='')}")
+    assert body["total"] == 1
+    assert body["items"][0]["path"].endswith("Вторая.fb2")
+
+    _status, body = api_call(f"{base}&subsection={quote('нет', safe='')}")
+    assert body["total"] == 0
+
+
+def test_meta_collections_stay_out_of_section_lists(card_cfg: dict[str, Any]) -> None:
+    with closing(bl.connect(card_cfg["db_path"])) as conn:
+        listed = {row["collection"] for row in bl.section_counts(conn, "1, 2")}
+        meta = {(row["kind"], row["collection"]) for row in bl.meta_collection_counts(conn)}
+
+    assert "Библиотека Мошкова" in listed
+    assert not listed & {"Издательская", "Тёмный лес (издание)"}
+    assert meta == {("edition", "Тёмный лес (издание)"), ("publisher-series", "Издательская")}
+
+
+def test_book_details_is_empty_before_v6(tmp_path: Path) -> None:
+    db = str(tmp_path / "v5.db")
+    with closing(sqlite3.connect(db)) as conn:
+        for number, sql in enumerate(bl.MIGRATIONS[:5], start=1):
+            conn.executescript(f"BEGIN;{sql};PRAGMA user_version={number};COMMIT;")
+    with closing(bl.connect(db)) as conn:
+        assert bl.book_details(conn, "x.fb2") == []
+
+
+def test_meta_label_prefixes_and_details_escaping() -> None:
+    assert bl.meta_label("translator") == "Переводчик"
+    assert bl.meta_label("pdf:page_size") == "PDF: page_size"
+    assert bl.meta_label("djvu:year") == "DjVu: year"
+    assert bl.meta_label("custom:ISBN-ALT") == "Доп.: ISBN-ALT"
+    assert bl.meta_label("неизвестно") == "неизвестно"
+    html_block = bl.details_html([("keyword", ["<script>x</script>"])])
+    assert "<script>" not in html_block and "&lt;script&gt;" in html_block

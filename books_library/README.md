@@ -30,6 +30,7 @@ python3 books_library/books_library.py <режим> [ключи]
 |---|---|---|
 | `serve` | веб-интерфейс на `127.0.0.1:8090` в переднем плане (по умолчанию) | нет |
 | `scan` | индексация каталога: новые и изменённые по размеру и mtime, исчезнувшие удаляются из базы; однокнижные zip перечитываются | нет (только база) |
+| `scan --reparse` | то же, но метаданные перечитываются у всех книг (схема v6: `book_meta`, подразделы и сборники из метаданных) | нет (только база) |
 | `fix-encoding` | кодировка fb2 (объявление и «полу-cp866») и txt (в UTF-8 без BOM, LF); то же внутри однокнижных zip | да, с журналом и карантином |
 | `unpack-fb2zip` | `.fb2` из `*.fb2.zip` рядом с архивом | да (добавляет файлы), архив остаётся |
 | `convert` | DOC/DOCX/RTF/ODT/MHT/MHTML → EPUB (по умолчанию, по главам `--split-level=2`) или FB2; `--only html` — HTML библиотеки Мошкова → «Фамилия - Название.epub» рядом; `--only fb2` — fb2 и однокнижный zip с fb2 → EPUB (собственный конвертер, при сбое — Calibre) | да; исходник — в карантин `replaced/` (`--only fb2`) или только с `--delete-source` (любой формат, не удаляется) |
@@ -641,6 +642,10 @@ zip и вложенные zip не трогаются.
 API: `GET /api/dups?status=…&page=…`; `POST /api/dups/<id>` с `{action: keep-both|resolve|quarantine|restore, path}`,
 где `path` — `key_path` участника (для `resolve` не нужен).
 
+### Карточка книги
+
+Блок «Сведения» — все метаданные книги из `book_meta` с русскими подписями; сборники из папок — «Сборник / подраздел» (ссылка с `subsection`); сборники из метаданных (издание, издательская серия, сборник) — отдельным списком «Из метаданных» и на странице `/sections`.
+
 ### Редактирование метаданных
 
 Страница `/edit/<id>` (ссылка «Редактировать» на странице книги и в списке «Проверки»): название, авторы (по одному
@@ -721,8 +726,8 @@ HOME и каталоги Calibre, потому что домашний ката�
 
 | Метод и путь | Что делает |
 |---|---|
-| `GET /api/books` | поиск: `q`, `author`, `series`, `genre`, `section`, `collection`, `fmt`, `lang`, `status`, `shelf`, `fav=1`, `dir`, `sort`, `page`, `per_page` (до 500). Ответ: `total`, `page`, `per_page`, `items` |
-| `GET /api/books/<id>` | книга с отметкой (`mark`), полками (`shelves`) и ссылками (`links`: `page`, `file`, `read`, `raw` — для однокнижного zip) |
+| `GET /api/books` | поиск: `q`, `author`, `series`, `genre`, `section`, `collection`, `subsection` (с `collection`), `fmt`, `lang`, `status`, `shelf`, `fav=1`, `dir`, `sort`, `page`, `per_page` (до 500). Ответ: `total`, `page`, `per_page`, `items`; у каждой книги `collections` — `section`, `collection`, `subsection`, `kind`, `source` |
+| `GET /api/books/<id>` | книга с отметкой (`mark`), полками (`shelves`), сведениями (`details`: `key`, `label`, `values`) и ссылками (`links`: `page`, `file`, `read`, `raw` — для однокнижного zip) |
 | `GET /api/books/<id>/file` | исходный файл книги как есть; для однокнижного zip — сам архив (распакованная книга — `/file/<id>`) |
 | `POST /api/books/<id>/mark` | `{status?, rating?, favorite?, note?}` — частичное обновление отметки |
 | `POST /api/books/<id>/shelves` | `{shelf_ids: [..]}` — заменить полки книги |

@@ -39,6 +39,7 @@ import re
 import shutil
 import secrets
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
@@ -52,7 +53,7 @@ import zlib
 from collections import Counter, deque
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from contextlib import ExitStack, closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager, nullcontext
 from datetime import UTC, date, datetime
 from difflib import SequenceMatcher
 from email import policy as email_policy
@@ -275,10 +276,29 @@ MIGRATIONS: list[str] = [
         PRIMARY KEY(a, b)
     ) WITHOUT ROWID;
     """,
+    # v6: подраздел и вид строки сборника (book_collections.subsection/kind; заполняет rebuild_collections);
+    # многозначные метаданные книги (book_meta: ключ → значения); VIEW collection_sections — сборники с подразделами.
+    """
+    ALTER TABLE book_collections ADD COLUMN subsection TEXT NOT NULL DEFAULT '';
+    ALTER TABLE book_collections ADD COLUMN kind TEXT NOT NULL DEFAULT '';
+    CREATE TABLE book_meta(
+        path TEXT NOT NULL,
+        key TEXT NOT NULL,
+        value TEXT NOT NULL,
+        PRIMARY KEY(path, key, value)
+    ) WITHOUT ROWID;
+    CREATE INDEX book_meta_key ON book_meta(key, value);
+    CREATE VIEW collection_sections AS
+        SELECT bc.section, bc.collection, bc.subsection, count(DISTINCT bc.path) AS books
+        FROM book_collections bc JOIN books b ON b.path = bc.path
+        GROUP BY bc.section, bc.collection, bc.subsection;
+    """,
 ]
 DB_LATEST = len(MIGRATIONS)
 # Первая схема с book_collections и VIEW collections: новые запросы к ним — только при user_version >= этого значения.
 SCHEMA_COLLECTIONS = 4
+# Первая схема с book_meta и подразделами сборников (subsection, kind): новые запросы — только при user_version >= этого.
+SCHEMA_META = 6
 
 
 class ConfigError(Exception):
@@ -556,7 +576,80 @@ def fb2_meta(raw: bytes) -> dict[str, Any]:
     if date:
         year = re.search(r"\b(1\d{3}|20\d{2})\b", parse_attrs(date.group(1)).get("value", "") + " " + date.group(2))
         meta["year"] = year.group(1) if year else ""
+    meta["kv"], meta["sets"] = fb2_details(text, info, title)
     return meta
+
+
+def xml_blocks(name: str, source: str) -> list[str]:
+    """Содержимое всех элементов name (с любым префиксом пространства имён)."""
+    return re.findall(rf"<(?:\w+:)?{name}\b[^>]*>(.*?)</(?:\w+:)?{name}>", source, re.S)
+
+
+def xml_section(name: str, source: str) -> str:
+    """Весь элемент name вместе с тегами; пусто, если его нет."""
+    match = re.search(rf"<(?:\w+:)?{name}\b.*?</(?:\w+:)?{name}>", source, re.S)
+    return match.group(0) if match else ""
+
+
+def fb2_person(block: str) -> str:
+    """Человек из fb2 целиком: ФИО, ник, email, id — одной строкой через «; »."""
+    name = " ".join(part for part in (xml_tag(k, block) for k in ("last-name", "first-name", "middle-name")) if part)
+    extra = [f"{label}: {xml_tag(tag, block)}" for label, tag in (("ник", "nickname"), ("email", "email"), ("id", "id"))
+             if xml_tag(tag, block)]
+    return "; ".join(part for part in (name, *extra) if part)
+
+
+def fb2_details(text: str, info: str, title: str) -> tuple[list[tuple[str, Any]], list[tuple[str, str]]]:
+    """Поля описания fb2 сверх основных колонок books: пары ключ-значение для book_meta и сборники из метаданных
+    (вид, название): edition — publish-info/book-name, если отличается от названия; publisher-series — издательская серия.
+    title — название из title-info без подстановок (для сравнения с book-name)."""
+    pairs: list[tuple[str, Any]] = [("author_full", fb2_person(block)) for block in xml_blocks("author", info)]
+    pairs += [("translator", fb2_person(block)) for block in xml_blocks("translator", info)]
+    pairs += [("keyword", word) for word in re.split(r"[,;]", xml_tag("keywords", info))]
+    date = re.search(r"<(?:\w+:)?date\b([^>]*)>(.*?)<", info, re.S)
+    if date:
+        pairs.append(("date", parse_attrs(date.group(1)).get("value", "") or strip_tags(date.group(2))))
+    pairs += [("src_lang", xml_tag("src-lang", info)), ("lang", xml_tag("lang", info))]
+    for seq in re.findall(r"<(?:\w+:)?sequence\b([^>]*)>", info)[1:]:
+        attrs = parse_attrs(seq)
+        name, number = attrs.get("name", "").strip(), attrs.get("number", "").strip()
+        if name:
+            pairs.append(("series_extra", f"{name} #{number}" if number else name))
+    cover = re.search(r"<(?:\w+:)?image\b[^>]*?href\s*=\s*[\"']#?([^\"']+)", info)
+    if cover:
+        pairs.append(("coverpage", cover.group(1)))
+    sets: list[tuple[str, str]] = []
+    src = xml_section("src-title-info", text)
+    if src:
+        pairs.append(("src_title", xml_tag("book-title", src)))
+        pairs += [("src_author", fb2_person(block)) for block in xml_blocks("author", src)]
+    doc = xml_section("document-info", text)
+    if doc:
+        pairs += [("doc_author", fb2_person(block)) for block in xml_blocks("author", doc)]
+        rest = re.sub(r"<(?:\w+:)?author\b.*?</(?:\w+:)?author>", "", doc, flags=re.S)
+        pairs += [("program_used", xml_tag("program-used", rest)), ("doc_date", xml_tag("date", rest)),
+                  ("src_ocr", xml_tag("src-ocr", rest)), ("doc_id", xml_tag("id", rest)),
+                  ("doc_version", xml_tag("version", rest)), ("history", xml_tag("history", rest)[:2000])]
+        pairs += [("src_url", strip_tags(url)) for url in xml_blocks("src-url", rest)]
+    pub = xml_section("publish-info", text)
+    if pub:
+        book_name = xml_tag("book-name", pub)
+        pairs += [("book_name", book_name), ("publisher", xml_tag("publisher", pub)), ("city", xml_tag("city", pub)),
+                  ("publish_year", xml_tag("year", pub)), ("isbn", xml_tag("isbn", pub))]
+        if book_name and author_norm(book_name) != author_norm(title):
+            sets.append(("edition", book_name))
+        seq = re.search(r"<(?:\w+:)?sequence\b([^>]*)>", pub)
+        if seq:
+            attrs = parse_attrs(seq.group(1))
+            series = attrs.get("name", "").strip()
+            pairs += [("publisher_series", series), ("publisher_series_no", attrs.get("number", "").strip())]
+            if series:
+                sets.append(("publisher-series", series))
+    for match in re.finditer(r"<(?:\w+:)?custom-info\b([^>]*)>(.*?)</(?:\w+:)?custom-info>", text, re.S):
+        info_type = parse_attrs(match.group(1)).get("info-type", "").strip()
+        if info_type:
+            pairs.append((f"custom:{info_type}", strip_tags(match.group(2))))
+    return pairs, sets
 
 
 def zip_read(archive: zipfile.ZipFile, name: str, limit: int = ZIP_MEMBER_MAX) -> bytes:
@@ -637,7 +730,52 @@ class Epub:
             elif attrs.get("name") == "calibre:series_index":
                 number = re.match(r"\d+", attrs.get("content", ""))
                 meta["series_no"] = int(number.group(0)) if number else None
+        meta["kv"], meta["sets"] = self.details()
         return meta
+
+    def details(self) -> tuple[list[tuple[str, Any]], list[tuple[str, str]]]:
+        """Поля OPF сверх основных колонок: dc:* (publisher, subject, date, rights, source, language, coverage, type,
+        identifier, isbn, contributor с ролью), meta (belongs-to-collection с collection-type и group-position,
+        calibre:rating/timestamp/title_sort, dcterms:modified) и версия EPUB. Сборник «set» — в sets."""
+        pairs: list[tuple[str, Any]] = []
+        sets: list[tuple[str, str]] = []
+        version = re.search(r"<(?:\w+:)?package\b[^>]*?\bversion\s*=\s*[\"']([^\"']+)", self.opf)
+        if version:
+            pairs.append(("epub_version", version.group(1)))
+        for name in ("publisher", "subject", "date", "rights", "source", "language", "coverage", "type"):
+            pairs += [(name, strip_tags(value)) for value in re.findall(rf"<dc:{name}\b[^>]*>(.*?)</dc:{name}>", self.opf, re.S)]
+        for attrs_text, body in re.findall(r"<dc:identifier\b([^>]*)>(.*?)</dc:identifier>", self.opf, re.S):
+            value, attrs = strip_tags(body), parse_attrs(attrs_text)
+            scheme = attrs.get("opf:scheme", attrs.get("scheme", ""))
+            pairs.append(("identifier", value))
+            if scheme.lower() == "isbn" or value.lower().startswith("urn:isbn:"):
+                pairs.append(("isbn", value.split(":")[-1]))
+        roles = {"trl": "translator", "edt": "editor", "ill": "illustrator"}
+        for attrs_text, body in re.findall(r"<dc:contributor\b([^>]*)>(.*?)</dc:contributor>", self.opf, re.S):
+            attrs = parse_attrs(attrs_text)
+            role = attrs.get("opf:role", attrs.get("role", "")).lower()
+            pairs.append((roles.get(role, "contributor"), strip_tags(body)))
+        refines: dict[str, dict[str, str]] = {}
+        collections: list[tuple[str, str]] = []
+        for attrs_text, body in re.findall(r"<(?:\w+:)?meta\b([^>]*?)(?:/>|>(.*?)</(?:\w+:)?meta\s*>)", self.opf, re.S):
+            attrs = parse_attrs(attrs_text)
+            value, prop, name = strip_tags(body or ""), attrs.get("property", ""), attrs.get("name", "")
+            if prop == "belongs-to-collection":
+                collections.append((attrs.get("id", ""), value))
+            elif attrs.get("refines"):
+                refines.setdefault(attrs["refines"].lstrip("#"), {})[prop] = value
+            elif prop == "dcterms:modified":
+                pairs.append(("modified", value))
+            elif name in ("calibre:rating", "calibre:timestamp", "calibre:title_sort"):
+                pairs.append((name.split(":", 1)[1], attrs.get("content", "")))
+        for ident, name in collections:
+            props = refines.get(ident, {})
+            ctype = props.get("collection-type", "")
+            pairs += [("belongs_to_collection", name), ("collection_type", ctype),
+                      ("group_position", props.get("group-position", ""))]
+            if ctype == "set" and name:
+                sets.append(("set", name))
+        return pairs, sets
 
 
 def split_name(rel: str) -> tuple[str, str]:
@@ -736,8 +874,11 @@ def path_meta(rel: str) -> dict[str, Any]:
     return meta
 
 
-def read_book_meta(root: Path, rel: str) -> dict[str, Any]:
-    """Метаданные одной книги; при любой ошибке разбора — данные по пути (книга остаётся в каталоге)."""
+def read_book_meta(root: Path, rel: str, size: int = 0, mtime: float = 0.0,
+                   cache: TextCache | None = None, detail: bool = False) -> dict[str, Any]:
+    """Метаданные одной книги; при любой ошибке разбора — данные по пути (книга остаётся в каталоге).
+    detail (только scan) — дополнительно pdf, djvu, mobi/azw, docx/odt, txt и число слов из cache, если текст книги
+    уже в кэше dedup (без извлечения). Остальные вызовы (dedup, веб) разбирают прежний набор форматов."""
     meta = path_meta(rel)
     full = root / rel
     try:
@@ -748,6 +889,8 @@ def read_book_meta(root: Path, rel: str) -> dict[str, Any]:
         elif meta["fmt"] == "epub" and not rel.lower().endswith(".zip"):
             with zipfile.ZipFile(full) as archive:
                 found = Epub(archive).meta()
+        elif detail and meta["fmt"] in OTHER_DETAIL_FORMATS and not rel.lower().endswith(".zip"):
+            found = other_meta(full, meta["fmt"], split_name(rel)[0])
         elif rel.lower().endswith(".zip"):
             with zipfile.ZipFile(full) as archive:
                 inner = single_member(archive)
@@ -764,6 +907,13 @@ def read_book_meta(root: Path, rel: str) -> dict[str, Any]:
         # Автор-ник (как у fb2 после pandoc-конвертации) не заменяет автора из имени папки.
         if found.pop("nick_only", False) and meta["authors"]:
             found.pop("authors", None)
+        for key, value in found.pop("fill", {}).items():
+            if value and not meta.get(key):
+                meta[key] = value
+        if detail and cache is not None:
+            text = cache.get(rel, size, mtime, meta["fmt"])
+            if text:
+                found.setdefault("kv", []).append(("words", count_words(text)))
         for key, value in found.items():
             if value not in ("", [], None):
                 meta[key] = value
@@ -821,6 +971,13 @@ def upsert_book(conn: sqlite3.Connection, rel: str, size: int, mtime: float, met
             " section, collection, path, added) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (*values, rel, time.time())).lastrowid
     conn.executemany("INSERT OR IGNORE INTO book_authors VALUES (?,?)", [(book_id, a[:300]) for a in authors])
     conn.executemany("INSERT OR IGNORE INTO book_genres VALUES (?,?)", [(book_id, g[:100]) for g in genres])
+    # book_meta и сборники из метаданных (source='meta') заменяются целиком при каждом разборе книги.
+    conn.execute("DELETE FROM book_meta WHERE path=?", (rel,))
+    conn.executemany("INSERT OR IGNORE INTO book_meta VALUES (?,?,?)", meta_rows(rel, meta.get("kv", [])))
+    conn.execute("DELETE FROM book_collections WHERE path=? AND source='meta'", (rel,))
+    set_rows = [(rel, clean_value(name)[:300], rel, kind) for kind, name in meta.get("sets", []) if clean_value(name)]
+    conn.executemany("INSERT OR IGNORE INTO book_collections(path, section, collection, source, orig_path, subsection, kind) "
+                     "VALUES (?,'',?,'meta',?,'',?)", set_rows)
     doc = " ".join([meta["title"], *authors, str(meta.get("series", "")), *genres, *(GENRES.get(g, "") for g in genres),
                     meta.get("section", ""), meta.get("collection", ""), split_name(rel)[0], str(meta.get("annotation", ""))[:4000]])
     conn.execute("INSERT INTO books_fts(rowid, doc) VALUES (?,?)", (book_id, fold(doc)))
@@ -846,8 +1003,10 @@ def apply_override(meta: dict[str, Any], row: sqlite3.Row) -> None:
         meta[key] = [v for v in value.split("; ") if v] if key in ("authors", "genres") else value
 
 
-def scan(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str], None] = print) -> dict[str, int]:
-    """Инкрементальное сканирование: новые и изменённые файлы разбираются, исчезнувшие удаляются из каталога."""
+def scan(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str], None] = print,
+         reparse: bool = False) -> dict[str, int]:
+    """Инкрементальное сканирование: новые и изменённые файлы разбираются, исчезнувшие удаляются из каталога.
+    reparse — перечитать метаданные всех книг, как если бы у каждой изменился mtime."""
     root = Path(cfg["books_dir"])
     if not root.is_dir():
         raise ConfigError(f"каталог книг недоступен: {root}")
@@ -865,7 +1024,7 @@ def scan(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str], None] 
     for rel, size, mtime in iter_book_files(root, errors):
         seen.add(rel)
         old = known.get(rel)
-        if old is None or old[0] != size or old[1] != mtime:
+        if reparse or old is None or old[0] != size or old[1] != mtime:
             todo.append((rel, size, mtime))
             new += old is None
     removed = [p for p in known if p not in seen]
@@ -889,17 +1048,21 @@ def scan(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str], None] 
     started = last_report = time.monotonic()
     parse_errors = 0
     SCAN_STATE.update(stage="разбор книг", total=len(todo))
-    with closing(connect(db_path)) as conn:
+    text_cache = TextCache.open(cfg)
+    with closing(connect(db_path)) as conn, (closing(text_cache.conn) if text_cache else nullcontext()):
         for start in range(0, len(removed), 500):
             chunk = removed[start:start + 500]
             marks = ",".join("?" * len(chunk))
             with conn:
                 conn.execute(f"DELETE FROM books_fts WHERE rowid IN (SELECT id FROM books WHERE path IN ({marks}))", chunk)
                 conn.execute(f"DELETE FROM books WHERE path IN ({marks})", chunk)
+                conn.execute(f"DELETE FROM book_meta WHERE path IN ({marks})", chunk)
+                conn.execute(f"DELETE FROM book_collections WHERE source='meta' AND path IN ({marks})", chunk)
         with ThreadPoolExecutor(max_workers=cfg["scan_workers"]) as pool:
             for start in range(0, len(todo), 500):
                 batch = todo[start:start + 500]
-                metas = list(pool.map(lambda item: read_book_meta(root, item[0]), batch))
+                metas = list(pool.map(
+                    lambda item: read_book_meta(root, item[0], item[1], item[2], text_cache, detail=True), batch))
                 with conn:
                     for (rel, size, mtime), meta in zip(batch, metas, strict=True):
                         if "error" in meta:
@@ -1316,6 +1479,176 @@ def docx_core(path: Path) -> tuple[str, str]:
     except (OSError, KeyError, ValueError, zipfile.BadZipFile):
         return "", ""
     return xml_tag("title", core), xml_tag("creator", core)
+
+
+META_TEXT_MAX = 4000  # длинное значение метаданных обрезается до стольких символов
+META_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+META_TOOL_TIMEOUT = 30  # секунд на pdfinfo или djvused одной книги
+META_OUTPUT_MAX = 1024 * 1024  # вывод внешней программы сверх этого размера отбрасывается
+MOBI_HEAD_BYTES = 1024 * 1024  # заголовки PalmDB, MOBI и EXTH лежат в начале файла
+TEXT_HEAD_BYTES = 64 * 1024  # байт начала txt для поиска автора (TEXT_HEAD_CHARS символов)
+OTHER_DETAIL_FORMATS = ("pdf", "djvu", "mobi", "azw", "azw3", "docx", "odt", "txt")  # scan: detail=True
+PDF_FIELDS = ("Title", "Author", "Subject", "Keywords", "Creator", "Producer", "CreationDate", "ModDate", "Pages",
+              "Encrypted", "Page size")
+DJVU_META = re.compile(r'^\s*\((\w+)\s+"((?:[^"\\]|\\.)*)"\)\s*$')  # строка print-meta: (ключ "значение")
+MOBI_EXTH_NAMES = {100: "author", 101: "publisher", 103: "description", 104: "isbn", 105: "subject",
+                   106: "publishing_date", 108: "contributor", 503: "updated_title", 524: "language"}
+DOCX_CORE_FIELDS = (("title", "title"), ("creator", "creator"), ("subject", "subject"), ("keywords", "keywords"),
+                    ("description", "description"), ("created", "created"), ("modified", "modified"),
+                    ("lastModifiedBy", "last_modified_by"))
+ODT_META_FIELDS = (("title", "title"), ("creator", "creator"), ("subject", "subject"), ("keyword", "keywords"),
+                   ("description", "description"), ("creation-date", "created"), ("date", "modified"))
+
+
+def clean_value(value: Any) -> str:
+    """Значение метаданных для БД: управляющие символы убраны, пробелы свёрнуты, длина до META_TEXT_MAX."""
+    return " ".join(META_CONTROL.sub("", str(value)).split())[:META_TEXT_MAX].rstrip()
+
+
+def meta_rows(path: str, pairs: list[tuple[str, Any]]) -> list[tuple[str, str, str]]:
+    """Строки book_meta для книги: пустые значения не пишутся, повторы одной пары — одна строка."""
+    rows: dict[tuple[str, str], None] = {}
+    for key, value in pairs:
+        text = clean_value(value)
+        if key and text:
+            rows[(key[:100], text)] = None
+    return [(path, key, text) for key, text in rows]
+
+
+def run_capture(args: list[str], timeout: int) -> str:
+    """Вывод внешней программы: список аргументов без оболочки, stdin из /dev/null, тайм-аут. Сбой — ValueError."""
+    try:
+        done = subprocess.run(args, capture_output=True, timeout=timeout, check=False, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired as error:
+        raise ValueError(f"тайм-аут {timeout} с: {args[0]}") from error
+    except OSError as error:
+        raise ValueError(f"{args[0]}: {error.strerror or error}") from error
+    if done.returncode != 0:
+        tail = (done.stderr or b"").decode("utf-8", errors="replace")[-200:].strip()
+        raise ValueError(f"{args[0]}: код {done.returncode}: {tail}")
+    return (done.stdout or b"")[:META_OUTPUT_MAX].decode("utf-8", errors="replace")
+
+
+def real_title(value: str, stem: str) -> str:
+    """Название из метаданных, если оно не похоже на имя файла и не «Microsoft Word - …»; иначе — пусто (остаётся из пути)."""
+    text = clean_value(value)
+    if not text or text.lower().startswith("microsoft word"):
+        return ""
+    if fold(text) in {fold(stem), fold(stem.replace("_", " "))} or re.search(r"\.(pdf|docx?|djvu|epub|fb2|txt|rtf)$", text, re.I):
+        return ""
+    return text
+
+
+def pdf_meta(path: Path, stem: str) -> dict[str, Any]:
+    """pdfinfo (poppler, UTF-8, даты ISO): поля → book_meta pdf:<поле>; название — если не из имени файла;
+    автор и тема (Subject) — в книгу, только если там пусто."""
+    output = run_capture(["pdfinfo", "-enc", "UTF-8", "-isodates", str(path)], META_TOOL_TIMEOUT)
+    fields: dict[str, str] = {}
+    for line in output.splitlines():
+        key, sep, value = line.partition(":")
+        if sep and key.strip() in PDF_FIELDS:
+            fields[key.strip()] = clean_value(value)
+    pairs: list[tuple[str, Any]] = [(f"pdf:{key.lower().replace(' ', '_')}", value) for key, value in fields.items()]
+    if fields.get("Pages"):
+        pairs.append(("pages", fields["Pages"]))
+    result: dict[str, Any] = {"kv": pairs, "fill": {"authors": [fields["Author"]] if fields.get("Author") else [],
+                                                    "annotation": fields.get("Subject", "")}}
+    title = real_title(fields.get("Title", ""), stem)
+    if title:
+        result["title"] = title
+    return result
+
+
+def djvu_meta(path: Path) -> dict[str, Any]:
+    """djvused print-meta (djvulibre): строки (ключ "значение") → book_meta djvu:<ключ>; число из «n» — pages."""
+    output = run_capture(["djvused", "-e", "print-meta; n", str(path)], META_TOOL_TIMEOUT)
+    pairs: list[tuple[str, Any]] = []
+    for line in output.splitlines():
+        match = DJVU_META.match(line)
+        if match:
+            pairs.append((f"djvu:{match.group(1).lower()}", re.sub(r"\\(.)", r"\1", match.group(2))))
+        elif line.strip().isdigit():
+            pairs.append(("pages", line.strip()))
+    return {"kv": pairs}
+
+
+def mobi_u32(data: bytes, offset: int) -> int:
+    if offset < 0 or offset + 4 > len(data):
+        raise ValueError("MOBI: заголовок обрывается раньше, чем ожидалось")
+    return int(struct.unpack_from(">I", data, offset)[0])
+
+
+def mobi_meta(head: bytes, stem: str) -> dict[str, Any]:
+    """MOBI/AZW: PalmDB → запись 0 → заголовок MOBI → EXTH (struct, без внешних программ). Ошибка формата — ValueError."""
+    if len(head) < 82 or head[60:68] != b"BOOKMOBI":
+        raise ValueError("не MOBI: нет заголовка PalmDB")
+    rec = head[mobi_u32(head, 78):]
+    if rec[16:20] != b"MOBI":
+        raise ValueError("MOBI: нет заголовка записи 0")
+    encoding = "utf-8" if mobi_u32(rec, 28) == 65001 else "cp1252"
+
+    def text(start: int, size: int) -> str:
+        return clean_value(rec[start:start + size].decode(encoding, errors="replace"))
+
+    full_name = text(mobi_u32(rec, 100), mobi_u32(rec, 104))
+    pairs: list[tuple[str, Any]] = []
+    authors: list[str] = []
+    updated = ""
+    exth_at = 16 + mobi_u32(rec, 20)
+    if mobi_u32(rec, 16 + 128) & 0x40 and rec[exth_at:exth_at + 4] == b"EXTH":
+        position = exth_at + 12
+        for _ in range(min(mobi_u32(rec, exth_at + 8), 1000)):
+            kind, size = mobi_u32(rec, position), mobi_u32(rec, position + 4)
+            if size < 8:
+                raise ValueError("MOBI: запись EXTH короче заголовка")
+            name = MOBI_EXTH_NAMES.get(kind, "")
+            value = text(position + 8, size - 8)
+            if name == "updated_title":
+                updated = value
+            if name == "author":
+                authors.append(value)
+            if name and value:
+                pairs.append((name, value))
+            position += size
+    result: dict[str, Any] = {"kv": pairs, "fill": {"authors": authors}}
+    title = real_title(updated or full_name, stem)
+    if title:
+        result["title"] = title
+    return result
+
+
+def office_meta(path: Path, fmt: str) -> dict[str, Any]:
+    """DOCX: docProps/core.xml; ODT: meta.xml (dc:*, meta:keyword, meta:document-statistic page-count) → book_meta."""
+    with zipfile.ZipFile(path) as archive:
+        if fmt == "docx":
+            core = zip_read(archive, "docProps/core.xml", 1024 * 1024).decode("utf-8", errors="replace")
+            return {"kv": [(key, xml_tag(tag, core)) for tag, key in DOCX_CORE_FIELDS]}
+        xml = zip_read(archive, "meta.xml", 1024 * 1024).decode("utf-8", errors="replace")
+    pairs: list[tuple[str, Any]] = [(key, xml_tag(tag, xml)) for tag, key in ODT_META_FIELDS]
+    stats = re.search(r"<meta:document-statistic\b([^>]*)>", xml)
+    if stats:
+        pairs.append(("pages", parse_attrs(stats.group(1)).get("meta:page-count", "")))
+    return {"kv": pairs}
+
+
+def text_meta(path: Path) -> dict[str, Any]:
+    """TXT: первый кандидат-автор из начала текста (без папки — только как book_meta text_author)."""
+    head = decode_text(read_limited(path, TEXT_HEAD_BYTES))[:TEXT_HEAD_CHARS]
+    name = next(text_names(head), "")
+    return {"kv": [("text_author", name)]} if name else {}
+
+
+def other_meta(full: Path, fmt: str, stem: str) -> dict[str, Any]:
+    """Разбор форматов, которых раньше не касался scan: pdf, djvu, mobi/azw, docx/odt, txt."""
+    if fmt == "pdf":
+        return pdf_meta(full, stem)
+    if fmt == "djvu":
+        return djvu_meta(full)
+    if fmt in ("mobi", "azw", "azw3"):
+        return mobi_meta(read_limited(full, MOBI_HEAD_BYTES), stem)
+    if fmt in ("docx", "odt"):
+        return office_meta(full, fmt)
+    return text_meta(full)
 
 
 def verify_book(path: Path, fmt: str) -> str | None:
@@ -1826,6 +2159,9 @@ def relink(db_path: str, pairs: list[tuple[str, str]]) -> int:
             conn.execute("UPDATE OR IGNORE marks SET path=? WHERE path=?", (new, old))
             conn.execute("UPDATE OR IGNORE shelf_items SET path=? WHERE path=?", (new, old))
             conn.execute("DELETE FROM shelf_items WHERE path=?", (old,))
+            if version >= SCHEMA_META:
+                conn.execute("UPDATE OR IGNORE book_meta SET path=? WHERE path=?", (new, old))
+                conn.execute("DELETE FROM book_meta WHERE path=?", (old,))
             if version >= SCHEMA_COLLECTIONS:
                 conn.execute("UPDATE OR IGNORE book_collections SET path=? WHERE path=?", (new, old))
                 conn.execute("DELETE FROM book_collections WHERE path=?", (old,))
@@ -1839,9 +2175,13 @@ def rebuild_collections(conn: sqlite3.Connection) -> dict[str, int]:
     принадлежность книги к сборнику переживает перенос файла из папки сборника (его путь переносит relink).
     folder — книги из папок сборников; dedup — копии из сборников, ушедшие в карантин как дубли: принадлежность
     переходит к оставленной книге (keeper), с учётом переименования keeper в name.ext.zip. Без книги — keeper не
-    найден ни как путь, ни как .zip."""
-    counts = {"folder": conn.execute("INSERT OR IGNORE INTO book_collections SELECT path, section, collection, 'folder', path "
-                                     "FROM books WHERE collection <> ''").rowcount, "dedup": 0, "unresolved": 0}
+    найден ни как путь, ни как .zip. Подраздел — путь между папкой сборника и файлом (subsection_of), вид — source."""
+    counts = {"folder": 0, "dedup": 0, "unresolved": 0}
+    folders = conn.execute("SELECT path, section, collection FROM books WHERE collection <> ''").fetchall()
+    for path, section, collection in folders:
+        counts["folder"] += conn.execute(
+            "INSERT OR IGNORE INTO book_collections(path, section, collection, source, orig_path, subsection, kind) "
+            "VALUES (?,?,?,'folder',?,?,'folder')", (path, section, collection, path, subsection_of(path))).rowcount
     known = {row[0] for row in conn.execute("SELECT path FROM books")}
     for path, keeper in conn.execute("SELECT path, keeper FROM dup_members WHERE role='duplicate' AND keeper <> ''").fetchall():
         section, collection = path_collection(path)
@@ -1854,9 +2194,28 @@ def rebuild_collections(conn: sqlite3.Connection) -> dict[str, int]:
         else:
             counts["unresolved"] += 1
             continue
-        counts["dedup"] += conn.execute("INSERT OR IGNORE INTO book_collections VALUES (?,?,?,'dedup',?)",
-                                        (target, section, collection, path)).rowcount
+        counts["dedup"] += conn.execute(
+            "INSERT OR IGNORE INTO book_collections(path, section, collection, source, orig_path, subsection, kind) "
+            "VALUES (?,?,?,'dedup',?,?,'dedup')", (target, section, collection, path, subsection_of(path))).rowcount
+    fill_collection_kinds(conn)
     return counts
+
+
+def subsection_of(rel: str) -> str:
+    """Подраздел сборника: путь между папкой сборника и именем файла. «_Раздел/Сборник/Подраздел/x.txt» → «Подраздел»."""
+    parts = PurePosixPath(rel).parts
+    if len(parts) > 1 and parts[0].startswith("_"):
+        return "/".join(parts[2:-1])
+    return ""
+
+
+def fill_collection_kinds(conn: sqlite3.Connection) -> None:
+    """Строки book_collections до схемы v6 дополняются пустыми subsection (из orig_path) и kind (= source).
+    Заполненные строки не переписываются: условие kind = '' отбирает только старые строки."""
+    for orig, source in conn.execute("SELECT DISTINCT orig_path, source FROM book_collections "
+                                     "WHERE kind = '' AND source IN ('folder', 'dedup')").fetchall():
+        conn.execute("UPDATE book_collections SET subsection=?, kind=source WHERE orig_path=? AND source=? AND kind=''",
+                     (subsection_of(orig), orig, source))
 
 
 def report_collections(counts: dict[str, int], out: Callable[[str], None]) -> None:
@@ -4829,10 +5188,9 @@ def alone_name(line: str) -> str:
     return ""
 
 
-def text_author(head: str, index: dict[frozenset[str], str]) -> tuple[str, str]:
-    """Автор из начала текста: «Имя Фамилия. Название», «ИМЯ ФАМИЛИЯ» или «Имя Фамилия[.]» в первых TEXT_ALONE_LINES
-    строках (название — следующей строкой).
-    Возвращает (папка, имя) первого кандидата, совпавшего с существующей папкой; иначе ('', '')."""
+def text_names(head: str) -> Iterator[str]:
+    """Имена-кандидаты из начала текста по порядку: «Имя Фамилия. Название», «ИМЯ ФАМИЛИЯ» (название — следующей
+    строкой) или «Имя Фамилия[.]» в первых TEXT_ALONE_LINES строках."""
     lines = [line for line in head.splitlines() if line.strip()][:40]
     for position, line in enumerate(lines):
         match = TEXT_NAME_LINE.match(line)
@@ -4842,8 +5200,14 @@ def text_author(head: str, index: dict[frozenset[str], str]) -> tuple[str, str]:
             name = match.group(1) if match is not None else ""
             if not name and position < TEXT_ALONE_LINES:
                 name = alone_name(line)
-        if not name:
-            continue
+        if name:
+            yield name
+
+
+def text_author(head: str, index: dict[frozenset[str], str]) -> tuple[str, str]:
+    """Автор из начала текста: первый кандидат из text_names, совпавший с существующей папкой.
+    Возвращает (папка, имя); иначе ('', '')."""
+    for name in text_names(head):
         folder = folder_for_name(name, index)
         if folder:
             return folder, name
@@ -6185,7 +6549,7 @@ def command_params(command: str, raw: dict[str, Any]) -> dict[str, Any]:
     if command not in (*COMMANDS, *CLI_COMMANDS):
         raise ConfigError(f"неизвестная команда {command!r}; допустимо: {', '.join(COMMANDS)}")
     allowed = {
-        "scan": set(), "migrate": set(), "fix-encoding": {"path", "only"}, "unpack-fb2zip": {"path", "max_mb"},
+        "scan": {"reparse"}, "migrate": set(), "fix-encoding": {"path", "only"}, "unpack-fb2zip": {"path", "max_mb"},
         "convert": {"path", "only", "to", "overwrite", "skip_newer", "exclude", "author", "title_mode", "toc", "toc_depth",
                     "delete_source", "workers"},
         "dedup": {"path", "workers"}, "dedup-folders": {"path", "workers"}, "zip-books": {"path", "workers"},
@@ -6198,6 +6562,10 @@ def command_params(command: str, raw: dict[str, Any]) -> dict[str, Any]:
     if unknown:
         raise ConfigError(f"{command}: неизвестные параметры {', '.join(sorted(unknown))}")
     params: dict[str, Any] = {}
+    if "reparse" in allowed:
+        if not isinstance(raw.get("reparse", False), bool):
+            raise ConfigError("reparse: логическое значение")
+        params["reparse"] = raw.get("reparse", False)
     if "path" in allowed:
         path = raw.get("path")
         if path is not None and (not isinstance(path, str) or not path or "\x00" in path):
@@ -6263,7 +6631,7 @@ def run_command(cfg: dict[str, Any], command: str, dry_run: bool, params: dict[s
     """Единая точка запуска режимов для CLI и API. Изменяющий запуск берёт общую блокировку (код 3 — занято)."""
     def action() -> Any:
         if command == "scan":
-            return scan(cfg, dry_run, out=out)
+            return scan(cfg, dry_run, out=out, reparse=params.get("reparse", False))
         if command == "migrate":
             return {"schema": migrate_database(cfg["db_path"], dry_run, out=out)}
         if command == "fix-encoding":
@@ -6673,7 +7041,9 @@ border-bottom:1px solid var(--line)}.cv{width:48px;min-width:48px;height:68px;ob
 font-size:.8em;color:var(--mut);margin-right:.2rem}.cols{columns:18rem;column-gap:2rem}.cols a{display:block}
 .book{display:flex;flex-wrap:wrap;gap:1.5rem}.book img{max-width:220px;border-radius:4px}.book .info{flex:1 1 20rem}
 .pager{margin:1rem 0;display:flex;gap:.6rem;flex-wrap:wrap}table{border-collapse:collapse}td,th{padding:.2rem .8rem .2rem 0;text-align:left}
-.letters a{display:inline-block;min-width:1.6rem}.reader{max-width:42rem;margin:0 auto;padding:1rem;font:1.15rem/1.65 Georgia,serif}
+.details{width:100%;max-width:48rem;margin:.4rem 0 1rem}.details th,.details td{vertical-align:top;padding:.25rem .6rem .25rem 0;
+border-bottom:1px solid var(--line)}.details th{color:var(--mut);font-weight:400;white-space:nowrap;width:1%}
+.details td{overflow-wrap:anywhere}.letters a{display:inline-block;min-width:1.6rem}.reader{max-width:42rem;margin:0 auto;padding:1rem;font:1.15rem/1.65 Georgia,serif}
 .reader img{max-width:100%}.reader h3,.reader h4{text-align:center}.bar{position:sticky;top:0;background:var(--bg);padding:.4rem 0;
 border-bottom:1px solid var(--line);display:flex;flex-wrap:wrap;gap:.8rem;font:14px system-ui,sans-serif}
 """
@@ -6747,39 +7117,119 @@ def set_shelves(conn: sqlite3.Connection, path: str, shelf_ids: list[int]) -> No
     conn.executemany("INSERT OR IGNORE INTO shelf_items SELECT id, ? FROM shelves WHERE id=?", [(path, sid) for sid in shelf_ids])
 
 
-def book_collections(conn: sqlite3.Connection, paths: list[str]) -> dict[str, list[tuple[str, str]]]:
-    """Все сборники книг по путям из book_collections: {путь: [(раздел, сборник), …]}. До схемы v4 таблицы нет — пусто."""
-    found: dict[str, list[tuple[str, str]]] = {}
+class Collection(NamedTuple):
+    """Строка book_collections книги. subsection и kind — со схемы v6 (раньше пусто)."""
+    section: str
+    collection: str
+    subsection: str
+    kind: str  # folder, dedup, а для source='meta' — edition, publisher-series, set
+    source: str  # folder, dedup или meta
+
+
+META_LABELS = {
+    "author_full": "Автор (полностью)", "translator": "Переводчик", "editor": "Редактор",
+    "illustrator": "Иллюстратор", "contributor": "Участник", "keyword": "Ключевые слова", "keywords": "Ключевые слова",
+    "date": "Дата", "src_lang": "Язык оригинала", "lang": "Язык", "language": "Язык", "series_extra": "Серия (доп.)",
+    "coverpage": "Обложка (файл)", "src_title": "Оригинальное название", "src_author": "Автор оригинала",
+    "doc_author": "Автор документа", "program_used": "Программа", "doc_date": "Дата документа", "src_ocr": "OCR",
+    "doc_id": "ID документа", "doc_version": "Версия документа", "history": "История правок",
+    "src_url": "Ссылка на источник", "book_name": "Название издания", "publisher": "Издательство", "city": "Город",
+    "publish_year": "Год издания", "isbn": "ISBN", "publisher_series": "Издательская серия",
+    "publisher_series_no": "Номер в издательской серии", "epub_version": "Версия EPUB", "identifier": "Идентификатор",
+    "subject": "Тема", "rights": "Права", "source": "Источник", "coverage": "Охват", "type": "Тип",
+    "modified": "Изменено", "rating": "Оценка", "timestamp": "Добавлено в библиотеку",
+    "title_sort": "Сортировочное название", "belongs_to_collection": "Сборник (EPUB)",
+    "collection_type": "Тип сборника", "group_position": "Номер в сборнике", "pages": "Страниц",
+    "author": "Автор (MOBI)", "description": "Описание", "publishing_date": "Дата публикации",
+    "updated_title": "Название (обновлённое)", "title": "Название (метаданные)", "creator": "Автор (метаданные)",
+    "created": "Создано", "last_modified_by": "Кто изменил", "text_author": "Автор (из текста)",
+}
+META_KIND_LABELS = {"edition": "издание", "publisher-series": "издательская серия", "set": "сборник"}
+
+
+def meta_label(key: str) -> str:
+    """Подпись ключа book_meta; pdf:/djvu:/custom: — с префиксом формата, неизвестный ключ — сам ключ."""
+    if key in META_LABELS:
+        return META_LABELS[key]
+    prefix, _, field = key.partition(":")
+    return {"pdf": f"PDF: {field}", "djvu": f"DjVu: {field}", "custom": f"Доп.: {field}"}.get(prefix, key)
+
+
+def book_details(conn: sqlite3.Connection, path: str) -> list[tuple[str, list[str]]]:
+    """Все book_meta книги: (ключ, значения) — в порядке META_LABELS, затем прочие ключи по алфавиту.
+    Подпись — meta_label(ключ). До схемы v6 таблицы book_meta нет — пусто."""
+    if conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_META:
+        return []
+    grouped: dict[str, list[str]] = {}
+    for key, value in conn.execute("SELECT key, value FROM book_meta WHERE path=? ORDER BY key, value", (path,)):
+        grouped.setdefault(key, []).append(value)
+    order = {key: number for number, key in enumerate(META_LABELS)}
+    return sorted(grouped.items(), key=lambda item: (order.get(item[0], len(order)), item[0]))
+
+
+def details_html(details: list[tuple[str, list[str]]]) -> str:
+    """Блок «Сведения»: таблица подпись → значения; значения экранируются, длинные переносятся (CSS .details)."""
+    if not details:
+        return ""
+    rows = []
+    for key, values in details:
+        cells = "<br>".join(e(value) for value in values)
+        rows.append(f"<tr><th>{e(meta_label(key))}</th><td>{cells}</td></tr>")
+    return f'<h3>Сведения</h3><table class="details">{"".join(rows)}</table>'
+
+
+def book_collections(conn: sqlite3.Connection, paths: list[str]) -> dict[str, list[Collection]]:
+    """Все сборники книг по путям из book_collections (папки, дубли и сборники из метаданных).
+    До схемы v4 таблицы нет — пусто; subsection и kind появляются со схемы v6."""
+    found: dict[str, list[Collection]] = {}
     unique = list(dict.fromkeys(paths))
-    if not unique or conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_COLLECTIONS:
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if not unique or version < SCHEMA_COLLECTIONS:
         return found
+    columns = "subsection, kind, source" if version >= SCHEMA_META else "'' AS subsection, '' AS kind, source"
     for start in range(0, len(unique), 500):
         chunk = unique[start:start + 500]
         marks = ",".join("?" * len(chunk))
-        for path, section, collection in conn.execute(
-                f"SELECT DISTINCT path, section, collection FROM book_collections WHERE path IN ({marks}) "
-                "ORDER BY path, section, collection", chunk):
-            found.setdefault(path, []).append((section, collection))
+        for row in conn.execute(
+                f"SELECT DISTINCT path, section, collection, {columns} FROM book_collections WHERE path IN ({marks}) "
+                "ORDER BY path, source, section, collection, subsection", chunk):
+            found.setdefault(row[0], []).append(Collection(*row[1:]))
     return found
 
 
 def section_counts(conn: sqlite3.Connection, order: str) -> list[sqlite3.Row]:
-    """Разделы и сборники с числом книг: сборники — из VIEW collections (схема v4), книги без сборника — из books."""
+    """Разделы и сборники с числом книг: сборники — как VIEW collections (схема v4), но без сборников из метаданных
+    (source='meta' — их вид в section_counts не попадает); книги без сборника — из books."""
     if conn.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_COLLECTIONS:
-        source = ("SELECT section, collection, books AS n FROM collections UNION ALL "
+        source = ("SELECT bc.section AS section, bc.collection AS collection, count(DISTINCT bc.path) AS n "
+                  "FROM book_collections bc JOIN books b ON b.path = bc.path WHERE bc.source <> 'meta' "
+                  "GROUP BY bc.section, bc.collection UNION ALL "
                   "SELECT section, '', count(*) FROM books WHERE collection='' GROUP BY section")
     else:
         source = "SELECT section, collection, count(*) AS n FROM books GROUP BY section, collection"
     return conn.execute(f"SELECT section, collection, n FROM ({source}) ORDER BY {order}").fetchall()
 
 
-def collection_tag(section: str, collection: str) -> str:
-    """Тег-ссылка на сборник: поиск по разделу и сборнику, по папкам."""
-    return (f'<a class="tag" href="/?section={quote(section)}&collection={quote(collection)}&sort=path">'
-            f'{e(collection)}</a>')
+def meta_collection_counts(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Сборники из метаданных (source='meta') по виду с числом книг каталога; до схемы v6 — пусто."""
+    if conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_META:
+        return []
+    return conn.execute("SELECT bc.kind AS kind, bc.collection AS collection, count(DISTINCT bc.path) AS n "
+                        "FROM book_collections bc JOIN books b ON b.path = bc.path WHERE bc.source = 'meta' "
+                        "GROUP BY bc.kind, bc.collection ORDER BY bc.kind, bc.collection").fetchall()
 
 
-def book_json(row: sqlite3.Row, pairs: list[tuple[str, str]] | None = None) -> dict[str, Any]:
+def collection_tag(section: str, collection: str, subsection: str = "") -> str:
+    """Тег-ссылка на сборник (и его подраздел): поиск по разделу, сборнику и подразделу. Подпись: «Сборник / подраздел»."""
+    link = f"/?section={quote(section)}&collection={quote(collection)}"
+    label = collection
+    if subsection:
+        link += f"&subsection={quote(subsection, safe='')}"
+        label += " / " + " / ".join(part for part in subsection.split("/") if part)
+    return f'<a class="tag" href="{link}&sort=path">{e(label)}</a>'
+
+
+def book_json(row: sqlite3.Row, colls: list[Collection] | None = None) -> dict[str, Any]:
     data = {k: row[k] for k in row.keys() if k not in ("mtime",)}  # noqa: SIM118 — у sqlite3.Row нет __iter__ по ключам
     data["path"] = display_path(row["path"], row["fmt"])
     data["authors"] = [a for a in row["authors"].split("; ") if a]
@@ -6789,14 +7239,14 @@ def book_json(row: sqlite3.Row, pairs: list[tuple[str, str]] | None = None) -> d
                      "cover": f"/cover/{row['id']}" if row["cover"] else None}
     if is_wrapped(row["path"], row["fmt"]):
         data["links"]["raw"] = f"/api/books/{row['id']}/file"  # исходный однокнижный архив — только через API
-    data["collections"] = [{"section": s, "collection": c} for s, c in pairs or []]
+    data["collections"] = [c._asdict() for c in colls or []]
     return data
 
 
 API_HELP = {
-    "GET /api/books": "поиск: q, author, series, genre, section, collection, fmt, lang, status, shelf, fav=1, dir, sort, page, "
-                      "per_page (≤500)",
-    "GET /api/books/<id>": "книга с отметками и полками",
+    "GET /api/books": "поиск: q, author, series, genre, section, collection, subsection (с collection), fmt, lang, status, "
+                      "shelf, fav=1, dir, sort, page, per_page (≤500)",
+    "GET /api/books/<id>": "книга с отметками, полками, сведениями (details: key, label, values) и сборниками",
     "POST /api/books/<id>/mark": "{status?, rating?, favorite?, note?} — частичное обновление",
     "POST /api/books/<id>/shelves": "{shelf_ids: [..]} — заменить полки книги",
     "GET /api/authors | /api/series": "q (подстрока) или l (первая буква); не больше 1000",
@@ -7018,10 +7468,15 @@ class Handler(BaseHTTPRequestHandler):
                 where.append(clause)
                 args.append(params[key])
         section, collection = params.get("section", ""), params.get("collection", "")
-        if collection and conn.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_COLLECTIONS:
-            # сборник — по book_collections: книга-keeper из другого раздела тоже попадает в свой сборник
-            where.append("b.path IN (SELECT path FROM book_collections WHERE collection=? AND (?='' OR section=?))")
-            args.extend([collection, section, section])
+        subsection = params.get("subsection", "")
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if collection and version >= SCHEMA_COLLECTIONS:
+            # сборник — по book_collections: книга-keeper из другого раздела тоже попадает в свой сборник;
+            # подраздел (схема v6) — только вместе со сборником; сборники из метаданных сюда не входят
+            sub_sql = " AND subsection=?" if subsection and version >= SCHEMA_META else ""
+            where.append("b.path IN (SELECT path FROM book_collections WHERE collection=? AND (?='' OR section=?) "
+                         f"AND source <> 'meta'{sub_sql})")
+            args.extend([collection, section, section, *([subsection] if sub_sql else [])])
         else:
             if section:
                 where.append("b.section=?")
@@ -7082,7 +7537,7 @@ class Handler(BaseHTTPRequestHandler):
             return f'<select name="{name}"><option value="">{empty}</option>{opts}</select>'
 
         hidden = "".join(f'<input type="hidden" name="{k}" value="{e(params[k])}">'
-                         for k in ("author", "series", "genre", "dir", "lang", "collection") if params.get(k))
+                         for k in ("author", "series", "genre", "dir", "lang", "collection", "subsection") if params.get(k))
         sort_names = {"title": "по названию", "author": "по автору", "series": "по серии", "added": "новые",
                       "year": "по году", "size": "по размеру", "path": "по папкам (выпуски)"}
         form = (f'<form class="s" action="/">{hidden}<input name="q" value="{e(params.get("q", ""))}" placeholder='
@@ -7095,7 +7550,8 @@ class Handler(BaseHTTPRequestHandler):
                 f'<label><input type="checkbox" name="fav" value="1"{" checked" if params.get("fav") else ""}> ★</label>'
                 f'<button>Найти</button></form>')
         active = " ".join(f'<span class="tag">{e(k)}: {e(genre_name(v) if k == "genre" else v)}</span>'
-                          for k, v in params.items() if k in {"author", "series", "genre", "dir", "lang", "collection"})
+                          for k, v in params.items()
+                          if k in {"author", "series", "genre", "dir", "lang", "collection", "subsection"})
         if active:
             active += ' <a href="/">сбросить</a>'
         rename = ""
@@ -7183,17 +7639,20 @@ class Handler(BaseHTTPRequestHandler):
                      lambda s: f"/?series={quote(s)}&sort=series")
 
     @staticmethod
-    def section_tag(row: sqlite3.Row, pairs: list[tuple[str, str]] | None = None) -> str:
-        """Теги раздела книги и всех её сборников; pairs — из book_collections (None — прежний вид по books)."""
+    def section_tag(row: sqlite3.Row, colls: list[Collection] | None = None) -> str:
+        """Теги раздела книги и её сборников (без сборников из метаданных); colls — из book_collections
+        (None — прежний вид по books)."""
         tag = f'<a class="tag" href="/?section={quote(row["section"])}">{e(row["section"])}</a>' if row["section"] else ""
-        if pairs is None:
-            pairs = [(row["section"], row["collection"])] if row["collection"] else []
-        return tag + "".join(collection_tag(s, c) for s, c in pairs if c)
+        if colls is None:
+            colls = [Collection(row["section"], row["collection"], "", "", "")] if row["collection"] else []
+        return tag + "".join(collection_tag(c.section, c.collection, c.subsection)
+                             for c in colls if c.collection and c.source != "meta")
 
     def view_sections(self, _parts: list[str]) -> None:
         """Разделы (папки «_…») с коллекциями: журналы, сборники, документация, неразобранное."""
         with closing(self.db()) as conn:
             rows = section_counts(conn, "section = '', section, collection")
+            meta = meta_collection_counts(conn)
         blocks: dict[str, list[tuple[str, int]]] = {}
         for section, collection, count in rows:
             blocks.setdefault(section, []).append((collection, count))
@@ -7208,6 +7667,10 @@ class Handler(BaseHTTPRequestHandler):
             links = "".join(f'<a href="/?section={quote(section)}&collection={quote(c)}&sort=path">{e(c)} '
                             f'<span class="mut">{n}</span></a>' for c, n in sorted(items, key=lambda x: -x[1]) if c)
             html_parts.append(f'{head}<div class="cols">{links}</div>')
+        if meta:  # сборники из метаданных — отдельно от разделов, без ссылок: поиск по ним не ведётся
+            meta_items = "".join(f'<span>{e(META_KIND_LABELS.get(row["kind"], row["kind"]))}: {e(row["collection"])} '
+                            f'<span class="mut">{row["n"]}</span></span>' for row in meta)
+            html_parts.append(f'<h3>Сборники из метаданных</h3><div class="cols">{meta_items}</div>')
         self.page("Разделы", "<h2>Разделы</h2>" + ("".join(html_parts) or "<p>Каталог пуст.</p>"))
 
     def view_genres(self, _parts: list[str]) -> None:
@@ -7299,13 +7762,20 @@ class Handler(BaseHTTPRequestHandler):
                                     "WHERE b.series=? AND b.id<>? ORDER BY b.series_no, b.title LIMIT 50",
                                     (book["series"], book["id"])).fetchall()
             colls = book_collections(conn, [book["path"]]).get(book["path"], [])
+            details = book_details(conn, book["path"])
         bid = book["id"]
         authors = ", ".join(f'<a href="/?author={quote(a)}">{e(a)}</a>' for a in book["authors"].split("; ") if a) or "—"
         genres = " ".join(f'<a class="tag" href="/?genre={quote(g)}">{e(genre_name(g))}</a>' for g in book["genres"].split("; ") if g)
         series = (f'<p>Серия: <a href="/?series={quote(book["series"])}&sort=series">{e(book["series"])}</a>'
                   f'{" #" + str(book["series_no"]) if book["series_no"] else ""}</p>') if book["series"] else ""
-        collections = "".join(collection_tag(s, c) for s, c in colls if c)
+        collections = "".join(collection_tag(c.section, c.collection, c.subsection)
+                              for c in colls if c.collection and c.source != "meta")
         series += f'<p>Сборники: {collections}</p>' if collections else ""
+        from_meta = [c for c in colls if c.source == "meta"]
+        if from_meta:
+            series += ('<p class="mut">Из метаданных:</p><ul>'
+                       + "".join(f"<li>{e(META_KIND_LABELS.get(c.kind, c.kind))}: {e(c.collection)}</li>" for c in from_meta)
+                       + "</ul>")
         if book["fmt"] == "pdf":
             actions = [f'<a href="/file/{bid}?inline=1"><b>Открыть PDF</b></a>']
         elif book["fmt"] == "zip":
@@ -7340,6 +7810,7 @@ class Handler(BaseHTTPRequestHandler):
                 f'<p><textarea name="note" rows="3" cols="50" placeholder="Заметка">{e(mark["note"] if mark else "")}</textarea></p>'
                 f'<p>Полки: {shelf_boxes or "<span class=mut>нет полок</span>"} <input name="new_shelf" placeholder="новая полка">'
                 f'</p><button>Сохранить</button></form></div></div>')
+        body += details_html(details)
         if same:
             body += "<h3>Другие книги серии</h3>" + self.book_list(same)
         self.page(book["title"], body)
@@ -7681,8 +8152,10 @@ class Handler(BaseHTTPRequestHandler):
                 shelves = conn.execute("SELECT s.id, s.name FROM shelves s JOIN shelf_items i ON i.shelf_id=s.id WHERE i.path=?",
                                        (book["path"],)).fetchall()
                 colls = book_collections(conn, [book["path"]])
+                details = [{"key": key, "label": meta_label(key), "values": values}
+                           for key, values in book_details(conn, book["path"])]
                 self.send_json({**book_json(book, colls.get(book["path"])), "mark": dict(mark) if mark else None,
-                                "shelves": [dict(x) for x in shelves]})
+                                "shelves": [dict(x) for x in shelves], "details": details})
             elif name == "books":
                 params = {k: v for k, v in self.query.items() if k not in ("page", "per_page") and v}
                 page = max(int(self.query["page"]), 1) if self.query.get("page", "").isdigit() else 1
@@ -8170,12 +8643,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--epubcheck", action="store_true",
                         help="reconvert-fb2: проверять каждый новый epub утилитой epubcheck (медленно, выборочно)")
     parser.add_argument("-n", "--dry-run", action="store_true", help="ничего не менять, показать план")
+    parser.add_argument("--reparse", action="store_true",
+                        help="scan: перечитать метаданные всех книг (не только новых и изменённых)")
     parser.add_argument("--migrate-db", action="store_true", help="только миграции схемы БД")
     parser.add_argument("--config", type=Path, default=CONFIG_PATH, help="путь к books_library.json")
     args = parser.parse_args(argv)
     setup_logging()
     if args.limit is not None and args.command not in ("sort-underscore", "reconvert-fb2"):
         parser.error("--limit применяется только к sort-underscore и reconvert-fb2")
+    if args.reparse and args.command != "scan":
+        parser.error("--reparse применяется только к scan")
     try:
         cfg = load_config(args.config)
         if args.migrate_db or args.command != "serve":
@@ -8200,6 +8677,8 @@ def main(argv: list[str] | None = None) -> int:
                 raw = {"from": args.from_folders, "to": args.to}
             elif command == "strip-suffix":
                 raw = {"path": args.path}
+            elif command == "scan":
+                raw = {"reparse": args.reparse}
             elif command == "convert" and args.only == "fb2":
                 raw.update(workers=args.workers)
             elif command == "convert":
