@@ -178,6 +178,10 @@ fb2 и однокнижный zip с fb2 → `name.epub` рядом (то же �
 `ENTITY` в начале отвергается). Упаковка: `mimetype` первым без сжатия; `nav.xhtml` (оглавление по разделам и
 ориентиры), `toc.ncx` для старых читалок; метаданные: авторы с ролью и сортировкой, переводчики, серия (`belongs-to-collection`
 и `calibre:series`), жанры, аннотация, ISBN, дата; обложка с `cover-image` первой в порядке чтения.
+Бумажное издание из `publish-info`: `book-name`, если отличается от названия, — сборник `belongs-to-collection` с
+`collection-type` `set` (`id="edition1"`); издательская серия — не `belongs-to-collection`, а
+`<meta name="books_library:publisher-series">` и `books_library:publisher-series-index` (номер), чтобы не спутаться с
+авторской серией. `Epub.details` при скане читает их в `book_meta` и `book_collections` (`publisher-series`).
 Картинки из `<binary>` определяются по сигнатуре (JPEG, PNG, GIF, WebP); SVG не принимается, битые пропускаются.
 
 **Сноски.** Ссылка на сноску (`type="note"` или ссылка на раздел тел `notes`/`comments`) становится

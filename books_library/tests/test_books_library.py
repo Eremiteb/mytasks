@@ -3324,6 +3324,31 @@ def test_epub_belongs_to_collection_set_becomes_meta_collection(tmp_path: Path) 
     assert ("epub_version", "3.0") in pairs
 
 
+def test_fb2_to_epub3_keeps_publish_info_as_set_and_publisher_series(tmp_path: Path) -> None:
+    epub = tmp_path / "book.epub"
+    bl.fb2_to_epub3(make_fb2_full(), epub)
+    with zipfile.ZipFile(epub) as archive:
+        opf = archive.read("OEBPS/content.opf").decode("utf-8")
+    assert '<meta property="belongs-to-collection" id="edition1">Тёмный лес (издание)</meta>' in opf
+    assert '<meta refines="#edition1" property="collection-type">set</meta>' in opf
+    assert '<meta name="books_library:publisher-series" content="Издательская"/>' in opf
+    assert '<meta name="books_library:publisher-series-index" content="7"/>' in opf
+
+
+def test_converted_epub_publish_info_becomes_meta_collections(tmp_path: Path) -> None:
+    root = tmp_path / "books"
+    (root / "Иванов Иван").mkdir(parents=True)
+    rel = "Иванов Иван/Издание.epub"
+    bl.fb2_to_epub3(make_fb2_full(), root / rel)
+    cfg = make_cfg(tmp_path, root)
+    bl.scan(cfg)
+
+    assert meta_collections(cfg, rel) == {("set", "Тёмный лес (издание)"), ("publisher-series", "Издательская")}
+    pairs = meta_pairs(cfg, rel)
+    assert ("publisher_series", "Издательская") in pairs
+    assert ("publisher_series_no", "7") in pairs
+
+
 def test_subsection_from_orig_path_and_v6_backfill(tmp_path: Path) -> None:
     rel = "_Сборники/Библиотека Мошкова/Мошков часть 4/LIB/trnslsf/x.txt"
     db = str(tmp_path / "v5.db")

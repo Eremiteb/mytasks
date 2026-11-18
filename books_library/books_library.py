@@ -758,6 +758,7 @@ class Epub:
             pairs.append((roles.get(role, "contributor"), strip_tags(body)))
         refines: dict[str, dict[str, str]] = {}
         collections: list[tuple[str, str]] = []
+        series: list[list[str]] = []  # [название, номер] издательской серии; номер относится к последней серии
         for attrs_text, body in re.findall(r"<(?:\w+:)?meta\b([^>]*?)(?:/>|>(.*?)</(?:\w+:)?meta\s*>)", self.opf, re.S):
             attrs = parse_attrs(attrs_text)
             value, prop, name = strip_tags(body or ""), attrs.get("property", ""), attrs.get("name", "")
@@ -769,6 +770,10 @@ class Epub:
                 pairs.append(("modified", value))
             elif name in ("calibre:rating", "calibre:timestamp", "calibre:title_sort"):
                 pairs.append((name.split(":", 1)[1], attrs.get("content", "")))
+            elif name == "books_library:publisher-series":
+                series.append([attrs.get("content", ""), ""])
+            elif name == "books_library:publisher-series-index" and series:
+                series[-1][1] = attrs.get("content", "")
         for ident, name in collections:
             props = refines.get(ident, {})
             ctype = props.get("collection-type", "")
@@ -776,6 +781,10 @@ class Epub:
                       ("group_position", props.get("group-position", ""))]
             if ctype == "set" and name:
                 sets.append(("set", name))
+        for name, number in series:  # издательская серия, записанная конвертером fb2_to_epub3 (как fb2_details)
+            if name:
+                pairs += [("publisher_series", name), ("publisher_series_no", number)]
+                sets.append(("publisher-series", name))
         return pairs, sets
 
 
@@ -3713,6 +3722,9 @@ class _Fb2Book:
         self.year = self.year or _year(_text(_first(publish, "year")))
         self.publisher = _text(_first(publish, "publisher"))
         self.isbn = re.sub(r"[\s-]", "", _text(_first(publish, "isbn")))
+        self.book_name = _text(_first(publish, "book-name"))  # бумажное издание-сборник (как fb2_details)
+        self.publisher_series = [(_attr(seq, "name").strip(), _attr(seq, "number").strip())
+                                 for seq in _kids(publish, "sequence") if _attr(seq, "name").strip()]
         seq = _first(ti, "sequence")
         self.series = _attr(seq, "name").strip()
         number = re.match(r"\d+", _attr(seq, "number").strip())
@@ -4035,6 +4047,13 @@ def fb2_to_epub3(data: bytes, out: Path) -> None:
         if book.series_no:
             meta.append(f'<meta refines="#c1" property="group-position">{_esc(book.series_no)}</meta>')
             meta.append(f'<meta name="calibre:series_index" content="{_esc(book.series_no)}"/>')
+    if book.book_name and author_norm(book.book_name) != author_norm(book.title):
+        meta.append(f'<meta property="belongs-to-collection" id="edition1">{_esc(book.book_name)}</meta>')
+        meta.append('<meta refines="#edition1" property="collection-type">set</meta>')
+    for name, number in book.publisher_series:  # издательская серия — не belongs-to-collection, чтобы не спутаться с авторской
+        meta.append(f'<meta name="books_library:publisher-series" content="{_esc(name)}"/>')
+        if number:
+            meta.append(f'<meta name="books_library:publisher-series-index" content="{_esc(number)}"/>')
     meta.append(f'<meta property="dcterms:modified">{modified}</meta>')
     meta.append(f'<meta name="generator" content="{FB2_CONVERTER_GENERATOR}"/>')
     if book.cover_name:
