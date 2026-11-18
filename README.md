@@ -410,8 +410,7 @@ journalctl --user -u check-backups.service -n 20
 | `utility-bills.timer` | user-юнит | `utility_bills.sh` 20-го числа в 10:00, пропущенный запуск — после загрузки: квитанции ЖКУ из почты в SQLite |
 | `books-library.service` | user-юнит | `books_library/books_library.py serve` постоянно: веб-интерфейс библиотеки книг на 127.0.0.1:8090 |
 | `books-library-rework.timer` | user-юнит | `books_library/books_library.py scan` ежедневно в 04:30 и через 10 мин после каждой загрузки, пропущенный запуск — после загрузки: индексация каталога книг |
-| `btrfs-monitor.timer` | user-юнит | `btrfs_monitor.sh` в 00/06/12/18 ч, пропущенный — после загрузки (только если `/` на Btrfs) |
-| `getip.timer` | user-юнит | `getip.sh` через 2 мин после загрузки и каждые 30 мин |
+| `host-checks.timer` | user-юнит | `getip.sh` и `btrfs_monitor.sh` через 5 мин после загрузки и каждые 6 ч (00/06/12/18 ч), пропущенный — после загрузки; сбой одной проверки не мешает другой |
 | `crontab` | старый cron | в crontab нет строк `music_downloader.sh`, `sources.sh`, `btrfs_monitor.sh`, `getip.sh`, `utility_bills.sh` (иначе — второй, параллельный запуск); исправление — удаление строк вместе с комментарием `# mytasks:` |
 | `conf/check_backups.conf`, `conf/sources.conf`, `music_downloader/music_downloader.json`, `utility_bills/utility_bills.json`, `books_library/books_library.json` | конфиг | создаются мастером |
 | `music_downloader/venv`, `utility_bills/venv` | venv | `music_downloader/setup_venv.sh`, `utility_bills/setup_venv.sh` |
@@ -476,7 +475,7 @@ journalctl --user -u check-backups.service -n 20
 ./btrfs_monitor.sh
 ```
 
-**Расписание:** user-таймер `btrfs-monitor.timer` (00/06/12/18 ч, `Persistent=true`) — ставит `check_mytasks.sh`, если `/` на Btrfs. Из user-службы работает и уведомление `notify-send` (есть сессионная шина D-Bus, которой у cron не было).
+**Расписание:** user-таймер `host-checks.timer` (через 5 мин после загрузки и каждые 6 ч, `Persistent=true`) — ставит `check_mytasks.sh`. Из user-службы работает и уведомление `notify-send` (есть сессионная шина D-Bus, которой у cron не было).
 
 **Режим dry-run:** `-n, --dry-run` — счётчики читаются и сравниваются как обычно, но файл состояния не создаётся и не обновляется, уведомление не отправляется (печатается).
 

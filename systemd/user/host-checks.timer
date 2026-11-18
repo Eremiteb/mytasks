@@ -1,11 +1,12 @@
 [Unit]
-Description=Проверка ошибок Btrfs: каждые 6 ч, пропущенный запуск — после загрузки
+Description=Проверки хоста: через 5 минут после загрузки и каждые 6 часов
 
 [Timer]
+OnBootSec=5min
 OnCalendar=*-*-* 00/6:00:00
 # Пропущенный при выключенном компьютере интервал выполняется один раз после загрузки
 Persistent=true
-Unit=btrfs-monitor.service
+Unit=host-checks.service
 
 [Install]
 WantedBy=timers.target
