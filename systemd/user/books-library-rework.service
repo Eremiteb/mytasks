@@ -1,5 +1,5 @@
 [Unit]
-Description=Библиотека книг: ночная обработка и индексация /mnt/copy/Books (scan, fix-encoding, convert, unpack-collections, sort-underscore, merge-authors, author-variants, fix-misplaced, dedup, dedup-folders, strip-suffix, scan)
+Description=Библиотека книг: переделка библиотеки — ночная обработка и индексация /mnt/copy/Books (scan, fix-encoding, convert, unpack-collections, sort-underscore, merge-authors, author-variants, fix-misplaced, dedup, dedup-folders, strip-suffix, scan)
 Documentation=file://@MYTASKS_DIR@/books_library/README.md
 # Одновременный запуск scan и кнопки «Пересканировать» исключён блокировкой движка (код 3 — не повторять).
 StartLimitIntervalSec=2h

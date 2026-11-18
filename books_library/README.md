@@ -15,7 +15,7 @@ fb2 в EPUB через Calibre и DOC/DOCX/RTF/ODT/MHT в EPUB или FB2, на�
 | `books_library.json.example` | пример настроек (рабочий `books_library.json` не попадает в Git) |
 | `tests/test_books_library.py` | тесты pytest на синтетических данных во временных каталогах |
 | `../systemd/user/books-library.service` | постоянный веб-сервер |
-| `../systemd/user/books-library-scan.service`, `books-library-scan.timer` | ночная обработка и индексация |
+| `../systemd/user/books-library-rework.service`, `books-library-rework.timer` | юнит переделки библиотеки: ночная обработка и индексация |
 | `reports/` | журналы и отчёты служебных режимов (в Git не попадают) |
 
 Запуск — прямой вызов движка (файл исполняемый, интерпретатор — `python3`):
@@ -504,7 +504,7 @@ zip и вложенные zip не трогаются.
 
 ## Ночная обработка
 
-`books-library-scan.service` запускается таймером ежедневно в 04:30 (и через 10 минут после загрузки) и выполняет
+`books-library-rework.service` запускается таймером ежедневно в 04:30 (и через 10 минут после загрузки) и выполняет
 конвейер по порядку:
 
 1. `scan` — новые книги попадают в индекс; сбой этого шага прерывает конвейер.
@@ -596,17 +596,17 @@ zip и вложенные zip не трогаются.
 Движок пишет JSONL-журнал в `logs/books_library-<время>.jsonl` (каталог — `MYTASKS_LOG_DIR` или `logs/`
 репозитория; права 600; хранятся последние `KEEP_LOGS` из `conf/log_template.conf`). Журналы служебных режимов —
 в `reports/` (см. «Отчёты и журналы»). Вывод `serve` в терминале или в журнале systemd:
-`journalctl --user -u books-library.service`; ночной конвейер — `journalctl --user -u books-library-scan.service`.
+`journalctl --user -u books-library.service`; ночной конвейер — `journalctl --user -u books-library-rework.service`.
 
 ## Юниты systemd (user)
 
 | Юнит | Что делает |
 |---|---|
 | `books-library.service` | постоянный `python3 -I books_library/books_library.py serve`; перезапуск при сбое через 10 с (код 2 не перезапускается); потолок памяти 8 ГБ (`MemoryMax=8G`: Calibre, рендер DjVu и ebook-convert, 12 потоков); запись разрешена в `books_library/` (включая `reports/`), `logs/`, в каталог книг и карантин (для заданий API) |
-| `books-library-scan.service` | oneshot: ночной конвейер (см. «Ночная обработка»); `Nice=10`, `IOSchedulingClass=idle`, `MemoryMax=8G`; коды 2 и 3 не перезапускаются |
-| `books-library-scan.timer` | ежедневно в 04:30 и через 10 мин после включения таймера и каждой загрузки (`OnActiveSec=10min`), `Persistent=true` (пропущенный запуск — после загрузки), случайная задержка до 10 мин |
+| `books-library-rework.service` | oneshot: ночной конвейер (см. «Ночная обработка»); `Nice=10`, `IOSchedulingClass=idle`, `MemoryMax=8G`; коды 2 и 3 не перезапускаются |
+| `books-library-rework.timer` | ежедневно в 04:30 и через 10 мин после каждой загрузки (`OnBootSec=10min`), `Persistent=true` (пропущенный запуск — после загрузки), случайная задержка до 10 мин |
 
-Юниты ставит и включает `check_mytasks.sh` (задания `books-library.service` и `books-library-scan.timer`).
+Юниты ставит и включает `check_mytasks.sh` (задания `books-library.service` и `books-library-rework.timer`).
 Служебные режимы через `books-library.service` не запускаются: их вызывает ночной конвейер или запуск вручную
 после `-n`, либо задания API. Песочница юнитов: `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome=read-only`,
 запись в `books_library/` (включая `reports/`), `logs/`, в каталог книг (`-/mnt/copy/Books`) и карантин
@@ -618,7 +618,7 @@ zip и вложенные zip не трогаются.
 1. `python3 books_library/books_library.py scan -n` — проверить план (количество книг и ошибки обхода).
 2. `python3 books_library/books_library.py scan` — создать базу и проиндексировать каталог.
 3. `systemctl --user enable --now books-library.service` — запустить веб-интерфейс.
-4. `systemctl --user enable --now books-library-scan.timer` — включить ночную обработку.
+4. `systemctl --user enable --now books-library-rework.timer` — включить ночную обработку.
 5. Открыть http://127.0.0.1:8090/ .
 
 ## Возможности интерфейса

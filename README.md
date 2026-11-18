@@ -410,7 +410,7 @@ journalctl --user -u check-backups.service -n 20
 | `music-downloader.timer` | user-юнит | `music_downloader.sh` ежедневно в 21:00, пропущенный запуск — после загрузки |
 | `utility-bills.timer` | user-юнит | `utility_bills.sh` 20-го числа в 10:00, пропущенный запуск — после загрузки: квитанции ЖКУ из почты в SQLite |
 | `books-library.service` | user-юнит | `books_library/books_library.py serve` постоянно: веб-интерфейс библиотеки книг на 127.0.0.1:8090 |
-| `books-library-scan.timer` | user-юнит | `books_library/books_library.py scan` ежедневно в 04:30 и через 10 мин после включения и каждой загрузки, пропущенный запуск — после загрузки: индексация каталога книг |
+| `books-library-rework.timer` | user-юнит | `books_library/books_library.py scan` ежедневно в 04:30 и через 10 мин после каждой загрузки, пропущенный запуск — после загрузки: индексация каталога книг |
 | `btrfs-monitor.timer` | user-юнит | `btrfs_monitor.sh` в 00/06/12/18 ч, пропущенный — после загрузки (только если `/` на Btrfs) |
 | `getip.timer` | user-юнит | `getip.sh` через 2 мин после загрузки и каждые 30 мин |
 | `crontab` | старый cron | в crontab нет строк `music_downloader.sh`, `sources.sh`, `btrfs_monitor.sh`, `getip.sh`, `utility_bills.sh` (иначе — второй, параллельный запуск); исправление — удаление строк вместе с комментарием `# mytasks:` |
@@ -961,7 +961,7 @@ python3 books_library/books_library.py serve                         # веб-и
 `cp1251_to_utf8.sh` и `replace_encoding.sh` → `fix-encoding` (с проверкой содержимого); `mht_to_fb2.py` → `convert` (MHT/MHTML, по умолчанию EPUB; CHM не поддерживается).
 
 **Настройки:** `books_library/books_library.json` (каталог книг, база, адрес и порт, авторизация,
-`convert_timeout`). **Расписание и сервис:** `systemd/user/books-library-scan.timer` — ежедневно в 04:30 и через 10 мин после включения и загрузки,
+`convert_timeout`). **Расписание и сервис:** `systemd/user/books-library-rework.timer` — ежедневно в 04:30 и через 10 мин после загрузки,
 `Persistent=true`; `systemd/user/books-library.service` — постоянный веб-сервер (ставит `check_mytasks.sh`).
 **JSON API** (`/api`): поиск, отметки, полки и фоновые задания; боевой запуск изменяющих режимов — только с `confirm` успешного dry-run (см. [README проекта](books_library/README.md#json-api)).
 **Логи:** `logs/books_library-*.jsonl`. Подробно — [README проекта](books_library/README.md), CI —
