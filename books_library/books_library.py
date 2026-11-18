@@ -4529,8 +4529,13 @@ TEXT_HEAD_CHARS = 2048  # начало текста для поиска авто
 FILENAME_SPLIT = re.compile(r"^(.+?)(?: - |_-_|\.-\.)(.+)$")  # «Автор - Название», «Автор_-_Название», «Автор.-.Название»
 TEXT_NAME_LINE = re.compile(r"^\s*([А-ЯЁ][а-яё]+(?:[ \t]+[А-ЯЁ][а-яё]+){1,2})\.[ \t]+\S")  # «Имя Фамилия. Название»
 TEXT_CAPS_LINE = re.compile(r"^\s*([А-ЯЁ]{2,}(?:[ \t]+[А-ЯЁ]{2,}){1,2})\s*$")  # «ИМЯ ФАМИЛИЯ» + название следующей строкой
-# «Имя Фамилия» или «Имя Фамилия.» отдельной строкой в первых TEXT_ALONE_LINES строках + название следующей строкой
-TEXT_NAME_ALONE = re.compile(r"^\s*([А-ЯЁ][а-яё]+(?:[ \t]+[А-ЯЁ][а-яё]+){1,2})\.?\s*$")
+# Слово имени: «Имя» с заглавной и строчными или фамилия КАПСОМ
+TEXT_WORD = r"(?:[А-ЯЁ][а-яё]+|[А-ЯЁ]{2,})"
+# «Имя Фамилия», «ИМЯ ФАМИЛИЯ», «Имя ФАМИЛИЯ»; соавторы через запятую отбрасываются (берётся первый), точка — необязательна
+# отдельной строкой в первых TEXT_ALONE_LINES строках + название следующей строкой
+TEXT_NAME_ALONE = re.compile(rf"^\s*({TEXT_WORD}(?:[ \t]+{TEXT_WORD}){{1,2}})\.?(?:,\s*\S.*)?\s*$")
+TEXT_INITIALS_ALONE = re.compile(r"^\s*((?:[А-ЯЁ]\.\s*){1,2})([А-ЯЁ][а-яё]+|[А-ЯЁ]{2,})\.?\s*$")  # «И. О. Фамилия»
+TEXT_SURNAME_INITIALS = re.compile(r"^\s*([А-ЯЁ][а-яё]+|[А-ЯЁ]{2,})\s+((?:[А-ЯЁ]\.\s*){1,2})\s*$")  # «Фамилия И. О.»
 TEXT_ALONE_LINES = 5
 
 
@@ -4582,21 +4587,39 @@ def filename_author(stem: str) -> str:
     return left
 
 
+def alone_name(line: str) -> str:
+    """Имя из строки-одиночки: «Имя Фамилия», «ФАМИЛИЯ ИМЯ», «И. О. Фамилия» → «Фамилия И.О.», «Фамилия И. О.» → «Фамилия И.О.»
+    (форма для folder_for_name). Не имя — ''."""
+    match = TEXT_NAME_ALONE.match(line)
+    if match is not None:
+        return match.group(1)
+    match = TEXT_INITIALS_ALONE.match(line)
+    if match is not None:
+        return f"{match.group(2)} {''.join(match.group(1).split())}"
+    match = TEXT_SURNAME_INITIALS.match(line)
+    if match is not None:
+        return f"{match.group(1)} {''.join(match.group(2).split())}"
+    return ""
+
+
 def text_author(head: str, index: dict[frozenset[str], str]) -> tuple[str, str]:
     """Автор из начала текста: «Имя Фамилия. Название», «ИМЯ ФАМИЛИЯ» или «Имя Фамилия[.]» в первых TEXT_ALONE_LINES
     строках (название — следующей строкой).
     Возвращает (папка, имя) первого кандидата, совпавшего с существующей папкой; иначе ('', '')."""
     lines = [line for line in head.splitlines() if line.strip()][:40]
     for position, line in enumerate(lines):
-        candidate = TEXT_NAME_LINE.match(line)
-        if candidate is None and position + 1 < len(lines):
-            candidate = TEXT_CAPS_LINE.match(line) or (
-                TEXT_NAME_ALONE.match(line) if position < TEXT_ALONE_LINES else None)
-        if candidate is None:
+        match = TEXT_NAME_LINE.match(line)
+        name = match.group(1) if match is not None else ""
+        if not name and position + 1 < len(lines):
+            match = TEXT_CAPS_LINE.match(line)
+            name = match.group(1) if match is not None else ""
+            if not name and position < TEXT_ALONE_LINES:
+                name = alone_name(line)
+        if not name:
             continue
-        folder = folder_for_name(candidate.group(1), index)
+        folder = folder_for_name(name, index)
         if folder:
-            return folder, candidate.group(1)
+            return folder, name
     return "", ""
 
 
