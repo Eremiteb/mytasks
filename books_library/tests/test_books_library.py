@@ -8,6 +8,7 @@ import json
 import os
 import sqlite3
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -594,6 +595,132 @@ def test_unpack_skips_entry_over_max_mb(tmp_path: Path) -> None:
     assert not (root / "big.fb2").exists()
 
 
+def make_multi(path: Path, members: dict[str, bytes]) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, data in members.items():
+            archive.writestr(name, data)
+
+
+def multi_members() -> dict[str, bytes]:
+    """Три записи: две с метаданными/без (номера librusec) и запись с путём «..», которая должна быть отброшена."""
+    return {
+        "24.fb2": make_fb2("Книга", "Иван", "Петров"),
+        "3.fb2": b"<FictionBook>no meta</FictionBook>",
+        "../x.fb2": make_fb2("Чужая", "Иван", "Чужой"),
+    }
+
+
+@pytest.fixture
+def multi_cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    root = tmp_path / "lib"
+    root.mkdir()
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    return make_cfg(tmp_path, root)
+
+
+def test_multi_extracts_into_folder_with_metadata_names(multi_cfg: dict[str, Any]) -> None:
+    root = Path(multi_cfg["books_dir"])
+    make_multi(root / "lib-3.zip", multi_members())
+
+    stats = bl.unpack_fb2zip(multi_cfg, multi=True)
+
+    folder = root / "lib-3"
+    assert sorted(p.name for p in folder.iterdir()) == ["Петров - Книга.fb2", "librusec-3.fb2"]
+    assert (folder / "librusec-3.fb2").read_bytes() == b"<FictionBook>no meta</FictionBook>"
+    assert not (root / "x.fb2").exists()
+    assert not (root.parent / "x.fb2").exists()
+    assert (root / "lib-3.zip").is_file()  # запись отброшена — распаковка неполная, архив остаётся
+    assert stats["extracted"] == 2
+    assert stats["skipped"] == 1
+
+
+def test_multi_dry_run_writes_nothing(multi_cfg: dict[str, Any]) -> None:
+    root = Path(multi_cfg["books_dir"])
+    make_multi(root / "lib-3.zip", multi_members())
+
+    bl.unpack_fb2zip(multi_cfg, dry_run=True, multi=True)
+
+    assert not (root / "lib-3").exists()
+    assert (root / "lib-3.zip").is_file()
+
+
+def test_multi_md5_mismatch_skips_archive(multi_cfg: dict[str, Any]) -> None:
+    root = Path(multi_cfg["books_dir"])
+    make_multi(root / "lib-3.zip", multi_members())
+    (root / "md5_sum.txt").write_text("lib-3.zip\t\t: " + "0" * 32 + "\n", encoding="utf-8")
+
+    stats = bl.unpack_fb2zip(multi_cfg, multi=True)
+
+    assert stats["md5_mismatch"] == 1
+    assert not (root / "lib-3").exists()
+    assert (root / "lib-3.zip").is_file()
+
+
+def test_multi_ignore_md5_extracts_with_warning(multi_cfg: dict[str, Any]) -> None:
+    root = Path(multi_cfg["books_dir"])
+    make_multi(root / "lib-3.zip", multi_members())
+    (root / "md5_sum.txt").write_text("lib-3.zip\t\t: " + "0" * 32 + "\n", encoding="utf-8")
+
+    stats = bl.unpack_fb2zip(multi_cfg, multi=True, ignore_md5=True)
+
+    assert stats["md5_ignored"] == 1
+    assert stats["extracted"] == 2
+
+
+def test_multi_matching_md5_passes(multi_cfg: dict[str, Any]) -> None:
+    root = Path(multi_cfg["books_dir"])
+    make_multi(root / "lib-3.zip", multi_members())
+    (root / "md5_sum.txt").write_text(f"lib-3.zip\t\t: {bl.file_md5(root / 'lib-3.zip')}\n", encoding="utf-8")
+
+    stats = bl.unpack_fb2zip(multi_cfg, multi=True)
+
+    assert stats["extracted"] == 2
+    assert "md5_mismatch" not in stats
+
+
+def test_multi_delete_source_quarantines_archive_after_full_unpack(multi_cfg: dict[str, Any]) -> None:
+    root = Path(multi_cfg["books_dir"])
+    make_multi(root / "lib-2.zip", {"24.fb2": make_fb2("Книга", "Иван", "Петров"), "3.fb2": b"<FictionBook/>"})
+
+    stats = bl.unpack_fb2zip(multi_cfg, multi=True, delete_source=True)
+
+    assert (root / "lib-2" / "Петров - Книга.fb2").is_file()
+    assert not (root / "lib-2.zip").exists()
+    assert (Path(multi_cfg["quarantine_dir"]) / "replaced" / "lib-2.zip").is_file()
+    assert stats["replaced"] == 1
+
+
+def test_multi_out_dir_outside_books(multi_cfg: dict[str, Any], tmp_path: Path) -> None:
+    root = Path(multi_cfg["books_dir"])
+    make_multi(root / "lib-3.zip", multi_members())
+    out = tmp_path / "ssd" / "unpacked"
+
+    bl.unpack_fb2zip(multi_cfg, multi=True, out_dir=str(out))
+
+    assert sorted(p.name for p in (out / "lib-3").iterdir()) == ["Петров - Книга.fb2", "librusec-3.fb2"]
+    assert not (root / "lib-3").exists()
+
+
+def test_multi_out_dir_inside_books_rejected(multi_cfg: dict[str, Any]) -> None:
+    root = Path(multi_cfg["books_dir"])
+    with pytest.raises(bl.ConfigError):
+        bl.unpack_fb2zip(multi_cfg, dry_run=True, multi=True, out_dir=str(root / "inside"))
+
+
+def test_out_requires_multi(zip_cfg: dict[str, Any], tmp_path: Path) -> None:
+    with pytest.raises(bl.ConfigError):
+        bl.unpack_fb2zip(zip_cfg, out_dir=str(tmp_path / "out"))
+
+
+def test_single_fb2zip_unchanged_with_multi_flag(zip_cfg: dict[str, Any]) -> None:
+    root = Path(zip_cfg["books_dir"])
+
+    bl.unpack_fb2zip(zip_cfg, multi=True)
+
+    assert (root / "a.fb2").read_bytes() == b"<FictionBook>a</FictionBook>"
+    assert (root / "a.fb2.zip").is_file()
+
+
 # ---- convert: безопасность и проверка результата --------------------------------------------
 
 def test_strip_foreign_images_keeps_only_media_paths(tmp_path: Path) -> None:
@@ -977,6 +1104,7 @@ def view_cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     converted = tmp_path / "converted.epub"
     make_epub(converted)
     cfg = make_cfg(tmp_path, root)
+    monkeypatch.setattr(bl, "djvu_meta", lambda path: {})  # djvused не вызывается: файл синтетический
     bl.scan(cfg)
     monkeypatch.setattr(bl, "djvu_page_count", lambda path, timeout: 3)
     monkeypatch.setattr(bl, "djvu_page_text", lambda path, page, timeout: "текст")
@@ -1545,12 +1673,12 @@ def test_migration_v4_creates_book_collections_and_view(tmp_path: Path) -> None:
         for number, sql in enumerate(bl.MIGRATIONS[:3], start=1):
             conn.executescript(f"BEGIN;{sql};PRAGMA user_version={number};COMMIT;")
 
-    assert bl.migrate_database(empty, out=lambda _line: None) == 4
-    assert bl.migrate_database(old, out=lambda _line: None) == 4
+    assert bl.migrate_database(empty, out=lambda _line: None) == bl.DB_LATEST
+    assert bl.migrate_database(old, out=lambda _line: None) == bl.DB_LATEST
 
     for path in (empty, old):
         with closing(bl.connect(path)) as conn:
-            assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == bl.DB_LATEST
             names = {row[0] for row in conn.execute(
                 "SELECT name FROM sqlite_master WHERE name IN ('book_collections', 'collections')")}
             assert names == {"book_collections", "collections"}
@@ -1607,7 +1735,8 @@ def test_collection_filter_finds_keeper_from_other_section(
     assert status == 200
     assert body["total"] == 1
     assert body["items"][0]["path"] == "Автор/b.epub"
-    assert body["items"][0]["collections"] == [{"section": bl.section_name("_Сборники"), "collection": "Серия Y"}]
+    assert body["items"][0]["collections"] == [{"section": bl.section_name("_Сборники"), "collection": "Серия Y",
+                                                "subsection": "", "kind": "dedup", "source": "dedup"}]
 
 
 def test_collections_view_counts_only_books_in_catalog_and_rebuild_keeps_rows(coll_db: str) -> None:
@@ -1672,6 +1801,23 @@ def test_person_name_accepts_people_and_rejects_titles_and_genres() -> None:
 
 def test_pick_folder_not_person_creates_no_folder() -> None:
     assert bl.pick_folder("Охота на драконов", frozenset({"охота", "на", "драконов"}), "", {}) == ("", "not-person")
+
+
+def test_split_authors_first_author_is_folder_and_rest_are_coauthors() -> None:
+    assert bl.split_authors("Григорий Белых, Алексей Пантелеев") == ["Григорий Белых", "Алексей Пантелеев"]
+    assert bl.split_authors("Григорий Белых и Алексей Пантелеев; Иван Иванов") == \
+        ["Григорий Белых", "Алексей Пантелеев", "Иван Иванов"]
+    assert bl.split_authors("Охота на драконов, эпос Японский") == ["Охота на драконов, эпос Японский"]
+    first = bl.split_authors("Григорий Белых, Алексей Пантелеев")[0]
+    assert bl.pick_folder(first, bl.author_key(first), "", {}) == ("Белых Григорий", "new")
+
+
+def test_pick_folder_initials_before_surname_and_particle_keep_order() -> None:
+    assert bl.pick_folder("И.Гарин", bl.author_key("И.Гарин"), "", {}) == ("Гарин И", "new")
+    assert bl.pick_folder("И.О.Гарин", bl.author_key("И.О.Гарин"), "", {}) == ("Гарин И.О", "new")
+    existing = {bl.author_key("Гарин Иван"): "Гарин Иван"}
+    assert bl.pick_folder("И.Гарин", bl.author_key("И.Гарин"), "", existing) == ("Гарин Иван", "initials")
+    assert bl.pick_folder("Де Рокамболь", bl.author_key("Де Рокамболь"), "", {}) == ("Де Рокамболь", "new")
 
 
 def unpack_cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
@@ -1821,6 +1967,101 @@ def test_text_author_name_alone_forms() -> None:
         ("Маринина Александра Борисовна", "Маринина А.Б.")
     # без папки в библиотеке — пусто
     assert bl.text_author("Джон СТЕЙНБЕК\nЗаблудившийся автобус\n", index) == ("", "")
+
+
+def write_epub_chapters(path: Path, chapters: list[str]) -> None:
+    """EPUB без метаданных автора: главы — тела <body> в порядке spine."""
+    container = (
+        '<?xml version="1.0"?>'
+        '<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+        '<rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>'
+        "</container>"
+    )
+    manifest = "".join(f'<item id="c{i}" href="ch{i}.xhtml" media-type="application/xhtml+xml"/>'
+                       for i in range(len(chapters)))
+    spine = "".join(f'<itemref idref="c{i}"/>' for i in range(len(chapters)))
+    opf = ('<?xml version="1.0" encoding="utf-8"?>'
+           '<package xmlns="http://www.idpf.org/2007/opf" version="3.0">'
+           '<metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Роман</dc:title></metadata>'
+           f"<manifest>{manifest}</manifest><spine>{spine}</spine></package>")
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("mimetype", "application/epub+zip")
+        archive.writestr("META-INF/container.xml", container)
+        archive.writestr("OEBPS/content.opf", opf)
+        for i, body in enumerate(chapters):
+            archive.writestr(f"OEBPS/ch{i}.xhtml", '<?xml version="1.0" encoding="utf-8"?>'
+                             f'<html xmlns="http://www.w3.org/1999/xhtml"><body>{body}</body></html>')
+
+
+def test_serial_filename_folder_needs_exactly_one_folder_with_surname() -> None:
+    index = {frozenset({"кейт", "дэвид"}): "Кейт Дэвид", frozenset({"андерсон", "кевин"}): "Андерсон Кевин",
+             frozenset({"андерсон", "пол"}): "Андерсон Пол", frozenset({"фёдоров", "иван"}): "Фёдоров Иван"}
+    assert bl.serial_filename_folder("Война Роботов 01(шагающая Смерть 1)кейт", index) == "Кейт Дэвид"
+    # две папки с фамилией «Андерсон» — не угадываем
+    assert bl.serial_filename_folder("Звездные Войны 002(проклятье Ситхов)андерсон", index) == ""
+    # ё→е при сравнении
+    assert bl.serial_filename_folder("Вселенная 3(тень)федоров", index) == "Фёдоров Иван"
+    # папки с такой фамилией нет
+    assert bl.serial_filename_folder("Война Роботов 11(естественный  Отбор)стакпол", index) == ""
+    # фамилия должна быть строчными после «)»
+    assert bl.serial_filename_folder("Книга (часть)Кейт", index) == ""
+    assert bl.serial_filename_folder("Книга без скобок", index) == ""
+
+
+def test_folder_author_number_coauthors_and_initials() -> None:
+    index = {frozenset({"уэйс", "михаил"}): "Уэйс Михаил", frozenset({"сальваторе", "роберт"}): "Сальваторе Роберт"}
+    assert bl.folder_author_name("1. М.Уэйс и Т.Хикмен") == "Уэйс М."
+    assert bl.folder_author_name("2) Р.Сальваторе") == "Сальваторе Р."
+    assert bl.folder_author_name("3) Иван Иванов & Пётр Петров") == "Иван Иванов"
+    assert bl.folder_author_name("Иван Иванов") == "Иван Иванов"
+    assert bl.folder_for_name(bl.folder_author_name("1. М.Уэйс и Т.Хикмен"), index) == "Уэйс Михаил"
+    assert bl.folder_for_name(bl.folder_author_name("2) Р.Сальваторе"), index) == "Сальваторе Роберт"
+    assert bl.folder_for_name(bl.folder_author_name("1. Д.Кейт"), index) == ""
+
+
+def test_epub_head_reads_only_leading_chapters(tmp_path: Path) -> None:
+    path = tmp_path / "Роман.epub"
+    write_epub_chapters(path, ["<p>Станислав Лем</p>\n<p>КАК МИКРОМИЛ</p>\n", "<p>ВТОРАЯ ГЛАВА</p>\n"])
+    head = bl.epub_head(path, 10)
+    assert "Станислав Лем" in head
+    assert "ВТОРАЯ" not in head
+    assert "ВТОРАЯ" in bl.epub_head(path, 10 ** 6)
+
+
+def test_sort_underscore_serial_numbered_folder_and_epub_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "sort_books"
+    for folder in ("Кейт Дэвид", "Андерсон Кевин", "Андерсон Пол", "Фёдоров Иван", "Уэйс Михаил",
+                   "Сальваторе Роберт", "Лем Станислав"):
+        (root / folder).mkdir(parents=True)
+    serial = root / "_Серии"
+    serial.mkdir()
+    (serial / "Война Роботов 01(шагающая Смерть 1)кейт.txt").write_text("Текст.\n", encoding="utf-8")
+    (serial / "Война Роботов 11(естественный  Отбор)кейт.txt").write_text("Текст.\n", encoding="utf-8")
+    (serial / "Звездные Войны 002(проклятье Ситхов)андерсон.txt").write_text("Текст.\n", encoding="utf-8")
+    (serial / "Вселенная 3(тень)федоров.txt").write_text("Текст.\n", encoding="utf-8")
+    (root / "_разобрать" / "1. М.Уэйс и Т.Хикмен").mkdir(parents=True)
+    (root / "_разобрать" / "1. М.Уэйс и Т.Хикмен" / "Книга.txt").write_text("Текст.\n", encoding="utf-8")
+    (root / "_разобрать" / "2) Р.Сальваторе").mkdir(parents=True)
+    (root / "_разобрать" / "2) Р.Сальваторе" / "Другая.txt").write_text("Текст.\n", encoding="utf-8")
+    write_epub_chapters(root / "_разобрать" / "Роман.epub", ["<p>Станислав Лем</p>\n<p>КАК МИКРОМИЛ</p>\n"])
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    cfg = make_cfg(tmp_path, root)
+    bl.scan(cfg)
+
+    stats = bl.sort_underscore(cfg, out=lambda _line: None)
+
+    assert stats["moved"] == 6
+    assert stats["source_filename"] == 3
+    assert stats["source_folder"] == 2
+    assert stats["source_text"] == 1
+    assert stats["no_author"] == 1
+    assert (root / "Кейт Дэвид" / "Война Роботов 01(шагающая Смерть 1)кейт.txt").is_file()
+    assert (root / "Кейт Дэвид" / "Война Роботов 11(естественный  Отбор)кейт.txt").is_file()
+    assert (root / "Фёдоров Иван" / "Вселенная 3(тень)федоров.txt").is_file()
+    assert (root / "Уэйс Михаил" / "Книга.txt").is_file()
+    assert (root / "Сальваторе Роберт" / "Другая.txt").is_file()
+    assert (root / "Лем Станислав" / "Роман.epub").is_file()
+    assert (serial / "Звездные Войны 002(проклятье Ситхов)андерсон.txt").is_file()
 
 
 # ---- merge-authors: склейка «Фамилия Имя» + «Фамилия Имя Отчество» ---------------------------------------
@@ -2816,3 +3057,492 @@ def test_command_params_merge_folder_and_strip_suffix() -> None:
         bl.command_params("merge-folder", {"from": [], "to": "B"})
     with pytest.raises(bl.ConfigError):
         bl.command_params("fix-misplaced", {"path": "x"})
+
+
+def test_merge_folder_from_nested_service_path_into_new_folder_keeps_collection(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "_Сборники/Серия/Иван Петров/a.txt": "А.\n",
+        "_Сборники/Серия/Иван Петров/sub/b.txt": "Б.\n",
+    })
+    root = Path(cfg["books_dir"])
+    old = "_Сборники/Серия/Иван Петров/a.txt"
+    with closing(bl.connect(cfg["db_path"])) as conn, conn:
+        conn.execute("INSERT INTO marks(path, status, updated) VALUES (?,?,?)", (old, "done", 1.0))
+
+    stats = bl.folder_merge(cfg, ["_Сборники/Серия/Иван Петров"], "Петров Иван")
+
+    assert stats["merged"] == 1
+    assert stats["moved"] == 2
+    assert (root / "Петров Иван" / "a.txt").is_file()
+    assert (root / "Петров Иван" / "sub" / "b.txt").is_file()
+    assert not (root / "_Сборники" / "Серия" / "Иван Петров").exists()
+    assert (root / "_Сборники" / "Серия").is_dir()
+    with closing(bl.connect(cfg["db_path"])) as conn:
+        marks = [r[0] for r in conn.execute("SELECT path FROM marks")]
+        rows = conn.execute("SELECT collection, orig_path FROM book_collections WHERE path=? AND source='folder'",
+                            ("Петров Иван/a.txt",)).fetchall()
+    assert marks == ["Петров Иван/a.txt"]
+    assert [tuple(r) for r in rows] == [("Серия", old)]
+
+
+def test_merge_folder_nested_into_existing_folder_counts_conflicts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "_Сборники/Серия/Иван Петров/a.txt": "А.\n",
+        "Петров Иван/a.txt": "Другой.\n",
+    })
+    root = Path(cfg["books_dir"])
+
+    stats = bl.folder_merge(cfg, ["_Сборники/Серия/Иван Петров"], "Петров Иван")
+
+    assert stats["merged"] == 1
+    assert stats["conflicts"] == 1
+    assert (root / "Петров Иван" / "a.txt").read_text(encoding="utf-8") == "Другой.\n"
+    assert (root / "Петров Иван" / "a_1.txt").read_text(encoding="utf-8") == "А.\n"
+
+
+def test_merge_folder_rejects_nested_path_outside_service_section(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {"Иван Петров/sub/a.txt": "А.\n", "_Сборники/Серия/x.txt": "Х.\n"})
+    root = Path(cfg["books_dir"])
+
+    for bad in ("Иван Петров/sub", "_Сборники/../Иван Петров", "../outside", "_Сборники", "_Сборники/Серия/Нет"):
+        with pytest.raises(bl.ConfigError):
+            bl.folder_merge(cfg, [bad], "Петров Иван")
+    assert (root / "Иван Петров" / "sub" / "a.txt").is_file()
+    assert (root / "_Сборники" / "Серия" / "x.txt").is_file()
+
+
+def test_merge_folder_into_razobrat_subfolder_keeps_subfolders_and_collection(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "_Сборники/X/_эпос/Книга.fb2": make_fb2("Книга", "Иван", "Иванов"),
+        "_Сборники/X/_эпос/Том 2/Книга2.txt": "Текст.\n",
+        "_Сборники/X/Остаётся.txt": "Х.\n",
+    })
+    root = Path(cfg["books_dir"])
+    old, new = "_Сборники/X/_эпос/Книга.fb2", "_разобрать/X/Книга.fb2"
+    with closing(bl.connect(cfg["db_path"])) as conn, conn:
+        conn.execute("INSERT INTO marks(path, status, updated) VALUES (?,?,?)", (old, "done", 1.0))
+
+    stats = bl.folder_merge(cfg, ["_Сборники/X/_эпос"], "_разобрать/X")
+
+    assert stats["merged"] == 1
+    assert stats["moved"] == 2
+    assert (root / new).is_file()
+    assert (root / "_разобрать" / "X" / "Том 2" / "Книга2.txt").is_file()
+    assert not (root / "_Сборники" / "X" / "_эпос").exists()
+    assert (root / "_Сборники" / "X" / "Остаётся.txt").is_file()
+    with closing(bl.connect(cfg["db_path"])) as conn:
+        marks = [r[0] for r in conn.execute("SELECT path FROM marks")]
+        rows = conn.execute("SELECT collection, orig_path FROM book_collections WHERE path=? AND source='folder'",
+                            (new,)).fetchall()
+    assert marks == [new]
+    assert [tuple(r) for r in rows] == [("X", old)]
+
+
+def test_merge_folder_target_must_be_author_folder_or_inside_razobrat(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {"Иван Петров/a.txt": "А.\n", "_Сборники/X/Книга.txt": "Х.\n"})
+    root = Path(cfg["books_dir"])
+
+    for bad in ("_Сборники/X", "_разобрать", "_разобрать/../x", "Петров/Иван"):
+        with pytest.raises(bl.ConfigError):
+            bl.folder_merge(cfg, ["Иван Петров"], bad)
+    assert (root / "Иван Петров" / "a.txt").is_file()
+
+
+# ---- (в) схема v6: book_meta, подразделы сборников, сборники из метаданных --------------------
+
+def make_fb2_full() -> bytes:
+    """fb2 с переводчиком, второй серией, издательскими данными, custom-info и серией издательства."""
+    text = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0">'
+        "<description><title-info><genre>sf</genre>"
+        "<author><first-name>Иван</first-name><last-name>Иванов</last-name><nickname>ivan</nickname></author>"
+        "<translator><first-name>Пётр</first-name><last-name>Петров</last-name></translator>"
+        "<book-title>Тёмный лес</book-title><keywords>лес, тьма</keywords>"
+        '<date value="1999">1999</date><lang>ru</lang><src-lang>en</src-lang>'
+        '<sequence name="Серия А" number="2"/><sequence name="Серия Б" number="5"/>'
+        "</title-info>"
+        "<publish-info><book-name>Тёмный лес (издание)</book-name><publisher>Издатель</publisher>"
+        '<year>2005</year><isbn>9785000000001</isbn><sequence name="Издательская" number="7"/></publish-info>'
+        '<custom-info info-type="ISBN-ALT">X1</custom-info>'
+        "</description><body><section><p>Текст.</p></section></body></FictionBook>"
+    )
+    return text.encode("utf-8")
+
+
+def make_epub_opf(path: Path, metadata: str) -> None:
+    """EPUB 3 с произвольным содержимым metadata (элементы dc:* и meta внутри <metadata>)."""
+    container = (
+        '<?xml version="1.0"?>'
+        '<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+        '<rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>'
+        "</container>"
+    )
+    opf = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<package xmlns="http://www.idpf.org/2007/opf" version="3.0">'
+        '<metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">'
+        f"<dc:title>Электронная книга</dc:title><dc:creator>Сидоров Сергей</dc:creator>{metadata}"
+        "</metadata>"
+        '<manifest><item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/></manifest>'
+        '<spine><itemref idref="c1"/></spine>'
+        "</package>"
+    )
+    chapter = '<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml"><body><p>Глава</p></body></html>'
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("mimetype", "application/epub+zip")
+        archive.writestr("META-INF/container.xml", container)
+        archive.writestr("OEBPS/content.opf", opf)
+        archive.writestr("OEBPS/ch1.xhtml", chapter)
+
+
+def meta_pairs(cfg: dict[str, Any], rel: str) -> set[tuple[str, str]]:
+    with closing(bl.connect(cfg["db_path"])) as conn:
+        return {(row[0], row[1]) for row in conn.execute("SELECT key, value FROM book_meta WHERE path=?", (rel,))}
+
+
+def meta_collections(cfg: dict[str, Any], rel: str) -> set[tuple[str, str]]:
+    with closing(bl.connect(cfg["db_path"])) as conn:
+        return {(row[0], row[1]) for row in conn.execute(
+            "SELECT kind, collection FROM book_collections WHERE path=? AND source='meta'", (rel,))}
+
+
+def test_fb2_details_go_to_book_meta_and_meta_collections(tmp_path: Path) -> None:
+    root = tmp_path / "books"
+    (root / "Иванов Иван").mkdir(parents=True)
+    rel = "Иванов Иван/Издание.fb2"
+    (root / rel).write_bytes(make_fb2_full())
+    cfg = make_cfg(tmp_path, root)
+    bl.scan(cfg)
+
+    pairs = meta_pairs(cfg, rel)
+    assert ("author_full", "Иванов Иван; ник: ivan") in pairs
+    assert ("translator", "Петров Пётр") in pairs
+    assert ("publisher", "Издатель") in pairs
+    assert ("publisher_series_no", "7") in pairs
+    assert ("series_extra", "Серия Б #5") in pairs
+    assert ("custom:ISBN-ALT", "X1") in pairs
+    assert meta_collections(cfg, rel) == {("edition", "Тёмный лес (издание)"), ("publisher-series", "Издательская")}
+
+
+def test_epub_belongs_to_collection_set_becomes_meta_collection(tmp_path: Path) -> None:
+    root = tmp_path / "books"
+    (root / "Сидоров Сергей").mkdir(parents=True)
+    rel = "Сидоров Сергей/Серийная.epub"
+    make_epub_opf(root / rel, (
+        '<meta property="belongs-to-collection" id="c01">Серия Эпуб</meta>'
+        '<meta refines="#c01" property="collection-type">set</meta>'
+        '<meta refines="#c01" property="group-position">3</meta>'
+        "<dc:publisher>Издательство</dc:publisher>"
+        '<dc:identifier opf:scheme="ISBN">9785000000002</dc:identifier>'
+        '<dc:contributor opf:role="trl">Смирнов А.</dc:contributor>'
+    ))
+    cfg = make_cfg(tmp_path, root)
+    bl.scan(cfg)
+
+    assert meta_collections(cfg, rel) == {("set", "Серия Эпуб")}
+    pairs = meta_pairs(cfg, rel)
+    assert ("translator", "Смирнов А.") in pairs
+    assert ("isbn", "9785000000002") in pairs
+    assert ("group_position", "3") in pairs
+    assert ("epub_version", "3.0") in pairs
+
+
+def test_subsection_from_orig_path_and_v6_backfill(tmp_path: Path) -> None:
+    rel = "_Сборники/Библиотека Мошкова/Мошков часть 4/LIB/trnslsf/x.txt"
+    db = str(tmp_path / "v5.db")
+    section, collection = bl.path_collection(rel)
+    with closing(sqlite3.connect(db)) as conn:
+        for number, sql in enumerate(bl.MIGRATIONS[:5], start=1):
+            conn.executescript(f"BEGIN;{sql};PRAGMA user_version={number};COMMIT;")
+        conn.execute("INSERT INTO books(path, size, mtime, fmt, title, added, section, collection) VALUES (?,?,?,?,?,?,?,?)",
+                     (rel, 1, 1.0, "txt", "x", 1.0, section, collection))
+        conn.execute("INSERT INTO book_collections(path, section, collection, source, orig_path) VALUES (?,?,?,?,?)",
+                     (rel, section, collection, "folder", rel))
+        conn.commit()
+
+    assert bl.migrate_database(db, out=lambda _line: None) == bl.DB_LATEST
+    with closing(bl.connect(db)) as conn, conn:
+        bl.rebuild_collections(conn)
+        row = conn.execute("SELECT subsection, kind FROM book_collections WHERE path=?", (rel,)).fetchone()
+    assert tuple(row) == ("Мошков часть 4/LIB/trnslsf", "folder")
+
+
+def test_relink_moves_book_meta(tmp_path: Path) -> None:
+    db = str(tmp_path / "meta.db")
+    bl.migrate_database(db, out=lambda _line: None)
+    with closing(bl.connect(db)) as conn, conn:
+        conn.execute("INSERT INTO book_meta VALUES (?,?,?)", ("Автор/a.epub", "publisher", "Издатель"))
+
+    bl.relink(db, [("Автор/a.epub", "Автор/a2.epub")])
+
+    with closing(bl.connect(db)) as conn:
+        rows = [tuple(row) for row in conn.execute("SELECT path, key, value FROM book_meta")]
+    assert rows == [("Автор/a2.epub", "publisher", "Издатель")]
+
+
+def test_pdf_meta_uses_pdfinfo_output_and_fills_only_real_title(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pdf = tmp_path / "Автор - Книга.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+    output = ("Title:          Настоящее название\nAuthor:         Автор Иванов\nSubject:        Тема книги\n"
+              "Pages:          12\nPage size:      595 x 842 pts (A4)\n")
+    calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout=output.encode("utf-8"), stderr=b"")
+
+    monkeypatch.setattr(bl.subprocess, "run", fake_run)
+    meta = bl.pdf_meta(pdf, "Автор - Книга")
+
+    assert calls[0][:3] == ["pdfinfo", "-enc", "UTF-8"]
+    assert meta["title"] == "Настоящее название"
+    assert meta["fill"] == {"authors": ["Автор Иванов"], "annotation": "Тема книги"}
+    assert ("pages", "12") in meta["kv"]
+    assert ("pdf:page_size", "595 x 842 pts (A4)") in meta["kv"]
+
+
+def test_real_title_rejects_file_name_and_word_template() -> None:
+    assert bl.real_title("Microsoft Word - Глава 1", "Книга") == ""
+    assert bl.real_title("Книга.pdf", "Книга") == ""
+    assert bl.real_title("Тёмный лес", "Иванов - Тёмный лес") == "Тёмный лес"
+
+
+def test_djvu_meta_parses_print_meta_and_pages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    output = '(metadata\n    (title "Скан \\"Т\\"")\n    (year "1990")\n)\n12\n'
+
+    def fake_run(args: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        assert args[:3] == ["djvused", "-e", "print-meta; n"]
+        return subprocess.CompletedProcess(args, 0, stdout=output.encode("utf-8"), stderr=b"")
+
+    monkeypatch.setattr(bl.subprocess, "run", fake_run)
+    meta = bl.djvu_meta(tmp_path / "scan.djvu")
+
+    assert ("djvu:title", 'Скан "Т"') in meta["kv"]
+    assert ("djvu:year", "1990") in meta["kv"]
+    assert ("pages", "12") in meta["kv"]
+
+
+def make_mobi(title: bytes, author: bytes, updated: bytes | None = None) -> bytes:
+    """Минимальный PalmDB с одной записью MOBI и EXTH (100 — автор, 503 — обновлённое название); без текста книги."""
+    records = [(100, author)] + ([(503, updated)] if updated else [])
+    body = b"".join(struct.pack(">II", kind, len(data) + 8) + data for kind, data in records)
+    exth = b"EXTH" + struct.pack(">II", len(body) + 12, len(records)) + body
+    mobi = bytearray(232)
+    mobi[0:4] = b"MOBI"
+    struct.pack_into(">I", mobi, 4, 232)
+    struct.pack_into(">I", mobi, 12, 65001)
+    struct.pack_into(">I", mobi, 128, 0x40)
+    struct.pack_into(">II", mobi, 84, 16 + 232 + len(exth), len(title))
+    record0 = bytes(16) + bytes(mobi) + exth + title
+    palm = bytearray(78)
+    palm[60:68] = b"BOOKMOBI"
+    struct.pack_into(">H", palm, 76, 1)
+    return bytes(palm) + struct.pack(">II", 86, 0) + record0
+
+
+def test_mobi_exth_and_full_title(tmp_path: Path) -> None:
+    plain = tmp_path / "plain.mobi"
+    plain.write_bytes(make_mobi("Полное название".encode(), "Автор Авторов".encode()))
+    meta = bl.other_meta(plain, "mobi", "Файл")
+    assert meta["title"] == "Полное название"
+    assert ("author", "Автор Авторов") in meta["kv"]
+    assert meta["fill"] == {"authors": ["Автор Авторов"]}
+
+    updated = tmp_path / "updated.mobi"
+    updated.write_bytes(make_mobi("Старое".encode(), "Автор".encode(), "Обновлённое".encode()))
+    assert bl.other_meta(updated, "mobi", "Файл")["title"] == "Обновлённое"
+
+
+def test_scan_reparse_rereads_every_book(cfg: dict[str, Any]) -> None:
+    first = bl.scan(cfg)
+    again = bl.scan(cfg, reparse=True)
+    assert first["files"] == again["files"]
+    assert again["changed"] == again["files"]
+    assert again["new"] == 0
+
+
+def test_scan_reparse_is_a_checked_parameter() -> None:
+    assert bl.command_params("scan", {"reparse": True}) == {"reparse": True}
+    assert bl.command_params("scan", {}) == {"reparse": False}
+    with pytest.raises(bl.ConfigError):
+        bl.command_params("scan", {"reparse": "yes"})
+
+
+# ---- (ж) веб v6: сведения, подразделы сборников, сборники из метаданных ------------------------
+
+CARD_REL = "_Сборники/Библиотека Мошкова/Мошков часть 4/LIB/Тёмный лес.fb2"
+CARD_OTHER_REL = "_Сборники/Библиотека Мошкова/Другой/Вторая.fb2"
+
+
+@pytest.fixture
+def card_cfg(tmp_path: Path) -> dict[str, Any]:
+    """Книга в подразделе сборника с метаданными fb2 и книга в другом подразделе того же сборника."""
+    root = tmp_path / "card_books"
+    (root / CARD_REL).parent.mkdir(parents=True)
+    (root / CARD_REL).write_bytes(make_fb2_full())
+    (root / CARD_OTHER_REL).parent.mkdir(parents=True)
+    (root / CARD_OTHER_REL).write_bytes(make_fb2("Вторая", "Пётр", "Сидоров"))
+    cfg = make_cfg(tmp_path, root)
+    bl.scan(cfg)
+    with closing(bl.connect(cfg["db_path"])) as conn, conn:
+        bl.rebuild_collections(conn)
+    return cfg
+
+
+@pytest.fixture
+def card_web(card_cfg: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
+    yield from _serving(card_cfg, monkeypatch)
+
+
+def test_card_shows_details_subsection_and_meta_collections(card_web: str, card_cfg: dict[str, Any]) -> None:
+    status, _headers, body = fetch(f"{card_web}/book/{book_id(card_cfg, CARD_REL)}")
+    text = body.decode("utf-8")
+
+    assert status == 200
+    assert "<h3>Сведения</h3>" in text
+    assert "<th>Переводчик</th><td>Петров Пётр</td>" in text
+    assert "<th>ISBN</th><td>9785000000001</td>" in text
+    assert "Библиотека Мошкова / Мошков часть 4 / LIB" in text
+    assert "Из метаданных" in text
+    assert "издательская серия: Издательская" in text
+    assert "издание: Тёмный лес (издание)" in text
+
+
+def test_api_book_details_and_collections(card_web: str, card_cfg: dict[str, Any]) -> None:
+    status, body = api_call(f"{card_web}/api/books/{book_id(card_cfg, CARD_REL)}")
+
+    assert status == 200
+    details = {item["key"]: item for item in body["details"]}
+    assert details["translator"] == {"key": "translator", "label": "Переводчик", "values": ["Петров Пётр"]}
+    assert details["isbn"]["label"] == "ISBN"
+    folder = [c for c in body["collections"] if c["source"] == "folder"]
+    assert folder == [{"section": bl.section_name("_Сборники"), "collection": "Библиотека Мошкова",
+                       "subsection": "Мошков часть 4/LIB", "kind": "folder", "source": "folder"}]
+    assert {c["kind"] for c in body["collections"] if c["source"] == "meta"} == {"edition", "publisher-series"}
+
+
+def test_collection_filter_by_subsection(card_web: str, card_cfg: dict[str, Any]) -> None:
+    base = f"{card_web}/api/books?collection={quote('Библиотека Мошкова')}&section={quote(bl.section_name('_Сборники'))}"
+
+    _status, body = api_call(base)
+    assert body["total"] == 2
+
+    _status, body = api_call(f"{base}&subsection={quote('Мошков часть 4/LIB', safe='')}")
+    assert body["total"] == 1
+    assert "Мошков часть 4" in body["items"][0]["path"]
+
+    _status, body = api_call(f"{base}&subsection={quote('Другой', safe='')}")
+    assert body["total"] == 1
+    assert body["items"][0]["path"].endswith("Вторая.fb2")
+
+    _status, body = api_call(f"{base}&subsection={quote('нет', safe='')}")
+    assert body["total"] == 0
+
+
+def test_meta_collections_stay_out_of_section_lists(card_cfg: dict[str, Any]) -> None:
+    with closing(bl.connect(card_cfg["db_path"])) as conn:
+        listed = {row["collection"] for row in bl.section_counts(conn, "1, 2")}
+        meta = {(row["kind"], row["collection"]) for row in bl.meta_collection_counts(conn)}
+
+    assert "Библиотека Мошкова" in listed
+    assert not listed & {"Издательская", "Тёмный лес (издание)"}
+    assert meta == {("edition", "Тёмный лес (издание)"), ("publisher-series", "Издательская")}
+
+
+def test_book_details_is_empty_before_v6(tmp_path: Path) -> None:
+    db = str(tmp_path / "v5.db")
+    with closing(sqlite3.connect(db)) as conn:
+        for number, sql in enumerate(bl.MIGRATIONS[:5], start=1):
+            conn.executescript(f"BEGIN;{sql};PRAGMA user_version={number};COMMIT;")
+    with closing(bl.connect(db)) as conn:
+        assert bl.book_details(conn, "x.fb2") == []
+
+
+def test_meta_label_prefixes_and_details_escaping() -> None:
+    assert bl.meta_label("translator") == "Переводчик"
+    assert bl.meta_label("pdf:page_size") == "PDF: page_size"
+    assert bl.meta_label("djvu:year") == "DjVu: year"
+    assert bl.meta_label("custom:ISBN-ALT") == "Доп.: ISBN-ALT"
+    assert bl.meta_label("неизвестно") == "неизвестно"
+    html_block = bl.details_html([("keyword", ["<script>x</script>"])])
+    assert "<script>" not in html_block and "&lt;script&gt;" in html_block
+
+
+# ---- нативный epub предпочтительнее сконвертированного из fb2 -------------------------------------
+
+def make_text_epub(path: Path, text: str, *, converted: bool) -> None:
+    """Epub с одним текстом. converted — метка fb2_to_epub3 в OPF; без неё epub выглядит как издательский."""
+    generator = f'<meta name="generator" content="{bl.FB2_CONVERTER_GENERATOR}"/>' if converted else ""
+    container = (
+        '<?xml version="1.0"?>'
+        '<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+        '<rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>'
+        "</container>"
+    )
+    opf = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<package xmlns="http://www.idpf.org/2007/opf" version="3.0">'
+        '<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">'
+        "<dc:title>Книга</dc:title><dc:creator>Иванов Иван</dc:creator><dc:language>ru</dc:language>"
+        f"{generator}</metadata>"
+        '<manifest><item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/></manifest>'
+        '<spine><itemref idref="c1"/></spine></package>'
+    )
+    chapter = ('<?xml version="1.0" encoding="utf-8"?>'
+               f'<html xmlns="http://www.w3.org/1999/xhtml"><body><p>{text}</p></body></html>')
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("mimetype", "application/epub+zip")
+        archive.writestr("META-INF/container.xml", container)
+        archive.writestr("OEBPS/content.opf", opf)
+        archive.writestr("OEBPS/ch1.xhtml", chapter)
+
+
+def test_fb2_to_epub3_writes_generator_meta_and_is_converted(tmp_path: Path) -> None:
+    epub = tmp_path / "book.epub"
+    bl.fb2_to_epub3(make_fb2("Тёмный лес", "Иван", "Иванов"), epub)
+    with zipfile.ZipFile(epub) as archive:
+        opf = archive.read("OEBPS/content.opf").decode("utf-8")
+    assert f'<meta name="generator" content="{bl.FB2_CONVERTER_GENERATOR}"/>' in opf
+    assert bl.epub_converted(epub) is True
+
+
+def test_native_epub_is_not_converted(tmp_path: Path) -> None:
+    epub = tmp_path / "native.epub"
+    make_epub(epub)
+    assert bl.epub_converted(epub) is False
+
+
+def test_converted_opf_markers_calibre_pandoc_and_fb2_manifest() -> None:
+    calibre = '<dc:contributor opf:role="bkp">calibre 5.44.0 [https://calibre-ebook.com]</dc:contributor>'
+    pandoc = '<package version="3.0" unique-identifier="epub-id-1">'
+    fb2_manifest = ('<manifest><item id="css" href="css/book.css" media-type="text/css"/>'
+                    '<item id="title-page" href="text/title.xhtml" media-type="application/xhtml+xml"/></manifest>')
+    assert bl.converted_opf(f"<metadata>{calibre}</metadata>") is True
+    assert bl.converted_opf(pandoc) is True
+    assert bl.converted_opf(fb2_manifest) is True
+    assert bl.converted_opf('<package unique-identifier="pub-id"><manifest/></package>') is False
+
+
+def test_mark_roles_native_epub_wins_over_converted() -> None:
+    base = {"fmt": "epub", "s": {1, 2, 3, 4}, "reason": "", "role": "kept", "coverage": None, "keeper": "", "quarantine": ""}
+    texts = [{**base, "path": "A/Конверт.epub", "words": 300, "converted": True},
+             {**base, "path": "A/Нативный.epub", "words": 250, "converted": False}]
+    bl.mark_roles(texts)
+    assert {t["path"]: t["role"] for t in texts} == {"A/Конверт.epub": "duplicate", "A/Нативный.epub": "kept"}
+
+
+def test_dedup_folders_keeps_native_epub_though_converted_is_larger(authors_cfg: dict[str, Any]) -> None:
+    folder = Path(authors_cfg["books_dir"]) / "Иванов Иван Иванович"
+    folder.mkdir(parents=True)
+    text = folder_text(300, "слово")
+    make_text_epub(folder / "Тёмный лес (конверт).epub", text, converted=True)
+    make_text_epub(folder / "Тёмный лес.epub", text, converted=False)
+
+    result = bl.dedup_folders(authors_cfg, out=lambda _line: None)
+
+    assert result["duplicate"] == 1
+    assert (folder / "Тёмный лес.epub").is_file()
+    assert not (folder / "Тёмный лес (конверт).epub").exists()
