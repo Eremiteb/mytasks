@@ -2937,20 +2937,47 @@ def test_fix_misplaced_fewer_words_and_initials_targets_are_skipped(tmp_path: Pa
     assert (root / "Иванов Иван" / "B.fb2").is_file()
 
 
-def test_fix_misplaced_renames_folder_without_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # fb2 хранит фамилию первой; first/last переставлены, чтобы автор книги был «Иван Сидоров», как в именах файлов
+def make_fb2_author(title: str, name: str) -> bytes:
+    """fb2 с автором «Слово Слово Слово» в порядке базы (как books.authors): тот же порядок, что у _fb2_author."""
+    raw = make_fb2(title, "", "")
+    return raw.replace(b"<author><first-name></first-name><last-name></last-name></author>",
+                       bl._fb2_author(name).encode("utf-8"))
+
+
+def test_fix_misplaced_renames_folder_when_name_only_grows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = merge_cfg(tmp_path, monkeypatch, {
-        "Иван Петров/A.fb2": make_fb2("A", "Сидоров", "Иван"),
-        "Иван Петров/B.fb2": make_fb2("B", "Сидоров", "Иван"),
+        "Петров Иван/A.fb2": make_fb2_author("A", "Иван Сергеевич Петров"),
+        "Петров Иван/B.fb2": make_fb2_author("B", "Иван Сергеевич Петров"),
     })
     root = Path(cfg["books_dir"])
 
     stats = bl.fix_misplaced(cfg)
 
     assert stats["folder-renamed"] == 1
-    assert not (root / "Иван Петров").exists()
-    assert (root / "Сидоров Иван" / "A.fb2").is_file()
-    assert (root / "Сидоров Иван" / "B.fb2").is_file()
+    assert not (root / "Петров Иван").exists()
+    assert (root / "Петров Иван Сергеевич" / "A.fb2").is_file()
+    assert (root / "Петров Иван Сергеевич" / "B.fb2").is_file()
+
+
+@pytest.mark.parametrize("folder, author, reason", [
+    ("Мамонова Марина", "Мария Мамонова", "skip-rename-changes"),  # «Марина» → «Мария»: меняется существующее слово
+    ("Тейлор Джули", "Джуди Тейлор", "skip-rename-changes"),  # «Джули» → «Джуди»
+    ("Хаббард Рон", "Рон Л Хаббард", "skip-rename-initials"),  # добавлен инициал «Л»
+    ("де Сад Донасьен", "Донасьен Альфонс Франсуа Де Сад", "skip-rename-particle"),  # имя оканчивается частицей «Де»
+])
+def test_fix_misplaced_rename_refused_by_rules(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                               folder: str, author: str, reason: str) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        f"{folder}/A.fb2": make_fb2_author("A", author),
+        f"{folder}/B.fb2": make_fb2_author("B", author),
+    })
+    root = Path(cfg["books_dir"])
+
+    stats = bl.fix_misplaced(cfg)
+
+    assert stats.get(reason, 0) == 1
+    assert stats.get("folder-renamed", 0) == 0
+    assert (root / folder / "A.fb2").is_file()
 
 
 def test_fix_misplaced_dry_run_changes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

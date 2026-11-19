@@ -6840,6 +6840,27 @@ def move_guard(folder: str, target: str) -> str:
     return ""
 
 
+def rename_guard(folder: str, name: str) -> str:
+    """Причина, по которой папку folder нельзя переименовать в name; '' — можно. Сначала move_guard (с префиксом
+    skip-rename-), затем правила переименования: ключ имени ⊇ ключ папки (меняется только дополнение, существующие
+    слова не меняются); добавленные слова — не инициалы (≥ 3 буквы); имя не оканчивается частицей и частица
+    стоит на той же позиции, что в папке."""
+    reason = move_guard(folder, name)
+    if reason:
+        return "skip-rename-" + reason.removeprefix("skip-")
+    folder_key, name_key = author_key(folder), author_key(name)
+    if folder_key is None or name_key is None or not folder_key <= name_key:
+        return "skip-rename-changes"
+    if any(len(word) < 3 for word in name_key - folder_key):
+        return "skip-rename-initials"
+    words_folder, words_name = author_words(folder), author_words(name)
+    if words_name[-1] in AUTHOR_PARTICLES or any(
+            i >= len(words_name) or words_name[i] != word
+            for i, word in enumerate(words_folder) if word in AUTHOR_PARTICLES):
+        return "skip-rename-particle"
+    return ""
+
+
 def first_author(authors: str) -> str:
     return authors.split("; ")[0].strip()
 
@@ -6873,8 +6894,13 @@ def folder_action(run: NightRun, db_path: str, root: Path, index: dict[frozenset
     author = first_author(rows[0]["authors"])
     if key is None or author_key(folder) == key:
         return False
-    name, method = pick_folder(author, key, "", index)
-    if method != "new" or not name or name == folder or (root / name).exists() or move_guard(folder, name):
+    # сама папка не участвует в подборе имени, иначе «Петров Иван» нашла бы себя и не переименовалась бы
+    name, method = pick_folder(author, key, "", {known: owner for known, owner in index.items() if owner != folder})
+    if method != "new" or not name or name == folder or (root / name).exists():
+        return False
+    reason = rename_guard(folder, name)
+    if reason:
+        run.count(reason)
         return False
     run.out(f"{folder} → {name} (переименование, книг {total})")
     if run.dry_run:
