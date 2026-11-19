@@ -71,3 +71,58 @@
 - JSON API (`/api`): боевой запуск изменяющих режимов (`fix-encoding`, `unpack-fb2zip`, `convert`, `dedup`, `dedup-folders`, `unzip-books`, `author-variants`, `reconvert-fb2`, `fix-misplaced`, `merge-folder`, `strip-suffix`, `name-variants`, `enrich-epub`) — только с `confirm` = id успешного dry-run с теми же параметрами; иначе 409.
 - Решения пользователя переживают удаление базы: `export-decisions` (ночной таймер — перед итоговым `scan`) пишет решения `author_variants` (different/merged) в `books_library/decisions/author_variants.json` (в репозиторий), личные отметки, полки, правки метаданных и решённые дубли — в `decisions_dir` вне репозитория (0600). Загрузка — `import-decisions` или автоматически в конце `scan` при пустой `author_variants`; книги сопоставляются по ключу (автор + название), не по пути. Личное в Git не попадает. Подробности — [README](../../books_library/README.md), раздел export-decisions.
 - Расширенные метаданные (схема v6: `book_meta`, подразделы и сборники из метаданных, `scan --reparse`) — спецификация [`books_library/docs/SPEC-meta-v6.md`](../../books_library/docs/SPEC-meta-v6.md); после реализации раздел переносится в README.
+
+## Пересборка библиотеки после восстановления Books из бэкапа
+
+Регламент: восстановленная `/mnt/copy/Books` (каталог есть, `books_library.db` нет) проходит весь путь до текущего результата. Команды — из корня репозитория, в виде `python3 -I books_library/books_library.py <режим>`; ключи и режимы сверены с argparse и `CLI_COMMANDS`/`FILE_CHANGING` в `books_library.py`. Все режимы, кроме `purge-quarantine`, запускаются сразу боевыми (решение 18.11.2026). Пункты, где ключ или путь не сверены, помечены «проверить --help».
+
+1. **До начала.**
+   - `systemctl --user stop books-library-rework.timer`; если сервис активен (`systemctl --user is-active books-library-rework.service`), то и `systemctl --user stop books-library-rework.service`.
+   - Старую базу `books_library/books_library.db*` (вместе с `-wal`/`-shm`; путь — `db_path` из `books_library.json`, если он переопределён) перенести вне репозитория, не удалять: `mv books_library/books_library.db* <каталог вне репозитория>/`.
+   - Решения на месте: `~/.local/share/books_library/decisions/personal.json` (0600, вне Git; если файла нет — взять из резервной копии до `scan`) и `books_library/decisions/author_variants.json` (в репозитории; `[]` означает, что пар решений нет).
+
+2. **Новая база.**
+   - `python3 -I books_library/books_library.py scan -n` — план без изменений.
+   - `python3 -I books_library/books_library.py scan` — создаёт БД и схему; при пустой `author_variants` решения из обоих файлов загружаются автоматически (`import_decisions` в конце `scan`).
+   - Строку итога `scan` и ошибки проверить по выводу (формат строки проверить --help / вывод: в коде не сверен).
+
+3. **Сборники Lib.rus.ec.**
+   - `python3 -I books_library/books_library.py unpack-fb2zip -p <каталог архивов Lib.rus.ec> --multi --out <абсолютный каталог вне Books> --ignore-md5 --delete-source` — `--out` должен быть абсолютным и вне каталога книг и карантина; `--ignore-md5` нужен для архива с несовпавшим md5 (`fb2-000024-030559.zip`); `--delete-source` переносит в `replaced/` только полностью распакованные архивы.
+   - Повреждённый архив при частичной распаковке по коду остаётся на месте и в `replaced/` автоматически не уходит: перенос — вручную, только по решению пользователя, с отчётом.
+   - Раскладка: `mv <каталог вне Books>/<имя архива без .zip> /mnt/copy/Books/_Сборники/` — `merge-folder --from` принимает только пути внутри Books, поэтому перенос ручной; затем `python3 -I books_library/books_library.py scan`.
+   - `python3 -I books_library/books_library.py convert --only fb2 -p _Сборники/<имя папки>` — `-p` задаётся относительно каталога книг; затем `scan`.
+
+4. **Мошков (HTML), по частям.**
+   - `python3 -I books_library/books_library.py convert --only html --allow-no-author --delete-source -p "_Сборники/Библиотека Мошкова/<часть>"` — каждая часть отдельным вызовом. Фактический путь частей проверить: примеры в коде — `_разобрать/Библиотека Мошкова/…`.
+
+5. **Unpack-collections и ночной конвейер вручную.** Сначала раскладка сборников, затем весь конвейер в порядке `ExecStart` юнита; каждый шаг — сразу боевым:
+```
+python3 -I books_library/books_library.py unpack-collections
+python3 -I books_library/books_library.py fix-encoding
+python3 -I books_library/books_library.py convert --only fb2
+python3 -I books_library/books_library.py sort-underscore
+python3 -I books_library/books_library.py merge-authors
+python3 -I books_library/books_library.py author-variants
+python3 -I books_library/books_library.py fix-misplaced
+python3 -I books_library/books_library.py dedup
+python3 -I books_library/books_library.py dedup-folders
+python3 -I books_library/books_library.py enrich-epub
+python3 -I books_library/books_library.py strip-suffix
+python3 -I books_library/books_library.py name-variants
+python3 -I books_library/books_library.py windows-names
+python3 -I books_library/books_library.py check-folders
+python3 -I books_library/books_library.py export-decisions
+python3 -I books_library/books_library.py scan
+```
+   `purge-quarantine` в конвейер не входит.
+
+6. **После.**
+   - `python3 -I books_library/books_library.py check-folders` — отчёт `reports/check-folders-*.json`, файлы не меняются.
+   - `python3 -I books_library/books_library.py export-decisions` — обновить `books_library/decisions/author_variants.json`; личное пишется в `decisions_dir`, в Git не попадает.
+   - `systemctl --user start books-library-rework.timer` — включить таймер обратно (`systemctl --user is-enabled books-library-rework.timer` — проверить, что включён).
+
+7. **Решает пользователь (не автоматически).**
+   - «Похожие» разноимённые книги (совпадение 85–97 %) — решение пользователя (20.11.2026).
+   - Конфликты (`conflict` в журналах `reports/*.jsonl`, конфликты регистра для `windows-names`) — решает `dedup-folders` или человек.
+   - Повреждённый архив из п. 3 — перенос в `replaced/`, если пользователь подтвердит.
+   - Окончательное удаление карантина: `purge-quarantine --reason <R> -n` для проверки; боевой запуск — только по прямому «удалить».
