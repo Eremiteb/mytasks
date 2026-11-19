@@ -1572,7 +1572,7 @@ def unzip_cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unzip_relinks: li
     return make_cfg(tmp_path, root)
 
 
-def make_multi(path: Path) -> None:
+def make_multi_pair(path: Path) -> None:
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("a.txt", b"one")
         archive.writestr("b.txt", b"two")
@@ -1609,7 +1609,7 @@ def test_unzip_txt_archive_becomes_plain_file(unzip_cfg: dict[str, Any], unzip_r
 
 def test_unzip_multi_file_archive_untouched(unzip_cfg: dict[str, Any]) -> None:
     root = Path(unzip_cfg["books_dir"])
-    make_multi(root / "pack.txt.zip")
+    make_multi_pair(root / "pack.txt.zip")
 
     stats = bl.unzip_books(unzip_cfg)
 
@@ -2537,7 +2537,7 @@ def test_author_variants_web_different_button_saves_status(web: str, scanned: di
     assert headers.get("Location") == "/authors?variants=1"
     assert db_rows(scanned, "SELECT status FROM author_variants") == [("different",)]
     status, _headers, body = fetch(f"{web}/authors?variants=1")
-    assert status == 200 and "Варианты написания".encode("utf-8") in body
+    assert status == 200 and "Варианты написания".encode() in body
 
 
 def test_author_variants_coauthor_folder_is_distributed_by_copy(authors_cfg: dict[str, Any]) -> None:

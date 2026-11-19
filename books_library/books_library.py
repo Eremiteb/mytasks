@@ -36,8 +36,8 @@ import logging
 import os
 import posixpath
 import re
-import shutil
 import secrets
+import shutil
 import sqlite3
 import struct
 import subprocess
@@ -53,7 +53,7 @@ import zlib
 from collections import Counter, deque
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from contextlib import ExitStack, closing, contextmanager, nullcontext
+from contextlib import ExitStack, closing, contextmanager, nullcontext, suppress
 from datetime import UTC, date, datetime
 from difflib import SequenceMatcher
 from email import policy as email_policy
@@ -2238,10 +2238,7 @@ def convert_documents(cfg: dict[str, Any], dry_run: bool = False, path: str | No
     target = target_dir(cfg, path)
     fmt = options["to"]
     html_mode = options["only"] == "html"
-    if options["only"] == "all":
-        only = CONVERT_SOURCES
-    else:
-        only = HTML_SOURCES if html_mode else (options["only"],)
+    only = CONVERT_SOURCES if options["only"] == "all" else HTML_SOURCES if html_mode else (options["only"],)
     limit = cfg["reader_max_mb"] * 1024 * 1024
     excludes = [x.casefold() for x in options["exclude"]]
     errors: list[str] = []
@@ -2888,7 +2885,7 @@ def edited_name(fields: dict[str, Any], ext: str) -> str:
     """«Автор - Название» + исходное расширение; запрещённые в Windows символы заменяются, название обрезается."""
     authors = EDIT_BAD_CHARS.sub("_", ", ".join(fields["authors"]))
     title = EDIT_BAD_CHARS.sub("_", fields["title"])
-    while title and len(f"{authors} - {title}{ext}".encode("utf-8")) > EDIT_NAME_MAX:
+    while title and len(f"{authors} - {title}{ext}".encode()) > EDIT_NAME_MAX:
         title = title[:-1]
     base = f"{authors} - {title}" if title else authors
     return base.strip(" .") + ext
@@ -3322,7 +3319,7 @@ def verify_zip(path: Path, name: str, size: int, crc: int) -> str | None:
             infos = archive.infolist()
             if len(infos) != 1 or infos[0].filename != name:
                 return "не одна запись или чужое имя"
-            if infos[0].file_size != size or infos[0].CRC != crc:
+            if infos[0].file_size != size or crc != infos[0].CRC:
                 return "размер или CRC не совпадают с исходником"
             if archive.testzip() is not None:
                 return "ошибка CRC при чтении"
@@ -5679,7 +5676,7 @@ def initials_folder(name: str, index: dict[frozenset[str], str]) -> str:
     for folder in index.values():
         words = author_words(folder)
         if words[:1] == [surname] and len(words) > len(initials) and \
-                all(word.startswith(initial) for word, initial in zip(words[1:], initials)):
+                all(word.startswith(initial) for word, initial in zip(words[1:], initials, strict=False)):
             found.add(folder)
     return found.pop() if len(found) == 1 else ""
 
@@ -5820,7 +5817,7 @@ def unpack_collections(cfg: dict[str, Any], dry_run: bool = False, path: str | N
     if limit is not None:
         candidates = candidates[:limit]
     errors: list[str] = []
-    for scope, prefix in zip(scopes, prefixes):
+    for scope, prefix in zip(scopes, prefixes, strict=True):
         for rel, _size, _mtime in iter_book_files(scope, errors):
             if prefix + rel not in books:
                 run.count("not_book")
@@ -6163,10 +6160,8 @@ def merge_folder(run: NightRun, db_path: str, root: Path, short: str, full: str,
     status = "dry" if dry_run else "done"
     if not dry_run:
         for current, _dirs, _files in os.walk(src_top, topdown=False):
-            try:
+            with suppress(OSError):
                 os.rmdir(current)
-            except OSError:
-                pass
         if src_top.exists():
             run.count("errors")
             status = "partial"
@@ -6862,7 +6857,7 @@ def typo_fix(folder: str, name: str) -> bool:
     words_folder, words_name = author_words(folder), author_words(name)
     if len(words_folder) != len(words_name):
         return False
-    diff = [i for i, (word, other) in enumerate(zip(words_folder, words_name)) if word != other]
+    diff = [i for i, (word, other) in enumerate(zip(words_folder, words_name, strict=True)) if word != other]
     if len(diff) != 1:
         return False
     i = diff[0]
