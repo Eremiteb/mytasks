@@ -571,14 +571,16 @@ def test_unpack_extracts_next_to_archive_and_keeps_archive(zip_cfg: dict[str, An
     assert (root / "a.fb2.zip").is_file()
 
 
-def test_unpack_conflict_gets_numeric_suffix(zip_cfg: dict[str, Any]) -> None:
+def test_unpack_conflict_gets_variant_name(zip_cfg: dict[str, Any]) -> None:
     root = Path(zip_cfg["books_dir"])
     (root / "a.fb2").write_bytes(b"old")
 
     bl.unpack_fb2zip(zip_cfg)
 
     assert (root / "a.fb2").read_bytes() == b"old"
-    assert (root / "a_1.fb2").read_bytes() == b"<FictionBook>a</FictionBook>"
+    assert not (root / "a_1.fb2").exists()  # без «_N»: уточнение в скобках
+    variants = [p for p in root.glob("a (*).fb2")]
+    assert len(variants) == 1 and variants[0].read_bytes() == b"<FictionBook>a</FictionBook>"
 
 
 def test_unpack_skips_entry_over_max_mb(tmp_path: Path) -> None:
@@ -2781,7 +2783,7 @@ def test_footnote_is_aside_in_chapter_where_first_referenced(tmp_path: Path) -> 
     assert 'aside epub:type="footnote"' in first and 'id="n1"' in first
     assert 'role="doc-backlink"' in first
     second = files["OEBPS/text/ch002.xhtml"].decode("utf-8")
-    assert 'href="#n1"' in second  # повторная ссылка локальная: сноска-копия в том же файле
+    assert 'href="#n1-2"' in second  # повторная ссылка локальная: копия сноски n1-2 в том же файле
     assert 'aside epub:type="footnote"' in second
     assert 'id="ref-n1-2"' in second
 
