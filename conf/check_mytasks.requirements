@@ -130,6 +130,7 @@ DEPS=(
     "pdfimages|poppler;debian=poppler-utils;redhat=poppler-utils;suse=poppler-tools;alpine=poppler-utils;gentoo=app-text/poppler||utility_bills: извлечение изображения страницы из PDF-квитанции"
     "zenity,kdialog|zenity||Окна вопросов этого скрипта (кнопка «Стоп» во всех окнах — только у zenity) и графический askpass для sudo"
     "sensors|lm_sensors;debian=lm-sensors;suse=sensors;alpine=lm-sensors;gentoo=sys-apps/lm-sensors||system_monitor.sh: температура CPU"
+    "gh|gh;arch=github-cli;alpine=github-cli;void=github-cli;solus=github-cli;gentoo=dev-util/github-cli||Агенты (Claude, Codex, Gemini): состояние CI и логи упавших прогонов (gh run list, gh run view --log-failed), PR и issues GitHub"
     "ffmpeg|ffmpeg;redhat=ffmpeg-free||all_to_mp3.sh, music_downloader (YouTube Music): перекодирование в MP3; beufm_recorder.py: проверка дублей"
     "yt-dlp|yt-dlp;gentoo=net-misc/yt-dlp||music_downloader: последний источник MP3 — песни YouTube Music"
     "fpcalc|chromaprint;debian=libchromaprint-tools;redhat=chromaprint-tools;suse=chromaprint-fpcalc;gentoo=media-libs/chromaprint||beufm_recorder.py: сравнение дублей эфира по акустическим отпечаткам"
