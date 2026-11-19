@@ -266,7 +266,7 @@ MIGRATIONS: list[str] = [
         SELECT bc.section, bc.collection, count(DISTINCT bc.path) AS books
         FROM book_collections bc JOIN books b ON b.path = bc.path
         GROUP BY bc.section, bc.collection;
-    -- keeper, переименованные позже упаковкой zip-books (name.ext -> name.ext.zip):
+    -- keeper, переименованные позже упаковкой zip (name.ext -> name.ext.zip, режима больше нет):
     UPDATE dup_members SET keeper = keeper || '.zip'
         WHERE keeper <> '' AND keeper NOT IN (SELECT path FROM books) AND keeper || '.zip' IN (SELECT path FROM books);
     UPDATE OR IGNORE dup_members SET path = path || '.zip'
@@ -1641,6 +1641,66 @@ def unique_path(directory: Path, name: str, taken: set[Path]) -> Path:
     return candidate
 
 
+def variant_values_at(cfg: dict[str, Any], full: Path | None) -> dict[str, str]:
+    """Уточнения книги по её пути в базе (как у name-variants); без базы, без пути или вне каталога книг — пусто."""
+    if full is None or not Path(cfg["db_path"]).is_file():
+        return {}
+    try:
+        rel = full.relative_to(Path(cfg["books_dir"])).as_posix()
+    except ValueError:
+        return {}
+    conn = connect(cfg["db_path"], readonly=True)
+    try:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        return name_variant_values(conn, rel, version >= SCHEMA_META, version >= SCHEMA_COLLECTIONS)
+    except sqlite3.Error:
+        return {}
+    finally:
+        conn.close()
+
+
+def qualified_name(base: str, text: str, suffix: str) -> str:
+    """«основа (уточнение)расширение»; основа укорачивается, пока имя не проходит правила Windows; пусто — не вышло."""
+    stem = base
+    while stem:
+        candidate = f"{stem} ({text}){suffix}"
+        if not windows_name_error(candidate):
+            return candidate
+        stem = stem[:-1]
+    return ""
+
+
+def free_variant_name(cfg: dict[str, Any], directory: Path, name: str, taken: set[Path], *, src: Path | None = None,
+                      leaving: frozenset[Path] | set[Path] = frozenset()) -> Path:
+    """Свободное имя в каталоге книг без «_N». Занятое имя — уточнение в скобках, каким src отличается от занявшего
+    файла (пер. Фамилия, язык, источник, год — как у name-variants), иначе «(вариант N)». Файл из leaving (уходит в
+    карантин) занятым не считается. Имя резервируется в taken. Ошибка — только если не найти имя за 999 попыток."""
+
+    def free(candidate: Path) -> bool:
+        return (not candidate.exists() or candidate in leaving) and candidate not in taken
+
+    def take(candidate: Path) -> Path:
+        taken.add(candidate)
+        return candidate
+
+    first = directory / name
+    if free(first):
+        return take(first)
+    stem, dot, ext = name.rpartition(".")
+    base, suffix = (stem, dot + ext) if stem else (name, "")
+    mine, other = variant_values_at(cfg, src), variant_values_at(cfg, first)
+    for kind in NAME_VARIANT_KINDS:
+        if mine.get(kind) and mine[kind] != other.get(kind):
+            candidate = qualified_name(base, mine[kind], suffix)
+            if candidate and free(directory / candidate):
+                return take(directory / candidate)
+    for number in range(1, 1000):
+        candidate = qualified_name(base, f"вариант {number}", suffix)
+        if candidate and free(directory / candidate):
+            return take(directory / candidate)
+    raise OSError(f"нет свободного имени рядом с «{name}»")
+
+
 UNPACK_PROGRESS_SECONDS = 30
 UNPACK_CHUNK = 1024 * 1024
 MULTI_MIN_MEMBERS = 2
@@ -1755,7 +1815,7 @@ def store_member(run: NightRun, archive: zipfile.ZipFile, archive_path: Path, in
         name = multi_name(base, head)
         if name is None:
             raise ValueError(f"{info.filename}: пустое имя после очистки")
-        target = unique_path(dest, name, taken)
+        target = free_variant_name(run.cfg, dest, name, taken, src=archive_path)
         run.record("planned", archive_path, member=info.filename, to=str(target))
         return target
     fd, tmp_name = tempfile.mkstemp(prefix=".unpack-multi.", suffix=".tmp", dir=dest)
@@ -1775,7 +1835,7 @@ def store_member(run: NightRun, archive: zipfile.ZipFile, archive_path: Path, in
         name = multi_name(base, head)
         if name is None:
             raise ValueError(f"{info.filename}: пустое имя после очистки")
-        target = unique_path(dest, name, taken)
+        target = free_variant_name(run.cfg, dest, name, taken, src=archive_path)
         os.chmod(tmp, 0o644)
         os.replace(tmp, target)
     finally:
@@ -1849,7 +1909,7 @@ def unpack_multi(run: NightRun, archive_path: Path, members: list[zipfile.ZipInf
 
 def unpack_single(run: NightRun, archive_path: Path, members: list[zipfile.ZipInfo], *, limit: int, max_mb: int,
                   taken: set[Path], progress: UnpackProgress) -> None:
-    """Однокнижный *.fb2.zip, как раньше: запись рядом с архивом под исходным именем, конфликт — суффикс _1, _2…"""
+    """Однокнижный *.fb2.zip, как раньше: запись рядом с архивом под исходным именем, конфликт — уточнение в скобках (free_variant_name)"""
     parent = archive_path.parent
     if not members:
         say(f"в архиве нет .fb2: {archive_path}", "no_fb2_inside", logging.WARNING, detail=str(archive_path))
@@ -1861,7 +1921,7 @@ def unpack_single(run: NightRun, archive_path: Path, members: list[zipfile.ZipIn
             if problem is not None:
                 run.record("skipped", archive_path, member=info.filename, reason=problem)
                 continue
-            target_file = unique_path(parent, name, taken)
+            target_file = free_variant_name(run.cfg, parent, name, taken, src=archive_path)
             if run.dry_run:
                 run.record("planned", archive_path, member=info.filename, to=str(target_file))
                 continue
@@ -1875,7 +1935,7 @@ def unpack_single(run: NightRun, archive_path: Path, members: list[zipfile.ZipIn
                     handle.write(data)
                 os.chmod(tmp_name, archive_path.stat().st_mode & 0o666)
                 if target_file.exists():  # появился после планирования — новое свободное имя
-                    target_file = unique_path(parent, name, taken)
+                    target_file = free_variant_name(run.cfg, parent, name, taken, src=archive_path)
                 os.replace(tmp_name, target_file)
             finally:
                 Path(tmp_name).unlink(missing_ok=True)
@@ -2604,7 +2664,7 @@ def convert_documents(cfg: dict[str, Any], dry_run: bool = False, path: str | No
             stats["skipped_exists"] += 1
             continue
         if html_mode and result in taken:  # два HTML с одним автором и названием в одной папке
-            result = unique_path(src.parent, result.name, taken)
+            result = free_variant_name(cfg, src.parent, result.name, taken, src=src)
         taken.add(result)
         plan.append((src, result))
     stats["planned"] = len(plan)
@@ -2650,7 +2710,7 @@ def convert_documents(cfg: dict[str, Any], dry_run: bool = False, path: str | No
 
 
 # ======================================================================
-# Ночные режимы: карантин, кодировки, fb2 → epub, дубликаты, упаковка книг в zip
+# Ночные режимы: карантин, кодировки, fb2 → epub, дубликаты, распаковка однокнижных zip
 # ======================================================================
 
 # Причины карантина: <quarantine_dir>/<причина>/<путь в каталоге книг>. Карантин не индексируется.
@@ -2734,7 +2794,7 @@ FORMAT_RANK = {"epub": 0, "fb2": 1, "txt": 2, "pdf": 3, "djvu": 4}
 DEDUP_MIN_WORDS = 200
 DEDUP_COVERAGE = 0.97
 DEDUP_GROUP_MAX = 16
-DEDUP_SIMILAR = 0.85  # dedup-folders: доля шинглов от оставленных, с которой книга «похожая» (решает человек)
+DEDUP_SIMILAR = 0.85  # доля шинглов от оставленных, с которой книга «похожая»: разноимённые — решает человек; одноимённые (same_name) — дубль
 DEDUP_FOLDER_MAX = 3000  # dedup-folders: книг в папке автора больше — папка пропускается (folder-too-large)
 FOLDER_SAMPLE = 4  # dedup-folders: единая выборка шинглов (остаток по модулю 4) для всех книг папки
 # «Полу-cp866»: заглавные кириллицы cp866 (0x80–0x9F) прочитаны как cp1251, строчные верны («‘тейнбек „жон»).
@@ -3921,7 +3981,7 @@ def fix_encoding(cfg: dict[str, Any], dry_run: bool = False, path: str | None = 
                         return
                     raw = read_member(archive, info, run.limit)
             except (ValueError, zipfile.BadZipFile, EOFError) as error:
-                run.record("skipped", full, reason=str(error))  # битые zip разбирает zip-books
+                run.record("skipped", full, reason=str(error))  # битые архивы пропускаются
                 return
             try:
                 data, what, _semi = transform(member_ext(info), raw)
@@ -5580,7 +5640,7 @@ def reconvert_fb2(cfg: dict[str, Any], dry_run: bool = False, path: str | None =
             if produced is None:
                 run.record("sample-rejected", cand["full"], reason=problem)
                 return
-            dest = unique_path(target, f"{cand['stem']}.epub", set())
+            dest = free_variant_name(cfg, target, f"{cand['stem']}.epub", set(), src=cand["full"])
             shutil.move(produced, dest)
             run.record("sample", cand["full"], to=str(dest), source=str(source), notes=b'type="note"' in source_bytes(source),
                        old_size=cand["full"].stat().st_size, new_size=dest.stat().st_size)
@@ -5824,7 +5884,7 @@ def dedup(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None, w
     for index, ((rel, _size, _mtime), meta) in enumerate(zip(files, metas, strict=True)):
         if meta["fmt"] == "zip":
             continue  # многофайловый архив — не книга для сравнения
-        # суффикс _1, _2… от unique_path (конфликт имён при переносе) не мешает найти кандидата; решает сравнение текста
+        # уточнение в скобках от free_variant_name (конфликт имён при переносе) не мешает найти кандидата; решает сравнение текста
         keys = [f"n:{PurePosixPath(rel).parent}/{norm_key(re.sub(r'_\d+$', '', split_name(rel)[0]))}"]
         title = norm_key(meta.get("title", ""))
         authors = " ".join(sorted(norm_key(" ".join(meta.get("authors", []))).split()))
@@ -5950,19 +6010,6 @@ def dedup(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None, w
 # ----------------------------------------------------------------------
 # dedup-folders: дубли внутри папки автора (папка верхнего уровня «Фамилия Имя Отчество»), каждая папка независимо.
 # Правила: дубль — книга, почти полностью (≥ 97 % шинглов) уже есть у оставленной, с ≥ 200 словами; похожая — 85–97 %.
-
-
-def free_name(directory: Path, name: str, leaving: set[Path], taken: set[Path]) -> Path:
-    """Свободное имя рядом: name, затем name_1… . Файл, уходящий в карантин (leaving), занятым не считается: в dry-run
-    дубль ещё на месте, и план совпадает с боевым запуском. taken — имена, уже запланированные в этом прогоне."""
-    stem, dot, ext = name.rpartition(".")
-    base, suffix = (stem, dot + ext) if stem else (name, "")
-    candidate, number = directory / name, 1
-    while (candidate.exists() and candidate not in leaving) or candidate in taken:
-        candidate = directory / f"{base}_{number}{suffix}"
-        number += 1
-    taken.add(candidate)
-    return candidate
 
 
 def group_member(item: dict[str, Any], role: str, keeper: str = "", quarantine: str = "",
@@ -6165,7 +6212,7 @@ def dedup_folder(run: NightRun, folder_rel: str, texts: list[dict[str, Any]]) ->
             renames[old] = new_name  # занятое без учёта регистра имя оставляем для strip-suffix
     for old, new_name in renames.items():
         full = run.root / old
-        target = free_name(full.parent, new_name, leaving, taken)
+        target = free_variant_name(run.cfg, full.parent, new_name, taken, src=full, leaving=leaving)
         try:
             if not run.dry_run:
                 os.rename(full, target)
@@ -6390,95 +6437,7 @@ def dedup_folders(cfg: dict[str, Any], dry_run: bool = False, path: str | None =
 
 
 # ----------------------------------------------------------------------
-# zip-books: каждая книга (кроме epub и zip) → name.ext.zip; однокнижные zip — к виду name.ext.zip
-# ----------------------------------------------------------------------
-
-def zip_books(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None, workers: int | None = None,
-              out: Callable[[str], None] = print) -> dict[str, Any]:
-    """Упаковка: уже сжатые форматы — ZIP_STORED, прочие — deflate 6; сначала пакуются прочие, затем сжатые. Проверка: одна запись, размер и CRC как у
-    исходника, testzip; только после неё исходник удаляется (содержимое в zip побайтно — это не карантин).
-    Многофайловые zip не трогаются; битые zip — в rejected-zip/, недопустимые для NTFS или длинные имена — в rejected-name/."""
-    run = NightRun(cfg, "zip-books", dry_run, path, out)
-    suffixes = tuple(f".{x}" for x in BOOK_EXTENSIONS if x != "epub")
-
-    def old_zip(src: Path) -> None:
-        try:
-            with zipfile.ZipFile(src) as archive:
-                info = single_member(archive)
-                if info is None:
-                    return  # многофайловый архив — не трогаем
-                if archive.testzip() is not None:
-                    raise zipfile.BadZipFile("ошибка CRC")
-        except (zipfile.BadZipFile, EOFError, ValueError) as error:
-            run.quarantine(src, "rejected-zip", reason=f"{type(error).__name__}: {error}")
-            return
-        wanted = f"{split_name(src.name)[0]}.{member_ext(info)}.zip"
-        if src.name == wanted:
-            run.count("ok")
-            return
-        if not name_ok(wanted):
-            run.quarantine(src, "rejected-name", reason=f"имя {wanted} недопустимо")
-            return
-        dest = src.parent / wanted
-        if dest.exists():
-            run.record("conflict", src, to=str(dest))
-            return
-        run.record("renamed", src, to=str(dest))
-        if not dry_run:
-            os.rename(src, dest)
-            run.moved(src, dest)
-
-    def one(item: tuple[Path, int]) -> None:
-        src, size = item
-        ext = src.name.rpartition(".")[2].lower()
-        if ext == "zip":
-            old_zip(src)
-            return
-        dest = src.parent / f"{src.name}.zip"
-        if not name_ok(dest.name):
-            run.quarantine(src, "rejected-name", reason="имя zip длиннее 255 байт или недопустимо для NTFS")
-            return
-        if dest.exists():
-            run.quarantine(src, "rejected-zip", reason=f"имя занято: {dest.name}")
-            return
-        if dry_run:
-            run.record("zipped", src, to=str(dest))
-            return
-        stat = src.stat()
-        fd, tmp_name = tempfile.mkstemp(prefix=".zip-books.", suffix=".tmp", dir=src.parent)
-        os.close(fd)
-        tmp = Path(tmp_name)
-        try:
-            with src.open("rb") as source:
-                crc = write_zip(tmp, src.name, stat.st_mtime, source, stat.st_size, ext)
-            problem = verify_zip(tmp, src.name, stat.st_size, crc)
-            now = src.stat()
-            if problem or (now.st_size, now.st_mtime) != (stat.st_size, stat.st_mtime):
-                raise ValueError(problem or "исходник изменился во время упаковки")
-            os.chmod(tmp, stat.st_mode & 0o666)
-            os.utime(tmp, (stat.st_atime, stat.st_mtime))
-            if dest.exists():
-                raise FileExistsError(str(dest))
-            os.replace(tmp, dest)
-        except (OSError, ValueError, zipfile.BadZipFile) as error:
-            tmp.unlink(missing_ok=True)
-            run.quarantine(src, "rejected-zip", reason=f"{type(error).__name__}: {error}")
-            return
-        src.unlink()
-        run.record("zipped", src, to=str(dest), size=stat.st_size, zip_size=dest.stat().st_size)
-        run.moved(src, dest)
-
-    def stored(item: tuple[Path, int]) -> bool:
-        return item[0].name.rpartition(".")[2].lower() in STORED_EXTENSIONS
-
-    errors: list[str] = []
-    for second in (False, True):  # сначала текстовые форматы, затем уже сжатые (pdf, djvu…)
-        parallel((i for i in walk_files(run.target, suffixes, errors) if stored(i) == second), one, workers or cfg["workers"], run)
-    return run.finish({"walk_errors": errors[:200]})
-
-
-# ----------------------------------------------------------------------
-# unzip-books: однокнижный name.ext.zip → name.ext (обратный zip-books; решение 17.11.2026: книги хранятся распакованными)
+# unzip-books: однокнижный name.ext.zip → name.ext (решение 17.11.2026: книги хранятся распакованными)
 # ----------------------------------------------------------------------
 
 UNZIP_CHUNK = 4 * 1024 * 1024  # блок потоковой распаковки и хеширования
@@ -6528,9 +6487,9 @@ def unzip_extract(run: NightRun, archive: Path, info: zipfile.ZipInfo, name: str
         if tmp.stat().st_size != info.file_size:
             raise ValueError(f"распаковано {tmp.stat().st_size} байт вместо {info.file_size}")
         os.chmod(tmp, st.st_mode & 0o666)
-        os.utime(tmp, (st.st_atime, st.st_mtime))  # дата книги — дата архива (zip-books записывал её в архив)
+        os.utime(tmp, (st.st_atime, st.st_mtime))  # дата книги — дата архива
         with run.lock:
-            target = unique_path(archive.parent, name, set())
+            target = free_variant_name(run.cfg, archive.parent, name, set(), src=archive)
             os.replace(tmp, target)
         return target
     except BaseException:
@@ -6578,9 +6537,10 @@ def unzip_books(cfg: dict[str, Any], dry_run: bool = False, path: str | None = N
             run.record("twin", archive, to=str(dest))
             target = dest
         else:
-            target = unique_path(archive.parent, name, set()) if dry_run else unzip_extract(run, archive, info, name)
+            target = (free_variant_name(run.cfg, archive.parent, name, set(), src=archive) if dry_run
+                      else unzip_extract(run, archive, info, name))
             if target.name != name:
-                run.count("conflict")  # имя занято другим содержимым: книга — с суффиксом _N
+                run.count("conflict")  # имя занято другим содержимым: книга — с уточнением в скобках
             run.record("extracted", archive, to=str(target))
         run.quarantine(archive, "unzipped", book=str(target))
         if not dry_run:
@@ -6931,14 +6891,13 @@ PERIODICAL_WORDS = frozenset({"газета", "газеты", "газету", "�
                               "журналу", "журналом", "журнале"})  # слово, по которому автор — издание
 PERIODICAL_NOISE = PERIODICAL_WORDS | {"оглавление"}  # слова, которые убираются из имени издания по умолчанию
 PERIODICAL_QUOTES = str.maketrans({ch: " " for ch in "«»\"“”„"})
-PERIODICAL_TOP = "Если"  # значение таблицы для издания верхнего уровня (журнал «Если»)
 UNSORTED_SECTION = "_1tmp"  # безавторские книги разделов «_Сборники» и «_разобрать» (sort-underscore)
 EXACT_MATCHES = frozenset({"periodical", "unsorted"})  # переносы без «_N»: занятое имя — conflict, книга на месте
 
 
 def load_periodicals(path: Path | None = None) -> dict[str, str]:
-    """Таблица «автор из метаданных» → «_Журналы/Издание» или «Если». Файла нет — пустая таблица (работает правило по
-    умолчанию). Битый файл и значения вне _Журналы/ и «Если» — ошибка конфигурации: прогон не начинается."""
+    """Таблица «автор из метаданных» → «_Журналы/Издание». Файла нет — пустая таблица (работает правило по умолчанию).
+    Битый файл и значения вне «_Журналы/…» — ошибка конфигурации: прогон не начинается."""
     path = path or PERIODICALS_FILE
     if not path.is_file():
         return {}
@@ -6950,8 +6909,8 @@ def load_periodicals(path: Path | None = None) -> dict[str, str]:
         raise ConfigError(f"{path}: нужен объект «автор» → «папка» из строк")
     for folder in data.values():
         parts = PurePosixPath(folder).parts
-        if folder != PERIODICAL_TOP and not (len(parts) >= 2 and parts[0] == PERIODICALS_SECTION):
-            raise ConfigError(f"{path}: папка «{folder}» вне «{PERIODICALS_SECTION}/…» и не «{PERIODICAL_TOP}»")
+        if not (len(parts) >= 2 and parts[0] == PERIODICALS_SECTION):
+            raise ConfigError(f"{path}: папка «{folder}» вне «{PERIODICALS_SECTION}/…»")
         if any(folder_name(part) != part for part in parts):  # Windows-имена (Syncthing), без «..» и абсолютных путей
             raise ConfigError(f"{path}: папка «{folder}» не проходит правила имён библиотеки")
     return dict(data)
@@ -7148,7 +7107,7 @@ def unpack_collections(cfg: dict[str, Any], dry_run: bool = False, path: str | N
                 continue
             taken.add(dest)
         else:
-            dest = unique_path(directory, src.name, taken)
+            dest = free_variant_name(cfg, directory, src.name, taken, src=src)
         if dest.name != src.name:
             run.count("conflicts")
         dst_rel = dest.relative_to(root).as_posix()
@@ -7379,7 +7338,7 @@ def merge_folder(run: NightRun, db_path: str, root: Path, short: str, full: str,
                 else:
                     run.count("quarantined_not_book")
                 continue
-            dest = unique_path(target, name, taken)
+            dest = free_variant_name(run.cfg, target, name, taken, src=src)
             if dest.name != name:
                 run.count("conflicts")
             src_rel = src.relative_to(root).as_posix()
@@ -7793,7 +7752,7 @@ def copy_coauthors(run: NightRun, root: Path, dest: Path, authors: list[str], fo
             journal_row(run, {"from": origin, "path": origin, "to": "", "author": author, "source": source,
                               "status": "no-folder", "error": ""})
             continue
-        target = unique_path(root / folder, dest.name, taken)  # имя резервируется сразу
+        target = free_variant_name(run.cfg, root / folder, dest.name, taken, src=dest)  # имя резервируется сразу
         copy_rel = target.relative_to(root).as_posix()
         base = {"from": origin, "path": copy_rel, "to": copy_rel, "author": author, "folder": folder,
                 "source": source}
@@ -7855,7 +7814,7 @@ def distribute_coauthor(run: NightRun, root: Path, name: str, taken: set[Path], 
             run.count("errors")
             journal_row(run, {"action": "error", "folder": name, "error": f"автор без папки: {parts[0]}"})
             return False
-        dest = unique_path(root / first, src.name, taken)
+        dest = free_variant_name(run.cfg, root / first, src.name, taken, src=src)
         source = src.relative_to(root).as_posix()
         try:
             (root / first).mkdir(parents=True, exist_ok=True)
@@ -8340,8 +8299,8 @@ def safe_relative(text: str) -> bool:
 
 
 def move_one(run: NightRun, root: Path, db_path: str, move: Move, taken: set[Path], pending: list[tuple[str, str]]) -> None:
-    """Перенос одной книги в папку автора; при занятом имени — суффикс _1, _2… (unique_path). Связи — пачками."""
-    dest = unique_path(root / move.expected, move.name, taken)
+    """Перенос одной книги в папку автора; при занятом имени — уточнение в скобках (free_variant_name). Связи — пачками."""
+    dest = free_variant_name(run.cfg, root / move.expected, move.name, taken, src=root / move.rel)
     if dest.name != move.name:
         run.count("conflicts")
     dst = dest.relative_to(root).as_posix()
@@ -8464,24 +8423,30 @@ def prepare_collections(cfg: dict[str, Any], dry_run: bool, out: Callable[[str],
 def folder_merge(cfg: dict[str, Any], sources: list[str], target: str, dry_run: bool = False,
                  out: Callable[[str], None] = print, non_books_to_quarantine: bool = False) -> dict[str, Any]:
     """merge-folder: папка A → B. A — папка верхнего уровня или папка внутри служебного раздела «_…» (--from
-    «_Сборники/Серия/Автор»). B — папка автора верхнего уровня или путь внутри «_разобрать» (--to «_разобрать/Серия»),
-    создаётся при отсутствии. Если B нет и A верхнего уровня — переименование A в B; иначе склейка (merge_folder: файлы
-    и подпапки A переносятся в B с теми же относительными путями, конфликт имени — суффикс _1). Повторяемый --from —
-    несколько папок подряд. Связи и принадлежность к сборнику переносятся (relink). Журнал reports/merge-folder-*.jsonl.
+    «_Сборники/Серия/Автор»). B — папка автора верхнего уровня, существующая служебная папка «_…» верхнего уровня
+    (--to «_1tmp», новая не создаётся) или путь внутри служебного раздела «_…» (--to «_разобрать/Серия» — создаётся
+    при отсутствии; --to «_Журналы/Если» — раздел должен существовать). Если B нет и A верхнего уровня — переименование
+    A в B; иначе склейка (merge_folder: файлы и подпапки A переносятся в B с теми же относительными путями, конфликт
+    имени — уточнение в скобках). Повторяемый --from — несколько папок подряд. Связи и принадлежность к сборнику
+    переносятся (relink). Журнал reports/merge-folder-*.jsonl.
     non_books_to_quarantine: только с --to внутри «_разобрать»; файлы не книг (не из BOOK_EXTENSIONS, в т. ч. html)
     уходят в карантин not-book/ вместо переноса.
-    B — также существующая служебная папка верхнего уровня «_…» (--to «_1tmp»): новая «_…» не создаётся, всегда склейка."""
+    Путь внутри раздела всегда склейка; сегменты проходят windows_name_error, итог — внутри каталога книг."""
     root = Path(cfg["books_dir"])
     db_path = cfg["db_path"]
     if not sources:
         raise ConfigError("merge-folder: укажите --from")
-    if "/" in target:  # путь внутри «_разобрать»: создаётся при отсутствии, подпапки сохраняются
+    if "/" in target:  # путь внутри служебного раздела «_…»: подпапки создаются, сохраняются
         parts = PurePosixPath(target).parts
-        if len(parts) < 2 or parts[0] != RAZOBRAT_SECTION or any(part == ".." for part in parts) \
-                or "\x00" in target or "\\" in target or target.startswith("/"):
-            raise ConfigError(f"merge-folder: --to «{target}» — папка автора, служебная «_…» или путь внутри «{RAZOBRAT_SECTION}»")
-        if not (root / target).resolve().is_relative_to((root / RAZOBRAT_SECTION).resolve()):
-            raise ConfigError(f"merge-folder: --to «{target}» выходит за пределы «{RAZOBRAT_SECTION}»")
+        if len(parts) < 2 or not parts[0].startswith("_") or any(part in ("", ".", "..") for part in parts) \
+                or "\x00" in target or "\\" in target or target.startswith("/") \
+                or any(windows_name_error(part) for part in parts):
+            raise ConfigError(f"merge-folder: --to «{target}» — папка автора, служебная «_…» или путь внутри «_…/…» "
+                              "с именами, годными для Windows")
+        if parts[0] != RAZOBRAT_SECTION and not (root / parts[0]).is_dir():
+            raise ConfigError(f"merge-folder: раздела «{parts[0]}» нет: путь внутри него не создаёт раздел")
+        if not (root / target).resolve().is_relative_to((root / parts[0]).resolve()):
+            raise ConfigError(f"merge-folder: --to «{target}» выходит за пределы «{parts[0]}»")
     elif target.startswith("_"):  # служебная папка верхнего уровня: только существующая, склейка
         if not (root / target).is_dir():
             raise ConfigError(f"merge-folder: служебной папки «{target}» нет: новая «_…» не создаётся")
@@ -8500,8 +8465,8 @@ def folder_merge(cfg: dict[str, Any], sources: list[str], target: str, dry_run: 
             raise ConfigError("merge-folder: --from и --to совпадают или вложены друг в друга")
     if (root / target).exists() and not (root / target).is_dir():
         raise ConfigError(f"merge-folder: «{target}» есть, но это не папка")
-    if non_books_to_quarantine and "/" not in target:
-        raise ConfigError(f"merge-folder: --non-books-to-quarantine допустим только с --to внутри «{RAZOBRAT_SECTION}»")
+    if non_books_to_quarantine and not target.startswith(RAZOBRAT_SECTION + "/"):
+        raise ConfigError(f"merge-folder: --non-books-to-quarantine допустим только с --to внутри «{RAZOBRAT_SECTION}/…»")
     run = NightRun(cfg, "merge-folder", dry_run, None, out)
     prepare_collections(cfg, dry_run, out)
     target_exists = (root / target).is_dir()
@@ -9209,7 +9174,7 @@ def purge_quarantine(cfg: dict[str, Any], reasons: list[str], dry_run: bool) -> 
     return stats
 
 
-FILE_CHANGING = ("fix-encoding", "unpack-fb2zip", "convert", "dedup", "dedup-folders", "zip-books", "unzip-books",
+FILE_CHANGING = ("fix-encoding", "unpack-fb2zip", "convert", "dedup", "dedup-folders", "unzip-books",
                  "author-variants", "reconvert-fb2", "fix-misplaced", "merge-folder", "strip-suffix", "name-variants", "windows-names", "enrich-epub")
 COMMANDS = ("scan", "migrate", *FILE_CHANGING)
 JOBS: dict[str, dict[str, Any]] = {}
@@ -9226,7 +9191,7 @@ def command_params(command: str, raw: dict[str, Any]) -> dict[str, Any]:
         "unpack-fb2zip": {"path", "max_mb", "multi", "out", "delete_source", "ignore_md5"},
         "convert": {"path", "only", "to", "overwrite", "skip_newer", "exclude", "author", "title_mode", "toc", "toc_depth",
                     "delete_source", "workers", "allow_no_author"},
-        "dedup": {"path", "workers"}, "dedup-folders": {"path", "workers"}, "zip-books": {"path", "workers"},
+        "dedup": {"path", "workers"}, "dedup-folders": {"path", "workers"},
         "unzip-books": {"path", "workers"}, "unpack-collections": {"path"}, "merge-authors": set(),
         "author-variants": set(), "sort-underscore": {"limit"},
         "reconvert-fb2": {"path", "workers", "limit", "sample", "out", "epubcheck"},
@@ -9346,8 +9311,6 @@ def run_command(cfg: dict[str, Any], command: str, dry_run: bool, params: dict[s
             return dedup_folders(cfg, dry_run, params["path"], params["workers"], out=out)
         if command == "author-variants":
             return author_variants(cfg, dry_run, out=out)
-        if command == "zip-books":
-            return zip_books(cfg, dry_run, params["path"], params["workers"], out=out)
         if command == "unzip-books":
             return unzip_books(cfg, dry_run, params["path"], params["workers"], out=out)
         if command == "unpack-collections":
@@ -10008,10 +9971,10 @@ API_HELP = {
     "POST /api/shelves": "{name} — создать полку",
     "POST /api/shelves/<id>/delete": "удалить полку (книги не трогаются)",
     "GET /api/jobs, GET /api/jobs/<id>": "фоновые задания: состояние, вывод плана, результат",
-    "POST /api/jobs": "{command: scan|migrate|fix-encoding|unpack-fb2zip|convert|dedup|dedup-folders|zip-books|unzip-books|"
+    "POST /api/jobs": "{command: scan|migrate|fix-encoding|unpack-fb2zip|convert|dedup|dedup-folders|unzip-books|"
                       "author-variants, dry_run: true (по умолчанию), "
                       "confirm: <id успешного dry-run с теми же параметрами> — обязателен для боевого запуска fix-encoding/unpack-fb2zip/"
-                      "convert/dedup/dedup-folders/zip-books/unzip-books/author-variants/enrich-epub, "
+                      "convert/dedup/dedup-folders/unzip-books/author-variants/enrich-epub, "
                       "параметры режима: path, only (для convert — fb2 и источники), workers, max_mb, multi, out, ignore_md5 (unpack-fb2zip), to, overwrite, skip_newer, exclude, "
                       "author, title_mode, toc, "
                       "toc_depth, delete_source}",
@@ -11370,7 +11333,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Лёгкая веб-библиотека книг: каталог в SQLite и интерфейс в браузере.")
     parser.add_argument("command", nargs="?", choices=("serve", "scan", *FILE_CHANGING, *CLI_COMMANDS), default="serve",
                         help="serve (по умолчанию), scan, fix-encoding, unpack-fb2zip, convert, reconvert-fb2, dedup, dedup-folders, "
-                             "zip-books, unzip-books, unpack-collections, merge-authors, sort-underscore, author-variants, "
+                             "unzip-books, unpack-collections, merge-authors, sort-underscore, author-variants, "
                              "misplaced, check-folders (только отчёт), fix-misplaced, merge-folder (--from A --to B), strip-suffix, "
                              "name-variants, windows-names, enrich-epub, move-books (--list ФАЙЛ) "
                              "или purge-quarantine (--reason R, необратимо)")
@@ -11386,13 +11349,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--only", default="all",
                         help="fix-encoding: all|fb2|txt; convert: all|fb2|doc|docx|rtf|odt|mht|mhtml|html (fb2 — в epub через Calibre; html — только явно)")
     parser.add_argument("--workers", type=int,
-                        help="convert --only fb2, dedup, dedup-folders, zip-books: потоков (по умолчанию workers из конфига); "
+                        help="convert --only fb2, dedup, dedup-folders: потоков (по умолчанию workers из конфига); "
                              "unzip-books: потоков (по умолчанию unzip_workers)")
     parser.add_argument("--max-mb", type=int, default=200, help="unpack-fb2zip: предел размера записи, МБ")
     parser.add_argument("--limit", type=int,
                         help="sort-underscore: не больше N книг; reconvert-fb2: не больше N сопоставленных книг")
     parser.add_argument("--to", help="convert: epub|fb2 (по умолчанию epub); merge-folder: папка автора, существующая служебная «_…» "
-                                     "(склейка в неё) или путь внутри «_разобрать»")
+                                     "(склейка в неё) или путь внутри служебного раздела «_…» («_разобрать/…», «_Журналы/Если»)")
     parser.add_argument("--non-books-to-quarantine", action="store_true",
                         help="merge-folder: только с --to «_разобрать/…»; файлы не книг (оглавления, картинки, служебные) "
                              "уходят в карантин not-book/, а не в папку назначения")
@@ -11450,7 +11413,7 @@ def main(argv: list[str] | None = None) -> int:
             elif command == "reconvert-fb2":
                 raw = {"path": args.path, "workers": args.workers, "limit": args.limit, "sample": args.sample,
                        "out": args.out, "epubcheck": args.epubcheck}
-            elif command in ("dedup", "dedup-folders", "zip-books", "unzip-books"):
+            elif command in ("dedup", "dedup-folders", "unzip-books"):
                 raw = {"path": args.path, "workers": args.workers}
             elif command == "unpack-collections":
                 raw = {"path": args.path}

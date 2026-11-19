@@ -1437,9 +1437,10 @@ def test_command_params_rejects_out_of_range_toc_depth() -> None:
         bl.command_params("convert", {"toc_depth": 9})
 
 
-def test_command_params_accepts_workers_for_dedup_and_zip_books() -> None:
+def test_command_params_accepts_workers_for_dedup() -> None:
     assert bl.command_params("dedup", {"workers": 4})["workers"] == 4
-    assert bl.command_params("zip-books", {})["workers"] is None
+    with pytest.raises(bl.ConfigError):
+        bl.command_params("zip-books", {})  # режим удалён: неизвестная команда
 
 
 def test_command_params_rejects_zero_workers() -> None:
@@ -1528,23 +1529,6 @@ def test_fix_encoding_moves_binary_txt_to_quarantine(night_cfg: dict[str, Any]) 
     assert not (root / "bin.txt").exists()
     quarantined = Path(night_cfg["quarantine_dir"]) / "rejected-encoding" / "bin.txt"
     assert quarantined.read_bytes() == b"\x00\x01abc"
-
-
-def test_zip_books_wraps_txt_and_removes_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    root = tmp_path / "zip_src"
-    root.mkdir()
-    data = TXT_TEXT.encode("utf-8")
-    (root / "a.txt").write_bytes(data)
-    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
-    cfg = make_cfg(tmp_path, root)
-
-    stats = bl.zip_books(cfg)
-
-    assert stats["zipped"] == 1
-    assert not (root / "a.txt").exists()
-    with zipfile.ZipFile(root / "a.txt.zip") as archive:
-        assert archive.namelist() == ["a.txt"]
-        assert archive.read("a.txt") == data
 
 
 # ---- unzip-books: распаковка однокнижных zip обратно (решение: книги хранятся распакованными) ----
@@ -1642,7 +1626,7 @@ def test_unzip_different_target_gets_numeric_suffix(unzip_cfg: dict[str, Any]) -
 
     assert stats["conflict"] == 1
     assert (root / "a.txt").read_bytes() == b"other"
-    assert (root / "a_1.txt").read_bytes() == data
+    assert only_variant(root, "a", ".txt").read_bytes() == data
 
 
 def test_unzip_entry_path_cannot_leave_folder(unzip_cfg: dict[str, Any]) -> None:
@@ -1682,9 +1666,17 @@ def coll_db(tmp_path: Path) -> str:
         for path in ("_Сборники/Серия X/a.epub", "Автор/b.epub", "Автор/c.txt.zip"):
             insert_book(conn, path)
         insert_duplicate(conn, "_Сборники/Серия Y/b.epub", "Автор/b.epub")
-        insert_duplicate(conn, "_Сборники/Серия Y/c.txt", "Автор/c.txt")  # keeper упакован в zip-books
+        insert_duplicate(conn, "_Сборники/Серия Y/c.txt", "Автор/c.txt")  # keeper без .zip (zip-режима больше нет)
         insert_duplicate(conn, "_Сборники/Серия Z/d.epub", "Нет/d.epub")  # keeper пропал совсем
     return db
+
+
+def only_variant(folder: Path, stem: str, ext: str) -> Path:
+    """Единственный файл папки «stem (уточнение)ext»; «_N» в папке быть не должно."""
+    assert not any(p.name.endswith(ext) and "_1" in p.name for p in folder.iterdir())
+    found = [p for p in folder.iterdir() if p.name.startswith(f"{stem} (") and p.name.endswith(ext)]
+    assert len(found) == 1, [p.name for p in folder.iterdir()]
+    return found[0]
 
 
 def test_migration_v4_creates_book_collections_and_view(tmp_path: Path) -> None:
@@ -1878,7 +1870,7 @@ def test_unpack_collections_moves_books_relinks_and_removes_empty_dirs(tmp_path:
     assert stats["no_author"] == 1
     assert stats["removed_dirs"] == 2  # «Серия Y» опустела, «Пустая» была пустой; «Серия X» с заметкой остаётся
     assert (root / "Иванов Иван" / "Иван Иванов - Книга.fb2").is_file()
-    assert (root / "Иванов Иван" / "Иван Иванов - Книга_1.fb2").is_file()
+    moved = only_variant(root / "Иванов Иван", "Иван Иванов - Книга", ".fb2")
     assert (root / "_Сборники" / "Серия X" / "Заметки.txt").is_file()
     assert not (root / "_Сборники" / "Серия Y").exists()
     assert not (root / "_Сборники" / "Пустая").exists()
@@ -1887,7 +1879,7 @@ def test_unpack_collections_moves_books_relinks_and_removes_empty_dirs(tmp_path:
         collection = dict(conn.execute("SELECT path, collection FROM book_collections WHERE source='folder'").fetchall())
         marks = [r[0] for r in conn.execute("SELECT path FROM marks")]
     assert collection["Иванов Иван/Иван Иванов - Книга.fb2"] == "Серия X"
-    assert collection["Иванов Иван/Иван Иванов - Книга_1.fb2"] == "Серия Y"
+    assert collection[f"Иванов Иван/{moved.name}"] == "Серия Y"
     assert marks == ["Иванов Иван/Иван Иванов - Книга.fb2"]
 
 
@@ -1979,6 +1971,10 @@ def test_periodical_rules_and_table_validation(tmp_path: Path) -> None:
     bad.write_text(json.dumps({"Журнал А": "Иванов Иван"}, ensure_ascii=False), encoding="utf-8")
     with pytest.raises(bl.ConfigError):
         bl.load_periodicals(bad)
+    top = tmp_path / "top.json"  # «Если» на верхнем уровне — ошибка: только «_Журналы/…»
+    top.write_text(json.dumps({"журнал Если": "Если"}, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(bl.ConfigError):
+        bl.load_periodicals(top)
 
 
 def test_periodical_author_goes_to_journals_folder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2207,12 +2203,12 @@ def test_merge_moves_short_folder_into_full_and_relinks(tmp_path: Path, monkeypa
     assert stats["moved"] == 2
     assert not (root / "Иванов Иван").exists()
     assert (full / "a.txt").read_text(encoding="utf-8") == "Другой.\n"
-    assert (full / "a_1.txt").read_text(encoding="utf-8") == "А.\n"
+    assert only_variant(full, "a", ".txt").read_text(encoding="utf-8") == "А.\n"
     assert (full / "sub" / "b.txt").is_file()
     assert (full / "c.txt").is_file()
     with closing(bl.connect(cfg["db_path"])) as conn:
         marks = [r[0] for r in conn.execute("SELECT path FROM marks")]
-    assert marks == ["Иванов Иван Петрович/a_1.txt"]
+    assert marks == [f"Иванов Иван Петрович/{only_variant(full, 'a', '.txt').name}"]
 
 
 def test_merge_renames_folder_by_patronymic_from_book_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2598,7 +2594,7 @@ def test_author_variants_common_merges_into_full_name(authors_cfg: dict[str, Any
     assert result["merged"] == 1 and result["conflicts"] == 1
     assert not (root / "Petrov Petr").exists()
     target = root / "Петров Пётр Иванович"
-    assert (target / "Тёмный лес.txt").is_file() and (target / "Тёмный лес_1.txt").is_file()
+    assert (target / "Тёмный лес.txt").is_file() and only_variant(target, "Тёмный лес", ".txt").is_file()
     assert db_rows(authors_cfg, "SELECT status, target FROM author_variants") == [("merged", "Петров Пётр Иванович")]
 
 
@@ -2785,7 +2781,8 @@ def test_footnote_is_aside_in_chapter_where_first_referenced(tmp_path: Path) -> 
     assert 'aside epub:type="footnote"' in first and 'id="n1"' in first
     assert 'role="doc-backlink"' in first
     second = files["OEBPS/text/ch002.xhtml"].decode("utf-8")
-    assert 'href="ch001.xhtml#n1"' in second  # повторная ссылка ведёт в файл сноски
+    assert 'href="#n1"' in second  # повторная ссылка локальная: сноска-копия в том же файле
+    assert 'aside epub:type="footnote"' in second
     assert 'id="ref-n1-2"' in second
 
 
@@ -3179,8 +3176,42 @@ def test_merge_folder_merges_into_existing_and_counts_conflicts(tmp_path: Path, 
     assert stats["conflicts"] == 1
     assert not (root / "Иванов Иван").exists()
     assert (full / "a.txt").read_text(encoding="utf-8") == "Другой.\n"
-    assert (full / "a_1.txt").read_text(encoding="utf-8") == "А.\n"
+    assert only_variant(full, "a", ".txt").read_text(encoding="utf-8") == "А.\n"
     assert (full / "sub" / "b.txt").is_file()
+
+
+def test_merge_folder_conflict_gets_variant_name_not_suffix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "Иванов Иван/a.txt": "А.\n",
+        "Иванов Иван Петрович/a.txt": "Другой.\n",
+    })
+    full = Path(cfg["books_dir"]) / "Иванов Иван Петрович"
+
+    stats = bl.folder_merge(cfg, ["Иванов Иван"], "Иванов Иван Петрович")
+
+    assert stats["conflicts"] == 1
+    assert (full / "a.txt").read_text(encoding="utf-8") == "Другой.\n"
+    assert only_variant(full, "a", ".txt").read_text(encoding="utf-8") == "А.\n"
+
+
+def test_merge_folder_into_journal_subfolder_of_existing_section(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "Если/1 номер.txt": "Н.\n",
+        "_Журналы/Прочее/x.txt": "Х.\n",
+    })
+    root = Path(cfg["books_dir"])
+
+    stats = bl.folder_merge(cfg, ["Если"], "_Журналы/Если")
+
+    assert stats["merged"] == 1
+    assert (root / "_Журналы" / "Если" / "1 номер.txt").is_file()
+    assert not (root / "Если").exists()
+
+
+def test_merge_folder_rejects_missing_section_for_journal_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {"Если/1 номер.txt": "Н.\n"})
+    with pytest.raises(bl.ConfigError):
+        bl.folder_merge(cfg, ["Если"], "_Журналы/Если")
 
 
 def test_merge_folder_rejects_bad_arguments(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3486,7 +3517,7 @@ def test_merge_folder_nested_into_existing_folder_counts_conflicts(tmp_path: Pat
     assert stats["merged"] == 1
     assert stats["conflicts"] == 1
     assert (root / "Петров Иван" / "a.txt").read_text(encoding="utf-8") == "Другой.\n"
-    assert (root / "Петров Иван" / "a_1.txt").read_text(encoding="utf-8") == "А.\n"
+    assert only_variant(root / "Петров Иван", "a", ".txt").read_text(encoding="utf-8") == "А.\n"
 
 
 def test_merge_folder_rejects_nested_path_outside_service_section(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3532,7 +3563,7 @@ def test_merge_folder_target_must_be_author_folder_or_inside_razobrat(tmp_path: 
     cfg = merge_cfg(tmp_path, monkeypatch, {"Иван Петров/a.txt": "А.\n", "_Сборники/X/Книга.txt": "Х.\n"})
     root = Path(cfg["books_dir"])
 
-    for bad in ("_Сборники/X", "_разобрать", "_разобрать/../x", "Петров/Иван"):
+    for bad in ("_разобрать", "_разобрать/../x", "Петров/Иван", "_Сборники/../x"):
         with pytest.raises(bl.ConfigError):
             bl.folder_merge(cfg, ["Иван Петров"], bad)
     assert (root / "Иван Петров" / "a.txt").is_file()
