@@ -4216,12 +4216,51 @@ def calibre_fb2_problem(data: bytes, staged: Path, produced: Path, tmp: Path, ti
 # convert fb2 → epub (Calibre), в т. ч. fb2 внутри однокнижного zip
 # ----------------------------------------------------------------------
 
+# book_meta-ключ отказа конвертации fb2: «причина|размер|mtime_ns». Пока файл не изменился, повторно не конвертируем
+# (безнадёжный fb2 не пересобирается каждую ночь); изменился — пробуем снова.
+CONVERT_ERROR = "convert_error"
+
+
+def convert_error_value(reason: str, st: os.stat_result) -> str:
+    return f"{' '.join(reason.split())[:300]}|{st.st_size}|{st.st_mtime_ns}"
+
+
+def stored_convert_error(db_path: str, rel: str) -> str | None:
+    """convert_error книги или None: нет БД, схемы v6 или записи. Сбой чтения трактуется как отсутствие записи."""
+    if not Path(db_path).is_file():
+        return None
+    try:
+        with closing(connect(db_path, readonly=True)) as conn:
+            if conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_META:
+                return None
+            row = conn.execute("SELECT value FROM book_meta WHERE path=? AND key=?", (rel, CONVERT_ERROR)).fetchone()
+    except sqlite3.Error:
+        return None
+    return row[0] if row else None
+
+
+def convert_error_current(value: str, st: os.stat_result) -> bool:
+    """Файл не изменился с момента отказа: размер и mtime совпадают с записанными."""
+    parts = value.rsplit("|", 2)
+    return len(parts) == 3 and parts[1] == str(st.st_size) and parts[2] == str(st.st_mtime_ns)
+
+
+def set_convert_error(db_path: str, rel: str, value: str | None) -> None:
+    """Записывает convert_error книги (value) или снимает его (None)."""
+    with closing(connect(db_path)) as conn, conn:
+        conn.execute("DELETE FROM book_meta WHERE path=? AND key=?", (rel, CONVERT_ERROR))
+        if value is not None:
+            conn.execute("INSERT INTO book_meta VALUES (?,?,?)", (rel, CONVERT_ERROR, value))
+
+
 def convert_fb2(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None, workers: int | None = None,
                 out: Callable[[str], None] = print) -> dict[str, Any]:
     """fb2 и однокнижный zip с fb2 → name.epub рядом (имя как у fb2), проверка verify_book, исходник — в карантин
     replaced/. Рядом уже есть epub с тем же нормализованным именем — исходник сразу в replaced/ без конвертации.
     Сначала собственный конвертер fb2_to_epub3; при его ошибке или провале проверок — Calibre. Поле engine в журнале:
-    fb2epub3 или calibre. Сбой обоих или проверки — исходник в rejected-convert/."""
+    fb2epub3 или calibre. Сбой обоих или проверки — fb2 остаётся на месте (решение пользователя 18.11.2026):
+    строка rejected-convert в журнале и book_meta convert_error; пока файл не изменился, он пропускается
+    (skipped-rejected)."""
     run = NightRun(cfg, "convert-fb2", dry_run, path, out)
     timeout = cfg["convert_timeout"]
 
@@ -4234,6 +4273,7 @@ def convert_fb2(cfg: dict[str, Any], dry_run: bool = False, path: str | None = N
 
     def one(item: tuple[Path, dict[str, str]]) -> None:
         src, epubs = item
+        st = src.stat()  # подпись до чтения: правка во время конвертации не попадёт в convert_error
         data: bytes | None = None
         if src.name.lower().endswith(".zip"):
             try:
@@ -4248,13 +4288,20 @@ def convert_fb2(cfg: dict[str, Any], dry_run: bool = False, path: str | None = N
         stem = split_name(src.name)[0]
         result = src.parent / f"{stem}.epub"
         existing = epubs.get(norm_key(stem))
+        rel = run.rel(src)
+        marker = stored_convert_error(cfg["db_path"], rel)
         if existing or result.exists():
             keeper = src.parent / (existing or result.name)
+            if marker is not None and not dry_run:  # маркер уходит с исходником, а не переезжает на epub при relink
+                set_convert_error(cfg["db_path"], rel, None)
             run.quarantine(src, "replaced", reason="рядом уже есть epub", keeper=str(keeper))
             run.moved(src, keeper)
             return
         if not name_ok(result.name):
             run.quarantine(src, "rejected-name", reason="имя epub недопустимо")
+            return
+        if marker is not None and convert_error_current(marker, st):
+            run.record("skipped-rejected", src, reason=marker.rsplit("|", 2)[0])
             return
         if dry_run:
             run.record("convert", src, to=str(result))
@@ -4275,8 +4322,12 @@ def convert_fb2(cfg: dict[str, Any], dry_run: bool = False, path: str | None = N
                 produced.unlink(missing_ok=True)
                 engine = "calibre"
                 problem = calibre_fb2_problem(data, staged, produced, tmp, timeout)
-            if problem:
-                run.quarantine(src, "rejected-convert", reason=problem, engine=engine)
+            if problem:  # fb2 не трогаем: отказ — журнал и convert_error
+                try:
+                    set_convert_error(cfg["db_path"], rel, convert_error_value(problem, st))
+                except sqlite3.Error as error:
+                    run.record("failed", src, reason=f"convert_error: {error}")
+                run.record("rejected-convert", src, reason=problem, engine=engine)
                 return
             fd, tmp_out = tempfile.mkstemp(prefix=".convert.", suffix=".tmp", dir=src.parent)
             os.close(fd)
@@ -4288,6 +4339,8 @@ def convert_fb2(cfg: dict[str, Any], dry_run: bool = False, path: str | None = N
                 os.replace(tmp_out, result)
             finally:
                 Path(tmp_out).unlink(missing_ok=True)
+        if marker is not None:  # прежний отказ уходит с исходником, а не переезжает на epub
+            set_convert_error(cfg["db_path"], rel, None)
         run.quarantine(src, "replaced", reason="заменён проверенным epub", keeper=str(result), engine=engine)
         run.moved(src, result)
 
@@ -6787,6 +6840,56 @@ def move_guard(folder: str, target: str) -> str:
     return ""
 
 
+def edit_distance(a: str, b: str) -> int:
+    """Расстояние Левенштейна: вставка, удаление и замена одной буквы стоят по одной правке."""
+    previous = list(range(len(b) + 1))
+    for i, char_a in enumerate(a, 1):
+        current = [i]
+        for j, char_b in enumerate(b, 1):
+            current.append(min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (char_a != char_b)))
+        previous = current
+    return previous[-1]
+
+
+def typo_fix(folder: str, name: str) -> bool:
+    """Опечатка в одном слове: слова совпадают, кроме одного; различие не больше 2 правок; оба слова не короче 3 букв;
+    это фамилия (первое слово папки) либо разница — одна лишняя или пропущенная буква (удвоение, пропуск)."""
+    words_folder, words_name = author_words(folder), author_words(name)
+    if len(words_folder) != len(words_name):
+        return False
+    diff = [i for i, (word, other) in enumerate(zip(words_folder, words_name)) if word != other]
+    if len(diff) != 1:
+        return False
+    i = diff[0]
+    word, other = words_folder[i], words_name[i]
+    if min(len(word), len(other)) < 3 or edit_distance(word, other) > 2:
+        return False
+    return i == 0 or (abs(len(word) - len(other)) == 1 and edit_distance(word, other) == 1)
+
+
+def rename_guard(folder: str, name: str) -> str:
+    """Причина, по которой папку folder нельзя переименовать в name; '' — можно. Сначала move_guard (с префиксом
+    skip-rename-), затем правила переименования: ключ имени ⊇ ключ папки (меняется только дополнение, существующие
+    слова не меняются) либо опечатка в одном слове (typo_fix); добавленные слова — не инициалы (≥ 3 буквы); имя не
+    оканчивается частицей и частица стоит на той же позиции, что в папке."""
+    reason = move_guard(folder, name)
+    if reason:
+        return "skip-rename-" + reason.removeprefix("skip-")
+    folder_key, name_key = author_key(folder), author_key(name)
+    if folder_key is None or name_key is None:
+        return "skip-rename-changes"
+    if not folder_key <= name_key and not typo_fix(folder, name):
+        return "skip-rename-changes"
+    if any(len(word) < 3 for word in name_key - folder_key):
+        return "skip-rename-initials"
+    words_folder, words_name = author_words(folder), author_words(name)
+    if words_name[-1] in AUTHOR_PARTICLES or any(
+            i >= len(words_name) or words_name[i] != word
+            for i, word in enumerate(words_folder) if word in AUTHOR_PARTICLES):
+        return "skip-rename-particle"
+    return ""
+
+
 def first_author(authors: str) -> str:
     return authors.split("; ")[0].strip()
 
@@ -6820,8 +6923,13 @@ def folder_action(run: NightRun, db_path: str, root: Path, index: dict[frozenset
     author = first_author(rows[0]["authors"])
     if key is None or author_key(folder) == key:
         return False
-    name, method = pick_folder(author, key, "", index)
-    if method != "new" or not name or name == folder or (root / name).exists() or move_guard(folder, name):
+    # сама папка не участвует в подборе имени, иначе «Петров Иван» нашла бы себя и не переименовалась бы
+    name, method = pick_folder(author, key, "", {known: owner for known, owner in index.items() if owner != folder})
+    if method != "new" or not name or name == folder or (root / name).exists():
+        return False
+    reason = rename_guard(folder, name)
+    if reason:
+        run.count(reason)
         return False
     run.out(f"{folder} → {name} (переименование, книг {total})")
     if run.dry_run:
@@ -8041,6 +8149,7 @@ class Collection(NamedTuple):
 
 
 META_LABELS = {
+    CONVERT_ERROR: "Отказ конвертации fb2",
     "author_full": "Автор (полностью)", "translator": "Переводчик", "editor": "Редактор",
     "illustrator": "Иллюстратор", "contributor": "Участник", "keyword": "Ключевые слова", "keywords": "Ключевые слова",
     "date": "Дата", "src_lang": "Язык оригинала", "lang": "Язык", "language": "Язык", "series_extra": "Серия (доп.)",
