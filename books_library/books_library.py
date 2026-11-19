@@ -6840,16 +6840,45 @@ def move_guard(folder: str, target: str) -> str:
     return ""
 
 
+def edit_distance(a: str, b: str) -> int:
+    """Расстояние Левенштейна: вставка, удаление и замена одной буквы стоят по одной правке."""
+    previous = list(range(len(b) + 1))
+    for i, char_a in enumerate(a, 1):
+        current = [i]
+        for j, char_b in enumerate(b, 1):
+            current.append(min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (char_a != char_b)))
+        previous = current
+    return previous[-1]
+
+
+def typo_fix(folder: str, name: str) -> bool:
+    """Опечатка в одном слове: слова совпадают, кроме одного; различие не больше 2 правок; оба слова не короче 3 букв;
+    это фамилия (первое слово папки) либо разница — одна лишняя или пропущенная буква (удвоение, пропуск)."""
+    words_folder, words_name = author_words(folder), author_words(name)
+    if len(words_folder) != len(words_name):
+        return False
+    diff = [i for i, (word, other) in enumerate(zip(words_folder, words_name)) if word != other]
+    if len(diff) != 1:
+        return False
+    i = diff[0]
+    word, other = words_folder[i], words_name[i]
+    if min(len(word), len(other)) < 3 or edit_distance(word, other) > 2:
+        return False
+    return i == 0 or (abs(len(word) - len(other)) == 1 and edit_distance(word, other) == 1)
+
+
 def rename_guard(folder: str, name: str) -> str:
     """Причина, по которой папку folder нельзя переименовать в name; '' — можно. Сначала move_guard (с префиксом
     skip-rename-), затем правила переименования: ключ имени ⊇ ключ папки (меняется только дополнение, существующие
-    слова не меняются); добавленные слова — не инициалы (≥ 3 буквы); имя не оканчивается частицей и частица
-    стоит на той же позиции, что в папке."""
+    слова не меняются) либо опечатка в одном слове (typo_fix); добавленные слова — не инициалы (≥ 3 буквы); имя не
+    оканчивается частицей и частица стоит на той же позиции, что в папке."""
     reason = move_guard(folder, name)
     if reason:
         return "skip-rename-" + reason.removeprefix("skip-")
     folder_key, name_key = author_key(folder), author_key(name)
-    if folder_key is None or name_key is None or not folder_key <= name_key:
+    if folder_key is None or name_key is None:
+        return "skip-rename-changes"
+    if not folder_key <= name_key and not typo_fix(folder, name):
         return "skip-rename-changes"
     if any(len(word) < 3 for word in name_key - folder_key):
         return "skip-rename-initials"

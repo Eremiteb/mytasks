@@ -2980,6 +2980,28 @@ def test_fix_misplaced_rename_refused_by_rules(tmp_path: Path, monkeypatch: pyte
     assert (root / folder / "A.fb2").is_file()
 
 
+@pytest.mark.parametrize("folder, author, target", [
+    ("Игнан Грег", "Грег Иган", "Иган Грег"),  # опечатка в фамилии: «Игнан» → «Иган»
+    ("Дубининская Яна", "Яна Дубинянская", "Дубинянская Яна"),  # опечатка в фамилии
+    ("Трубалаини Николай", "Николай Трублаини", "Трублаини Николай"),  # пропуск буквы в фамилии
+    ("Кизи Кенн", "Кен Кизи", "Кизи Кен"),  # удвоенная буква в имени
+])
+def test_fix_misplaced_renames_typo_in_one_word(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                folder: str, author: str, target: str) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        f"{folder}/A.fb2": make_fb2_author("A", author),
+        f"{folder}/B.fb2": make_fb2_author("B", author),
+    })
+    root = Path(cfg["books_dir"])
+
+    stats = bl.fix_misplaced(cfg)
+
+    assert stats["folder-renamed"] == 1
+    assert not (root / folder).exists()
+    assert (root / target / "A.fb2").is_file()
+    assert (root / target / "B.fb2").is_file()
+
+
 def test_fix_misplaced_dry_run_changes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cfg = merge_cfg(tmp_path, monkeypatch, {
         "Иванов Иван/Ok.fb2": make_fb2("Ok", "Иван", "Иванов"),
