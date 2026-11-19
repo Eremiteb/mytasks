@@ -5463,7 +5463,7 @@ def unzip_books(cfg: dict[str, Any], dry_run: bool = False, path: str | None = N
 # unpack-collections и sort-underscore: книги из раздела сборников / служебных папок «_» — в папки авторов (только CLI; в веб и API не выведены)
 # ----------------------------------------------------------------------
 
-CLI_COMMANDS = ("unpack-collections", "merge-authors", "sort-underscore", "misplaced", "purge-quarantine")
+CLI_COMMANDS = ("unpack-collections", "merge-authors", "sort-underscore", "misplaced", "purge-quarantine", "move-books")
 COLLECTIONS_SECTION = "Сборники"  # section_name папки «_…» каталога книг: раздел сборников
 RELINK_BATCH = 1000  # пар переноса на один relink: при сбое связи и файлы расходятся не больше чем на пачку
 FOLDER_NAME_MAX = 120
@@ -7083,6 +7083,7 @@ def rename_folder(run: NightRun, db_path: str, root: Path, src: str, dst: str, p
 
 
 RAZOBRAT_SECTION = "_разобрать"  # служебный раздел: в него можно склеивать папки через --to «_разобрать/…»
+PERIODICALS_SECTION = "_Журналы"  # служебный раздел журналов: move-books кладёт файлы в «_Журналы/Издание/…» (не короче трёх сегментов)
 
 
 def service_path(root: Path, rel: str, min_parts: int) -> Path:
@@ -7219,6 +7220,120 @@ def strip_suffix(cfg: dict[str, Any], dry_run: bool = False, path: str | None = 
             journal_row(run, {"action": "move", "from": src_rel, "to": dst_rel, "status": "moved", "error": ""})
             run.moved(src, dest)
     return run.finish({"walk_errors": walk_errors})
+
+
+def move_path_error(rel: str) -> str:
+    """Форма относительного пути из списка переноса: непустой, без NUL, «\\», абсолютного пути и пустых, «.» или «..» сегментов."""
+    if not rel:
+        return "путь пустой"
+    if "\x00" in rel or "\\" in rel:
+        return "NUL или «\\» в пути"
+    if rel.startswith("/"):
+        return "путь абсолютный"
+    if any(part in ("", ".", "..") for part in rel.split("/")):
+        return "пустой, «.» или «..» сегмент пути"
+    return ""
+
+
+def existing_ancestor(path: Path) -> Path:
+    """Ближайший существующий предок пути (сам путь, если он существует)."""
+    while not path.exists() and path != path.parent:
+        path = path.parent
+    return path
+
+
+def move_line_error(root: Path, src_rel: str, dst_rel: str) -> str:
+    """Причина, по которой строка списка переноса не выполняется (пусто — можно переносить)."""
+    for rel in (src_rel, dst_rel):
+        reason = move_path_error(rel)
+        if reason:
+            return reason
+    dst_parts = dst_rel.split("/")
+    if dst_parts[0] == PERIODICALS_SECTION:
+        if len(dst_parts) < 3:
+            return f"«куда» в «{PERIODICALS_SECTION}» короче трёх сегментов"
+    elif not folder_top_ok(dst_parts[0]):
+        return "«куда» — не папка автора верхнего уровня"
+    elif len(dst_parts) < 2:
+        return "«куда» короче двух сегментов"
+    src = root / src_rel
+    if src.is_symlink() or not src.is_file():
+        return "источник — не обычный файл"
+    dst = root / dst_rel
+    if dst.exists() or dst.is_symlink():
+        return "цель существует"
+    root_real = root.resolve()
+    if not src.resolve().is_relative_to(root_real):
+        return "источник выходит за пределы каталога книг"
+    if not existing_ancestor(dst.parent).resolve().is_relative_to(root_real):
+        return "«куда» выходит за пределы каталога книг"
+    return ""
+
+
+def remove_emptied_parents(run: NightRun, root: Path, moved_from: list[str]) -> None:
+    """Папки-предки перенесённых файлов, в которых не осталось файлов, удаляются снизу вверх (remove_empty_folder).
+    Корень каталога и папки верхнего уровня «_…» не удаляются."""
+    chain: set[tuple[str, ...]] = set()
+    for rel in moved_from:
+        parts = rel.split("/")[:-1]
+        chain.update(tuple(parts[:depth]) for depth in range(1, len(parts) + 1))
+    for parts in sorted(chain, key=len, reverse=True):
+        if len(parts) == 1 and parts[0].startswith("_"):
+            continue
+        folder = root.joinpath(*parts)
+        if folder.is_dir() and not folder.is_symlink() and not any(path.is_file() for path in folder.rglob("*")):
+            remove_empty_folder(run, folder)
+
+
+def move_books(cfg: dict[str, Any], list_path: Path, dry_run: bool = False,
+               out: Callable[[str], None] = print) -> dict[str, Any]:
+    """move-books: перенос отдельных книг по списку «откуда<TAB>куда» (UTF-8, пути относительно каталога книг; пустые
+    строки и строки с «#» пропускаются). Ошибка строки пропускает её, прогон продолжается. Связи переносятся relink,
+    опустевшие папки-источники удаляются. Журнал reports/move-books-*.jsonl: строки move с from/to для отката."""
+    root = Path(cfg["books_dir"])
+    try:
+        text = list_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise ConfigError(f"move-books: не прочитать список {list_path}: {error}") from error
+    run = NightRun(cfg, "move-books", dry_run, None, out)
+    prepare_collections(cfg, dry_run, out)
+    moved_from: list[str] = []
+    for number, line in enumerate(text.split("\n"), 1):
+        line = line.rstrip("\r")
+        if not line.strip() or line.startswith("#"):
+            continue
+        run.tick()
+        fields = line.split("\t")
+        if len(fields) != 2:
+            run.count("errors")
+            journal_row(run, {"action": "error", "from": line, "to": "",
+                              "error": f"строка {number}: нужны два поля через TAB"})
+            continue
+        src_rel, dst_rel = fields
+        reason = move_line_error(root, src_rel, dst_rel)
+        if reason:
+            run.count("errors")
+            journal_row(run, {"action": "error", "from": src_rel, "to": dst_rel, "error": f"строка {number}: {reason}"})
+            continue
+        if dry_run:
+            run.count("moved")
+            journal_row(run, {"action": "move", "from": src_rel, "to": dst_rel, "status": "dry", "error": ""})
+            continue
+        src, dest = root / src_rel, root / dst_rel
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            os.rename(src, dest)
+        except OSError as error:
+            run.count("errors")
+            journal_row(run, {"action": "error", "from": src_rel, "to": dst_rel, "error": str(error)})
+            continue
+        run.count("moved")
+        journal_row(run, {"action": "move", "from": src_rel, "to": dst_rel, "status": "moved", "error": ""})
+        run.moved(src, dest)
+        moved_from.append(src_rel)
+    if not dry_run:
+        remove_emptied_parents(run, root, moved_from)
+    return run.finish()
 
 
 # ----------------------------------------------------------------------
@@ -7546,7 +7661,7 @@ def command_params(command: str, raw: dict[str, Any]) -> dict[str, Any]:
         "author-variants": set(), "sort-underscore": {"limit"},
         "reconvert-fb2": {"path", "workers", "limit", "sample", "out", "epubcheck"},
         "misplaced": set(), "fix-misplaced": set(), "merge-folder": {"from", "to", "non_books_to_quarantine"},
-        "strip-suffix": {"path"}, "purge-quarantine": {"reasons"},
+        "strip-suffix": {"path"}, "purge-quarantine": {"reasons"}, "move-books": {"list_path"},
     }[command]
     unknown = set(raw) - allowed
     if unknown:
@@ -7632,6 +7747,10 @@ def command_params(command: str, raw: dict[str, Any]) -> dict[str, Any]:
             raise ConfigError(f"purge-quarantine: неизвестная причина {', '.join(unknown)}; "
                               f"допустимо: {', '.join(QUARANTINE_REASONS)}")
         params["reasons"] = list(dict.fromkeys(reasons))
+    if command == "move-books":
+        if not isinstance(raw.get("list_path"), Path):
+            raise ConfigError("list_path: путь к файлу списка (--list)")
+        params["list_path"] = raw["list_path"]
     return params
 
 
@@ -7676,6 +7795,8 @@ def run_command(cfg: dict[str, Any], command: str, dry_run: bool, params: dict[s
             return strip_suffix(cfg, dry_run, params["path"], out=out)
         if command == "purge-quarantine":
             return purge_quarantine(cfg, params["reasons"], dry_run)
+        if command == "move-books":
+            return move_books(cfg, params["list_path"], dry_run, out=out)
         if command == "reconvert-fb2":
             return reconvert_fb2(cfg, dry_run, params["path"], params["workers"], params["limit"], params["sample"],
                                  params["out"], params["epubcheck"], out=out)
@@ -9665,7 +9786,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("command", nargs="?", choices=("serve", "scan", *FILE_CHANGING, *CLI_COMMANDS), default="serve",
                         help="serve (по умолчанию), scan, fix-encoding, unpack-fb2zip, convert, reconvert-fb2, dedup, dedup-folders, "
                              "zip-books, unzip-books, unpack-collections, merge-authors, sort-underscore, author-variants, "
-                             "misplaced, fix-misplaced, merge-folder (--from A --to B), strip-suffix или purge-quarantine (--reason R, необратимо)")
+                             "misplaced, fix-misplaced, merge-folder (--from A --to B), strip-suffix, move-books (--list ФАЙЛ) "
+                             "или purge-quarantine (--reason R, необратимо)")
     parser.add_argument("--reason", dest="reasons", action="append", default=[],
                         help="purge-quarantine: причина карантина, папка которой удаляется окончательно (можно повторять): "
                              + ", ".join(QUARANTINE_REASONS))
@@ -9673,6 +9795,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--from", dest="from_folders", action="append", default=[],
                         help="merge-folder: папка верхнего уровня или папка внутри «_…» (например «_Сборники/Серия/Автор»), "
                              "которую склеить или переименовать (можно повторять)")
+    parser.add_argument("--list", dest="list_path", type=Path,
+                        help="move-books: файл списка UTF-8, строки «откуда<TAB>куда» (пути относительно каталога книг)")
     parser.add_argument("--only", default="all",
                         help="fix-encoding: all|fb2|txt; convert: all|fb2|doc|docx|rtf|odt|mht|mhtml|html (fb2 — в epub через Calibre; html — только явно)")
     parser.add_argument("--workers", type=int,
@@ -9722,6 +9846,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--multi и --ignore-md5 применяются только к unpack-fb2zip")
     if args.reasons and args.command != "purge-quarantine":
         parser.error("--reason применяется только к purge-quarantine")
+    if args.list_path is not None and args.command != "move-books":
+        parser.error("--list применяется только к move-books")
+    if args.command == "move-books" and args.list_path is None:
+        parser.error("move-books требует --list ФАЙЛ")
     try:
         cfg = load_config(args.config)
         if args.migrate_db or args.command != "serve":
@@ -9749,6 +9877,8 @@ def main(argv: list[str] | None = None) -> int:
                 raw = {"path": args.path}
             elif command == "purge-quarantine":
                 raw = {"reasons": args.reasons}
+            elif command == "move-books":
+                raw = {"list_path": args.list_path}
             elif command == "scan":
                 raw = {"reparse": args.reparse}
             elif command == "convert" and args.only == "fb2":
