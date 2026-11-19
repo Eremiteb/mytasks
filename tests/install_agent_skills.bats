@@ -69,7 +69,7 @@ EOF
   [[ "$output" == *"[ok] хук PreToolUse подключён"* ]]
   [[ "$output" == *"[ok] хук UserPromptSubmit подключён"* ]]
   run python3 -c 'import json,sys; h=json.load(open(sys.argv[1]))["hooks"]; u=h["UserPromptSubmit"]; print(len(h["PreToolUse"]), len(u), u[0]["hooks"][0]["command"])' "$HOME/.claude/settings.json"
-  [ "$output" = "2 1 python3 -I ~/.claude/skills/model-routing/remind.py" ]
+  [ "$output" = "2 1 python3 -I ~/.claude/skills/model-routing/remind.py claude" ]
 }
 
 @test "неверный JSON настроек не перезаписывается и останавливает установку" {
