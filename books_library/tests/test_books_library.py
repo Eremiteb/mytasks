@@ -3241,6 +3241,42 @@ def test_strip_suffix_dry_run_changes_nothing(tmp_path: Path, monkeypatch: pytes
     assert not (root / "Иванов Иван" / "A.txt").exists()
 
 
+def test_name_variants_qualifies_by_lang_and_falls_back_to_variant(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "Иванов Иван/А - X.txt": "А.\n",
+        "Иванов Иван/А - X_1.txt": "Б.\n",
+        "Иванов Иван/В - Y_1.txt": "В1.\n",
+        "Иванов Иван/В - Y_2.txt": "В2.\n",
+    })
+    root = Path(cfg["books_dir"])
+    with closing(bl.connect(cfg["db_path"])) as conn, conn:
+        conn.execute("UPDATE books SET lang='bg' WHERE path=?", ("Иванов Иван/А - X_1.txt",))
+
+    dry = bl.name_variants(cfg, dry_run=True, out=lambda _line: None)
+
+    assert dry["renamed"] == 3
+    assert (root / "Иванов Иван" / "А - X_1.txt").is_file()
+    assert not (root / "Иванов Иван" / "А - X (bg).txt").exists()
+
+    stats = bl.name_variants(cfg)
+
+    assert stats["renamed"] == 3
+    assert stats["qualifier-lang"] == 1
+    assert stats["qualifier-variant"] == 2
+    assert (root / "Иванов Иван" / "А - X (bg).txt").read_text(encoding="utf-8") == "Б.\n"
+    assert (root / "Иванов Иван" / "А - X.txt").is_file()
+    assert (root / "Иванов Иван" / "В - Y (вариант 1).txt").read_text(encoding="utf-8") == "В1.\n"
+    assert (root / "Иванов Иван" / "В - Y (вариант 2).txt").read_text(encoding="utf-8") == "В2.\n"
+    assert not (root / "Иванов Иван" / "А - X_1.txt").exists()
+
+
+def test_short_source_and_person_for_name_variants() -> None:
+    assert bl.short_source("Библиотека Trauma 2.0 (69660 файлов,fb2)") == "Trauma 2.0"
+    assert bl.short_source("Lib.rus.ec - Официальная") == "Lib.rus.ec"
+    assert bl.short_source("Библиотека Мошкова") == "Мошкова"
+    assert bl.short_person("Н. И. Виленская") == "Виленская"
+
+
 def test_windows_name_error_rules() -> None:
     assert bl.windows_name_error("a.txt") == ""
     assert bl.windows_name_error("CONSOLE.txt") == ""
@@ -3293,6 +3329,7 @@ def test_command_params_merge_folder_and_strip_suffix() -> None:
     with pytest.raises(bl.ConfigError):
         bl.command_params("merge-folder", {"from": ["A"], "to": "B", "non_books_to_quarantine": "yes"})
     assert bl.command_params("strip-suffix", {"path": "Иванов Иван"}) == {"path": "Иванов Иван"}
+    assert bl.command_params("name-variants", {"path": "Иванов Иван"}) == {"path": "Иванов Иван"}
     with pytest.raises(bl.ConfigError):
         bl.command_params("merge-folder", {"from": [], "to": "B"})
     with pytest.raises(bl.ConfigError):

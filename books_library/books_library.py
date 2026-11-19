@@ -7427,6 +7427,139 @@ def strip_suffix(cfg: dict[str, Any], dry_run: bool = False, path: str | None = 
     return run.finish({"walk_errors": walk_errors})
 
 
+NAME_VARIANT_KINDS = ("translator", "lang", "source", "year")  # уточнения по порядку предпочтения; «variant» — последним
+NAME_VARIANT_YEAR_CUTOFF = 2025  # год от этого и позже — дата конвертации, а не издания
+
+
+def short_person(value: str) -> str:
+    """Фамилия из значения contributor: последнее слово без скобок и точек («Н. И. Виленская» → «Виленская»)."""
+    words = re.sub(r"\([^()]*\)", " ", value).split()
+    return words[-1].strip(" .,;:") if words else ""
+
+
+def short_source(name: str) -> str:
+    """Короткое имя сборника для имени файла: без текста в скобках и хвоста « - …», без префикса «Библиотека »."""
+    text = re.sub(r"\s*\([^()]*\)", "", name).split(" - ", 1)[0].strip()
+    return text.removeprefix("Библиотека ").strip()
+
+
+def name_variant_values(conn: sqlite3.Connection, rel: str, has_meta: bool, has_collections: bool) -> dict[str, str]:
+    """Уточнения книги в виде текста для имени файла; пустая строка — значения нет или оно не годится."""
+    values = dict.fromkeys(NAME_VARIANT_KINDS, "")
+    row = conn.execute("SELECT lang, year FROM books WHERE path=?", (rel,)).fetchone()
+    if row is not None:
+        lang = (row["lang"] or "").strip()
+        if re.match(r"[A-Za-z]{2}", lang):
+            values["lang"] = lang[:2].lower()
+        year = (row["year"] or "").strip()
+        if re.fullmatch(r"\d{4}", year) and int(year) < NAME_VARIANT_YEAR_CUTOFF:
+            values["year"] = year
+    if has_meta:
+        found = conn.execute("SELECT value FROM book_meta WHERE path=? AND key IN ('translator', 'contributor') "
+                             "ORDER BY CASE key WHEN 'translator' THEN 0 ELSE 1 END, value LIMIT 1", (rel,)).fetchone()
+        surname = short_person(found[0]) if found else ""
+        if surname:
+            values["translator"] = f"пер. {surname}"
+    if has_collections:
+        found = conn.execute("SELECT collection FROM book_collections WHERE path=? AND source='folder' "
+                             "ORDER BY collection LIMIT 1", (rel,)).fetchone()
+        if found:
+            values["source"] = short_source(found[0])
+    return values
+
+
+def name_variant_groups(names: list[str]) -> dict[tuple[str, str], list[tuple[str, re.Match[str] | None]]]:
+    """Одноимённые файлы папки без учёта регистра: «основа.ext» и «основа_N.ext» (match — у «_N»-файлов)."""
+    groups: dict[tuple[str, str], list[tuple[str, re.Match[str] | None]]] = {}
+    for name in names:
+        match = SUFFIX_RE.match(name)
+        stem, ext = (match.group("base"), match.group("ext")) if match else os.path.splitext(name)
+        groups.setdefault((stem.casefold(), ext.casefold()), []).append((name, match))
+    return groups
+
+
+def name_variants(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None,
+                  out: Callable[[str], None] = print) -> dict[str, Any]:
+    """«основа_N.ext» в папке, где есть «основа.ext» или другой «основа_M.ext» (без учёта регистра), → «основа (уточнение).ext».
+    Уточнение — первое, что отличает файл от всей группы: пер. (переводчик), язык, источник, год; иначе «вариант N».
+    Занятое имя или имя, не проходящее windows_name_error, — следующее уточнение; не нашлось — ошибка в журнале.
+    Без --path — только внутри папок авторов верхнего уровня. База читается одним соединением, только SELECT."""
+    root = Path(cfg["books_dir"])
+    target = target_dir(cfg, path)
+    conn = connect(cfg["db_path"], readonly=True)
+    run = NightRun(cfg, "name-variants", dry_run, path, out)
+    walk_errors: list[str] = []
+    try:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        has_meta, has_collections = version >= SCHEMA_META, version >= SCHEMA_COLLECTIONS
+        for current, names in walk_dirs(target, walk_errors):
+            if path is None and not author_scope(current, root):
+                continue
+            taken = {other.casefold() for other in names}  # имена папки без учёта регистра и назначенные в этом прогоне
+            for group in name_variant_groups(names).values():
+                if len(group) < 2 or all(match is None for _, match in group):
+                    continue
+                try:
+                    values = {name: name_variant_values(conn, run.rel(current / name), has_meta, has_collections)
+                              for name, _ in group}
+                except sqlite3.Error as error:
+                    for name, match in group:
+                        if match is not None:
+                            run.count("errors")
+                            journal_row(run, {"action": "error", "from": run.rel(current / name), "to": "",
+                                              "error": f"чтение базы: {error}", "qualifier": ""})
+                    continue
+                for name, match in group:
+                    if match is None:
+                        continue
+                    run.tick()
+                    base, ext, num = match.group("base"), match.group("ext"), match.group("num")
+                    mine = values[name]
+                    others = [values[other] for other, _ in group if other != name]
+                    options = [(kind, mine[kind]) for kind in NAME_VARIANT_KINDS
+                               if mine[kind] and all(item[kind] != mine[kind] for item in others)]
+                    options.append(("variant", f"вариант {num}"))
+                    src, src_rel = current / name, run.rel(current / name)
+                    chosen: tuple[str, str] | None = None
+                    for kind, text in options:
+                        candidate = f"{base} ({text}){ext}"
+                        if not windows_name_error(candidate) and candidate.casefold() not in taken \
+                                and not (current / candidate).exists():
+                            chosen = (kind, candidate)
+                            break
+                    if chosen is None:
+                        run.count("errors")
+                        journal_row(run, {"action": "error", "from": src_rel, "to": "", "qualifier": "",
+                                          "error": "нет свободного имени: " + ", ".join(text for _, text in options)})
+                        continue
+                    kind, dest_name = chosen
+                    dest = current / dest_name
+                    dst_rel = run.rel(dest)
+                    if dry_run:
+                        taken.add(dest_name.casefold())
+                        run.count("renamed")
+                        run.count(f"qualifier-{kind}")
+                        journal_row(run, {"action": "move", "from": src_rel, "to": dst_rel, "status": "dry",
+                                          "error": "", "qualifier": kind})
+                        continue
+                    try:
+                        os.rename(src, dest)
+                    except OSError as error:
+                        run.count("errors")
+                        journal_row(run, {"action": "error", "from": src_rel, "to": dst_rel, "error": str(error),
+                                          "qualifier": kind})
+                        continue
+                    taken.add(dest_name.casefold())
+                    run.count("renamed")
+                    run.count(f"qualifier-{kind}")
+                    journal_row(run, {"action": "move", "from": src_rel, "to": dst_rel, "status": "moved",
+                                      "error": "", "qualifier": kind})
+                    run.moved(src, dest)
+    finally:
+        conn.close()
+    return run.finish({"walk_errors": walk_errors})
+
+
 def windows_names(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None,
                   out: Callable[[str], None] = print) -> dict[str, Any]:
     """windows-names: имена папок и файлов, недопустимые в Windows (Syncthing), приводятся к допустимым (windows_dir_plan),
@@ -7917,7 +8050,7 @@ def purge_quarantine(cfg: dict[str, Any], reasons: list[str], dry_run: bool) -> 
 
 
 FILE_CHANGING = ("fix-encoding", "unpack-fb2zip", "convert", "dedup", "dedup-folders", "zip-books", "unzip-books",
-                 "author-variants", "reconvert-fb2", "fix-misplaced", "merge-folder", "strip-suffix", "windows-names")
+                 "author-variants", "reconvert-fb2", "fix-misplaced", "merge-folder", "strip-suffix", "name-variants", "windows-names")
 COMMANDS = ("scan", "migrate", *FILE_CHANGING)
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
@@ -7939,7 +8072,7 @@ def command_params(command: str, raw: dict[str, Any]) -> dict[str, Any]:
         "reconvert-fb2": {"path", "workers", "limit", "sample", "out", "epubcheck"},
         "misplaced": set(), "check-folders": set(), "fix-misplaced": set(),
         "merge-folder": {"from", "to", "non_books_to_quarantine"},
-        "strip-suffix": {"path"}, "windows-names": {"path"}, "purge-quarantine": {"reasons"}, "move-books": {"list_path"},
+        "strip-suffix": {"path"}, "name-variants": {"path"}, "windows-names": {"path"}, "purge-quarantine": {"reasons"}, "move-books": {"list_path"},
     }[command]
     unknown = set(raw) - allowed
     if unknown:
@@ -8073,6 +8206,8 @@ def run_command(cfg: dict[str, Any], command: str, dry_run: bool, params: dict[s
                                 non_books_to_quarantine=params["non_books_to_quarantine"])
         if command == "strip-suffix":
             return strip_suffix(cfg, dry_run, params["path"], out=out)
+        if command == "name-variants":
+            return name_variants(cfg, dry_run, params["path"], out=out)
         if command == "windows-names":
             return windows_names(cfg, dry_run, params["path"], out=out)
         if command == "purge-quarantine":
@@ -10070,12 +10205,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="serve (по умолчанию), scan, fix-encoding, unpack-fb2zip, convert, reconvert-fb2, dedup, dedup-folders, "
                              "zip-books, unzip-books, unpack-collections, merge-authors, sort-underscore, author-variants, "
                              "misplaced, check-folders (только отчёт), fix-misplaced, merge-folder (--from A --to B), strip-suffix, "
-                             "windows-names, move-books (--list ФАЙЛ) "
+                             "name-variants, windows-names, move-books (--list ФАЙЛ) "
                              "или purge-quarantine (--reason R, необратимо)")
     parser.add_argument("--reason", dest="reasons", action="append", default=[],
                         help="purge-quarantine: причина карантина, папка которой удаляется окончательно (можно повторять): "
                              + ", ".join(QUARANTINE_REASONS))
-    parser.add_argument("-p", "--path", help="fix-encoding/unpack-fb2zip/convert/strip-suffix/windows-names: каталог (по умолчанию каталог книг)")
+    parser.add_argument("-p", "--path", help="fix-encoding/unpack-fb2zip/convert/strip-suffix/name-variants/windows-names: каталог (по умолчанию каталог книг)")
     parser.add_argument("--from", dest="from_folders", action="append", default=[],
                         help="merge-folder: папка верхнего уровня или папка внутри «_…» (например «_Сборники/Серия/Автор»), "
                              "которую склеить или переименовать (можно повторять)")
@@ -10158,7 +10293,7 @@ def main(argv: list[str] | None = None) -> int:
                 raw = {}
             elif command == "merge-folder":
                 raw = {"from": args.from_folders, "to": args.to, "non_books_to_quarantine": args.non_books_to_quarantine}
-            elif command in ("strip-suffix", "windows-names"):
+            elif command in ("strip-suffix", "name-variants", "windows-names"):
                 raw = {"path": args.path}
             elif command == "purge-quarantine":
                 raw = {"reasons": args.reasons}
