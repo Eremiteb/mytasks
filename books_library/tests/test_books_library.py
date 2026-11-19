@@ -7,6 +7,7 @@ import fcntl
 import importlib
 import json
 import os
+import re
 import sqlite3
 import struct
 import subprocess
@@ -4306,3 +4307,144 @@ def test_convert_fb2_changed_file_is_retried(fb2_fail_cfg: dict[str, Any], monke
     assert stats["rejected-convert"] == 1
     assert "skipped-rejected" not in stats
     assert src.is_file()
+
+
+# ---- epub не хуже fb2: полнота, дополнение из fb2, сноски и ссылки ---------------------------------
+
+def fb2_with_notes() -> bytes:
+    """fb2 с серией, аннотацией, двумя главами с заголовками и телом сносок (name="notes")."""
+    text = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0" xmlns:l="http://www.w3.org/1999/xlink">'
+        "<description><title-info><genre>sf</genre>"
+        "<author><first-name>Иван</first-name><last-name>Иванов</last-name></author>"
+        "<book-title>Книга</book-title><annotation><p>Аннотация</p></annotation>"
+        '<lang>ru</lang><sequence name="Цикл" number="2"/>'
+        "</title-info></description>"
+        '<body><section><title><p>Глава 1</p></title><p>Текст <a l:href="#n1" type="note">[1]</a>.</p></section>'
+        "<section><title><p>Глава 2</p></title><p>Ещё текст.</p></section></body>"
+        '<body name="notes"><section id="n1"><title><p>1</p></title><p>Сноска.</p></section></body>'
+        "</FictionBook>"
+    )
+    return text.encode("utf-8")
+
+
+def make_note_epub(path: Path, chapter_body: str) -> None:
+    """Epub с одной главой OEBPS/ch1.xhtml (тело как есть), без оглавления и сносок."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    container = (
+        '<?xml version="1.0"?>'
+        '<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+        '<rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>'
+        "</container>"
+    )
+    opf = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<package xmlns="http://www.idpf.org/2007/opf" version="3.0">'
+        '<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">'
+        "<dc:title>Книга</dc:title><dc:creator>Иванов Иван</dc:creator><dc:language>ru</dc:language></metadata>"
+        '<manifest><item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/></manifest>'
+        '<spine><itemref idref="c1"/></spine></package>'
+    )
+    chapter = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">'
+        f"<body>{chapter_body}</body></html>"
+    )
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("mimetype", "application/epub+zip")
+        archive.writestr("META-INF/container.xml", container)
+        archive.writestr("OEBPS/content.opf", opf)
+        archive.writestr("OEBPS/ch1.xhtml", chapter)
+
+
+def test_book_completeness_fb2_reports_series_toc_and_notes(tmp_path: Path) -> None:
+    fb2 = tmp_path / "book.fb2"
+    fb2.write_bytes(fb2_with_notes())
+    result = bl.book_completeness(fb2)
+    assert result["series"] is True
+    assert result["annotation"] is True
+    assert result["toc"] is True
+    assert result["notes"] is True
+    assert result["cover"] is False
+    assert result["translator"] is False
+
+
+def test_enrich_epub_from_adds_missing_fields_and_keeps_title(tmp_path: Path) -> None:
+    epub = tmp_path / "book.epub"
+    make_text_epub(epub, "текст", converted=False)
+    added = bl.enrich_epub_from(epub, {"series": "Цикл", "series_no": 2, "annotation": "Аннотация"}, None)
+    assert added == ["series", "annotation"]
+    with zipfile.ZipFile(epub) as archive:
+        assert archive.namelist()[0] == "mimetype"
+        opf = archive.read("OEBPS/content.opf").decode("utf-8")
+    assert "<dc:title>Книга</dc:title>" in opf
+    assert '<meta name="calibre:series" content="Цикл"/>' in opf
+    assert "<dc:description>Аннотация</dc:description>" in opf
+    assert bl.enrich_epub_from(epub, {"series": "Другой", "annotation": "Иная"}, None) == []
+
+
+def test_dedup_rebuilds_epub_without_toc_from_fb2_chapters(authors_cfg: dict[str, Any]) -> None:
+    folder = Path(authors_cfg["books_dir"]) / "Иванов Иван Иванович"
+    words = [f"слово{i}" for i in range(300)]
+    first, second = " ".join(words[:150]), " ".join(words[150:])
+    make_text_epub(folder / "Тёмный лес.epub", f"Глава 1 {first} Глава 2 {second}", converted=False)
+    bodies = (
+        "<body>"
+        f"<section><title><p>Глава 1</p></title><p>{first}</p></section>"
+        f"<section><title><p>Глава 2</p></title><p>{second}</p></section>"
+        "</body>"
+    )
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "Тёмный лес.fb2").write_bytes(_fb2_doc(bodies))
+
+    bl.dedup(authors_cfg, out=lambda _line: None)
+
+    quarantine = Path(authors_cfg["quarantine_dir"])
+    assert bl.book_completeness(folder / "Тёмный лес.epub")["toc"] is True
+    assert not (folder / "Тёмный лес.fb2").exists()
+    assert (quarantine / "duplicate" / "Иванов Иван Иванович" / "Тёмный лес.fb2").is_file()
+    old = quarantine / "replaced" / "Иванов Иван Иванович" / "Тёмный лес.epub"
+    assert old.is_file()
+    assert bl.book_completeness(old)["toc"] is False
+
+
+def test_note_referenced_from_two_chapters_gets_own_aside_in_each(tmp_path: Path) -> None:
+    bodies = (
+        "<body>"
+        '<section><title><p>Глава 1</p></title><p>Текст <a l:href="#n1" type="note">[1]</a>.</p></section>'
+        '<section><title><p>Глава 2</p></title><p>Ещё <a l:href="#n1" type="note">[1]</a>.</p></section>'
+        "</body>"
+        '<body name="notes"><section id="n1"><title><p>1</p></title><p>Сноска.</p></section></body>'
+    )
+    epub = tmp_path / "notes.epub"
+    bl.fb2_to_epub3(_fb2_doc(bodies), epub)
+    files = read_epub(epub)
+    first = files["OEBPS/text/ch001.xhtml"].decode("utf-8")
+    second = files["OEBPS/text/ch002.xhtml"].decode("utf-8")
+    assert 'id="ref-n1"' in first and 'href="#n1"' in first
+    assert '<aside epub:type="footnote" role="doc-footnote" id="n1"' in first
+    assert 'href="#ref-n1"' in first
+    assert 'id="ref-n1-2"' in second and 'href="#n1-2"' in second
+    assert '<aside epub:type="footnote" role="doc-footnote" id="n1-2"' in second
+    assert 'href="#ref-n1-2"' in second
+    assert 'href="#n1"' not in second and 'id="n1"' not in second
+    # блок сносок — последний элемент тела главы, сноски в нём не скрыты
+    assert re.search(r'<section class="footnotes"[^>]*>.*</section></body>', second, re.S)
+    assert 'class="footnote"' in second
+    assert "display:none" not in second
+    assert "-cr-hint: footnote-inpage" in files["OEBPS/css/book.css"].decode("utf-8")
+
+
+def test_enrich_epub_adds_noteref_and_footnote_without_fb2(authors_cfg: dict[str, Any]) -> None:
+    folder = Path(authors_cfg["books_dir"]) / "Иванов Иван Иванович"
+    epub = folder / "Книга.epub"
+    make_note_epub(epub, '<p>Текст <a href="#n1">1</a>.</p><div id="n1" class="note">Сноска.</div>')
+
+    bl.enrich_epub(authors_cfg, out=lambda _line: None)
+
+    with zipfile.ZipFile(epub) as archive:
+        chapter = archive.read("OEBPS/ch1.xhtml").decode("utf-8")
+    assert 'epub:type="noteref" href="#n1"' in chapter
+    assert '<div epub:type="footnote" id="n1" class="note footnote"' in chapter
+    assert bl.book_completeness(epub)["links_ok"] is True

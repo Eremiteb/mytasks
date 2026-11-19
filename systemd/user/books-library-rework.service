@@ -1,5 +1,5 @@
 [Unit]
-Description=Библиотека книг: переделка библиотеки — ночная обработка и индексация /mnt/copy/Books (scan, fix-encoding, convert, unpack-collections, sort-underscore, merge-authors, author-variants, fix-misplaced, dedup, dedup-folders, strip-suffix, name-variants, windows-names, check-folders, scan)
+Description=Библиотека книг: переделка библиотеки — ночная обработка и индексация /mnt/copy/Books (scan, fix-encoding, convert, unpack-collections, sort-underscore, merge-authors, author-variants, fix-misplaced, dedup, dedup-folders, enrich-epub, strip-suffix, name-variants, windows-names, check-folders, scan)
 Documentation=file://@MYTASKS_DIR@/books_library/README.md
 # Одновременный запуск scan и кнопки «Пересканировать» исключён блокировкой движка (код 3 — не повторять).
 StartLimitIntervalSec=2h
@@ -21,6 +21,7 @@ ExecStart=-/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py 
 ExecStart=-/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py fix-misplaced
 ExecStart=-/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py dedup
 ExecStart=-/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py dedup-folders
+ExecStart=-/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py enrich-epub
 ExecStart=-/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py strip-suffix
 ExecStart=-/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py name-variants
 ExecStart=-/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py windows-names
@@ -35,7 +36,7 @@ MemoryMax=8G
 
 # Ограничения: файлы книг меняют только служебные режимы (fix-encoding, convert, unpack-collections, sort-underscore, merge-authors,
 # author-variants (склейка только по same_person: разные люди не склеиваются),
-# fix-misplaced, dedup, dedup-folders, strip-suffix, name-variants, windows-names); удаляемое и заменяемое уходит в карантин /mnt/copy/Books-removed, а не
+# fix-misplaced, dedup, dedup-folders, enrich-epub, strip-suffix, name-variants, windows-names); удаляемое и заменяемое уходит в карантин /mnt/copy/Books-removed, а не
 # удаляется; папки авторов склеиваются и переименовываются без карантина (журнал прогона — для отката). Запись — в каталог библиотеки (БД), логи,
 # каталог книг, карантин и кэш текста dedup (/var/cache/books_library, «-» — не ошибка, если каталога нет).
 NoNewPrivileges=yes

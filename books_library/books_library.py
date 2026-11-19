@@ -2883,6 +2883,154 @@ def opf_with_meta(opf: str, fields: dict[str, Any]) -> str:
     return opf[:match.start(3)] + new_inner + opf[match.end(3):]
 
 
+# ----------------------------------------------------------------------
+# Дописывание метаданных epub из fb2 (правило «epub не хуже fb2»)
+# ----------------------------------------------------------------------
+
+ENRICH_META_FIELDS = ("series", "series_no", "annotation", "genres", "translator", "publisher", "isbn", "year", "lang")
+
+
+def _kv_map(meta: Mapping[str, Any]) -> dict[str, str]:
+    """Первое непустое значение каждого ключа из kv разбора (пары ключ-значение)."""
+    found: dict[str, str] = {}
+    for key, value in meta.get("kv", []):
+        if value and key not in found:
+            found[key] = str(value)
+    return found
+
+
+def _int_or_none(value: Any) -> int | None:
+    text = "" if value is None else str(value).strip()
+    return int(text) if text.isdigit() else None
+
+
+def fb2_epub_fields(meta: Mapping[str, Any]) -> dict[str, Any]:
+    """Поля для enrich_epub_from из разбора fb2: read_book_meta или meta JSON варианта (book_variants)."""
+    kv = _kv_map(meta)
+    return {
+        "series": str(meta.get("series") or ""), "series_no": _int_or_none(meta.get("series_no")),
+        "annotation": str(meta.get("annotation") or ""), "genres": [str(g) for g in meta.get("genres") or []],
+        "translator": kv.get("translator", "").split("; ")[0], "publisher": kv.get("publisher", ""),
+        "isbn": kv.get("isbn", ""), "year": str(meta.get("year") or ""), "lang": str(meta.get("lang") or ""),
+    }
+
+
+def merge_enrich_fields(sources: list[dict[str, Any]]) -> dict[str, Any]:
+    """Первое непустое значение каждого поля по списку источников (порядок списка — приоритет)."""
+    merged: dict[str, Any] = {}
+    for fields in sources:
+        for key in ENRICH_META_FIELDS:
+            if fields.get(key) and not merged.get(key):
+                merged[key] = fields[key]
+    return merged
+
+
+def _zip_rewrite(path: Path, payloads: dict[str, bytes]) -> None:
+    """Пересборка zip во временный файл рядом: прежний порядок записей, mimetype первым и без сжатия. payloads заменяют
+    запись с тем же именем или добавляются в конец. Затем os.replace и права исходного файла; временный файл — всегда удаляется."""
+    pending = dict(payloads)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name[:80]}.", suffix=".enrich.tmp", dir=path.parent)
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        with zipfile.ZipFile(path) as source, zipfile.ZipFile(tmp, "w") as target:
+            for info in sorted(source.infolist(), key=lambda item: item.filename != "mimetype"):
+                if info.filename in pending:
+                    data = pending.pop(info.filename)
+                else:
+                    data = read_member(source, info, EDIT_MEMBER_MAX)
+                entry = zipfile.ZipInfo(info.filename, date_time=info.date_time)
+                entry.compress_type = zipfile.ZIP_STORED if info.filename == "mimetype" else info.compress_type
+                entry.external_attr = info.external_attr
+                target.writestr(entry, data)
+            for name, data in pending.items():
+                target.writestr(name, data, compress_type=zipfile.ZIP_DEFLATED)
+        os.chmod(tmp, path.stat().st_mode & 0o777)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def enrich_epub_from(epub_path: Path, meta: Mapping[str, Any], cover: bytes | None, dry_run: bool = False) -> list[str]:
+    """Дописывает в OPF epub поля meta (ENRICH_META_FIELDS) и обложку cover, которых в epub нет или они пусты.
+    Непустые поля epub не меняются; title и авторы не трогаются. Возвращает добавленные поля; dry_run — только список.
+    Без dc-префикса в OPF dc-поля не дописываются; префикс у metadata — ValueError (книга не меняется)."""
+    with zipfile.ZipFile(epub_path) as source:
+        epub = Epub(source)
+        opf, opf_path = epub.opf, epub.opf_path
+        match = OPF_METADATA_RE.search(opf)
+        if not match:
+            raise ValueError("в OPF нет блока metadata")
+        if match.group(2):
+            raise ValueError("у metadata в OPF префикс пространства имён: дописывание не выполняется")
+        current = epub.meta()
+    present = {key for key, value in current["kv"] if value}
+    dc = "xmlns:dc" in opf
+    lines: list[str] = []
+    manifest: list[str] = []
+    payloads: dict[str, bytes] = {}
+    added: list[str] = []
+    if meta.get("series") and not current.get("series"):
+        series, number = _xml_text(str(meta["series"])), _int_or_none(meta.get("series_no"))
+        lines += [f'<meta property="belongs-to-collection" id="enrich-series">{series}</meta>',
+                  '<meta refines="#enrich-series" property="collection-type">series</meta>',
+                  f'<meta name="calibre:series" content="{series}"/>']
+        if number is not None:
+            lines += [f'<meta refines="#enrich-series" property="group-position">{number}</meta>',
+                      f'<meta name="calibre:series_index" content="{number}"/>']
+        added.append("series")
+    if dc:
+        if meta.get("annotation") and not current.get("annotation"):
+            lines.append(f"<dc:description>{_xml_text(str(meta['annotation']))}</dc:description>")
+            added.append("annotation")
+        if meta.get("genres") and not current.get("genres"):
+            lines += [f"<dc:subject>{_xml_text(str(genre))}</dc:subject>" for genre in meta["genres"]]
+            added.append("genres")
+        if meta.get("year") and not current.get("year"):
+            lines.append(f"<dc:date>{_xml_text(str(meta['year']))}</dc:date>")
+            added.append("year")
+        if meta.get("lang") and not current.get("lang"):
+            lines.append(f"<dc:language>{_xml_text(str(meta['lang']))}</dc:language>")
+            added.append("lang")
+        if meta.get("translator") and "translator" not in present:
+            name = _xml_text(str(meta["translator"]))
+            lines += [f'<dc:contributor id="enrich-translator">{name}</dc:contributor>',
+                      '<meta refines="#enrich-translator" property="role" scheme="marc:relators">trl</meta>']
+            added.append("translator")
+        if meta.get("publisher") and "publisher" not in present:
+            lines.append(f"<dc:publisher>{_xml_text(str(meta['publisher']))}</dc:publisher>")
+            added.append("publisher")
+        if meta.get("isbn") and "isbn" not in present:
+            lines.append(f"<dc:identifier>urn:isbn:{_xml_text(str(meta['isbn']))}</dc:identifier>")
+            added.append("isbn")
+    ext = _image_ext(cover) if cover else None
+    if cover and ext and not current.get("cover"):
+        base = posixpath.dirname(opf_path)
+        href = f"img/enrich-cover.{ext}"
+        inside = posixpath.join(base, href) if base else href
+        if inside in epub.names:
+            raise ValueError("имя файла обложки занято в epub")
+        manifest.append(f'<item id="enrich-cover" href="{href}" media-type="{EPUB_IMAGE_TYPES[ext]}" '
+                        'properties="cover-image"/>')
+        if not re.search(r"<(?:[\w.-]+:)?meta\b[^>]*\bname\s*=\s*[\"']cover[\"']", opf):
+            lines.append('<meta name="cover" content="enrich-cover"/>')
+        payloads[inside] = cover
+        added.append("cover")
+    if not added:
+        return []
+    if dry_run:
+        return added
+    inner = match.group(3).rstrip() + "".join(f"\n    {line}" for line in lines) + "\n  " if lines else match.group(3)
+    new_opf = opf[:match.start(3)] + inner + opf[match.end(3):]
+    if manifest:
+        if new_opf.count("</manifest>") != 1:
+            raise ValueError("в OPF нет единственного блока manifest")
+        new_opf = new_opf.replace("</manifest>", "".join(manifest) + "</manifest>")
+    payloads[opf_path] = new_opf.encode("utf-8")
+    _zip_rewrite(epub_path, payloads)
+    return added
+
+
 def epub_with_meta(data: bytes, fields: dict[str, Any]) -> bytes:
     """EPUB с обновлённым OPF: mimetype первым без сжатия, остальные записи переносятся как были."""
     with zipfile.ZipFile(io.BytesIO(data)) as source:
@@ -3517,6 +3665,7 @@ EPUB_CONTAINER = ('<?xml version="1.0" encoding="utf-8"?>\n'
                   "</rootfiles></container>\n")
 # Сдержанный стиль: размеры и шрифты задаёт читалка (только em и проценты), хрупкого позиционирования нет.
 EPUB_CSS = """@charset "UTF-8";
+@namespace epub "http://www.idpf.org/2007/ops";
 p{margin:0;text-indent:1.5em;text-align:justify;hyphens:auto;-epub-hyphens:auto;-webkit-hyphens:auto}
 h1,h2,h3,h4,h5,h6{text-align:center;text-indent:0;hyphens:none;-epub-hyphens:none;-webkit-hyphens:none;
 margin:1.2em 0 .6em;font-weight:bold;page-break-after:avoid;break-after:avoid}
@@ -3533,6 +3682,10 @@ p.v{text-indent:0;margin:0}
 div.annotation{font-size:.95em;margin:1em 0}
 div.annotation p{text-indent:0}
 aside.footnote{font-size:.9em;margin:.6em 0}
+a[epub|type~="noteref"], a.noteref { -cr-hint: noteref; }
+aside[epub|type~="footnote"], aside.footnote { -cr-hint: footnote-inpage; }
+.footnotes{font-size:.85em;margin-top:1.5em}
+.footnotes hr{width:30%;margin:0 0 .6em 0;text-align:left}
 aside.footnote p{text-indent:0}
 p.footnote-title{font-weight:bold;text-indent:0}
 p.backlink{text-indent:0;text-align:right}
@@ -3661,7 +3814,7 @@ class _Pass:
     def __init__(self) -> None:
         self.refs: list[str] = []
         self.anchors: dict[str, str] = {}
-        self.counts: dict[str, int] = {}
+        self.counts: dict[Any, int] = {}
         self.labels: dict[str, str] = {}
 
 
@@ -3797,33 +3950,35 @@ class _Renderer:
         return self.inline(node)
 
     def noteref(self, node: ET.Element, note: str) -> str:
-        """Ссылка на сноску; первая ссылка на сноску получает id ref-<id>, повторные — ref-<id>-<номер>."""
+        """Ссылка на сноску: ведёт на копию сноски в этом же файле (note_copies); первая ссылка в файле получает id
+        ref-<копия>, повторные — ref-<копия>-<номер>."""
         state = self.state
+        key = (self.file, note)
         state.refs.append(note)
-        count = state.counts.get(note, 0) + 1
-        state.counts[note] = count
+        count = state.counts.get(key, 0) + 1
+        state.counts[key] = count
         state.labels.setdefault(note, _text(node))
-        ref_id = f"ref-{note}" if count == 1 else f"ref-{note}-{count}"
-        home = self.book.homes.get(note, self.file)
-        prefix = "" if home == self.file else home
+        copy = self.book.note_copies.get(key, note)
+        ref_id = f"ref-{copy}" if count == 1 else f"ref-{copy}-{count}"
         text = self.inline(node) or "*"
-        return (f'<a epub:type="noteref" role="doc-noteref" class="noteref" href="{_esc(prefix + "#" + note)}" '
+        return (f'<a epub:type="noteref" role="doc-noteref" class="noteref" href="#{_esc(copy)}" '
                 f'id="{_esc(ref_id)}"><sup>{text}</sup></a>')
 
     def aside(self, note: str, out: list[str]) -> None:
-        """Сноска целиком: <aside epub:type="footnote"> с текстом и обратной ссылкой; заголовок, совпадающий со ссылкой, опускается."""
+        """Сноска в этом файле: <aside epub:type="footnote"> с текстом и обратной ссылкой на первую ссылку в файле;
+        заголовок, совпадающий со ссылкой, опускается."""
         section = self.book.notes[note]
-        self.state.anchors[note] = self.file
-        out.append(f'<aside epub:type="footnote" role="doc-footnote" id="{_esc(note)}" class="footnote">')
+        key = (self.file, note)
+        copy = self.book.note_copies.get(key, note)
+        self.state.anchors.setdefault(note, self.file)
+        out.append(f'<aside epub:type="footnote" role="doc-footnote" id="{_esc(copy)}" class="footnote">')
         label = self.state.labels.get(note)
         for child in _kids(section, "title"):
             if label is None or _text(child) != label:
                 out.append(f'<p class="footnote-title">{self.lines(child)}</p>')
         self.blocks(section, 2, out, skip_title=True)
-        if note in self.book.referenced:
-            home = self.book.homes.get(note, self.file)
-            prefix = "" if home == self.file else home
-            out.append(f'<p class="backlink"><a href="{_esc(prefix + "#ref-" + note)}" role="doc-backlink">↩</a></p>')
+        if key in self.book.note_copies:
+            out.append(f'<p class="backlink"><a href="#ref-{_esc(copy)}" role="doc-backlink">↩</a></p>')
         out.append("</aside>")
 
     def table(self, node: ET.Element, out: list[str]) -> None:
@@ -3917,7 +4072,7 @@ class _Fb2Book:
                     self.notes[anchor] = child
                     note_nodes.add(child)
         self.rest = [child for body in bodies if body not in self.main for child in body if child not in note_nodes]
-        self.referenced: set[str] = set()
+        self.note_copies: dict[tuple[str, str], str] = {}  # (файл, сноска) -> id её копии в этом файле
         self.homes: dict[str, str] = {}
         self.locs: dict[str, str] = {}
 
@@ -3995,29 +4150,45 @@ class _Fb2Book:
             return _text(_first(first, "title")) or "Раздел"
         return _text(_first(first, "title")) or self.title
 
-    def _home(self, file_refs: list[tuple[str, list[str]]],
-              note_refs: dict[str, list[str]]) -> tuple[dict[str, str], dict[str, list[str]]]:
-        """Файл, где выводится каждая сноска: первая ссылка в порядке документа (тело, затем сноски на этом месте).
-
-        Сноски, на которые нет ссылок, и разделы служебных тел — в notes.xhtml (он последний).
-        """
-        homes: dict[str, str] = {}
-        placed: dict[str, list[str]] = {}
-        for name, refs in file_refs:
-            placed[name] = []
-            queue = deque(refs)
+    def _placement(self, file_refs: list[tuple[str, list[str]]], note_refs: dict[str, list[str]]
+                   ) -> tuple[dict[str, str], dict[str, list[str]], list[str]]:
+        """Размещение сносок. Каждый файл, где есть ссылка, получает копию сноски (aside) в конце себя вместе с теми
+        сносками, на которые ссылаются сами сноски. Копии: первая — id сноски, далее nX-2, nX-3… Сноски, на которые нет
+        ни одной ссылки из глав и служебных разделов, — блоками в notes.xhtml; их ссылки ведут внутрь notes.xhtml.
+        Заполняет note_copies. Возвращает (первый файл сноски, сноски файлов, блоки notes.xhtml)."""
+        def closure(roots: list[str]) -> list[str]:
+            order: list[str] = []
+            queue = deque(roots)
             while queue:
                 note = queue.popleft()
-                if note in self.notes and note not in homes:
-                    homes[note] = name
-                    placed[name].append(note)
+                if note in self.notes and note not in order:
+                    order.append(note)
                     queue.extend(note_refs.get(note, []))
-        placed.setdefault(EPUB_NOTES_FILE, [])
-        for note in self.notes:
-            if note not in homes:
-                homes[note] = EPUB_NOTES_FILE
-                placed[EPUB_NOTES_FILE].append(note)
-        return homes, placed
+            return order
+
+        refs_by_file = dict(file_refs)
+        chapters = [name for name, _refs in file_refs if name != EPUB_NOTES_FILE]
+        placed: dict[str, list[str]] = {name: closure(refs_by_file[name]) for name in chapters}
+        rest_roots = refs_by_file.get(EPUB_NOTES_FILE, [])
+        used = {note for name in chapters for note in placed[name]} | set(closure(rest_roots))
+        blocks = [note for note in self.notes if note not in used]
+        block_roots = [ref for note in blocks for ref in note_refs.get(note, [])]
+        placed[EPUB_NOTES_FILE] = [note for note in closure(rest_roots + block_roots) if note not in blocks]
+        self.note_copies = {}
+        seq: dict[str, int] = {}
+        for name in [*chapters, EPUB_NOTES_FILE]:
+            for note in placed[name]:
+                seq[note] = seq.get(note, 0) + 1
+                self.note_copies[(name, note)] = note if seq[note] == 1 else f"{note}-{seq[note]}"
+        for note in blocks:
+            self.note_copies[(EPUB_NOTES_FILE, note)] = note
+        homes: dict[str, str] = {}
+        for name in [*chapters, EPUB_NOTES_FILE]:
+            for note in placed[name]:
+                homes.setdefault(note, name)
+        for note in blocks:
+            homes.setdefault(note, EPUB_NOTES_FILE)
+        return homes, placed, blocks
 
     def build(self) -> tuple[list[tuple[str, str, str]], dict[str, list[str]]]:
         """Тексты файлов: [(имя, заголовок, XHTML)] в порядке spine без обложки и страницы книги."""
@@ -4044,9 +4215,7 @@ class _Fb2Book:
             _Renderer(self, state, "").aside(note, [])
             note_refs[note] = state.refs
             note_anchors[note] = state.anchors
-        self.homes, placed = self._home(file_refs, note_refs)
-        self.referenced = {note for _name, refs in file_refs for note in refs}
-        self.referenced.update(note for refs in note_refs.values() for note in refs)
+        self.homes, placed, blocks = self._placement(file_refs, note_refs)
         self.locs = anchors
         for note, found in note_anchors.items():
             for anchor in found:
@@ -4059,15 +4228,15 @@ class _Fb2Book:
             out: list[str] = []
             for node in unit.nodes:
                 renderer.block(node, unit.depth, out)
-            for note in placed.get(unit.name, []):
-                renderer.aside(note, out)
+            _footnote_section(renderer, placed.get(unit.name, []), out)
             texts.append((unit.name, self._unit_title(unit), "".join(out)))
         renderer = _Renderer(self, final, EPUB_NOTES_FILE)
         out = []
         for node in self.rest:
             renderer.block(node, 1, out)
-        for note in placed.get(EPUB_NOTES_FILE, []):
+        for note in blocks:
             renderer.block(self.notes[note], 1, out)
+        _footnote_section(renderer, placed.get(EPUB_NOTES_FILE, []), out)
         if out:
             texts.append((EPUB_NOTES_FILE, "Примечания", "".join(out)))
         return texts, placed
@@ -4094,6 +4263,19 @@ class _Fb2Book:
         if self.annotation:
             parts.append('<div class="annotation">' + "".join(f"<p>{_esc(p)}</p>" for p in self.annotation) + "</div>")
         return "".join(parts)
+
+
+FOOTNOTES_OPEN = '<section class="footnotes" epub:type="footnotes"><hr/>'
+
+
+def _footnote_section(renderer: _Renderer, notes: list[str], out: list[str]) -> None:
+    """Все сноски файла одним блоком в самом конце: section.footnotes, порядок — по первой ссылке. Не скрываются."""
+    if not notes:
+        return
+    asides: list[str] = []
+    for note in notes:
+        renderer.aside(note, asides)
+    out.append(FOOTNOTES_OPEN + "".join(asides) + "</section>")
 
 
 def _page(title: str, lang: str, body: str, css: str = "../css/book.css", body_class: str = "") -> str:
@@ -4131,8 +4313,8 @@ def _nav_depth(items: list[tuple[str, str, list[Any]]]) -> int:
 def fb2_to_epub3(data: bytes, out: Path) -> None:
     """Пишет EPUB 3 из fb2 (данные уже прошли ensure_fb2_namespace). Неразборчивый fb2 — ValueError: откат на Calibre.
 
-    Главы — файлы text/chNNN.xhtml; сноски — всплывающие <aside epub:type="footnote"> в файле первой ссылки и
-    обычный текст в notes.xhtml; NCX для читалок EPUB 2. Текст не меняется, только экранируется.
+    Главы — файлы text/chNNN.xhtml; сноски — всплывающие <aside epub:type="footnote"> в каждом файле, где на них ссылаются (копии с id nX, nX-2…),
+    несвязанные — блоками в notes.xhtml; NCX для читалок EPUB 2. Текст не меняется, только экранируется.
     """
     book = _Fb2Book(_parse_fb2(data))
     texts, _placed = book.build()
@@ -4244,6 +4426,356 @@ def fb2_to_epub3(data: bytes, out: Path) -> None:
         archive.writestr("mimetype", b"application/epub+zip", compress_type=zipfile.ZIP_STORED)
         for name, payload in files:
             archive.writestr(name, payload)
+
+
+# ----------------------------------------------------------------------
+# Полнота книги и пересборка epub из fb2: оглавление и сноски
+# ----------------------------------------------------------------------
+
+EPUB_NOTE_RE = re.compile(r"\btype\s*=\s*[\"'][^\"']*\b(?:footnote|endnote|noteref)\b|<(?:\w+:)?aside\b")
+
+
+def epub_has_toc(epub: Epub) -> bool:
+    """Оглавление epub: nav-документ с epub:type="toc" или ncx, в каждом не меньше двух пунктов."""
+    for item in epub.items.values():
+        if "nav" in item.get("properties", "").split() and item["path"] in epub.names:
+            text = decode_xml(zip_read(epub.zip, item["path"]))
+            block = re.search(r"<(?:\w+:)?nav\b[^>]*\btype\s*=\s*[\"']toc[\"'][^>]*>(.*?)</(?:\w+:)?nav\s*>", text, re.S)
+            if block and len(re.findall(r"<(?:\w+:)?a\b", block.group(1))) >= 2:
+                return True
+    for item in epub.items.values():
+        if item.get("media-type") == "application/x-dtbncx+xml" and item["path"] in epub.names:
+            if len(re.findall(r"<(?:\w+:)?navPoint\b", decode_xml(zip_read(epub.zip, item["path"])))) >= 2:
+                return True
+    return False
+
+
+def epub_has_notes(epub: Epub) -> bool:
+    """Сноски epub: epub:type footnote/endnote/noteref или aside в главах (spine); каждая глава — в пределах ZIP_MEMBER_MAX."""
+    return any(EPUB_NOTE_RE.search(decode_xml(zip_read(epub.zip, path))) for path in epub.spine())
+
+
+def fb2_structure(text: str) -> tuple[bool, bool]:
+    """Оглавление fb2 (не меньше двух section с title вне тел сносок) и наличие тела сносок (FB2_NOTE_BODIES)."""
+    notes, sections = False, 0
+    for body in re.findall(r"<(?:\w+:)?body\b[^>]*>.*?</(?:\w+:)?body\s*>", text, re.S):
+        name = parse_attrs(re.match(r"<[^>]*>", body).group(0)).get("name", "").strip().lower()
+        if name in FB2_NOTE_BODIES:
+            notes = True
+            continue
+        sections += len(re.findall(r"<(?:\w+:)?section\b[^>]*>\s*<(?:\w+:)?title\b", body))
+    return sections >= 2, notes
+
+
+NOTE_ID_RE = re.compile(r"^(?:note|footnote|n\d+)", re.I)
+EXTERNAL_HREF = ("http:", "https:", "mailto:", "tel:")
+
+
+def _completeness(meta: Mapping[str, Any], toc: bool, notes: bool, links_ok: bool | None = None) -> dict[str, bool]:
+    kv = _kv_map(meta)
+    result = {
+        "title": bool(meta.get("title")), "authors": bool(meta.get("authors")), "series": bool(meta.get("series")),
+        "annotation": bool(meta.get("annotation")), "cover": bool(meta.get("cover")), "genres": bool(meta.get("genres")),
+        "lang": bool(meta.get("lang")), "year": bool(meta.get("year")), "translator": "translator" in kv,
+        "publisher": "publisher" in kv, "isbn": "isbn" in kv, "toc": toc, "notes": notes,
+    }
+    if links_ok is not None:
+        result["links_ok"] = links_ok
+    return result
+
+
+def _targets(text: str) -> dict[str, tuple[str, dict[str, str]]]:
+    """Элементы файла с id: id → (локальное имя тега, атрибуты)."""
+    found: dict[str, tuple[str, dict[str, str]]] = {}
+    for tag, attrs_text in re.findall(r"<([\w:.-]+)\b([^>]*)>", text):
+        attrs = parse_attrs(attrs_text)
+        if "id" in attrs:
+            found.setdefault(attrs["id"], (tag.rpartition(":")[2].lower(), attrs))
+    return found
+
+
+def _is_note_target(tag: str, attrs: Mapping[str, str]) -> bool:
+    """Сноска: aside, epub:type footnote, класс note/footnote или id вида note…, footnote…, n<цифры>."""
+    return (tag == "aside" or "footnote" in attrs.get("epub:type", "")
+            or re.search(r"\b(?:note|footnote)\b", attrs.get("class", "")) is not None
+            or NOTE_ID_RE.match(attrs.get("id", "")) is not None)
+
+
+def _link_files(epub: Epub) -> list[str]:
+    """Файлы с внутренними ссылками книги: главы (spine) и оглавление nav."""
+    nav = [item["path"] for item in epub.items.values()
+           if "nav" in item.get("properties", "").split() and item["path"] in epub.names]
+    return list(dict.fromkeys([*epub.spine(), *nav]))
+
+
+def _local_link(path: str, href: str) -> tuple[str, str] | None:
+    """Внутренняя ссылка из файла path: (файл назначения в zip, id после «#») или None для внешней."""
+    if not href or href.lower().startswith(EXTERNAL_HREF):
+        return None
+    name, _, frag = href.partition("#")
+    return (Epub.resolve(posixpath.dirname(path), name) if name else path), frag
+
+
+def epub_link_problems(epub: Epub) -> tuple[list[str], list[str]]:
+    """Внутренние ссылки epub: (битые — нет файла или элемента с #id; сноски — ссылка на сноску без epub:type="noteref"
+    или ведущая в другой файл). Внешние ссылки не проверяются. Только чтение."""
+    cache: dict[str, dict[str, tuple[str, dict[str, str]]]] = {}
+    broken: list[str] = []
+    notes_bad: list[str] = []
+    for path in _link_files(epub):
+        text = decode_xml(zip_read(epub.zip, path))
+        for attrs_text in re.findall(r"<a\b([^>]*)>", text):
+            attrs = parse_attrs(attrs_text)
+            href = attrs.get("href", "").strip()
+            local = _local_link(path, href)
+            if local is None:
+                continue
+            target, frag = local
+            if target not in epub.names:
+                broken.append(f"{path}: {href}")
+                continue
+            if not frag:
+                continue
+            if target not in cache:
+                cache[target] = _targets(decode_xml(zip_read(epub.zip, target)))
+            hit = cache[target].get(frag)
+            if hit is None:
+                broken.append(f"{path}: {href}")
+            elif _is_note_target(*hit) and (target != path or "noteref" not in attrs.get("epub:type", "").split()):
+                notes_bad.append(f"{path}: {href}")
+    return broken, notes_bad
+
+
+def _element_inner(text: str, frag: str) -> str | None:
+    """Содержимое элемента с id frag; None, если элемента нет или он вложен в элемент того же тега."""
+    match = re.search(r"<([\w:.-]+)\b[^>]*\bid\s*=\s*[\"']" + re.escape(frag) + r"[\"'][^>]*>(.*?)</\1\s*>", text, re.S)
+    if match is None or re.search(rf"<{re.escape(match.group(1))}\b", match.group(2)):
+        return None
+    return match.group(2)
+
+
+NOTES_CSS = ("\na.noteref { -cr-hint: noteref; }\n"
+             "aside.footnote, div.footnote, p.footnote { -cr-hint: footnote-inpage; }\n")
+
+
+def _with_class(attrs_text: str, token: str) -> str:
+    """Атрибуты тега с классом token: дописывается к class, если атрибут уже есть."""
+    found = re.search(r'\sclass\s*=\s*"([^"]*)"', attrs_text)
+    if found is None:
+        return f'{attrs_text} class="{token}"'
+    if token in found.group(1).split():
+        return attrs_text
+    return f'{attrs_text[:found.start()]} class="{found.group(1)} {token}"{attrs_text[found.end():]}'
+
+
+def _with_style(attrs_text: str, declaration: str) -> str:
+    """Атрибуты тега с объявлением style — для читалок, которым нужна подсказка без CSS книги."""
+    found = re.search(r'\sstyle\s*=\s*"([^"]*)"', attrs_text)
+    if found is None:
+        return f'{attrs_text} style="{declaration}"'
+    if declaration in found.group(1):
+        return attrs_text
+    return f'{attrs_text[:found.start()]} style="{found.group(1)}; {declaration}"{attrs_text[found.end():]}'
+
+
+def _style_attr(style: str) -> str:
+    return f' style="{style}"' if style else ""
+
+
+def _retag_a(attrs_text: str, href: str, types: list[str], style: str) -> str:
+    """Открывающий тег <a> ссылки на сноску: href, epub:type с noteref, class noteref; прочие атрибуты сохраняются."""
+    rest = re.sub(r"\s(?:href|epub:type)\s*=\s*(?:\"[^\"]*\"|'[^']*')", "", attrs_text)
+    rest = _with_class(rest, "noteref")
+    if style:
+        rest = _with_style(rest, style)
+    return f'<a epub:type="{" ".join(dict.fromkeys([*types, "noteref"]))}" href="{_esc(href)}"{rest}>'
+
+
+def _mark_footnote(match: re.Match[str], style: str) -> str:
+    """Открывающий тег сноски: epub:type="footnote" (если его нет), класс footnote, при нужде — style."""
+    tag, attrs = match.group(1), match.group(2)
+    if "epub:type" not in attrs:
+        attrs = f' epub:type="footnote"{attrs}'
+    attrs = _with_class(attrs, "footnote")
+    if style:
+        attrs = _with_style(attrs, style)
+    return f"<{tag}{attrs}>"
+
+
+def _add_footnotes(text: str, asides: list[str]) -> str | None:
+    """Добавляет сноски в блок section.footnotes в конце файла (создаёт блок, если его нет); None — нет </body>."""
+    if "</body>" not in text:
+        return None
+    block = re.search(r'<section class="footnotes"[^>]*>.*?</section>\s*(?=</body>)', text, re.S)
+    if block is None:
+        return text.replace("</body>", FOOTNOTES_OPEN + "".join(asides) + "</section></body>", 1)
+    whole = block.group(0)
+    close = whole.rindex("</section>")
+    return text[:block.start()] + whole[:close] + "".join(asides) + whole[close:] + text[block.end():]
+
+
+def fix_note_links(epub: Epub) -> tuple[dict[str, bytes], int]:
+    """Точечная правка сносок без fb2. Ссылка на сноску в том же файле получает epub:type="noteref" и class noteref,
+    целевой элемент — epub:type="footnote" и class footnote. Ссылка в другой файл заменяется на копию сноски (aside с
+    новым id) в файле ссылки; исходный файл сносок не меняется. Подсказки читалкам (-cr-hint) дописываются в первую
+    таблицу стилей книги, а без неё — в атрибут style. Битые href не трогаются.
+    Возвращает изменённые файлы (путь → байты) и число правок."""
+    css_paths = [item["path"] for item in epub.items.values()
+                 if item.get("media-type") == "text/css" and item["path"] in epub.names]
+    link_style = "" if css_paths else "-cr-hint: noteref"
+    note_style = "" if css_paths else "-cr-hint: footnote-inpage"
+    cache: dict[str, dict[str, tuple[str, dict[str, str]]]] = {}
+    texts: dict[str, str] = {}
+
+    def text_of(path: str) -> str:
+        if path not in texts:
+            texts[path] = decode_xml(zip_read(epub.zip, path))
+        return texts[path]
+
+    def targets_of(path: str) -> dict[str, tuple[str, dict[str, str]]]:
+        if path not in cache:
+            cache[path] = _targets(text_of(path))
+        return cache[path]
+
+    changed: dict[str, bytes] = {}
+    fixed = 0
+    for path in _link_files(epub):
+        used = set(targets_of(path))
+        same_file: set[str] = set()
+        copies: list[str] = []
+        copied: dict[tuple[str, str], str] = {}
+        count = [0]
+
+        def relink(match: re.Match[str], path: str = path, used: set[str] = used) -> str:
+            attrs_text = match.group(1)
+            attrs = parse_attrs(attrs_text)
+            local = _local_link(path, attrs.get("href", "").strip())
+            if local is None or not local[1] or local[0] not in epub.names:
+                return match.group(0)
+            target, frag = local
+            hit = targets_of(target).get(frag)
+            if hit is None or not _is_note_target(*hit):
+                return match.group(0)
+            types = attrs.get("epub:type", "").split()
+            if target == path:
+                if "noteref" in types:
+                    return match.group(0)
+                same_file.add(frag)
+                count[0] += 1
+                return _retag_a(attrs_text, f"#{frag}", types, link_style)
+            if (target, frag) not in copied:
+                inner = _element_inner(text_of(target), frag)
+                if inner is None:
+                    return match.group(0)
+                copy_id, number = frag, 2
+                while copy_id in used:
+                    copy_id, number = f"{frag}-{number}", number + 1
+                used.add(copy_id)
+                copied[(target, frag)] = copy_id
+                copies.append(f'<aside epub:type="footnote" role="doc-footnote" id="{copy_id}" class="footnote"'
+                              f'{_style_attr(note_style)}>{inner}</aside>')
+            count[0] += 1
+            return _retag_a(attrs_text, f"#{copied[(target, frag)]}", types, link_style)
+
+        new_text = re.sub(r"<a\b([^>]*)>", relink, text_of(path))
+        for frag in same_file:
+            new_text = re.sub(r"<([\w:.-]+)\b([^>]*\bid\s*=\s*[\"']" + re.escape(frag) + r"[\"'][^>]*)>",
+                              lambda m: _mark_footnote(m, note_style), new_text, count=1)
+        if copies:
+            placed_text = _add_footnotes(new_text, copies)
+            if placed_text is None:
+                continue
+            new_text = placed_text
+        if new_text != text_of(path):
+            changed[path] = new_text.encode("utf-8")
+            fixed += count[0]
+    if fixed and css_paths and "-cr-hint: noteref" not in text_of(css_paths[0]):
+        changed[css_paths[0]] = (text_of(css_paths[0]) + NOTES_CSS).encode("utf-8")
+    return changed, fixed
+
+
+def book_completeness(path: Path) -> dict[str, bool]:
+    """Полнота описания и структуры книги epub или fb2 (True — есть): title, authors, series, annotation, cover, genres,
+    lang, year, translator, publisher, isbn, toc, notes; у epub ещё links_ok (внутренние ссылки разрешаются, ссылки на
+    сноски — epub:type="noteref" и в том же файле). Только чтение: epub — OPF и главы в пределах ZIP_MEMBER_MAX, fb2 —
+    файл целиком до SOURCE_LIMIT. Ошибки чтения — исключения вызывающего."""
+    if path.name.lower().endswith(".zip"):
+        raise ValueError(f"{path.name}: zip-обёртка не разбирается")
+    fmt = split_name(path.name)[1]
+    if fmt == "epub":
+        with zipfile.ZipFile(path) as archive:
+            epub = Epub(archive)
+            broken, notes_bad = epub_link_problems(epub)
+            return _completeness(epub.meta(), epub_has_toc(epub), epub_has_notes(epub), not broken and not notes_bad)
+    if fmt == "fb2":
+        data = source_bytes(path)
+        return _completeness(fb2_meta(data), *fb2_structure(decode_xml(data)))
+    raise ValueError(f"{path.name}: полнота считается для epub и fb2")
+
+
+def fb2_cover(data: bytes) -> bytes | None:
+    """Байты обложки fb2 (картинка из coverpage) или None."""
+    book = _Fb2Book(_parse_fb2(data))
+    return dict(book.image_data).get(book.cover_name) if book.cover_name else None
+
+
+def rebuild_epub_from_fb2(run: NightRun, epub_full: Path, fb2_data: bytes, reason: str) -> str | None:
+    """Новый epub из fb2 на месте epub_full: сборка fb2_own_epub во временный файл рядом, старый epub — в карантин replaced.
+    None — заменено; иначе причина отказа, файлы не тронуты. В dry-run — только проверка сборки во временном каталоге."""
+    if run.dry_run:
+        with tempfile.TemporaryDirectory(prefix="books_library-rebuild-") as tmp_name:
+            return fb2_own_epub(fb2_data, Path(tmp_name) / "check.epub")
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{epub_full.name[:80]}.", suffix=".rebuild.tmp", dir=epub_full.parent)
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        problem = fb2_own_epub(fb2_data, tmp)
+        if problem:
+            return problem
+        os.chmod(tmp, epub_full.stat().st_mode & 0o777)
+        old = run.quarantine(epub_full, "replaced", reason=reason)
+        try:
+            os.replace(tmp, epub_full)
+        except OSError:
+            shutil.move(old, epub_full)  # прежний epub возвращается на место
+            raise
+        return None
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def upgrade_epub_keeper(run: NightRun, keeper_rel: str, dup_rel: str) -> bool:
+    """Перед уходом fb2-дубля в карантин оставленный epub не должен быть беднее fb2. Нет оглавления или сносок у epub,
+    которые есть у fb2, — новый epub из fb2 (старый — в replaced). Иначе недостающие метаданные дописываются из fb2
+    (старый — копия в edited). True — дубль можно уносить; False — ошибка, fb2 остаётся на месте для решения человека."""
+    keeper_full, dup_full = run.root / keeper_rel, run.root / dup_rel
+    try:
+        data = source_bytes(dup_full)
+        meta = read_book_meta(run.root, dup_rel)
+        toc_fb, notes_fb = fb2_structure(decode_xml(data))
+        with zipfile.ZipFile(keeper_full) as archive:
+            epub = Epub(archive)
+            toc_ep, notes_ep = epub_has_toc(epub), epub_has_notes(epub)
+            broken, notes_bad = epub_link_problems(epub)
+        gaps = [name for name, need, have in (("оглавление", toc_fb, toc_ep), ("сноски", notes_fb, notes_ep),
+                                              ("ссылки", True, not broken and not notes_bad)) if need and not have]
+        if gaps:
+            problem = rebuild_epub_from_fb2(run, keeper_full, data, reason=f"rebuilt-from-fb2: {dup_rel}")
+            if problem is None:
+                run.record("rebuilt", keeper_rel, source=dup_rel, gaps=gaps)
+                return True
+            run.record("skip", keeper_rel, reason=f"пересборка из fb2 не удалась: {problem}")
+        fields, cover = fb2_epub_fields(meta), fb2_cover(data)
+        added = enrich_epub_from(keeper_full, fields, cover, dry_run=True)
+        if added:
+            if not run.dry_run:
+                run.backup(keeper_full, "edited")
+                enrich_epub_from(keeper_full, fields, cover)
+            run.record("enriched", keeper_rel, fields=added, source=dup_rel)
+        return True
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile, EOFError) as error:
+        run.record("skip", keeper_rel, reason=f"{type(error).__name__}: {error}")
+        return False
 
 
 def fb2_own_epub(data: bytes, produced: Path) -> str | None:
@@ -5021,7 +5553,10 @@ def dedup(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None, w
                     if coverage > best:
                         best, keeper = coverage, other
             member["coverage"] = round(best, 4) if kept else None
-            if keeper is not None and member["words"] >= DEDUP_MIN_WORDS and best >= DEDUP_COVERAGE:
+            duplicate = keeper is not None and member["words"] >= DEDUP_MIN_WORDS and best >= DEDUP_COVERAGE
+            if duplicate and keeper["fmt"] == "epub" and member["fmt"] == "fb2":
+                duplicate = upgrade_epub_keeper(run, keeper["path"], member["path"])  # False — fb2 остаётся
+            if duplicate:
                 member.update(role="duplicate", keeper=keeper["path"])
                 dest = run.quarantine(root / member["path"], "duplicate", keeper=keeper["path"], coverage=member["coverage"])
                 member["quarantine"] = str(dest)
@@ -5262,8 +5797,14 @@ def dedup_folder(run: NightRun, folder_rel: str, texts: list[dict[str, Any]]) ->
             run.record("no-text", item["path"], reason=item["reason"] or "текста нет")
         elif item["role"] == "similar":
             run.record("similar", item["path"], keeper=item["keeper"], coverage=item["coverage"])
+    by_rel = {t["path"]: t for t in texts}
     for item in texts:
         if item["role"] != "duplicate":
+            continue
+        keeper_item = by_rel.get(item["keeper"])
+        if keeper_item is not None and keeper_item["fmt"] == "epub" and item["fmt"] == "fb2" \
+                and not upgrade_epub_keeper(run, item["keeper"], item["path"]):
+            item["role"] = "kept"  # fb2 остаётся на месте
             continue
         extra = {"reason": "same-name"} if item.get("same_name") else {}
         try:
@@ -5314,6 +5855,121 @@ def dedup_folder(run: NightRun, folder_rel: str, texts: list[dict[str, Any]]) ->
                            "members": [group_member(t, "kept", coverage=t["coverage"]),
                                        group_member(by_path[t["keeper"]], "kept")]})
     return groups, pairs
+
+
+# ----------------------------------------------------------------------
+# enrich-epub: дополнение уже сделанной библиотеки метаданными и структурой fb2
+# ----------------------------------------------------------------------
+
+def variant_fb2_meta(row: sqlite3.Row) -> dict[str, Any]:
+    """Метаданные fb2-варианта: meta JSON book_variants, дополненный колонками (series, series_no, lang, year, authors)."""
+    try:
+        loaded = json.loads(row["meta"] or "{}")
+    except ValueError:
+        loaded = {}
+    meta: dict[str, Any] = loaded if isinstance(loaded, dict) else {}
+    for column in ("series", "series_no", "lang", "year"):
+        if not meta.get(column) and row[column] not in (None, ""):
+            meta[column] = row[column]
+    if not meta.get("authors") and row["authors"]:
+        meta["authors"] = [name for name in row["authors"].split("; ") if name]
+    return meta
+
+
+def fb2_sources(conn: sqlite3.Connection | None, rel: str, qroot: Path,
+                by_keeper: dict[str, list[str]]) -> list[tuple[dict[str, Any], Path | None]]:
+    """fb2-дубли epub: строки book_variants (meta JSON и колонки) и дубли из dup_members, которых там ещё нет.
+    Второй элемент — файл в карантине, если он ещё есть (тогда доступны обложка и пересборка), иначе None."""
+    if conn is None:
+        return []
+    sources: list[tuple[dict[str, Any], Path | None]] = []
+    seen: set[str] = set()
+    for row in book_variants(conn, rel):
+        if row["fmt"] != "fb2":
+            continue
+        seen.add(row["variant_path"])
+        full = qroot / row["variant_path"]
+        sources.append((variant_fb2_meta(row), full if full.is_file() else None))
+    for variant in by_keeper.get(rel, []):
+        if variant in seen or split_name(variant)[1] != "fb2" or not (qroot / variant).is_file():
+            continue
+        reason, _, inner = variant.partition("/")
+        sources.append((read_book_meta(qroot / reason, inner), qroot / variant))
+    return sources
+
+
+def enrich_epub_one(run: NightRun, rel: str, sources: list[tuple[dict[str, Any], Path | None]]) -> None:
+    """Один epub. Пробелы оглавления, сносок и ссылок при fb2 в карантине — пересборка из fb2. Иначе ссылки на сноски
+    правятся точечно (fix_note_links), битые href не трогаются и считаются в журнале (broken_links). Затем дописываются
+    недостающие метаданные из источников fb2 (enrich_epub_from)."""
+    epub_full = run.root / rel
+    fields = merge_enrich_fields([fb2_epub_fields(meta) for meta, _full in sources])
+    with_file = [full for _meta, full in sources if full is not None]
+    data = source_bytes(with_file[0]) if with_file else None
+    with zipfile.ZipFile(epub_full) as archive:
+        epub = Epub(archive)
+        toc_ep, notes_ep = epub_has_toc(epub), epub_has_notes(epub)
+        broken, notes_bad = epub_link_problems(epub)
+        note_payloads, fixed = fix_note_links(epub)
+    links_ep = not broken and not notes_bad
+    if data is not None:
+        toc_fb, notes_fb = fb2_structure(decode_xml(data))
+        gaps = [name for name, need, have in (("оглавление", toc_fb, toc_ep), ("сноски", notes_fb, notes_ep),
+                                              ("ссылки", True, links_ep)) if need and not have]
+        if gaps:
+            problem = rebuild_epub_from_fb2(run, epub_full, data, reason=f"rebuilt-from-fb2: {with_file[0].name}")
+            if problem is None:
+                run.record("rebuilt", rel, gaps=gaps, source=str(with_file[0]), broken_links=len(broken))
+                return
+            run.record("skip", rel, reason=f"пересборка из fb2 не удалась: {problem}")
+    cover = fb2_cover(data) if data is not None else None
+    added = enrich_epub_from(epub_full, fields, cover, dry_run=True)
+    if not added and not note_payloads:
+        run.record("skip", rel, reason="недостающих полей и правок ссылок нет", broken_links=len(broken))
+        return
+    if not run.dry_run:
+        run.backup(epub_full, "edited")
+        if note_payloads:
+            _zip_rewrite(epub_full, note_payloads)
+        if added:
+            enrich_epub_from(epub_full, fields, cover)
+    run.record("enriched", rel, fields=added, note_links=fixed, broken_links=len(broken))
+
+
+def enrich_epub(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None,
+                out: Callable[[str], None] = print) -> dict[str, Any]:
+    """Режим enrich-epub: epub в папках авторов дополняются метаданными и структурой своих fb2 (book_variants и карантин,
+    dup_members). Недостающие поля дописываются enrich_epub_from; нет оглавления или сносок и fb2 ещё в карантине —
+    пересборка из fb2. Старый epub — в replaced или копия в edited. Журнал: enriched, rebuilt, skip, failed.
+    Ошибка одной книги не прерывает прогон."""
+    run = NightRun(cfg, "enrich-epub", dry_run, path, out)
+    root = run.root
+    if not run.target.resolve().is_relative_to(root.resolve()):
+        raise ConfigError("enrich-epub: --path должен быть внутри каталога книг")
+    errors: list[str] = []
+    by_keeper: dict[str, list[str]] = {}
+    conn: sqlite3.Connection | None = None
+    if Path(cfg["db_path"]).is_file():
+        _books, dups = load_variant_context(cfg["db_path"], (run.qroot,))
+        for variant, (keeper, _words) in dups.items():
+            by_keeper.setdefault(keeper, []).append(variant)
+        conn = connect(cfg["db_path"], readonly=True)
+    try:
+        for item_rel, _size, _mtime in iter_book_files(run.target, errors):
+            rel = run.rel(run.target / item_rel)
+            if split_name(rel)[1] != "epub" or rel.lower().endswith(".zip"):
+                continue
+            if path is None and not author_scope((root / rel).parent, root):
+                continue
+            run.tick()
+            try:
+                enrich_epub_one(run, rel, fb2_sources(conn, rel, run.qroot, by_keeper))
+            except (OSError, ValueError, KeyError, zipfile.BadZipFile, EOFError) as error:
+                run.record("failed", rel, reason=f"{type(error).__name__}: {error}")
+    finally:
+        if conn is not None:
+            conn.close()
+    return run.finish({"walk_errors": errors[:200]})
 
 
 def dedup_folders(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None, workers: int | None = None,
@@ -8214,7 +8870,7 @@ def purge_quarantine(cfg: dict[str, Any], reasons: list[str], dry_run: bool) -> 
 
 
 FILE_CHANGING = ("fix-encoding", "unpack-fb2zip", "convert", "dedup", "dedup-folders", "zip-books", "unzip-books",
-                 "author-variants", "reconvert-fb2", "fix-misplaced", "merge-folder", "strip-suffix", "name-variants", "windows-names")
+                 "author-variants", "reconvert-fb2", "fix-misplaced", "merge-folder", "strip-suffix", "name-variants", "windows-names", "enrich-epub")
 COMMANDS = ("scan", "migrate", *FILE_CHANGING)
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
@@ -8236,7 +8892,7 @@ def command_params(command: str, raw: dict[str, Any]) -> dict[str, Any]:
         "reconvert-fb2": {"path", "workers", "limit", "sample", "out", "epubcheck"},
         "misplaced": set(), "check-folders": set(), "fix-misplaced": set(),
         "merge-folder": {"from", "to", "non_books_to_quarantine"},
-        "strip-suffix": {"path"}, "name-variants": {"path"}, "windows-names": {"path"}, "purge-quarantine": {"reasons"}, "move-books": {"list_path"},
+        "strip-suffix": {"path"}, "name-variants": {"path"}, "windows-names": {"path"}, "enrich-epub": {"path"}, "purge-quarantine": {"reasons"}, "move-books": {"list_path"},
     }[command]
     unknown = set(raw) - allowed
     if unknown:
@@ -8372,6 +9028,8 @@ def run_command(cfg: dict[str, Any], command: str, dry_run: bool, params: dict[s
             return strip_suffix(cfg, dry_run, params["path"], out=out)
         if command == "name-variants":
             return name_variants(cfg, dry_run, params["path"], out=out)
+        if command == "enrich-epub":
+            return enrich_epub(cfg, dry_run, params["path"], out=out)
         if command == "windows-names":
             return windows_names(cfg, dry_run, params["path"], out=out)
         if command == "purge-quarantine":
@@ -9008,7 +9666,7 @@ API_HELP = {
     "POST /api/jobs": "{command: scan|migrate|fix-encoding|unpack-fb2zip|convert|dedup|dedup-folders|zip-books|unzip-books|"
                       "author-variants, dry_run: true (по умолчанию), "
                       "confirm: <id успешного dry-run с теми же параметрами> — обязателен для боевого запуска fix-encoding/unpack-fb2zip/"
-                      "convert/dedup/dedup-folders/zip-books/unzip-books/author-variants, "
+                      "convert/dedup/dedup-folders/zip-books/unzip-books/author-variants/enrich-epub, "
                       "параметры режима: path, only (для convert — fb2 и источники), workers, max_mb, multi, out, ignore_md5 (unpack-fb2zip), to, overwrite, skip_newer, exclude, "
                       "author, title_mode, toc, "
                       "toc_depth, delete_source}",
@@ -10369,12 +11027,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="serve (по умолчанию), scan, fix-encoding, unpack-fb2zip, convert, reconvert-fb2, dedup, dedup-folders, "
                              "zip-books, unzip-books, unpack-collections, merge-authors, sort-underscore, author-variants, "
                              "misplaced, check-folders (только отчёт), fix-misplaced, merge-folder (--from A --to B), strip-suffix, "
-                             "name-variants, windows-names, move-books (--list ФАЙЛ) "
+                             "name-variants, windows-names, enrich-epub, move-books (--list ФАЙЛ) "
                              "или purge-quarantine (--reason R, необратимо)")
     parser.add_argument("--reason", dest="reasons", action="append", default=[],
                         help="purge-quarantine: причина карантина, папка которой удаляется окончательно (можно повторять): "
                              + ", ".join(QUARANTINE_REASONS))
-    parser.add_argument("-p", "--path", help="fix-encoding/unpack-fb2zip/convert/strip-suffix/name-variants/windows-names: каталог (по умолчанию каталог книг)")
+    parser.add_argument("-p", "--path", help="fix-encoding/unpack-fb2zip/convert/strip-suffix/name-variants/windows-names/enrich-epub: каталог (по умолчанию каталог книг)")
     parser.add_argument("--from", dest="from_folders", action="append", default=[],
                         help="merge-folder: папка верхнего уровня или папка внутри «_…» (например «_Сборники/Серия/Автор»), "
                              "которую склеить или переименовать (можно повторять)")
@@ -10457,7 +11115,7 @@ def main(argv: list[str] | None = None) -> int:
                 raw = {}
             elif command == "merge-folder":
                 raw = {"from": args.from_folders, "to": args.to, "non_books_to_quarantine": args.non_books_to_quarantine}
-            elif command in ("strip-suffix", "name-variants", "windows-names"):
+            elif command in ("strip-suffix", "name-variants", "windows-names", "enrich-epub"):
                 raw = {"path": args.path}
             elif command == "purge-quarantine":
                 raw = {"reasons": args.reasons}
