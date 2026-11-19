@@ -5930,6 +5930,68 @@ def text_head(cfg: dict[str, Any], full: Path, fmt: str) -> str:
         return book_text(cfg, full, fmt, Path(tmp_name))[:TEXT_HEAD_CHARS]
 
 
+PERIODICALS_FILE = Path(__file__).resolve().parent / "periodicals.json"  # «автор из метаданных» → папка журнала
+PERIODICAL_WORDS = frozenset({"газета", "газеты", "газету", "газетой", "газетам", "журнал", "журнала", "журналы",
+                              "журналу", "журналом", "журнале"})  # слово, по которому автор — издание
+PERIODICAL_NOISE = PERIODICAL_WORDS | {"оглавление"}  # слова, которые убираются из имени издания по умолчанию
+PERIODICAL_QUOTES = str.maketrans({ch: " " for ch in "«»\"“”„"})
+PERIODICAL_TOP = "Если"  # значение таблицы для издания верхнего уровня (журнал «Если»)
+UNSORTED_SECTION = "_1tmp"  # безавторские книги разделов «_Сборники» и «_разобрать» (sort-underscore)
+EXACT_MATCHES = frozenset({"periodical", "unsorted"})  # переносы без «_N»: занятое имя — conflict, книга на месте
+
+
+def load_periodicals(path: Path | None = None) -> dict[str, str]:
+    """Таблица «автор из метаданных» → «_Журналы/Издание» или «Если». Файла нет — пустая таблица (работает правило по
+    умолчанию). Битый файл и значения вне _Журналы/ и «Если» — ошибка конфигурации: прогон не начинается."""
+    path = path or PERIODICALS_FILE
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ConfigError(f"{path}: не читается как JSON: {error}") from error
+    if not isinstance(data, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in data.items()):
+        raise ConfigError(f"{path}: нужен объект «автор» → «папка» из строк")
+    for folder in data.values():
+        parts = PurePosixPath(folder).parts
+        if folder != PERIODICAL_TOP and not (len(parts) >= 2 and parts[0] == PERIODICALS_SECTION):
+            raise ConfigError(f"{path}: папка «{folder}» вне «{PERIODICALS_SECTION}/…» и не «{PERIODICAL_TOP}»")
+        if any(folder_name(part) != part for part in parts):  # Windows-имена (Syncthing), без «..» и абсолютных путей
+            raise ConfigError(f"{path}: папка «{folder}» не проходит правила имён библиотеки")
+    return dict(data)
+
+
+def is_periodical(author: str) -> bool:
+    """Автор похож на издание: есть слово «газета» или «журнал» (любой регистр)."""
+    return any(word in PERIODICAL_WORDS for word in re.findall(r"\w+", author.casefold()))
+
+
+def periodical_folder(author: str, table: dict[str, str]) -> str:
+    """Папка журнала: из таблицы; иначе — имя издания без слов «газета»/«журнал»/«оглавление» и кавычек, повторы слов
+    схлопнуты (первое вхождение), folder_name() → «_Журналы/<имя>». Пустое имя — пустая строка."""
+    if author in table:
+        return table[author]
+    kept: list[str] = []
+    seen: set[str] = set()
+    for word in author.translate(PERIODICAL_QUOTES).split():
+        low = word.casefold()
+        if low in PERIODICAL_NOISE or low in seen:
+            continue
+        seen.add(low)
+        kept.append(word)
+    name = folder_name(" ".join(kept))
+    return f"{PERIODICALS_SECTION}/{name}" if name else ""
+
+
+def unsorted_rel(rel: str) -> str:
+    """Путь в «_1tmp» для безавторской книги «_Сборники»/«_разобрать»: без имени верхнего сборника (второго сегмента),
+    если внутри раздела есть вложенность: «_разобрать/Библиотека Мошкова/Мошков часть 4/LIB/x.txt» →
+    «_1tmp/Мошков часть 4/LIB/x.txt»; «_Сборники/Сборник/a.epub» → «_1tmp/a.epub»; «_разобрать/a.txt» → «_1tmp/a.txt»."""
+    parts = PurePosixPath(rel).parts
+    rest = parts[2:] if len(parts) >= 3 else parts[1:]
+    return PurePosixPath(UNSORTED_SECTION, *rest).as_posix()
+
+
 def unpack_collections(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None,
                        out: Callable[[str], None] = print, *, kind: str = "unpack-collections",
                        roots: list[Path] | None = None, sources: tuple[str, ...] = ("meta",),
@@ -5979,6 +6041,7 @@ def unpack_collections(cfg: dict[str, Any], dry_run: bool = False, path: str | N
     pending: list[tuple[str, str]] = []
     breakdown: dict[str, dict[str, int]] = {}  # раздел → источник → число переносов
     examples: dict[str, list[str]] = {source: [] for source in sources}
+    periodicals = load_periodicals()  # один раз на прогон
 
     def folder_of(author: str) -> str:
         """Папка автора по тем же правилам, что у первого автора книги; новая папка попадает в индекс."""
@@ -5997,6 +6060,16 @@ def unpack_collections(cfg: dict[str, Any], dry_run: bool = False, path: str | N
         if len(examples[source]) < EXAMPLES_PER_SOURCE:
             examples[source].append(f"{rel_src} → {dst_rel} [{who}]")
 
+    def note_done(rel_src: str, dst_rel: str, label: str, source: str, who: str, match: str) -> None:
+        """Счётчики перенесённого: безавторская книга — в to_unsorted (без источника), издание — в periodicals."""
+        if match == "unsorted":
+            run.count("moved")
+            run.count("to_unsorted")
+            return
+        note_moved(rel_src, dst_rel, label, source, who)
+        if match == "periodical":
+            run.count("periodicals")
+
     for rel in candidates:
         src = root / rel
         top = root / PurePosixPath(rel).parts[0]
@@ -6006,7 +6079,15 @@ def unpack_collections(cfg: dict[str, Any], dry_run: bool = False, path: str | N
         key = author_key(author) if author else None
         parent = "" if src.parent == top or src.parent.name.startswith(("_", ".")) else src.parent.name
         folder, match, source, found_by, name, failure = "", "", "", "", "", ""
-        if "meta" in sources and key is not None:
+        if "meta" in sources and is_periodical(author):  # издание — в «_Журналы», не в папку автора
+            folder = periodical_folder(author, periodicals)
+            if not folder:
+                run.count("no_author")
+                journal_row(run, {"from": rel, "path": rel, "to": "", "author": author, "folder": "", "match": "",
+                                  "source": "", "status": "no-author", "error": "издание без имени"})
+                continue
+            match, source, found_by = "periodical", "meta", author
+        elif "meta" in sources and key is not None:
             if is_initials(author):  # «Фамилия И.О.»: только существующая папка, новую «И.О. Фамилия» не создавать
                 folder, match = initials_folder(author, index), "initials"
             else:
@@ -6040,22 +6121,38 @@ def unpack_collections(cfg: dict[str, Any], dry_run: bool = False, path: str | N
                 failure = f"{type(error).__name__}: {error}"
             if folder:
                 source, found_by, match = "text", name, "existing"
+        if not folder and kind == "sort-underscore" and top.name in ("_" + COLLECTIONS_SECTION, RAZOBRAT_SECTION):
+            folder, match = PurePosixPath(unsorted_rel(rel)).parent.as_posix(), "unsorted"  # без автора → «_1tmp»
         if not folder:
             run.count("no_author")
             journal_row(run, {"from": rel, "path": rel, "to": "", "author": author, "folder": "", "match": "",
                               "source": "", "status": "no-author", "error": failure})
             continue
-        co_authors = authors[1:] if source == "meta" else []  # книга нескольких авторов: у каждого следующего — копия
-        fkey = author_key(folder)
-        if fkey is not None:
-            index.setdefault(fkey, folder)
-        if folder in pre_dirs:
-            run.count("into_existing")
-        elif folder not in created:
-            created.add(folder)
-            run.count("new_folders")
+        co_authors = authors[1:] if source == "meta" and match != "periodical" else []  # копии — у каждого следующего
+        exact = match in EXACT_MATCHES  # журнал и «_1tmp»: имя без «_N», занятое — conflict
+        if not exact:
+            fkey = author_key(folder)
+            if fkey is not None:
+                index.setdefault(fkey, folder)
+            if folder in pre_dirs:
+                run.count("into_existing")
+            elif folder not in created:
+                created.add(folder)
+                run.count("new_folders")
         directory = root / folder
-        dest = unique_path(directory, src.name, taken)
+        if exact:
+            dest = directory / src.name
+            if dest == src:  # уже в своей папке (журнал или «_1tmp»): ничего не переносим
+                continue
+            if dest.exists() or dest in taken:
+                run.count("conflicts")
+                journal_row(run, {"from": rel, "path": rel, "to": dest.relative_to(root).as_posix(),
+                                  "author": author, "folder": folder, "match": match, "source": source,
+                                  "status": "conflict", "error": ""})
+                continue
+            taken.add(dest)
+        else:
+            dest = unique_path(directory, src.name, taken)
         if dest.name != src.name:
             run.count("conflicts")
         dst_rel = dest.relative_to(root).as_posix()
@@ -6063,7 +6160,7 @@ def unpack_collections(cfg: dict[str, Any], dry_run: bool = False, path: str | N
                 "match": match, "source": source}
         if dry_run:
             planned_gone.add(str(src))
-            note_moved(rel, dst_rel, label, source, found_by or author)
+            note_done(rel, dst_rel, label, source, found_by or author, match)
             journal_row(run, {**base, "status": "dry", "error": ""})
             if co_authors:
                 copy_coauthors(run, root, dest, co_authors, folder_of, taken, dry_run=True, source=source)
@@ -6085,7 +6182,7 @@ def unpack_collections(cfg: dict[str, Any], dry_run: bool = False, path: str | N
         except OSError:
             intact = False
         if intact:
-            note_moved(rel, dst_rel, label, source, found_by or author)
+            note_done(rel, dst_rel, label, source, found_by or author, match)
             journal_row(run, {**base, "status": "moved", "error": ""})
             if co_authors:
                 copy_coauthors(run, root, dest, co_authors, folder_of, taken, dry_run=False, source=source)
@@ -6106,6 +6203,8 @@ def unpack_collections(cfg: dict[str, Any], dry_run: bool = False, path: str | N
             f"ошибки {s.get('errors', 0)}, "
             f"конфликтов имён {s.get('conflicts', 0)}, {'будет удалено' if dry_run else 'удалено'} пустых папок "
             f"{s['removed_dirs']}")
+    if kind == "sort-underscore":
+        line += f", журналы {s.get('periodicals', 0)}, в «{UNSORTED_SECTION}» {s.get('to_unsorted', 0)}"
     if len(sources) > 1:
         line += ", по источникам: " + ", ".join(f"{source} {s.get('source_' + source, 0)}" for source in sources)
     out(line)
@@ -6619,9 +6718,59 @@ def set_variant(db_path: str, a: str, b: str, status: str, target: str = "") -> 
                      (status, target, time.time(), a, b))
 
 
+# Латинские буквы-двойники в кириллическом слове («Mихаил») — к кириллице; видимое соответствие, не фонетика.
+HOMOGLYPHS = str.maketrans({"a": "а", "b": "в", "c": "с", "e": "е", "h": "н", "k": "к", "m": "м", "o": "о", "p": "р",
+                            "t": "т", "x": "х"})
+
+
+def person_word(word: str) -> str:
+    """Слово имени для same_person: смешанное слово — двойники в кириллицу, чисто латинское — транслит (VARIANT_TRANSLIT)."""
+    if not re.search(r"[а-я]", word):
+        return word.translate(VARIANT_TRANSLIT) if re.search(r"[a-z]", word) else word
+    return word.translate(HOMOGLYPHS)
+
+
+def _close(x: str, y: str) -> bool:
+    """Написания одного слова: правок не больше трети длины короткого (минимум одна) — «Толкиен»/«Толкин»,
+    «Бредбери»/«Брэдбери», «Mихаил»/«Михаил»; «Мария»/«Марина», «Джон»/«Джордж» — уже разные."""
+    return edit_distance(x, y) <= max(1, min(len(x), len(y)) // 3)
+
+
+def _same_given(x: str, y: str) -> bool:
+    """Имя: равны, инициал, краткая форма-префикс от трёх букв («Грег»/«Грегори», «Влад»/«Владимир»)
+    или близкое написание с той же первой буквой («Сэмюэл»/«Сэмюель»); «Алексей»/«Александр» — разные."""
+    if x == y:
+        return True
+    if min(len(x), len(y)) == 1:
+        return x[0] == y[0]
+    if min(len(x), len(y)) >= 3 and (x.startswith(y) or y.startswith(x)):
+        return True
+    return x[0] == y[0] and _close(x, y)
+
+
+def same_person(a: str, b: str) -> bool:
+    """Обязательный фильтр author-variants: два написания — один человек. Фамилия (первое слово) — близкое написание
+    (_close, латиница через транслит). Имя — _same_given. Отчества, оба полные, — равны или одна правка.
+    Лишние слова более длинного имени не сравниваются; соавторские папки сюда не доходят."""
+    words_a = [person_word(w) for w in author_words(a)]
+    words_b = [person_word(w) for w in author_words(b)]
+    if not words_a or not words_b or not _close(words_a[0], words_b[0]):
+        return False
+    for index in range(1, min(len(words_a), len(words_b))):
+        x, y = words_a[index], words_b[index]
+        if index == 2 and min(len(x), len(y)) >= 2:
+            if edit_distance(x, y) > 1:
+                return False
+        elif not _same_given(x, y):
+            return False
+    return True
+
+
 def variant_target(a: str, b: str, files: dict[str, int]) -> tuple[str, str]:
-    """(источник, цель) для склейки: цель — папка с полным ФИО (больше слов), затем с большим числом файлов, затем по имени."""
-    target, source = sorted((a, b), key=lambda n: (-len(author_words(n)), -files[n], n))
+    """(источник, цель) для склейки: цель — сначала папка категории «ok» (folder_category, без инициалов), затем
+    с большим числом слов (полное ФИО), затем с большим числом файлов, затем по имени."""
+    target, source = sorted(
+        (a, b), key=lambda n: (folder_category(n) != "ok", -len(author_words(n)), -files[n], n))
     return source, target
 
 
@@ -6778,6 +6927,9 @@ def author_variants(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[s
             elif distribute_coauthor(run, root, coauthor, taken, pending):
                 set_variant(db_path, a, b, "merged", b if coauthor == a else a)
             gone.add(coauthor)
+            continue
+        if not same_person(a, b):  # разные люди — не склеивать ни в одном tier
+            run.count("different")
             continue
         if tier == "manual":
             continue

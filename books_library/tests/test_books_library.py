@@ -1931,15 +1931,17 @@ def test_sort_underscore_takes_author_from_filename_text_and_folder(tmp_path: Pa
 
     stats = bl.sort_underscore(cfg, out=lambda _line: None)
 
-    assert stats["moved"] == 3
+    assert stats["moved"] == 4  # три с автором и «Пустой.txt» в «_1tmp»
+    assert stats["to_unsorted"] == 1
     assert stats["source_filename"] == 1
     assert stats["source_text"] == 1
     assert stats["source_folder"] == 1
-    assert stats["no_author"] == 1
+    assert stats.get("no_author", 0) == 0
     assert (root / "Иванов Иван Иванович" / "Иванов Иван.-.Заметка.txt").is_file()
     assert (root / "Иванов Иван Иванович" / "Лесные заметки.txt").is_file()
     assert (root / "Иванов Иван Иванович" / "Номер 1.txt").is_file()
-    assert (root / "_разобрать" / "Пустой.txt").is_file()
+    assert (root / "_1tmp" / "Пустой.txt").is_file()
+    assert not (root / "_разобрать" / "Пустой.txt").exists()
     assert not (root / "_Журналы" / "Иванов Иван Иванович").exists()
 
 
@@ -1952,6 +1954,86 @@ def test_sort_underscore_dry_run_respects_limit_and_changes_nothing(tmp_path: Pa
     assert stats["moved"] == 1
     assert (root / "_documentation" / "Иванов Иван.-.Заметка.txt").is_file()
     assert (root / "_разобрать" / "Лесные заметки.txt").is_file()
+
+
+def test_variant_target_prefers_folder_without_initials() -> None:
+    same = {"Д.Саймак Клиффорд": 3, "Саймак Клиффорд": 3}
+    assert bl.variant_target("Д.Саймак Клиффорд", "Саймак Клиффорд", same) == ("Д.Саймак Клиффорд", "Саймак Клиффорд")
+    assert bl.variant_target("Саймак Клиффорд", "Д.Саймак Клиффорд", same) == ("Д.Саймак Клиффорд", "Саймак Клиффорд")
+    more_files = {"Ж.Фармер Филип": 9, "Фармер Филип Жозе": 1}
+    assert bl.variant_target("Ж.Фармер Филип", "Фармер Филип Жозе", more_files) == (
+        "Ж.Фармер Филип", "Фармер Филип Жозе")
+
+
+def test_periodical_rules_and_table_validation(tmp_path: Path) -> None:
+    assert bl.is_periodical("Газета Завтра Газета")
+    assert bl.is_periodical("Оглавление журнала \"Киносценарии\"")
+    assert not bl.is_periodical("Иванов Иван Иванович")
+    assert bl.periodical_folder("Газета Завтра Газета", {}) == "_Журналы/Завтра"
+    assert bl.periodical_folder("Журнал «Вестник» Журнал", {}) == "_Журналы/Вестник"
+    assert bl.periodical_folder("Журнал Газета", {}) == ""
+    assert bl.load_periodicals(tmp_path / "нет.json") == {}
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"Журнал А": "Иванов Иван"}, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(bl.ConfigError):
+        bl.load_periodicals(bad)
+
+
+def test_periodical_author_goes_to_journals_folder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    table = tmp_path / "periodicals.json"
+    table.write_text(json.dumps({"Газета Завтра Газета": "_Журналы/Завтра"}, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(bl, "PERIODICALS_FILE", table)
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    root = tmp_path / "periodical_books"
+    (root / "_Сборники" / "X").mkdir(parents=True)
+    (root / "_Сборники" / "X" / "Номер 1.fb2").write_bytes(make_fb2_author("Номер 1", "Газета Завтра Газета"))
+    (root / "_Сборники" / "X" / "Номер 2.fb2").write_bytes(make_fb2_author("Номер 2", "Газета Завтра Газета"))
+    (root / "_Журналы" / "Завтра").mkdir(parents=True)
+    (root / "_Журналы" / "Завтра" / "Номер 2.fb2").write_bytes(make_fb2_author("Номер 2", "Газета Завтра Газета"))
+    cfg = make_cfg(tmp_path, root)
+    bl.scan(cfg)
+
+    stats = bl.unpack_collections(cfg, out=lambda _line: None)
+
+    assert stats["periodicals"] == 1
+    assert stats["conflicts"] == 1
+    assert (root / "_Журналы" / "Завтра" / "Номер 1.fb2").is_file()
+    assert (root / "_Сборники" / "X" / "Номер 2.fb2").is_file()  # занято — книга на месте, без «_N»
+    assert not (root / "_Журналы" / "Завтра" / "Номер 2_1.fb2").exists()
+    assert not (root / "Газета Завтра Газета").exists()
+
+
+def test_sort_underscore_moves_authorless_books_to_1tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "unsorted_books"
+    (root / "_разобрать" / "Библиотека Мошкова" / "Мошков часть 4" / "LIB").mkdir(parents=True)
+    (root / "_разобрать" / "Библиотека Мошкова" / "Мошков часть 4" / "LIB" / "x.txt").write_text(
+        "Текст без автора один.\n", encoding="utf-8")
+    (root / "_Сборники" / "Сборник").mkdir(parents=True)
+    (root / "_Сборники" / "Сборник" / "a.txt").write_text("Текст без автора два.\n", encoding="utf-8")
+    (root / "_разобрать" / "Конфликт.txt").write_text("Текст без автора три.\n", encoding="utf-8")
+    (root / "_1tmp").mkdir()
+    (root / "_1tmp" / "Конфликт.txt").write_text("Занято.\n", encoding="utf-8")
+    (root / "_Серии").mkdir()
+    (root / "_Серии" / "Серия.txt").write_text("Текст без автора четыре.\n", encoding="utf-8")
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    cfg = make_cfg(tmp_path, root)
+    bl.scan(cfg)
+
+    stats = bl.sort_underscore(cfg, out=lambda _line: None)
+
+    assert stats["to_unsorted"] == 2
+    assert stats["conflicts"] == 1
+    assert (root / "_1tmp" / "Мошков часть 4" / "LIB" / "x.txt").is_file()
+    assert (root / "_1tmp" / "a.txt").is_file()
+    assert (root / "_разобрать" / "Конфликт.txt").is_file()
+    assert (root / "_1tmp" / "Конфликт.txt").read_text(encoding="utf-8") == "Занято.\n"
+    assert (root / "_Серии" / "Серия.txt").is_file()  # не служебный раздел из набора — остаётся на месте
+
+
+def test_unsorted_path_drops_only_collection_name() -> None:
+    assert bl.unsorted_rel("_разобрать/Библиотека Мошкова/Мошков часть 4/LIB/x.txt") == "_1tmp/Мошков часть 4/LIB/x.txt"
+    assert bl.unsorted_rel("_Сборники/Сборник/a.epub") == "_1tmp/a.epub"
+    assert bl.unsorted_rel("_разобрать/a.txt") == "_1tmp/a.txt"
 
 
 def test_filename_author_separators_and_limits() -> None:
@@ -2564,6 +2646,36 @@ def test_author_variants_coauthor_folder_is_distributed_by_copy(authors_cfg: dic
     assert first.read_bytes() == second.read_bytes() == TXT_TEXT.encode("utf-8")
     assert not os.path.samefile(first, second)  # настоящая копия, не ссылка
     assert db_rows(authors_cfg, "SELECT status, target FROM author_variants") == [("merged", "Громыко Ольга")]
+
+
+@pytest.mark.parametrize(("a", "b", "expected"), [
+    ("Волков Алексей Алексеевич", "Волков Александр", False),
+    ("Брэдбери Рэй Дуглас", "Бредбери Рэй", True),
+    ("Плеханов Андрей Вячеславович", "Пллеханов Андрей", True),
+    ("Ахманов Михаил Сергеевич", "Ахманов Mихаил", True),
+    ("Волков А", "Волков Алексей", True),
+    ("Иванов Иван Петрович", "Иванов Иван Сергеевич", False),
+    ("Дилэни Сэмюэл Р", "Дилэни Сэмюель", True),
+    ("Бир Грег", "Бир Грегори", True),
+    ("Tolkien John", "Толкин Джон", True),
+    ("Мамонова Мария", "Мамонова Марина", False),
+    ("Гордон Джон", "Гордон Джордж", False),
+])
+def test_same_person(a: str, b: str, expected: bool) -> None:
+    assert bl.same_person(a, b) is expected
+
+
+def test_author_variants_does_not_glue_different_people(authors_cfg: dict[str, Any]) -> None:
+    root = Path(authors_cfg["books_dir"])
+    write_txt(root / "Волков Алексей Алексеевич" / "Тёмный лес.txt", TXT_TEXT)
+    write_txt(root / "Волков Александр" / "Тёмный лес.txt", TXT_TEXT)
+    bl.scan(authors_cfg)
+
+    result = bl.author_variants(authors_cfg, out=lambda _line: None)
+
+    assert result.get("merged", 0) == 0 and result["different"] == 1
+    assert (root / "Волков Алексей Алексеевич").is_dir() and (root / "Волков Александр").is_dir()
+    assert db_rows(authors_cfg, "SELECT status FROM author_variants") == [("pending",)]
 
 
 def test_unpack_collections_coauthor_book_is_copied_to_second_author(authors_cfg: dict[str, Any]) -> None:
