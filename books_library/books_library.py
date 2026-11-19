@@ -2935,10 +2935,7 @@ def _zip_rewrite(path: Path, payloads: dict[str, bytes]) -> None:
     try:
         with zipfile.ZipFile(path) as source, zipfile.ZipFile(tmp, "w") as target:
             for info in sorted(source.infolist(), key=lambda item: item.filename != "mimetype"):
-                if info.filename in pending:
-                    data = pending.pop(info.filename)
-                else:
-                    data = read_member(source, info, EDIT_MEMBER_MAX)
+                data = pending.pop(info.filename) if info.filename in pending else read_member(source, info, EDIT_MEMBER_MAX)
                 entry = zipfile.ZipInfo(info.filename, date_time=info.date_time)
                 entry.compress_type = zipfile.ZIP_STORED if info.filename == "mimetype" else info.compress_type
                 entry.external_attr = info.external_attr
@@ -4444,9 +4441,9 @@ def epub_has_toc(epub: Epub) -> bool:
             if block and len(re.findall(r"<(?:\w+:)?a\b", block.group(1))) >= 2:
                 return True
     for item in epub.items.values():
-        if item.get("media-type") == "application/x-dtbncx+xml" and item["path"] in epub.names:
-            if len(re.findall(r"<(?:\w+:)?navPoint\b", decode_xml(zip_read(epub.zip, item["path"])))) >= 2:
-                return True
+        if (item.get("media-type") == "application/x-dtbncx+xml" and item["path"] in epub.names
+                and len(re.findall(r"<(?:\w+:)?navPoint\b", decode_xml(zip_read(epub.zip, item["path"])))) >= 2):
+            return True
     return False
 
 
@@ -4614,6 +4611,62 @@ def _add_footnotes(text: str, asides: list[str]) -> str | None:
     return text[:block.start()] + whole[:close] + "".join(asides) + whole[close:] + text[block.end():]
 
 
+def _relink_file(epub: Epub, path: str, text_of: Callable[[str], str],
+                 targets_of: Callable[[str], dict[str, tuple[str, dict[str, str]]]],
+                 link_style: str, note_style: str) -> tuple[bytes | None, int]:
+    """Правка сносок в одном файле главы. Возвращает новые байты (None — файл не меняется, в том числе когда сноски
+    некуда поместить) и число правок."""
+    used = set(targets_of(path))
+    same_file: set[str] = set()
+    copies: list[str] = []
+    copied: dict[tuple[str, str], str] = {}
+    count = [0]
+
+    def relink(match: re.Match[str]) -> str:
+        attrs_text = match.group(1)
+        attrs = parse_attrs(attrs_text)
+        local = _local_link(path, attrs.get("href", "").strip())
+        if local is None or not local[1] or local[0] not in epub.names:
+            return match.group(0)
+        target, frag = local
+        hit = targets_of(target).get(frag)
+        if hit is None or not _is_note_target(*hit):
+            return match.group(0)
+        types = attrs.get("epub:type", "").split()
+        if target == path:
+            if "noteref" in types:
+                return match.group(0)
+            same_file.add(frag)
+            count[0] += 1
+            return _retag_a(attrs_text, f"#{frag}", types, link_style)
+        if (target, frag) not in copied:
+            inner = _element_inner(text_of(target), frag)
+            if inner is None:
+                return match.group(0)
+            copy_id, number = frag, 2
+            while copy_id in used:
+                copy_id, number = f"{frag}-{number}", number + 1
+            used.add(copy_id)
+            copied[(target, frag)] = copy_id
+            copies.append(f'<aside epub:type="footnote" role="doc-footnote" id="{copy_id}" class="footnote"'
+                          f'{_style_attr(note_style)}>{inner}</aside>')
+        count[0] += 1
+        return _retag_a(attrs_text, f"#{copied[(target, frag)]}", types, link_style)
+
+    new_text = re.sub(r"<a\b([^>]*)>", relink, text_of(path))
+    for frag in same_file:
+        new_text = re.sub(r"<([\w:.-]+)\b([^>]*\bid\s*=\s*[\"']" + re.escape(frag) + r"[\"'][^>]*)>",
+                          lambda m: _mark_footnote(m, note_style), new_text, count=1)
+    if copies:
+        placed_text = _add_footnotes(new_text, copies)
+        if placed_text is None:
+            return None, 0
+        new_text = placed_text
+    if new_text == text_of(path):
+        return None, 0
+    return new_text.encode("utf-8"), count[0]
+
+
 def fix_note_links(epub: Epub) -> tuple[dict[str, bytes], int]:
     """Точечная правка сносок без fb2. Ссылка на сноску в том же файле получает epub:type="noteref" и class noteref,
     целевой элемент — epub:type="footnote" и class footnote. Ссылка в другой файл заменяется на копию сноски (aside с
@@ -4640,55 +4693,10 @@ def fix_note_links(epub: Epub) -> tuple[dict[str, bytes], int]:
     changed: dict[str, bytes] = {}
     fixed = 0
     for path in _link_files(epub):
-        used = set(targets_of(path))
-        same_file: set[str] = set()
-        copies: list[str] = []
-        copied: dict[tuple[str, str], str] = {}
-        count = [0]
-
-        def relink(match: re.Match[str], path: str = path, used: set[str] = used) -> str:
-            attrs_text = match.group(1)
-            attrs = parse_attrs(attrs_text)
-            local = _local_link(path, attrs.get("href", "").strip())
-            if local is None or not local[1] or local[0] not in epub.names:
-                return match.group(0)
-            target, frag = local
-            hit = targets_of(target).get(frag)
-            if hit is None or not _is_note_target(*hit):
-                return match.group(0)
-            types = attrs.get("epub:type", "").split()
-            if target == path:
-                if "noteref" in types:
-                    return match.group(0)
-                same_file.add(frag)
-                count[0] += 1
-                return _retag_a(attrs_text, f"#{frag}", types, link_style)
-            if (target, frag) not in copied:
-                inner = _element_inner(text_of(target), frag)
-                if inner is None:
-                    return match.group(0)
-                copy_id, number = frag, 2
-                while copy_id in used:
-                    copy_id, number = f"{frag}-{number}", number + 1
-                used.add(copy_id)
-                copied[(target, frag)] = copy_id
-                copies.append(f'<aside epub:type="footnote" role="doc-footnote" id="{copy_id}" class="footnote"'
-                              f'{_style_attr(note_style)}>{inner}</aside>')
-            count[0] += 1
-            return _retag_a(attrs_text, f"#{copied[(target, frag)]}", types, link_style)
-
-        new_text = re.sub(r"<a\b([^>]*)>", relink, text_of(path))
-        for frag in same_file:
-            new_text = re.sub(r"<([\w:.-]+)\b([^>]*\bid\s*=\s*[\"']" + re.escape(frag) + r"[\"'][^>]*)>",
-                              lambda m: _mark_footnote(m, note_style), new_text, count=1)
-        if copies:
-            placed_text = _add_footnotes(new_text, copies)
-            if placed_text is None:
-                continue
-            new_text = placed_text
-        if new_text != text_of(path):
-            changed[path] = new_text.encode("utf-8")
-            fixed += count[0]
+        data, hits = _relink_file(epub, path, text_of, targets_of, link_style, note_style)
+        if data is not None:
+            changed[path] = data
+            fixed += hits
     if fixed and css_paths and "-cr-hint: noteref" not in text_of(css_paths[0]):
         changed[css_paths[0]] = (text_of(css_paths[0]) + NOTES_CSS).encode("utf-8")
     return changed, fixed
