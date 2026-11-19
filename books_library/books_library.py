@@ -7468,13 +7468,22 @@ def name_variant_values(conn: sqlite3.Connection, rel: str, has_meta: bool, has_
     return values
 
 
+VARIANT_TAIL_RE = re.compile(r"(?:_[1-9][0-9]?| \([^()]*\))+$")  # «_1_1», « (Мошкова)» в конце основы
+
+
+def name_variant_stem(stem: str) -> str:
+    """Основа без хвостов «_N» (в т. ч. повторных «_1_1») и уже назначенных уточнений « (…)»."""
+    return VARIANT_TAIL_RE.sub("", stem) or stem
+
+
 def name_variant_groups(names: list[str]) -> dict[tuple[str, str], list[tuple[str, re.Match[str] | None]]]:
-    """Одноимённые файлы папки без учёта регистра: «основа.ext» и «основа_N.ext» (match — у «_N»-файлов)."""
+    """Одноимённые файлы папки без учёта регистра: «основа.ext», «основа (уточнение).ext» и «основа_N.ext»
+    (match — у «_N»-файлов); «_1_1» сводится к той же основе."""
     groups: dict[tuple[str, str], list[tuple[str, re.Match[str] | None]]] = {}
     for name in names:
         match = SUFFIX_RE.match(name)
         stem, ext = (match.group("base"), match.group("ext")) if match else os.path.splitext(name)
-        groups.setdefault((stem.casefold(), ext.casefold()), []).append((name, match))
+        groups.setdefault((name_variant_stem(stem).casefold(), ext.casefold()), []).append((name, match))
     return groups
 
 
@@ -7513,7 +7522,7 @@ def name_variants(cfg: dict[str, Any], dry_run: bool = False, path: str | None =
                     if match is None:
                         continue
                     run.tick()
-                    base, ext, num = match.group("base"), match.group("ext"), match.group("num")
+                    base, ext, num = name_variant_stem(match.group("base")), match.group("ext"), match.group("num")
                     mine = values[name]
                     others = [values[other] for other, _ in group if other != name]
                     options = [(kind, mine[kind]) for kind in NAME_VARIANT_KINDS
