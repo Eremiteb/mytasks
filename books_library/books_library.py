@@ -3976,10 +3976,11 @@ class _Fb2Book:
             pending: list[ET.Element] = []
             for node in body:
                 if _local(node.tag) == "section":
-                    if pending:
-                        units.append(_Unit(pending, set(), 1))
-                        pending = []
+                    start = len(units)
                     self._plan_section(node, 1, units)
+                    # заголовок книги и вступление перед разделом — в начало файла этого раздела, без отдельного файла
+                    units[start].nodes[:0] = pending
+                    pending = []
                 else:
                     pending.append(node)
             if pending:
@@ -3989,7 +3990,7 @@ class _Fb2Book:
         return units
 
     def _unit_title(self, unit: _Unit) -> str:
-        first = unit.nodes[0]
+        first = next((node for node in unit.nodes if _local(node.tag) == "section"), unit.nodes[0])
         if _local(first.tag) == "section":
             return _text(_first(first, "title")) or "Раздел"
         return _text(_first(first, "title")) or self.title
@@ -4780,8 +4781,9 @@ class TextCache:
     без изменения содержимого, запись находится по размеру, mtime и формату и получает новый путь. Ошибки SQLite не
     останавливают dedup: промах кэша — обычная работа. Соединение общее для потоков, все обращения — под замком."""
 
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    def __init__(self, conn: sqlite3.Connection, root: Path | None = None) -> None:
         self.conn = conn
+        self.root = root  # каталог книг: запись чужого пути берётся, только если того файла уже нет (переименован)
         self.lock = threading.Lock()
 
     @staticmethod
@@ -4805,7 +4807,7 @@ class TextCache:
         except sqlite3.Error as error:
             say(f"кэш текста выключен: {path}: {error}", "text_cache_off", logging.WARNING)
             return None
-        return TextCache(conn)
+        return TextCache(conn, Path(cfg["books_dir"]))
 
     def get(self, rel: str, size: int, mtime: float, fmt: str) -> str | None:
         """Текст из кэша или None. Запись без совпадения по пути берётся, только если её единственная по размеру,
@@ -4818,11 +4820,12 @@ class TextCache:
                     (rel, size, *window, fmt)).fetchone()
                 if row is None:
                     found = self.conn.execute(
-                        "SELECT rowid, data FROM texts WHERE size = ? AND mtime BETWEEN ? AND ? AND fmt = ?",
+                        "SELECT rowid, data, path FROM texts WHERE size = ? AND mtime BETWEEN ? AND ? AND fmt = ?",
                         (size, *window, fmt)).fetchall()
-                    if len(found) != 1:
+                    # файл с той же записью ещё на месте — это другая книга того же размера, а не переименование
+                    if len(found) != 1 or (self.root is not None and (self.root / found[0][2]).exists()):
                         return None
-                    row = found[0]
+                    row = found[0][:2]
                 try:
                     text = zlib.decompress(row[1]).decode("utf-8")
                 except (zlib.error, UnicodeDecodeError):
@@ -6618,7 +6621,7 @@ def set_variant(db_path: str, a: str, b: str, status: str, target: str = "") -> 
 
 def variant_target(a: str, b: str, files: dict[str, int]) -> tuple[str, str]:
     """(источник, цель) для склейки: цель — папка с полным ФИО (больше слов), затем с большим числом файлов, затем по имени."""
-    source, target = sorted((a, b), key=lambda n: (-len(author_words(n)), -files[n], n))
+    target, source = sorted((a, b), key=lambda n: (-len(author_words(n)), -files[n], n))
     return source, target
 
 
@@ -8150,7 +8153,7 @@ def command_params(command: str, raw: dict[str, Any]) -> dict[str, Any]:
             raise ConfigError("author — строка, exclude — список строк")
     if command == "merge-folder":
         sources, target = raw.get("from"), raw.get("to")
-        if not isinstance(sources, list) or not all(isinstance(x, str) and x for x in sources):
+        if not isinstance(sources, list) or not sources or not all(isinstance(x, str) and x for x in sources):
             raise ConfigError("from: список непустых имён папок")
         if not isinstance(target, str) or not target:
             raise ConfigError("to: имя папки")

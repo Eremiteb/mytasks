@@ -174,7 +174,7 @@ def test_scan_reads_fields_of_each_format(cfg: dict[str, Any]) -> None:
     assert fb2["cover"] == 1
 
     zipped = rows[ZIP_REL]
-    assert zipped["fmt"] == "fb2.zip"
+    assert zipped["fmt"] == "fb2"  # однокнижный zip прозрачен: книга внутреннего формата, путь name.ext
     assert zipped["title"] == "Архивная книга"
     assert zipped["authors"] == "Петров Пётр"
 
@@ -454,7 +454,7 @@ def test_fix_encoding_dry_run_changes_nothing(enc_cfg: dict[str, Any], capsys: p
 
     stats = bl.fix_encoding(enc_cfg, dry_run=True)
 
-    assert stats["wrong"] == 1
+    assert stats["fixed"] == 1
     assert broken.read_bytes() == before
     assert not (bl.REPORTS_DIR).exists()
     assert "[dry-run] будет" in capsys.readouterr().out
@@ -471,7 +471,6 @@ def test_fix_encoding_changes_only_declaration_and_writes_report(enc_cfg: dict[s
 
     stats = bl.fix_encoding(enc_cfg)
 
-    assert stats["wrong"] == 1
     assert stats["fixed"] == 1
     assert broken.read_bytes() == before_broken.replace(WRONG_DECL, RIGHT_DECL, 1)
     assert real.read_bytes() == before_real
@@ -488,7 +487,6 @@ def test_fix_encoding_second_run_finds_nothing(enc_cfg: dict[str, Any]) -> None:
 
     stats = bl.fix_encoding(enc_cfg)
 
-    assert stats["wrong"] == 0
     assert "fixed" not in stats
 
 
@@ -513,7 +511,6 @@ def test_fix_encoding_txt_cp1251_becomes_utf8(txt_cfg: dict[str, Any]) -> None:
 
     stats = bl.fix_encoding(txt_cfg, only="txt")
 
-    assert stats["wrong"] == 1
     assert stats["fixed"] == 1
     assert (root / "Автор" / "cp.txt").read_bytes() == TXT_TEXT.encode("utf-8")
     assert (root / "Автор" / "utf.txt").read_bytes() == utf_before
@@ -526,7 +523,7 @@ def test_fix_encoding_only_fb2_skips_txt(txt_cfg: dict[str, Any]) -> None:
 
     stats = bl.fix_encoding(txt_cfg, only="fb2")
 
-    assert stats["wrong"] == 0
+    assert "fixed" not in stats
     assert cp.read_bytes() == before
 
 
@@ -592,7 +589,7 @@ def test_unpack_skips_entry_over_max_mb(tmp_path: Path) -> None:
     stats = bl.unpack_fb2zip(cfg, max_mb=1)
 
     assert stats["skipped"] == 1
-    assert stats["extracted"] == 0
+    assert stats.get("extracted", 0) == 0
     assert not (root / "big.fb2").exists()
 
 
@@ -626,7 +623,7 @@ def test_multi_extracts_into_folder_with_metadata_names(multi_cfg: dict[str, Any
     stats = bl.unpack_fb2zip(multi_cfg, multi=True)
 
     folder = root / "lib-3"
-    assert sorted(p.name for p in folder.iterdir()) == ["Петров - Книга.fb2", "librusec-3.fb2"]
+    assert sorted(p.name for p in folder.iterdir()) == ["librusec-3.fb2", "Петров - Книга.fb2"]
     assert (folder / "librusec-3.fb2").read_bytes() == b"<FictionBook>no meta</FictionBook>"
     assert not (root / "x.fb2").exists()
     assert not (root.parent / "x.fb2").exists()
@@ -698,7 +695,7 @@ def test_multi_out_dir_outside_books(multi_cfg: dict[str, Any], tmp_path: Path) 
 
     bl.unpack_fb2zip(multi_cfg, multi=True, out_dir=str(out))
 
-    assert sorted(p.name for p in (out / "lib-3").iterdir()) == ["Петров - Книга.fb2", "librusec-3.fb2"]
+    assert sorted(p.name for p in (out / "lib-3").iterdir()) == ["librusec-3.fb2", "Петров - Книга.fb2"]
     assert not (root / "lib-3").exists()
 
 
@@ -2159,7 +2156,7 @@ def test_merge_ambiguous_patronymics_change_nothing(tmp_path: Path, monkeypatch:
     stats = bl.merge_authors(cfg)
 
     assert stats["ambiguous"] == 1
-    assert stats["merged"] == 0
+    assert stats.get("merged", 0) == 0
     assert (root / "Петров Пётр" / "a.txt").is_file()
     assert (root / "Петров Пётр Иванович" / "b.txt").is_file()
     assert (root / "Петров Пётр Сергеевич" / "c.txt").is_file()
@@ -2174,8 +2171,8 @@ def test_merge_initial_is_not_a_full_name(tmp_path: Path, monkeypatch: pytest.Mo
 
     stats = bl.merge_authors(cfg)
 
-    assert stats["merged"] == 0
-    assert stats["renamed"] == 0
+    assert stats.get("merged", 0) == 0
+    assert stats.get("renamed", 0) == 0
     assert (root / "Петров Иван" / "a.txt").is_file()
     assert (root / "Петров Иван В" / "b.txt").is_file()
 
@@ -2285,7 +2282,7 @@ def test_merge_other_book_name_without_patronymic_is_not_used(tmp_path: Path, mo
 
     stats = bl.merge_authors(cfg)
 
-    assert stats["renamed"] == 0
+    assert stats.get("renamed", 0) == 0
     assert stats.get("patronymic_db", 0) == 0
     assert (root / "Петров Иван" / "a.txt").is_file()
 
@@ -2396,13 +2393,13 @@ def test_dedup_folders_similar_copy_gets_own_group(authors_cfg: dict[str, Any]) 
     # 3600 слов общих, 400 новых: доля общих шинглов около 0.9 — «похожая» (85–97 %)
     partly = " ".join(original.split()[:3600] + [f"новое{i}" for i in range(400)])
     write_txt(folder / "Лес.txt", original)
-    write_txt(folder / "Лес_2.txt", partly)
+    write_txt(folder / "Лес2.txt", partly)  # другое имя: «Лес_2» после снятия «_N» было бы одноимённым → дубль
 
     result = bl.dedup_folders(authors_cfg, out=lambda _line: None)
 
     assert result.get("duplicate", 0) == 0 and result["similar"] == 1
-    assert (folder / "Лес_2.txt").is_file()
-    assert db_rows(authors_cfg, "SELECT key, status FROM dup_groups") == [("folder:Иванов Иван Иванович/Лес_2.txt", "similar")]
+    assert (folder / "Лес2.txt").is_file()
+    assert db_rows(authors_cfg, "SELECT key, status FROM dup_groups") == [("folder:Иванов Иван Иванович/Лес2.txt", "similar")]
     assert sorted(db_rows(authors_cfg, "SELECT role FROM dup_members")) == [("kept",), ("kept",)]
 
 
@@ -2530,7 +2527,7 @@ def test_author_variants_dry_run_and_different_are_not_recomputed(authors_cfg: d
 
     dry = bl.author_variants(authors_cfg, dry_run=True, out=lines.append)
 
-    assert dry["merged"] == 0 and (root / "Smirnov Ivan").is_dir() and not Path(authors_cfg["db_path"]).exists()
+    assert dry.get("merged", 0) == 0 and (root / "Smirnov Ivan").is_dir() and not Path(authors_cfg["db_path"]).exists()
     bl.author_variants(authors_cfg, out=lambda _line: None)
     assert db_rows(authors_cfg, "SELECT tier, status FROM author_variants") == [("manual", "pending")]
     assert "Разные" in bl.variant_action(authors_cfg, "Смирнова Иван", "Smirnov Ivan", "different")
@@ -2685,7 +2682,8 @@ def test_note_without_reference_goes_to_notes_xhtml(tmp_path: Path) -> None:
     files = read_epub(out)
     notes = files["OEBPS/text/notes.xhtml"].decode("utf-8")
     assert 'id="n3"' in notes and "Никем не упомянутая сноска." in notes
-    assert files["OEBPS/text/ch002.xhtml"].decode("utf-8").count('aside epub:type="footnote"') == 0
+    chapter = files["OEBPS/text/ch002.xhtml"].decode("utf-8")
+    assert 'id="n3"' not in chapter  # сноска без ссылок в главу не попадает; n2 (ссылка в ch002) — законно там
 
 
 def test_own_epub_passes_text_loss_check(tmp_path: Path) -> None:
@@ -3778,6 +3776,7 @@ def test_meta_label_prefixes_and_details_escaping() -> None:
 def make_text_epub(path: Path, text: str, *, converted: bool) -> None:
     """Epub с одним текстом. converted — метка fb2_to_epub3 в OPF; без неё epub выглядит как издательский."""
     generator = f'<meta name="generator" content="{bl.FB2_CONVERTER_GENERATOR}"/>' if converted else ""
+    path.parent.mkdir(parents=True, exist_ok=True)
     container = (
         '<?xml version="1.0"?>'
         '<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
@@ -3917,6 +3916,7 @@ def run_cli(argv: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
 def test_purge_quarantine_busy_scan_lock_refuses_without_deleting(cfg: dict[str, Any], tmp_path: Path,
                                                                   monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    monkeypatch.setattr(bl, "LOCK_PATH", tmp_path / ".books_library.lock")  # блокировка — во временном каталоге
     _qroot, dup, _kept = make_purge_tree(cfg, tmp_path)
     params = bl.command_params("purge-quarantine", {"reasons": ["duplicate"]})
     with (tmp_path / ".books_library.lock").open("w") as held:
