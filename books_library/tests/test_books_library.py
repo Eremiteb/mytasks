@@ -128,6 +128,7 @@ def make_cfg(tmp_path: Path, books: Path, port: int = 8090) -> dict[str, Any]:
         "quarantine_dir": str(tmp_path / "quarantine"),
         "workers": 2,
         "text_cache_dir": "",  # кэш текста выключен: тесты не пишут в /var/cache
+        "decisions_dir": str(tmp_path / "decisions"),  # личные решения — во временном каталоге, не в домашнем
     }
     config.write_text(json.dumps(settings), encoding="utf-8")
     return bl.load_config(config)
@@ -4448,3 +4449,95 @@ def test_enrich_epub_adds_noteref_and_footnote_without_fb2(authors_cfg: dict[str
     assert 'epub:type="noteref" href="#n1"' in chapter
     assert '<div epub:type="footnote" id="n1" class="note footnote"' in chapter
     assert bl.book_completeness(epub)["links_ok"] is True
+
+
+# ---- (д) решения: выгрузка и загрузка переживают удаление базы ---------------------------------
+
+@pytest.fixture
+def public_variants(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Публичный файл решений и журналы — во временном каталоге: тесты не пишут в репозиторий."""
+    path = tmp_path / "public" / "author_variants.json"
+    monkeypatch.setattr(bl, "PUBLIC_VARIANTS_PATH", path)
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    return path
+
+
+def test_load_config_rejects_decisions_dir_inside_repo(tmp_path: Path) -> None:
+    config = tmp_path / "books_library.json"
+    config.write_text(json.dumps({"decisions_dir": str(bl.REPO_DIR / "private")}), encoding="utf-8")
+    with pytest.raises(bl.ConfigError, match="внутри репозитория"):
+        bl.load_config(config)
+
+
+def test_export_writes_public_and_private_files(cfg: dict[str, Any], public_variants: Path) -> None:
+    bl.scan(cfg)
+    with closing(bl.connect(cfg["db_path"])) as conn, conn:
+        conn.execute("INSERT INTO marks(path, status, rating, favorite, note, progress, updated) VALUES (?,?,?,?,?,?,?)",
+                     (FB2_REL, "done", 5, 1, "хорошая", 1.0, time.time()))
+        conn.execute("INSERT INTO marks(path, status, updated) VALUES (?,?,?)", ("Удалено/Книга.fb2", "want", time.time()))
+        conn.execute("INSERT INTO shelves(id, name) VALUES (1, 'Любимое')")
+        conn.execute("INSERT INTO shelf_items(shelf_id, path) VALUES (1, ?)", (FB2_REL,))
+        conn.execute("INSERT INTO author_variants(a, b, tier, status, target, updated) VALUES (?,?,?,?,?,?)",
+                     ("Иванов Иван", "Иванов Иванович", "common", "merged", "Иванов Иван", time.time()))
+        conn.execute("INSERT INTO author_variants(a, b, tier, status, target, updated) VALUES (?,?,?,?,?,?)",
+                     ("Петров Пётр", "Петров П.", "common", "pending", "", time.time()))
+
+    bl.export_decisions(cfg, out=lambda _line: None)
+
+    assert json.loads(public_variants.read_text(encoding="utf-8")) == [
+        {"a": "Иванов Иван", "b": "Иванов Иванович", "status": "merged", "target": "Иванов Иван"}]
+    private_dir = Path(cfg["decisions_dir"])
+    personal = private_dir / "personal.json"
+    assert personal.is_file()
+    assert oct(personal.stat().st_mode & 0o777) == "0o600"
+    assert oct(private_dir.stat().st_mode & 0o777) == "0o700"
+    assert not private_dir.resolve().is_relative_to(bl.REPO_DIR.resolve())
+    data = json.loads(personal.read_text(encoding="utf-8"))
+    book = book_rows(cfg)[FB2_REL]
+    key = bl.book_identity(book["authors"], book["title"])
+    assert [(m["key"], m["path"], m["status"], m["rating"]) for m in data["marks"]] == [
+        (key, FB2_REL, "done", 5), ("", "Удалено/Книга.fb2", "want", 0)]
+    assert data["shelves"] == [{"name": "Любимое", "items": [{"key": key, "path": FB2_REL}]}]
+
+
+def test_import_into_new_db_matches_moved_book_by_key(cfg: dict[str, Any], books_dir: Path,
+                                                    public_variants: Path) -> None:
+    bl.scan(cfg)
+    book = book_rows(cfg)[FB2_REL]
+    with closing(bl.connect(cfg["db_path"])) as conn, conn:
+        conn.execute("INSERT INTO marks(path, status, rating, updated) VALUES (?,?,?,?)", (FB2_REL, "done", 5, time.time()))
+        conn.execute("INSERT INTO marks(path, status, updated) VALUES (?,?,?)", ("Удалено/Книга.fb2", "want", time.time()))
+        conn.execute("INSERT INTO shelves(id, name) VALUES (1, 'Любимое')")
+        conn.execute("INSERT INTO shelf_items(shelf_id, path) VALUES (1, ?)", (FB2_REL,))
+        # правка метаданных: название меняется в базе, а разбор файла остаётся прежним
+        conn.execute("INSERT INTO meta_overrides(path, title, updated) VALUES (?,?,?)", (FB2_REL, "Тёмный лес. Издание 2", time.time()))
+        conn.execute("UPDATE books SET title=? WHERE path=?", ("Тёмный лес. Издание 2", FB2_REL))
+        conn.execute("INSERT INTO author_variants(a, b, tier, status, target, updated) VALUES (?,?,?,?,?,?)",
+                     ("Иванов Иван", "Иванов Иванович", "common", "merged", "Иванов Иван", time.time()))
+    bl.export_decisions(cfg, out=lambda _line: None)
+
+    # восстановление каталога: база удалена, книга перенесена в другую папку
+    for suffix in ("", "-wal", "-shm"):
+        Path(cfg["db_path"] + suffix).unlink(missing_ok=True)
+    (books_dir / "Разное").mkdir()
+    (books_dir / FB2_REL).rename(books_dir / "Разное" / "Тёмный лес.fb2")
+    new_rel = "Разное/Тёмный лес.fb2"
+    bl.scan(cfg)
+
+    assert db_rows(cfg, "SELECT path, status, rating FROM marks ORDER BY path") == [(new_rel, "done", 5)]
+    assert db_rows(cfg, "SELECT s.name, i.path FROM shelves s JOIN shelf_items i ON i.shelf_id = s.id") == [
+        ("Любимое", new_rel)]
+    assert db_rows(cfg, f"SELECT title FROM books WHERE path='{new_rel}'") == [("Тёмный лес. Издание 2",)]
+    assert db_rows(cfg, "SELECT a, b, status, target FROM author_variants") == [
+        ("Иванов Иван", "Иванов Иванович", "merged", "Иванов Иван")]
+    journals = list(bl.REPORTS_DIR.glob("import-decisions*.jsonl"))
+    assert journals and '"action": "unmatched"' in journals[-1].read_text(encoding="utf-8")
+    assert book["title"] == "Тёмный лес"
+
+    # повторный импорт не дублирует записи
+    before = db_rows(cfg, "SELECT path, status FROM marks ORDER BY path")
+    with closing(bl.connect(cfg["db_path"])) as conn:
+        bl.import_decisions(cfg, conn, out=lambda _line: None)
+    assert db_rows(cfg, "SELECT path, status FROM marks ORDER BY path") == before
+    assert db_rows(cfg, "SELECT count(*) FROM shelf_items") == [(1,)]
+

@@ -4,6 +4,7 @@
   "text_cache_mb": 20000,
   "books_dir": "/mnt/copy/Books",
   "quarantine_dir": "/mnt/copy/Books-removed",
+  "decisions_dir": "~/.local/share/books_library/decisions",
   "db_path": "books_library.db",
   "host": "127.0.0.1",
   "port": 8090,

@@ -1,5 +1,5 @@
 [Unit]
-Description=Библиотека книг: переделка библиотеки — ночная обработка и индексация /mnt/copy/Books (scan, fix-encoding, convert, unpack-collections, sort-underscore, merge-authors, author-variants, fix-misplaced, dedup, dedup-folders, enrich-epub, strip-suffix, name-variants, windows-names, check-folders, scan)
+Description=Библиотека книг: переделка библиотеки — ночная обработка и индексация /mnt/copy/Books (scan, fix-encoding, convert, unpack-collections, sort-underscore, merge-authors, author-variants, fix-misplaced, dedup, dedup-folders, enrich-epub, strip-suffix, name-variants, windows-names, check-folders, export-decisions, scan)
 Documentation=file://@MYTASKS_DIR@/books_library/README.md
 # Одновременный запуск scan и кнопки «Пересканировать» исключён блокировкой движка (код 3 — не повторять).
 StartLimitIntervalSec=2h
@@ -26,6 +26,7 @@ ExecStart=-/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py 
 ExecStart=-/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py name-variants
 ExecStart=-/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py windows-names
 ExecStart=-/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py check-folders
+ExecStart=-/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py export-decisions
 ExecStart=/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py scan
 # Конфигурация (2) и уже идущее сканирование (3) повтором не лечатся.
 RestartPreventExitStatus=2 3
@@ -43,7 +44,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=@MYTASKS_DIR@/books_library @MYTASKS_DIR@/logs -/mnt/copy/Books -/mnt/copy/Books-removed -/var/cache/books_library
+ReadWritePaths=@MYTASKS_DIR@/books_library @MYTASKS_DIR@/logs -/mnt/copy/Books -/mnt/copy/Books-removed -/var/cache/books_library -%h/.local/share/books_library
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=yes
 RestrictRealtime=yes

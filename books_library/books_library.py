@@ -93,6 +93,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "text_cache_mb": 20000,
     # Карантин служебных режимов: вместо удаления файлы переносятся сюда (<причина>/<путь в каталоге книг>).
     "quarantine_dir": "/mnt/copy/Books-removed",
+    # Личные решения (отметки, полки, правки метаданных, решённые дубли): вне репозитория, файлы 0600, каталог 0700.
+    "decisions_dir": "~/.local/share/books_library/decisions",
     "workers": 12,
     # Потоки unzip-books: распаковка пишет на диск, а HDD SMR при параллельной записи сильно замедляется.
     "unzip_workers": 2,
@@ -375,7 +377,7 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
                             ("unzip_workers", 1, 64), ("text_cache_mb", 0, 10_000_000)):
         if not isinstance(cfg[key], int) or isinstance(cfg[key], bool) or not low <= cfg[key] <= high:
             raise ConfigError(f"{key} должен быть целым от {low} до {high}")
-    for key in ("books_dir", "db_path", "host", "quarantine_dir"):
+    for key in ("books_dir", "db_path", "host", "quarantine_dir", "decisions_dir"):
         if not isinstance(cfg[key], str) or not cfg[key]:
             raise ConfigError(f"{key} должен быть непустой строкой")
     if not isinstance(cfg["text_cache_dir"], str):
@@ -387,6 +389,10 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
     cfg["db_path"] = str(db_path if db_path.is_absolute() else PROJECT_DIR / db_path)
     cfg["books_dir"] = str(Path(cfg["books_dir"]).expanduser())
     cfg["quarantine_dir"] = str(Path(cfg["quarantine_dir"]).expanduser())
+    decisions = Path(cfg["decisions_dir"]).expanduser()
+    cfg["decisions_dir"] = str(decisions if decisions.is_absolute() else PROJECT_DIR / decisions)
+    if Path(cfg["decisions_dir"]).resolve().is_relative_to(REPO_DIR.resolve()):
+        raise ConfigError("decisions_dir не может быть внутри репозитория: личные решения в Git не хранятся")
     if Path(cfg["quarantine_dir"]).resolve().is_relative_to(Path(cfg["books_dir"]).resolve()):
         raise ConfigError("quarantine_dir не может быть внутри books_dir: карантин не индексируется")
     auth = cfg["auth"]
@@ -1186,10 +1192,336 @@ def scan(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str], None] 
             if conn.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_COLLECTIONS:
                 report_collections(rebuild_collections(conn), out)
             conn.execute("INSERT OR REPLACE INTO meta VALUES ('last_scan', ?)", (datetime.now().isoformat(timespec="seconds"),))
+        # База пуста по решениям (восстановлена из каталога, а не прошла author-variants): решения из файлов.
+        if conn.execute("SELECT count(*) FROM author_variants").fetchone()[0] == 0 and decision_files_exist(cfg):
+            try:
+                import_decisions(cfg, conn, out=out)
+            except ConfigError as error:
+                say(f"решения не загружены: {error}", "decisions_skipped", logging.WARNING, detail=str(error))
         conn.execute("PRAGMA optimize")
     stats["parse_errors"] = parse_errors
     say(f"сканирование завершено: {json.dumps(stats, ensure_ascii=False)}", "scan_done", detail=json.dumps(stats))
     return stats
+
+
+# ======================================================================
+# Решения пользователя: выгрузка и загрузка (переживают удаление базы)
+# ======================================================================
+
+PUBLIC_DECISIONS_DIR = PROJECT_DIR / "decisions"  # в репозитории: только решения author_variants
+PUBLIC_VARIANTS_PATH = PUBLIC_DECISIONS_DIR / "author_variants.json"
+DECISIONS_VERSION = 1  # версия формата personal.json
+PERSONAL_FILE = "personal.json"  # вне репозитория (decisions_dir): отметки, полки, правки метаданных, решённые дубли
+PERSONAL_LISTS = ("marks", "shelves", "meta_overrides", "dup_groups")
+VARIANT_DECISIONS = ("different", "merged")
+
+
+def personal_decisions_path(cfg: dict[str, Any]) -> Path:
+    return Path(cfg["decisions_dir"]) / PERSONAL_FILE
+
+
+def decision_files_exist(cfg: dict[str, Any]) -> bool:
+    return PUBLIC_VARIANTS_PATH.is_file() or personal_decisions_path(cfg).is_file()
+
+
+def book_identity(authors: str, title: str) -> str:
+    """Ключ книги для решений: первый автор (author_key — набор слов) и название (norm_key). Путь в ключ не входит:
+    после восстановления каталога пути книг другие."""
+    first = authors.split("; ")[0] if authors else ""
+    author = author_key(first)
+    return f"{' '.join(sorted(author)) if author else ''}|{norm_key(title)}"
+
+
+def book_keys(conn: sqlite3.Connection) -> dict[str, str]:
+    """Путь книги → ключ книги по текущей базе."""
+    return {row["path"]: book_identity(row["authors"], row["title"])
+            for row in conn.execute("SELECT path, authors, title FROM books")}
+
+
+def book_index(conn: sqlite3.Connection) -> dict[str, list[str]]:
+    """Ключ книги → пути книг с этим ключом (одна книга в нескольких форматах — несколько путей)."""
+    index: dict[str, list[str]] = {}
+    for path, key in book_keys(conn).items():
+        index.setdefault(key, []).append(path)
+    return index
+
+
+def write_private_json(path: Path, data: Any, mode: int) -> None:
+    """JSON атомарно: временный файл рядом создаётся с правами mode до записи, затем os.replace."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), mode)
+            json.dump(data, handle, ensure_ascii=False, indent=1)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def load_decision_file(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ConfigError(f"не читается {path}: {error}") from error
+
+
+def load_variants(path: Path) -> list[dict[str, str]]:
+    """Публичный файл: список {a, b, status, target}; пары проверяются, битый файл — ошибка, а не частичная загрузка."""
+    data = load_decision_file(path)
+    if not isinstance(data, list):
+        raise ConfigError(f"{path}: ожидается список решений")
+    for item in data:
+        if not isinstance(item, dict) or not isinstance(item.get("a"), str) or not isinstance(item.get("b"), str) \
+                or not item["a"] or not item["b"] or item["a"] == item["b"] \
+                or item.get("status") not in VARIANT_DECISIONS or not isinstance(item.get("target", ""), str):
+            raise ConfigError(f"{path}: запись решения не разобрана: {item!r}"[:300])
+    return data
+
+
+def load_personal(path: Path) -> dict[str, list[dict[str, Any]]]:
+    """Личный файл: списки объектов по PERSONAL_LISTS; полки проверяются до загрузки, частичной загрузки не будет."""
+    data = load_decision_file(path)
+    if not isinstance(data, dict):
+        raise ConfigError(f"{path}: ожидается JSON-объект")
+    result: dict[str, list[dict[str, Any]]] = {}
+    for name in PERSONAL_LISTS:
+        items = data.get(name, [])
+        if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
+            raise ConfigError(f"{path}: {name} — список объектов")
+        result[name] = items
+    for shelf in result["shelves"]:
+        if not isinstance(shelf.get("name"), str) or not isinstance(shelf.get("items", []), list) \
+                or not all(isinstance(item, dict) for item in shelf.get("items", [])):
+            raise ConfigError(f"{path}: полка не разобрана: {shelf.get('name')!r}")
+    return result
+
+
+def keep_missing(previous: list[dict[str, Any]], exported: list[dict[str, Any]],
+                 identity: Callable[[dict[str, Any]], Any]) -> list[dict[str, Any]]:
+    """Записи прежнего файла, которых нет в выгрузке, сохраняются: решение не теряется, если его книги сейчас нет в базе."""
+    current = {identity(item) for item in exported}
+    return [item for item in previous if identity(item) not in current]
+
+
+def export_decisions(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str], None] = print) -> dict[str, int]:
+    """Выгрузка решений, только чтение базы (без scan_lock): author_variants с решениями different/merged —
+    books_library/decisions/author_variants.json (в репозиторий); отметки, полки, правки метаданных и решённые
+    группы дублей — personal.json в decisions_dir (вне репозитория, файл 0600, каталог 0700). Ключ книги — по
+    book_identity; путь сохраняется для справки. Записи прежнего файла, которых сейчас нет в базе, сохраняются."""
+    db_path = cfg["db_path"]
+    if not Path(db_path).is_file():
+        raise ConfigError(f"база не найдена: {db_path} (сначала scan)")
+    personal_path = personal_decisions_path(cfg)
+    root = Path(cfg["books_dir"])
+    with closing(connect(db_path, readonly=True)) as conn:
+        if conn.execute("PRAGMA user_version").fetchone()[0] < VARIANT_SCHEMA:
+            raise ConfigError(f"схема базы старше v{VARIANT_SCHEMA}: сначала scan")
+        keys = book_keys(conn)
+        db_keys = set(keys.values())
+        decided = ",".join("?" * len(VARIANT_DECISIONS))
+        variants = [dict(row) for row in conn.execute(
+            f"SELECT a, b, status, target FROM author_variants WHERE status IN ({decided}) ORDER BY a, b", VARIANT_DECISIONS)]
+        marks = [{"key": keys.get(row["path"], ""), **dict(row)} for row in conn.execute("SELECT * FROM marks ORDER BY path")]
+        shelves: dict[str, list[dict[str, str]]] = {}
+        for row in conn.execute("SELECT s.name, i.path FROM shelves s LEFT JOIN shelf_items i ON i.shelf_id = s.id "
+                                "ORDER BY s.name, i.path"):
+            items = shelves.setdefault(row["name"], [])
+            if row["path"] is not None:
+                items.append({"key": keys.get(row["path"], ""), "path": row["path"]})
+        overrides = []
+        for row in conn.execute("SELECT * FROM meta_overrides ORDER BY path"):
+            parsed = read_book_meta(root, row["path"]) if row["path"] in keys else {}
+            parsed_key = book_identity("; ".join(parsed.get("authors", [])), parsed.get("title", "")) if parsed else ""
+            overrides.append({"key": keys.get(row["path"], ""), "parsed_key": parsed_key,
+                              **{name: row[name] for name in ("path", *EDIT_KEYS, "updated")}})
+        groups = []
+        for group in conn.execute("SELECT id, key FROM dup_groups WHERE status = 'resolved' ORDER BY key"):
+            members = [{"key": keys.get(row["path"], ""), "path": row["path"]} for row in conn.execute(
+                "SELECT path FROM dup_members WHERE group_id=? ORDER BY path", (group["id"],))]
+            groups.append({"group_key": group["key"], "status": "resolved", "members": members})
+
+    previous = load_personal(personal_path) if personal_path.is_file() else {name: [] for name in PERSONAL_LISTS}
+    previous_variants = load_variants(PUBLIC_VARIANTS_PATH) if PUBLIC_VARIANTS_PATH.is_file() else []
+    variants += keep_missing(previous_variants, variants, lambda item: (item["a"], item["b"]))
+    variants.sort(key=lambda item: (item["a"], item["b"]))
+    marks += [item for item in previous["marks"] if item.get("key") not in db_keys]
+    overrides += [item for item in previous["meta_overrides"] if item.get("key") not in db_keys]
+    for item in previous["shelves"]:
+        kept = [entry for entry in item.get("items", []) if entry.get("key") not in db_keys]
+        if kept:
+            shelves.setdefault(item["name"], []).extend(kept)
+    groups += [item for item in previous["dup_groups"]
+               if not any(member.get("key") in db_keys for member in item.get("members", []))]
+    shelf_list = [{"name": name, "items": items} for name, items in shelves.items()]
+    personal = {"version": DECISIONS_VERSION, "exported": datetime.now().isoformat(timespec="seconds"),
+                "marks": marks, "shelves": shelf_list, "meta_overrides": overrides, "dup_groups": groups}
+
+    stats = {"variants": len(variants), "marks": len(marks), "shelves": len(shelf_list),
+             "meta_overrides": len(overrides), "dup_groups": len(groups)}
+    summary = (f"author_variants {stats['variants']} → {PUBLIC_VARIANTS_PATH}; отметки {stats['marks']}, полки "
+               f"{stats['shelves']}, правки {stats['meta_overrides']}, решённые дубли {stats['dup_groups']} → {personal_path}")
+    if dry_run:
+        out(f"[dry-run] будет: выгрузить решения: {summary}; файлы не записаны")
+        return stats
+    decisions_dir = Path(cfg["decisions_dir"])
+    decisions_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(decisions_dir, 0o700)
+    write_private_json(personal_path, personal, 0o600)
+    write_private_json(PUBLIC_VARIANTS_PATH, variants, 0o644)
+    say(f"решения выгружены: {summary}", "decisions_export", detail=json.dumps(stats, ensure_ascii=False))
+    out(f"выгружены решения: {summary}")
+    return stats
+
+
+def import_variants(conn: sqlite3.Connection, items: list[dict[str, str]], run: NightRun, dry_run: bool) -> None:
+    """Пары решений: отсутствующие создаются со статусом из файла; решённые в базе не перетираются (только pending)."""
+    for item in items:
+        a, b = sorted((item["a"], item["b"]))
+        row = conn.execute("SELECT status FROM author_variants WHERE a=? AND b=?", (a, b)).fetchone()
+        if row is not None and row["status"] != "pending":
+            continue
+        if not dry_run:
+            conn.execute(
+                "INSERT INTO author_variants(a, b, tier, status, target, updated) VALUES (?,?,'manual',?,?,?) "
+                "ON CONFLICT(a, b) DO UPDATE SET status=excluded.status, target=excluded.target, updated=excluded.updated "
+                "WHERE author_variants.status='pending'",
+                (a, b, item["status"], item.get("target", ""), time.time()))
+        run.record("imported", f"{a} | {b}", kind="variant", status=item["status"])
+
+
+def store_override(conn: sqlite3.Connection, path: str, item: dict[str, Any]) -> None:
+    """Правка из файла — в meta_overrides; существующая запись не перезаписывается."""
+    conn.execute(
+        "INSERT OR IGNORE INTO meta_overrides(path, title, authors, series, series_no, genres, year, lang, annotation, updated)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (path, item.get("title"), item.get("authors"), item.get("series"), item.get("series_no"), item.get("genres"),
+         item.get("year"), item.get("lang"), item.get("annotation"), item.get("updated") or time.time()))
+
+
+def apply_stored_override(cfg: dict[str, Any], conn: sqlite3.Connection, path: str) -> None:
+    """Правка из meta_overrides — поверх разбора книги сразу: scan уже разобрал книги до загрузки решений."""
+    row = conn.execute("SELECT * FROM meta_overrides WHERE path=?", (path,)).fetchone()
+    root = Path(cfg["books_dir"])
+    stat = (root / path).stat()
+    meta = read_book_meta(root, path, stat.st_size, stat.st_mtime, detail=True)
+    apply_override(meta, row)
+    upsert_book(conn, path, stat.st_size, stat.st_mtime, meta)
+
+
+def import_overrides(cfg: dict[str, Any], conn: sqlite3.Connection, items: list[dict[str, Any]],
+                     index: dict[str, list[str]], run: NightRun, dry_run: bool) -> None:
+    """Правки сопоставляются по разбору книги (parsed_key — до правки), затем применяются к книге."""
+    for item in items:
+        paths = index.get(str(item.get("parsed_key") or ""), [])
+        if not paths:
+            run.record("unmatched", str(item.get("path", "")), kind="meta_override", key=str(item.get("parsed_key") or ""))
+            continue
+        for path in paths:
+            if not dry_run:
+                store_override(conn, path, item)
+                apply_stored_override(cfg, conn, path)
+            run.record("imported", path, kind="meta_override")
+
+
+def import_marks(conn: sqlite3.Connection, items: list[dict[str, Any]], index: dict[str, list[str]],
+                 run: NightRun, dry_run: bool) -> None:
+    for item in items:
+        paths = index.get(str(item.get("key") or ""), [])
+        if not paths:
+            run.record("unmatched", str(item.get("path", "")), kind="mark", key=str(item.get("key") or ""))
+            continue
+        for path in paths:
+            if not dry_run:
+                conn.execute(
+                    "INSERT INTO marks(path, status, rating, favorite, note, progress, opened, updated) VALUES (?,?,?,?,?,?,?,?)"
+                    " ON CONFLICT(path) DO NOTHING",
+                    (path, item.get("status", ""), item.get("rating", 0), item.get("favorite", 0), item.get("note", ""),
+                     item.get("progress", 0), item.get("opened"), item.get("updated") or time.time()))
+            run.record("imported", path, kind="mark")
+
+
+def import_shelves(conn: sqlite3.Connection, shelves: list[dict[str, Any]], index: dict[str, list[str]],
+                   run: NightRun, dry_run: bool) -> None:
+    """Полка создаётся по имени (как и раньше — имя уникально); книги полки сопоставляются по ключу."""
+    for shelf in shelves:
+        name = shelf["name"]
+        shelf_id = None
+        if not dry_run:
+            conn.execute("INSERT OR IGNORE INTO shelves(name) VALUES (?)", (name,))
+            shelf_id = conn.execute("SELECT id FROM shelves WHERE name=?", (name,)).fetchone()[0]
+        for item in shelf.get("items", []):
+            paths = index.get(str(item.get("key") or ""), [])
+            if not paths:
+                run.record("unmatched", str(item.get("path", "")), kind="shelf", shelf=name, key=str(item.get("key") or ""))
+                continue
+            for path in paths:
+                if shelf_id is not None:
+                    conn.execute("INSERT OR IGNORE INTO shelf_items(shelf_id, path) VALUES (?,?)", (shelf_id, path))
+                run.record("imported", path, kind="shelf", shelf=name)
+
+
+def import_dup_groups(conn: sqlite3.Connection, groups: list[dict[str, Any]], index: dict[str, list[str]],
+                      run: NightRun, dry_run: bool) -> None:
+    """Решение по группе дублей — только для открытой группы (similar), в которой есть книги из файла."""
+    for group in groups:
+        ref = str(group.get("group_key", ""))
+        paths = [path for member in group.get("members", []) for path in index.get(str(member.get("key") or ""), [])]
+        if not paths:
+            run.record("unmatched", ref, kind="dup_group")
+            continue
+        slots = ",".join("?" * len(paths))
+        ids = [row[0] for row in conn.execute(
+            f"SELECT DISTINCT g.id FROM dup_groups g JOIN dup_members m ON m.group_id = g.id "
+            f"WHERE g.status = 'similar' AND m.path IN ({slots})", paths)]
+        if not ids:
+            run.record("unmatched", ref, kind="dup_group", reason="открытой группы нет")
+            continue
+        if not dry_run:
+            conn.execute(f"UPDATE dup_groups SET status='resolved' WHERE id IN ({','.join('?' * len(ids))})", ids)
+        run.record("imported", ref, kind="dup_group")
+
+
+def import_decisions(cfg: dict[str, Any], conn: sqlite3.Connection, dry_run: bool = False,
+                     out: Callable[[str], None] = print) -> dict[str, Any]:
+    """Загрузка решений в базу: вызывается в конце scan, если author_variants пуста и есть файлы решений, и режимом
+    import-decisions. Повтор безопасен: существующие записи не дублируются и не перезаписываются. Несопоставленное —
+    в журнал (action unmatched). Порядок: пары → правки метаданных (книга разбирается с правкой) → отметки, полки, дубли."""
+    variants = load_variants(PUBLIC_VARIANTS_PATH) if PUBLIC_VARIANTS_PATH.is_file() else []
+    personal_path = personal_decisions_path(cfg)
+    personal = load_personal(personal_path) if personal_path.is_file() else {name: [] for name in PERSONAL_LISTS}
+    if not variants and not any(personal.values()):
+        return {}  # решений нет: журнал и отчёт не создаются
+    run = NightRun(cfg, "import-decisions", dry_run, None, out)
+    try:
+        with conn:
+            import_variants(conn, variants, run, dry_run)
+            import_overrides(cfg, conn, personal["meta_overrides"], book_index(conn), run, dry_run)
+            index = book_index(conn)  # после правок ключи книг — уже с правками
+            import_marks(conn, personal["marks"], index, run, dry_run)
+            import_shelves(conn, personal["shelves"], index, run, dry_run)
+            import_dup_groups(conn, personal["dup_groups"], index, run, dry_run)
+    except BaseException:
+        run.journal.close()
+        raise
+    return run.finish({"variants_file": str(PUBLIC_VARIANTS_PATH), "personal_file": str(personal_path)})
+
+
+def import_decisions_command(cfg: dict[str, Any], dry_run: bool, out: Callable[[str], None] = print) -> dict[str, Any]:
+    """Режим import-decisions: загрузка решений независимо от содержимого базы (scan делает это сам при пустой author_variants)."""
+    if not Path(cfg["db_path"]).is_file():
+        raise ConfigError(f"база не найдена: {cfg['db_path']} (сначала scan)")
+    if not dry_run:
+        migrate_database(cfg["db_path"], out=out)
+    with closing(connect(cfg["db_path"], readonly=dry_run)) as conn:
+        if conn.execute("PRAGMA user_version").fetchone()[0] < VARIANT_SCHEMA:
+            raise ConfigError(f"схема базы старше v{VARIANT_SCHEMA}: сначала scan или migrate без -n")
+        return import_decisions(cfg, conn, dry_run=dry_run, out=out)
 
 
 DECL_RE = re.compile(rb'(<\?xml[^>]*?encoding\s*=\s*["\'])([\w.:-]+)(["\'])')
@@ -6272,7 +6604,7 @@ def unzip_books(cfg: dict[str, Any], dry_run: bool = False, path: str | None = N
 # ----------------------------------------------------------------------
 
 CLI_COMMANDS = ("unpack-collections", "merge-authors", "sort-underscore", "misplaced", "check-folders", "purge-quarantine",
-                "move-books")
+                "move-books", "export-decisions", "import-decisions")
 COLLECTIONS_SECTION = "Сборники"  # section_name папки «_…» каталога книг: раздел сборников
 RELINK_BATCH = 1000  # пар переноса на один relink: при сбое связи и файлы расходятся не больше чем на пачку
 FOLDER_NAME_MAX = 120
@@ -8899,6 +9231,7 @@ def command_params(command: str, raw: dict[str, Any]) -> dict[str, Any]:
         "author-variants": set(), "sort-underscore": {"limit"},
         "reconvert-fb2": {"path", "workers", "limit", "sample", "out", "epubcheck"},
         "misplaced": set(), "check-folders": set(), "fix-misplaced": set(),
+        "export-decisions": set(), "import-decisions": set(),
         "merge-folder": {"from", "to", "non_books_to_quarantine"},
         "strip-suffix": {"path"}, "name-variants": {"path"}, "windows-names": {"path"}, "enrich-epub": {"path"}, "purge-quarantine": {"reasons"}, "move-books": {"list_path"},
     }[command]
@@ -9044,6 +9377,10 @@ def run_command(cfg: dict[str, Any], command: str, dry_run: bool, params: dict[s
             return purge_quarantine(cfg, params["reasons"], dry_run)
         if command == "move-books":
             return move_books(cfg, params["list_path"], dry_run, out=out)
+        if command == "export-decisions":
+            return export_decisions(cfg, dry_run, out=out)
+        if command == "import-decisions":
+            return import_decisions_command(cfg, dry_run, out=out)
         if command == "reconvert-fb2":
             return reconvert_fb2(cfg, dry_run, params["path"], params["workers"], params["limit"], params["sample"],
                                  params["out"], params["epubcheck"], out=out)
@@ -9054,8 +9391,8 @@ def run_command(cfg: dict[str, Any], command: str, dry_run: bool, params: dict[s
 
     # purge-quarantine пишет в book_variants общей БД, поэтому боевой запуск берёт scan_lock как остальные изменяющие
     # режимы (карантин — не каталог книг, но база одна). Dry-run только читает и блокировку не берёт.
-    # check-folders только читает и блокировку не берёт (как dry-run).
-    if dry_run or command in ("migrate", "check-folders"):
+    # check-folders и export-decisions только читают и блокировку не берут (как dry-run).
+    if dry_run or command in ("migrate", "check-folders", "export-decisions"):
         return action()
     with scan_lock():
         return action()
@@ -11119,7 +11456,8 @@ def main(argv: list[str] | None = None) -> int:
                 raw = {"path": args.path}
             elif command == "sort-underscore":
                 raw = {"limit": args.limit}
-            elif command in ("author-variants", "misplaced", "check-folders", "fix-misplaced"):
+            elif command in ("author-variants", "misplaced", "check-folders", "fix-misplaced",
+                             "export-decisions", "import-decisions"):
                 raw = {}
             elif command == "merge-folder":
                 raw = {"from": args.from_folders, "to": args.to, "non_books_to_quarantine": args.non_books_to_quarantine}
