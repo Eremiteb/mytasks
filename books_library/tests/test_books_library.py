@@ -1819,6 +1819,11 @@ def test_person_name_accepts_people_and_rejects_titles_and_genres() -> None:
     for junk in ("драконов Охота на", "эпос Японский", "вБИТПЫЙО оЙЛПМБК", "автора без", "Tritsch by Bernhard",
                  "Рафел Н и", "Р‘СЂР°СѓРЅ Р¤СЂРµРґРµСЂРёРє", "ЧЧЧЧ"):
         assert not bl.person_name(junk), junk
+    assert not bl.person_name("DNS")
+    assert not bl.person_name("БСЭ")
+    assert bl.person_name("ИВАНОВ ИВАН")
+    assert bl.person_name("Гомер")
+    assert bl.person_name("А. Иванов")
     assert bl.author_key("ВЕЧЕ ИЗДАТЕЛЬСТВО") is None
 
 

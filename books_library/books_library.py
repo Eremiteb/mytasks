@@ -5506,11 +5506,13 @@ def author_key(name: str) -> frozenset[str] | None:
 
 def person_name(name: str) -> bool:
     """Похоже на имя человека, а не на название или жанр: каждое слово, кроме частиц AUTHOR_PARTICLES и приставок
-    «д'»/«л'»/«o'», начинается с заглавной буквы; слово целиком заглавными — годно при любой длине; в смешанном
+    «д'»/«л'»/«o'», начинается с заглавной буквы; многословное имя целиком заглавными — годно при любой длине;
+    одно слово целиком заглавными — аббревиатура, не имя; в смешанном
     регистре заглавных после первой буквы не больше половины (КОИ8-кракозябры вида «вБИТПЫЙО» отвергаются).
     Проверяется часть слова до первого дефиса. Слова без букв (инициалы с точкой и т. п.) пропускаются.
     Инициалы («А.», «Р») — годны. Нет ни одного проверенного слова — False."""
-    checked = False
+    checked = 0
+    acronym = False
     for word in name.split():
         part = word.split("-", 1)[0]
         if len(part) > 2 and part[1] in PERSON_APOSTROPHES and part[0].casefold() in PERSON_PREFIX_LETTERS:
@@ -5524,13 +5526,16 @@ def person_name(name: str) -> bool:
             return False
         if len(letters) > 1 and len(set(ch.casefold() for ch in letters)) == 1:
             return False  # «ЧЧЧЧ»: одна буква повтором — заглушка, не имя
-        checked = True
+        checked += 1
         if part.isupper():
+            acronym = len(letters) > 1
             continue
         rest = letters[1:]
         if sum(ch.isupper() for ch in rest) * 2 > len(rest):
             return False
-    return checked
+    if checked == 1 and acronym:
+        return False  # «DNS», «БСЭ»: единственное слово заглавными — аббревиатура
+    return checked > 0
 
 
 def split_authors(authors: str) -> list[str]:
