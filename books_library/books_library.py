@@ -4807,7 +4807,7 @@ class TextCache:
         except sqlite3.Error as error:
             say(f"кэш текста выключен: {path}: {error}", "text_cache_off", logging.WARNING)
             return None
-        return TextCache(conn, Path(cfg["books_dir"]))
+        return TextCache(conn, Path(cfg["books_dir"]) if cfg.get("books_dir") else None)
 
     def get(self, rel: str, size: int, mtime: float, fmt: str) -> str | None:
         """Текст из кэша или None. Запись без совпадения по пути берётся, только если её единственная по размеру,

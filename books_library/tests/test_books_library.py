@@ -456,7 +456,7 @@ def test_fix_encoding_dry_run_changes_nothing(enc_cfg: dict[str, Any], capsys: p
 
     assert stats["fixed"] == 1
     assert broken.read_bytes() == before
-    assert not (bl.REPORTS_DIR).exists()
+    assert not list((bl.REPORTS_DIR).glob("fix-encoding-2*"))  # dry-run пишет только журнал и отчёт «-dry-run»
     assert "[dry-run] будет" in capsys.readouterr().out
 
 
@@ -475,11 +475,10 @@ def test_fix_encoding_changes_only_declaration_and_writes_report(enc_cfg: dict[s
     assert broken.read_bytes() == before_broken.replace(WRONG_DECL, RIGHT_DECL, 1)
     assert real.read_bytes() == before_real
     assert normal.read_bytes() == before_normal
-    reports = list((bl.REPORTS_DIR).glob("books_library-fix-encoding-*.json"))
-    assert len(reports) == 1
-    report = json.loads(reports[0].read_text(encoding="utf-8"))
-    assert [item["path"] for item in report["files"]] == ["Автор/Ошибочная.fb2"]
-    assert report["files"][0]["declared"] == "windows-1251"
+    journals = list((bl.REPORTS_DIR).glob("fix-encoding-2*.jsonl"))
+    assert len(journals) == 1
+    rows = [json.loads(line) for line in journals[0].read_text(encoding="utf-8").splitlines()]
+    assert [Path(row["path"]).name for row in rows if row["action"] == "fixed"] == ["Ошибочная.fb2"]
 
 
 def test_fix_encoding_second_run_finds_nothing(enc_cfg: dict[str, Any]) -> None:
@@ -514,7 +513,7 @@ def test_fix_encoding_txt_cp1251_becomes_utf8(txt_cfg: dict[str, Any]) -> None:
     assert stats["fixed"] == 1
     assert (root / "Автор" / "cp.txt").read_bytes() == TXT_TEXT.encode("utf-8")
     assert (root / "Автор" / "utf.txt").read_bytes() == utf_before
-    assert len(list((bl.REPORTS_DIR).glob("books_library-fix-encoding-*.json"))) == 1
+    assert len(list((bl.REPORTS_DIR).glob("fix-encoding-2*.json"))) == 1
 
 
 def test_fix_encoding_only_fb2_skips_txt(txt_cfg: dict[str, Any]) -> None:
