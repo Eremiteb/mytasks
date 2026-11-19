@@ -3912,3 +3912,70 @@ def test_variant_card_shows_variants_of_kept_book(cfg: dict[str, Any], tmp_path:
         assert "zip-архив" in text and "Зелёная книга" in text
         status, _headers, body = fetch(f"{web}/book/{book_id(cfg, 'A/x.epub')}")
         assert "дубль" in body.decode("utf-8")
+
+
+# ---- convert --only fb2: отказ оставляет fb2 в библиотеке (решение пользователя 18.11.2026) ---------
+
+FB2_FAIL_REL = "Автор/Плохая.fb2"
+
+
+@pytest.fixture
+def fb2_fail_cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    root = tmp_path / "fb2fail"
+    (root / "Автор").mkdir(parents=True)
+    (root / FB2_FAIL_REL).write_bytes(make_fb2("Плохая", "Иван", "Иванов"))
+    monkeypatch.setattr(bl, "REPORTS_DIR", tmp_path / "reports")
+    cfg = make_cfg(tmp_path, root)
+    bl.migrate_database(cfg["db_path"])  # схема с book_meta: convert_error пишется в неё
+    return cfg
+
+
+def fail_both_converters(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bl, "fb2_own_epub", lambda data, produced: "собственный конвертер: тест")
+    monkeypatch.setattr(bl, "calibre_fb2_problem", lambda data, staged, produced, tmp, timeout: "calibre: тест")
+
+
+def test_convert_fb2_rejected_stays_in_library(fb2_fail_cfg: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    fail_both_converters(monkeypatch)
+    src = Path(fb2_fail_cfg["books_dir"]) / FB2_FAIL_REL
+    before = src.read_bytes()
+
+    stats = bl.convert_fb2(fb2_fail_cfg)
+
+    assert src.read_bytes() == before  # fb2 на месте, не тронут
+    assert stats["rejected-convert"] == 1
+    assert not (Path(fb2_fail_cfg["quarantine_dir"]) / "rejected-convert").exists()
+    st = src.stat()
+    assert bl.stored_convert_error(fb2_fail_cfg["db_path"], FB2_FAIL_REL) == f"calibre: тест|{st.st_size}|{st.st_mtime_ns}"
+
+
+def test_convert_fb2_marker_skips_unchanged_file(fb2_fail_cfg: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    fail_both_converters(monkeypatch)
+    bl.convert_fb2(fb2_fail_cfg)
+
+    def must_not_run(*_args: Any) -> None:
+        raise AssertionError("повторная конвертация неизменённого fb2")
+
+    monkeypatch.setattr(bl, "fb2_own_epub", must_not_run)
+    monkeypatch.setattr(bl, "calibre_fb2_problem", must_not_run)
+    stats = bl.convert_fb2(fb2_fail_cfg)
+
+    assert stats["skipped-rejected"] == 1
+    assert "rejected-convert" not in stats
+    assert (Path(fb2_fail_cfg["books_dir"]) / FB2_FAIL_REL).is_file()
+
+
+def test_convert_fb2_changed_file_is_retried(fb2_fail_cfg: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    fail_both_converters(monkeypatch)
+    bl.convert_fb2(fb2_fail_cfg)
+    src = Path(fb2_fail_cfg["books_dir"]) / FB2_FAIL_REL
+    src.write_bytes(make_fb2("Плохая вторая редакция", "Иван", "Иванов"))  # другой размер — подпись не совпадает
+
+    calls: list[int] = []
+    monkeypatch.setattr(bl, "fb2_own_epub", lambda data, produced: calls.append(1) or "собственный конвертер: тест")
+    stats = bl.convert_fb2(fb2_fail_cfg)
+
+    assert calls == [1]  # конвертация запущена снова
+    assert stats["rejected-convert"] == 1
+    assert "skipped-rejected" not in stats
+    assert src.is_file()

@@ -4216,12 +4216,51 @@ def calibre_fb2_problem(data: bytes, staged: Path, produced: Path, tmp: Path, ti
 # convert fb2 → epub (Calibre), в т. ч. fb2 внутри однокнижного zip
 # ----------------------------------------------------------------------
 
+# book_meta-ключ отказа конвертации fb2: «причина|размер|mtime_ns». Пока файл не изменился, повторно не конвертируем
+# (безнадёжный fb2 не пересобирается каждую ночь); изменился — пробуем снова.
+CONVERT_ERROR = "convert_error"
+
+
+def convert_error_value(reason: str, st: os.stat_result) -> str:
+    return f"{' '.join(reason.split())[:300]}|{st.st_size}|{st.st_mtime_ns}"
+
+
+def stored_convert_error(db_path: str, rel: str) -> str | None:
+    """convert_error книги или None: нет БД, схемы v6 или записи. Сбой чтения трактуется как отсутствие записи."""
+    if not Path(db_path).is_file():
+        return None
+    try:
+        with closing(connect(db_path, readonly=True)) as conn:
+            if conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_META:
+                return None
+            row = conn.execute("SELECT value FROM book_meta WHERE path=? AND key=?", (rel, CONVERT_ERROR)).fetchone()
+    except sqlite3.Error:
+        return None
+    return row[0] if row else None
+
+
+def convert_error_current(value: str, st: os.stat_result) -> bool:
+    """Файл не изменился с момента отказа: размер и mtime совпадают с записанными."""
+    parts = value.rsplit("|", 2)
+    return len(parts) == 3 and parts[1] == str(st.st_size) and parts[2] == str(st.st_mtime_ns)
+
+
+def set_convert_error(db_path: str, rel: str, value: str | None) -> None:
+    """Записывает convert_error книги (value) или снимает его (None)."""
+    with closing(connect(db_path)) as conn, conn:
+        conn.execute("DELETE FROM book_meta WHERE path=? AND key=?", (rel, CONVERT_ERROR))
+        if value is not None:
+            conn.execute("INSERT INTO book_meta VALUES (?,?,?)", (rel, CONVERT_ERROR, value))
+
+
 def convert_fb2(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None, workers: int | None = None,
                 out: Callable[[str], None] = print) -> dict[str, Any]:
     """fb2 и однокнижный zip с fb2 → name.epub рядом (имя как у fb2), проверка verify_book, исходник — в карантин
     replaced/. Рядом уже есть epub с тем же нормализованным именем — исходник сразу в replaced/ без конвертации.
     Сначала собственный конвертер fb2_to_epub3; при его ошибке или провале проверок — Calibre. Поле engine в журнале:
-    fb2epub3 или calibre. Сбой обоих или проверки — исходник в rejected-convert/."""
+    fb2epub3 или calibre. Сбой обоих или проверки — fb2 остаётся на месте (решение пользователя 18.11.2026):
+    строка rejected-convert в журнале и book_meta convert_error; пока файл не изменился, он пропускается
+    (skipped-rejected)."""
     run = NightRun(cfg, "convert-fb2", dry_run, path, out)
     timeout = cfg["convert_timeout"]
 
@@ -4234,6 +4273,7 @@ def convert_fb2(cfg: dict[str, Any], dry_run: bool = False, path: str | None = N
 
     def one(item: tuple[Path, dict[str, str]]) -> None:
         src, epubs = item
+        st = src.stat()  # подпись до чтения: правка во время конвертации не попадёт в convert_error
         data: bytes | None = None
         if src.name.lower().endswith(".zip"):
             try:
@@ -4248,13 +4288,20 @@ def convert_fb2(cfg: dict[str, Any], dry_run: bool = False, path: str | None = N
         stem = split_name(src.name)[0]
         result = src.parent / f"{stem}.epub"
         existing = epubs.get(norm_key(stem))
+        rel = run.rel(src)
+        marker = stored_convert_error(cfg["db_path"], rel)
         if existing or result.exists():
             keeper = src.parent / (existing or result.name)
+            if marker is not None and not dry_run:  # маркер уходит с исходником, а не переезжает на epub при relink
+                set_convert_error(cfg["db_path"], rel, None)
             run.quarantine(src, "replaced", reason="рядом уже есть epub", keeper=str(keeper))
             run.moved(src, keeper)
             return
         if not name_ok(result.name):
             run.quarantine(src, "rejected-name", reason="имя epub недопустимо")
+            return
+        if marker is not None and convert_error_current(marker, st):
+            run.record("skipped-rejected", src, reason=marker.rsplit("|", 2)[0])
             return
         if dry_run:
             run.record("convert", src, to=str(result))
@@ -4275,8 +4322,12 @@ def convert_fb2(cfg: dict[str, Any], dry_run: bool = False, path: str | None = N
                 produced.unlink(missing_ok=True)
                 engine = "calibre"
                 problem = calibre_fb2_problem(data, staged, produced, tmp, timeout)
-            if problem:
-                run.quarantine(src, "rejected-convert", reason=problem, engine=engine)
+            if problem:  # fb2 не трогаем: отказ — журнал и convert_error
+                try:
+                    set_convert_error(cfg["db_path"], rel, convert_error_value(problem, st))
+                except sqlite3.Error as error:
+                    run.record("failed", src, reason=f"convert_error: {error}")
+                run.record("rejected-convert", src, reason=problem, engine=engine)
                 return
             fd, tmp_out = tempfile.mkstemp(prefix=".convert.", suffix=".tmp", dir=src.parent)
             os.close(fd)
@@ -4288,6 +4339,8 @@ def convert_fb2(cfg: dict[str, Any], dry_run: bool = False, path: str | None = N
                 os.replace(tmp_out, result)
             finally:
                 Path(tmp_out).unlink(missing_ok=True)
+        if marker is not None:  # прежний отказ уходит с исходником, а не переезжает на epub
+            set_convert_error(cfg["db_path"], rel, None)
         run.quarantine(src, "replaced", reason="заменён проверенным epub", keeper=str(result), engine=engine)
         run.moved(src, result)
 
@@ -8041,6 +8094,7 @@ class Collection(NamedTuple):
 
 
 META_LABELS = {
+    CONVERT_ERROR: "Отказ конвертации fb2",
     "author_full": "Автор (полностью)", "translator": "Переводчик", "editor": "Редактор",
     "illustrator": "Иллюстратор", "contributor": "Участник", "keyword": "Ключевые слова", "keywords": "Ключевые слова",
     "date": "Дата", "src_lang": "Язык оригинала", "lang": "Язык", "language": "Язык", "series_extra": "Серия (доп.)",
