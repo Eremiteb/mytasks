@@ -2327,8 +2327,76 @@ QUARANTINE_REASONS = ("replaced", "duplicate", "edited", "rejected-convert", "re
 # Уже сжатые форматы кладутся в zip без сжатия: deflate их не уменьшит, только потратит процессор.
 STORED_EXTENSIONS = {"pdf", "djvu", "chm", "docx", "odt", "mobi", "azw", "azw3", "epub", "mp3", "jpg", "jpeg", "png",
                      "gif", "webp"}
-# Имя, недопустимое для NTFS/Windows (Syncthing): запрещённые символы, управляющие, точка или пробел в конце.
-NTFS_BAD = re.compile(r'[<>:"\\|?*\x00-\x1f]|[. ]$')
+# Имена папок и файлов библиотеки должны быть допустимы в Windows (Syncthing): см. windows_name_reason.
+WINDOWS_BAD_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+WINDOWS_RESERVED = frozenset({"CON", "PRN", "AUX", "NUL", *(f"{dev}{n}" for dev in ("COM", "LPT") for n in "0123456789¹²³")})
+WINDOWS_NAME_MESSAGES = {"empty": "пустое имя", "chars": "запрещённые символы или управляющие",
+                         "trailing": "точка или пробел в конце", "reserved": "зарезервированное имя устройства Windows",
+                         "long": "длиннее 255 байт UTF-8"}
+
+
+def windows_name_reason(name: str) -> str:
+    """Код причины, по которой имя недопустимо в Windows (empty, chars, trailing, reserved, long); пусто — имя годно.
+    Зарезервированные имена проверяются без учёта регистра и с любым расширением: «con.txt» — тоже нельзя."""
+    if not name:
+        return "empty"
+    if WINDOWS_BAD_CHARS.search(name):
+        return "chars"
+    if name.endswith((".", " ")):
+        return "trailing"
+    if name.partition(".")[0].upper() in WINDOWS_RESERVED:
+        return "reserved"
+    if len(name.encode("utf-8")) > 255:
+        return "long"
+    return ""
+
+
+def windows_name_error(name: str) -> str:
+    """Причина для сообщения (пусто — имя годно); см. windows_name_reason."""
+    reason = windows_name_reason(name)
+    return WINDOWS_NAME_MESSAGES[reason] if reason else ""
+
+
+def windows_name_fix(name: str, is_dir: bool) -> str:
+    """Допустимое имя вместо недопустимого (режим windows-names): запрещённые символы → «_», точки и пробелы в конце
+    убираются, зарезервированная основа получает «_» («CON.txt» → «CON_.txt»), длиннее 255 байт — укорачивается основа
+    (расширение файла сохраняется). Допустимое имя возвращается без изменений."""
+    fixed = WINDOWS_BAD_CHARS.sub("_", name).rstrip(" .") or "_"
+    base, dot, rest = fixed.partition(".")
+    if base.upper() in WINDOWS_RESERVED:
+        fixed = base + "_" + dot + rest
+    if len(fixed.encode("utf-8")) <= 255:
+        return fixed
+    stem, dot, ext = fixed.rpartition(".")
+    if is_dir or not dot or len(ext.encode("utf-8")) > 32:
+        stem, ext = fixed, ""
+    else:
+        ext = dot + ext
+    budget = 255 - len(ext.encode("utf-8"))
+    return (stem.encode("utf-8")[:budget].decode("utf-8", "ignore").rstrip(" .") or "_") + ext
+
+
+def windows_dir_plan(entries: list[tuple[str, bool]]) -> list[tuple[str, str, str, str]]:
+    """План windows-names для одной папки из (имя, это папка): (старое имя, новое, причина, twin). Сначала исправление
+    недопустимых имён. Совпадение без учёта регистра с уже оставленным именем — конфликт регистра: имя не переименовывается,
+    план (старое, старое, «case», оставленное имя). Первым остаётся неизменённое имя, затем по сортировке. Файлы и папки
+    делят одно пространство имён; конфликты решает dedup-folders или человек."""
+    fixed = []
+    for name, is_dir in entries:
+        reason = windows_name_reason(name)
+        fixed.append((name, windows_name_fix(name, is_dir) if reason else name, reason))
+    kept: dict[str, str] = {}
+    plan = []
+    for old, new, reason in sorted(fixed, key=lambda item: (item[1].casefold(), bool(item[2]), item[1])):
+        twin = kept.get(new.casefold())
+        if twin is not None:
+            plan.append((old, old, "case", twin))
+            continue
+        kept[new.casefold()] = new
+        plan.append((old, new, reason, ""))
+    return plan
+
+
 # Значимость форматов для dedup: остаётся самый значимый (epub → fb2 → txt → pdf → djvu → прочие).
 FORMAT_RANK = {"epub": 0, "fb2": 1, "txt": 2, "pdf": 3, "djvu": 4}
 DEDUP_MIN_WORDS = 200
@@ -3167,7 +3235,7 @@ def zip_date(mtime: float) -> tuple[int, int, int, int, int, int]:
 
 
 def name_ok(name: str) -> bool:
-    return len(name.encode("utf-8")) <= 255 and not NTFS_BAD.search(name)
+    return not windows_name_error(name)
 
 
 def parallel(items: Iterator[Any], fn: Callable[[Any], None], workers: int, run: NightRun) -> None:
@@ -5056,11 +5124,78 @@ def text_item(cfg: dict[str, Any], root: Path, cache: TextCache | None, known: d
             "role": "kept", "coverage": None, "keeper": "", "quarantine": ""}
 
 
+SAME_NAME_SUFFIX = re.compile(r"_[1-9][0-9]?$")  # хвост «_N» (N — 1..99) у копии с тем же именем
+LATIN_SMALL_WORDS = frozenset({"a", "an", "the", "of", "and", "in", "on", "to", "for"})  # служебные слова Title Case
+
+
+def same_name_base(rel: str) -> str:
+    """Основа имени книги без расширения и хвоста «_N»: «Белка_1.epub» → «Белка»."""
+    return SAME_NAME_SUFFIX.sub("", split_name(rel)[0])
+
+
+def same_name_key(rel: str) -> str:
+    """Ключ одноимённости для dedup-folders: основа без хвоста «_N» и без учёта регистра; расширения не сравниваются."""
+    return same_name_base(rel).casefold()
+
+
+def case_score(stem: str) -> tuple[int, int]:
+    """Оценка регистра названия, больше — лучше. Название — часть после « - », если она есть, иначе вся основа.
+    Кириллица — «как в предложении»: первая буква заглавная, в остальных словах меньше заглавных.
+    Латиница — Title Case: заглавные у слов, кроме служебных (a, an, the, of…); служебные строчными."""
+    words = stem.split(" - ", 1)[-1].split()
+    if not words:
+        return (0, 0)
+    if CYRILLIC.search(stem):
+        return (int(words[0][0].isupper()), -sum(int(word[0].isupper()) for word in words[1:]))
+    score = 0
+    for index, word in enumerate(words):
+        capital = int(word[0].isupper())
+        if index == 0 or word.lower() not in LATIN_SMALL_WORDS:
+            score += capital
+        else:
+            score -= capital
+    return (score, 0)
+
+
+def better_case(bases: list[str]) -> str:
+    """Лучшее по регистру основа из одноимённых. Первая — основа оставленного (keeper): при ничьей остаётся она."""
+    best = bases[0]
+    for base in bases[1:]:
+        if case_score(base) > case_score(best):
+            best = base
+    return best
+
+
+def same_name_renames(texts: list[dict[str, Any]]) -> dict[str, str]:
+    """Оставленный файл с одноимёнными дублями (same_name) получает лучшее по регистру имя группы (better_case):
+    основа без «_N» и расширение оставленного. Возвращает: старый путь → новое имя, только если имя меняется."""
+    renames: dict[str, str] = {}
+    for keeper in texts:
+        if keeper["role"] != "kept":
+            continue
+        group = [t["path"] for t in texts if t.get("same_name") and t["role"] == "duplicate" and t["keeper"] == keeper["path"]]
+        if not group:
+            continue
+        best = better_case([same_name_base(keeper["path"])] + [same_name_base(path) for path in group])
+        name = PurePosixPath(keeper["path"]).name
+        new_name = best + name[len(split_name(keeper["path"])[0]):]
+        if new_name != name and name_ok(new_name):
+            renames[keeper["path"]] = new_name
+    return renames
+
+
+def name_taken_ci(directory: Path, name: str, own: Path, leaving: set[Path]) -> bool:
+    """Занято ли имя в каталоге без учёта регистра другим файлом: свой файл и уходящие в карантин не считаются."""
+    return any(entry.casefold() == name.casefold() and directory / entry not in leaving and directory / entry != own
+               for entry in os.listdir(directory))
+
+
 def mark_roles(texts: list[dict[str, Any]]) -> None:
     """Жадный проход по значимости (формат → нативный раньше сконвертированного → кириллическое имя → больше слов →
     путь). Книга — дубль, если ≥ 97 % её шинглов уже есть у оставленных и похожих и в ней ≥ 200 слов; похожая — от 85 %
-    до 97 %; иначе оставлена. Без текста оставлена и в сравнении не участвует. У дубля и похожего keeper — оставленный
-    с наибольшей долей общих шинглов."""
+    до 97 %; иначе оставлена. Похожая с тем же именем без «_N» и регистра, что у keeper, — дубль (same_name): копия того же
+    текста. Без текста оставлена и в сравнении не участвует. У дубля и похожего keeper — оставленный с наибольшей долей
+    общих шинглов."""
     texts.sort(key=lambda t: (FORMAT_RANK.get(t["fmt"], 5), t.get("converted", False),
                               not CYRILLIC.search(split_name(t["path"])[0]), -t["words"], t["path"]))
     union: set[int] = set()
@@ -5084,8 +5219,10 @@ def mark_roles(texts: list[dict[str, Any]]) -> None:
             kept.append(item)
             union |= s
             continue
-        item.update(role=role, keeper=max(scored, key=lambda pair: pair[0])[1]["path"])
-        if role == "similar":
+        keeper = max(scored, key=lambda pair: pair[0])[1]["path"]
+        same = role == "similar" and same_name_key(item["path"]) == same_name_key(keeper)
+        item.update(role="duplicate" if same else role, keeper=keeper, same_name=same)
+        if role == "similar" and not same:
             union |= s
 
 
@@ -5125,8 +5262,10 @@ def dedup_folder(run: NightRun, folder_rel: str, texts: list[dict[str, Any]]) ->
     for item in texts:
         if item["role"] != "duplicate":
             continue
+        extra = {"reason": "same-name"} if item.get("same_name") else {}
         try:
-            dest = run.quarantine(run.root / item["path"], "duplicate", keeper=item["keeper"], coverage=item["coverage"])
+            dest = run.quarantine(run.root / item["path"], "duplicate", keeper=item["keeper"], coverage=item["coverage"],
+                                  **extra)
         except OSError as error:
             run.record("failed", item["path"], reason=f"карантин: {error}")
             item["role"] = "kept"  # файл остался на месте: его связи и группа не меняются
@@ -5135,7 +5274,12 @@ def dedup_folder(run: NightRun, folder_rel: str, texts: list[dict[str, Any]]) ->
     leaving = {run.root / t["path"] for t in texts if t["role"] == "duplicate"}
     taken: set[Path] = set()
     moves: dict[str, str] = {}
-    for old, new_name in keeper_renames(texts).items():
+    renames = keeper_renames(texts)
+    for old, new_name in same_name_renames(texts).items():
+        full = run.root / old
+        if old not in renames and not name_taken_ci(full.parent, new_name, full, leaving):
+            renames[old] = new_name  # занятое без учёта регистра имя оставляем для strip-suffix
+    for old, new_name in renames.items():
         full = run.root / old
         target = free_name(full.parent, new_name, leaving, taken)
         try:
@@ -5460,7 +5604,8 @@ def unzip_books(cfg: dict[str, Any], dry_run: bool = False, path: str | None = N
 # unpack-collections и sort-underscore: книги из раздела сборников / служебных папок «_» — в папки авторов (только CLI; в веб и API не выведены)
 # ----------------------------------------------------------------------
 
-CLI_COMMANDS = ("unpack-collections", "merge-authors", "sort-underscore", "misplaced", "purge-quarantine", "move-books")
+CLI_COMMANDS = ("unpack-collections", "merge-authors", "sort-underscore", "misplaced", "check-folders", "purge-quarantine",
+                "move-books")
 COLLECTIONS_SECTION = "Сборники"  # section_name папки «_…» каталога книг: раздел сборников
 RELINK_BATCH = 1000  # пар переноса на один relink: при сбое связи и файлы расходятся не больше чем на пачку
 FOLDER_NAME_MAX = 120
@@ -5553,8 +5698,9 @@ def split_authors(authors: str) -> list[str]:
 
 def folder_name(name: str) -> str:
     """Имя папки для Windows и Syncthing: без запрещённых и управляющих символов, без пробелов и точек по краям,
-    не длиннее FOLDER_NAME_MAX. Пустой результат — имени нет."""
-    return FOLDER_BAD_CHARS.sub("", name).strip(" .")[:FOLDER_NAME_MAX].strip(" .")
+    не длиннее FOLDER_NAME_MAX; зарезервированное имя устройства Windows получает «_». Пустой результат — имени нет."""
+    clean = FOLDER_BAD_CHARS.sub("", name).strip(" .")[:FOLDER_NAME_MAX].strip(" .")
+    return clean + "_" if clean.partition(".")[0].upper() in WINDOWS_RESERVED else clean
 
 
 def collections_section(root: Path) -> Path:
@@ -6818,6 +6964,57 @@ def misplaced(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str], N
     return stats
 
 
+CHECK_FOLDERS_CATEGORIES = ("ok", "not-person", "coauthors", "single", "initials")
+CHECK_FOLDERS_EXAMPLES = 20  # папок на категорию в выводе; JSON-отчёт содержит все
+
+
+def folder_category(name: str) -> str:
+    """Категория папки верхнего уровня для check-folders: «Фамилия Имя [Отчество]» — ok. Проверяется первая подходящая:
+    соавторы (разделители или больше трёх слов) — раньше проверки имени, иначе «Ильф Илья и Петров Евгений» (строчное «и»)
+    попала бы в not-person; затем not-person, single (одно слово), initials (буква или точка в слове)."""
+    words = name.split()
+    if COAUTHOR_SEPARATOR.search(name) or " - " in name or len(words) > 3:
+        return "coauthors"
+    if not person_name(name):
+        return "not-person"
+    if len(words) == 1:
+        return "single"
+    if any(len(word) == 1 or "." in word for word in words):
+        return "initials"
+    return "ok"
+
+
+def check_folders(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str], None] = print) -> dict[str, int]:
+    """Отчёт без изменений: папки верхнего уровня без «_» и «.» в начале — соответствие «Фамилия Имя [Отчество]».
+    Счётчики по категориям, по CHECK_FOLDERS_EXAMPLES папок на категорию; JSON — reports/check-folders-*.json (кроме dry-run).
+    Файлы не трогаются, база не открывается; симлинки-папки пропускаются."""
+    root = Path(cfg["books_dir"])
+    if not root.is_dir():
+        raise ConfigError(f"каталог недоступен: {root}")
+    with os.scandir(root) as entries:
+        names = sorted(entry.name for entry in entries if entry.is_dir(follow_symlinks=False) and folder_top_ok(entry.name))
+    groups: dict[str, list[dict[str, Any]]] = {category: [] for category in CHECK_FOLDERS_CATEGORIES}
+    for name in names:
+        books = sum(1 for _current, _dirs, files in os.walk(root / name) for file in files if is_book_name(file))
+        groups[folder_category(name)].append({"folder": name, "books": books})
+    stats = {category: len(groups[category]) for category in CHECK_FOLDERS_CATEGORIES}
+    out(f"папок верхнего уровня: {len(names)}, книг в них: {sum(item['books'] for rows in groups.values() for item in rows)}")
+    out("категории:")
+    for category in CHECK_FOLDERS_CATEGORIES:
+        out(f"  {category}: {stats[category]}")
+    for category in CHECK_FOLDERS_CATEGORIES:
+        rows = groups[category]
+        out(f"примеры {category} ({min(len(rows), CHECK_FOLDERS_EXAMPLES)} из {len(rows)}):")
+        for item in rows[:CHECK_FOLDERS_EXAMPLES]:
+            out(f"  {item['folder']} — книг: {item['books']}")
+    if dry_run:
+        out("dry-run: JSON не записан")
+        return stats
+    report = write_report("check-folders", {"stats": stats, "folders": groups})
+    out(f"JSON: {report}")
+    return stats
+
+
 def move_guard(folder: str, target: str) -> str:
     """Причина, по которой книги или папку из folder нельзя переносить в target; '' — можно. Запреты общие, без списков:
     папка в скобках (псевдоним или настоящее имя); цель хуже исходной (меньше слов); цель — инициалы; в цели
@@ -7121,7 +7318,8 @@ def folder_merge(cfg: dict[str, Any], sources: list[str], target: str, dry_run: 
     и подпапки A переносятся в B с теми же относительными путями, конфликт имени — суффикс _1). Повторяемый --from —
     несколько папок подряд. Связи и принадлежность к сборнику переносятся (relink). Журнал reports/merge-folder-*.jsonl.
     non_books_to_quarantine: только с --to внутри «_разобрать»; файлы не книг (не из BOOK_EXTENSIONS, в т. ч. html)
-    уходят в карантин not-book/ вместо переноса."""
+    уходят в карантин not-book/ вместо переноса.
+    B — также существующая служебная папка верхнего уровня «_…» (--to «_1tmp»): новая «_…» не создаётся, всегда склейка."""
     root = Path(cfg["books_dir"])
     db_path = cfg["db_path"]
     if not sources:
@@ -7130,9 +7328,14 @@ def folder_merge(cfg: dict[str, Any], sources: list[str], target: str, dry_run: 
         parts = PurePosixPath(target).parts
         if len(parts) < 2 or parts[0] != RAZOBRAT_SECTION or any(part == ".." for part in parts) \
                 or "\x00" in target or "\\" in target or target.startswith("/"):
-            raise ConfigError(f"merge-folder: --to «{target}» — папка автора или путь внутри «{RAZOBRAT_SECTION}»")
+            raise ConfigError(f"merge-folder: --to «{target}» — папка автора, служебная «_…» или путь внутри «{RAZOBRAT_SECTION}»")
         if not (root / target).resolve().is_relative_to((root / RAZOBRAT_SECTION).resolve()):
             raise ConfigError(f"merge-folder: --to «{target}» выходит за пределы «{RAZOBRAT_SECTION}»")
+    elif target.startswith("_"):  # служебная папка верхнего уровня: только существующая, склейка
+        if not (root / target).is_dir():
+            raise ConfigError(f"merge-folder: служебной папки «{target}» нет: новая «_…» не создаётся")
+        if windows_name_error(target):
+            raise ConfigError(f"merge-folder: «{target}»: {windows_name_error(target)}")
     elif not folder_top_ok(target) or folder_name(target) != target:
         raise ConfigError(f"merge-folder: имя «{target}» не подходит для папки автора")
     for name in sources:
@@ -7192,6 +7395,7 @@ def strip_suffix(cfg: dict[str, Any], dry_run: bool = False, path: str | None = 
     for current, names in walk_dirs(target, walk_errors):
         if path is None and not author_scope(current, root):
             continue
+        taken = {other.casefold() for other in names}  # имена папки без учёта регистра: Windows не различает «Книга» и «книга»
         for name in names:
             match = SUFFIX_RE.match(name)
             if not match:
@@ -7199,7 +7403,7 @@ def strip_suffix(cfg: dict[str, Any], dry_run: bool = False, path: str | None = 
             run.tick()
             base, ext = match.group("base"), match.group("ext")
             src, dest = current / name, current / (base + ext)
-            if dest.exists():
+            if dest.exists() or dest.name.casefold() in taken:
                 run.count("skip-original-exists")
                 continue
             if any(other != name and numbered_sibling(other, base, ext) for other in names):
@@ -7217,8 +7421,75 @@ def strip_suffix(cfg: dict[str, Any], dry_run: bool = False, path: str | None = 
                 journal_row(run, {"action": "error", "from": src_rel, "to": dst_rel, "error": str(error)})
                 continue
             run.count("renamed")
+            taken.add(dest.name.casefold())
             journal_row(run, {"action": "move", "from": src_rel, "to": dst_rel, "status": "moved", "error": ""})
             run.moved(src, dest)
+    return run.finish({"walk_errors": walk_errors})
+
+
+def windows_names(cfg: dict[str, Any], dry_run: bool = False, path: str | None = None,
+                  out: Callable[[str], None] = print) -> dict[str, Any]:
+    """windows-names: имена папок и файлов, недопустимые в Windows (Syncthing), приводятся к допустимым (windows_dir_plan),
+    конфликты регистра не переименовываются (строка conflict, решает dedup-folders или человек). Обход снизу вверх: переименование папки не меняет пути
+    ещё не обработанных внутри неё. Файл — os.rename + run.moved; папка — со связями (books_under + flush_relinks).
+    Служебные «.…» и симлинки пропускаются; ошибка одной записи записывается в журнал и не останавливает прогон."""
+    db_path = cfg["db_path"]
+    target = target_dir(cfg, path)
+    run = NightRun(cfg, "windows-names", dry_run, path, out)
+    walk_errors: list[str] = []
+
+    def onerror(error: OSError) -> None:
+        walk_errors.append(f"{error.filename}: {error.strerror}")
+
+    def rename(current: Path, old: str, new: str, is_dir: bool, reason: str) -> None:
+        src, dest = current / old, current / new
+        src_rel, dst_rel = run.rel(src), run.rel(dest)
+        action = "rename" if is_dir else "move"
+        if os.path.lexists(dest):
+            run.count("errors")
+            message = "цель существует, нужна склейка merge-folder" if is_dir else "цель существует"
+            journal_row(run, {"action": "error", "from": src_rel, "to": dst_rel, "reason": reason, "error": message})
+            return
+        if dry_run:
+            run.count("renamed")
+            journal_row(run, {"action": action, "from": src_rel, "to": dst_rel, "status": "dry", "error": "", "reason": reason})
+            return
+        pairs: list[tuple[str, str]] = []
+        if is_dir:
+            # файлы этого прогона уже переименованы: их отметки и полки должны быть в БД раньше, чем читаем пути папки
+            if run.relinks:
+                run.stats["relinked"] = run.stats.get("relinked", 0) + relink(db_path, run.relinks)
+                run.relinks.clear()
+            pairs = [(row["path"], dst_rel + row["path"][len(src_rel):]) for row in books_under(db_path, src_rel)]
+        os.rename(src, dest)
+        run.count("renamed")
+        journal_row(run, {"action": action, "from": src_rel, "to": dst_rel, "status": "moved", "error": "", "reason": reason})
+        if is_dir:
+            flush_relinks(db_path, pairs, force=True)
+        else:
+            run.moved(src, dest)
+
+    for current, dirs, files in os.walk(target, topdown=False, onerror=onerror):
+        here = Path(current)
+        if any(part.startswith(".") for part in here.relative_to(target).parts):
+            continue
+        kinds = {name: True for name in dirs if not name.startswith(".") and not (here / name).is_symlink()}
+        kinds.update({name: False for name in files if not name.startswith(".") and not (here / name).is_symlink()})
+        for old, new, reason, twin in windows_dir_plan(list(kinds.items())):
+            run.tick()
+            if twin:
+                run.count("case_conflicts")
+                journal_row(run, {"action": "conflict", "from": run.rel(here / old), "to": run.rel(here / twin),
+                                  "reason": "case", "error": "конфликт регистра: решает dedup-folders или человек"})
+                continue
+            if new == old:
+                continue
+            try:
+                rename(here, old, new, kinds[old], reason)
+            except (OSError, sqlite3.Error) as error:
+                run.count("errors")
+                journal_row(run, {"action": "error", "from": run.rel(here / old), "to": run.rel(here / new),
+                                  "reason": reason, "error": str(error)})
     return run.finish({"walk_errors": walk_errors})
 
 
@@ -7249,6 +7520,10 @@ def move_line_error(root: Path, src_rel: str, dst_rel: str) -> str:
         if reason:
             return reason
     dst_parts = dst_rel.split("/")
+    for part in dst_parts:
+        reason = windows_name_error(part)
+        if reason:
+            return f"«куда»: сегмент «{part}» — {reason}"
     if dst_parts[0] == PERIODICALS_SECTION:
         if len(dst_parts) < 3:
             return f"«куда» в «{PERIODICALS_SECTION}» короче трёх сегментов"
@@ -7262,6 +7537,8 @@ def move_line_error(root: Path, src_rel: str, dst_rel: str) -> str:
     dst = root / dst_rel
     if dst.exists() or dst.is_symlink():
         return "цель существует"
+    if dst.parent.is_dir() and any(entry.casefold() == dst.name.casefold() for entry in os.listdir(dst.parent)):
+        return "цель существует (без учёта регистра)"
     root_real = root.resolve()
     if not src.resolve().is_relative_to(root_real):
         return "источник выходит за пределы каталога книг"
@@ -7640,7 +7917,7 @@ def purge_quarantine(cfg: dict[str, Any], reasons: list[str], dry_run: bool) -> 
 
 
 FILE_CHANGING = ("fix-encoding", "unpack-fb2zip", "convert", "dedup", "dedup-folders", "zip-books", "unzip-books",
-                 "author-variants", "reconvert-fb2", "fix-misplaced", "merge-folder", "strip-suffix")
+                 "author-variants", "reconvert-fb2", "fix-misplaced", "merge-folder", "strip-suffix", "windows-names")
 COMMANDS = ("scan", "migrate", *FILE_CHANGING)
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
@@ -7660,8 +7937,9 @@ def command_params(command: str, raw: dict[str, Any]) -> dict[str, Any]:
         "unzip-books": {"path", "workers"}, "unpack-collections": {"path"}, "merge-authors": set(),
         "author-variants": set(), "sort-underscore": {"limit"},
         "reconvert-fb2": {"path", "workers", "limit", "sample", "out", "epubcheck"},
-        "misplaced": set(), "fix-misplaced": set(), "merge-folder": {"from", "to", "non_books_to_quarantine"},
-        "strip-suffix": {"path"}, "purge-quarantine": {"reasons"}, "move-books": {"list_path"},
+        "misplaced": set(), "check-folders": set(), "fix-misplaced": set(),
+        "merge-folder": {"from", "to", "non_books_to_quarantine"},
+        "strip-suffix": {"path"}, "windows-names": {"path"}, "purge-quarantine": {"reasons"}, "move-books": {"list_path"},
     }[command]
     unknown = set(raw) - allowed
     if unknown:
@@ -7786,6 +8064,8 @@ def run_command(cfg: dict[str, Any], command: str, dry_run: bool, params: dict[s
             return merge_authors(cfg, dry_run, out=out)
         if command == "misplaced":
             return misplaced(cfg, dry_run, out=out)
+        if command == "check-folders":
+            return check_folders(cfg, dry_run, out=out)
         if command == "fix-misplaced":
             return fix_misplaced(cfg, dry_run, out=out)
         if command == "merge-folder":
@@ -7793,6 +8073,8 @@ def run_command(cfg: dict[str, Any], command: str, dry_run: bool, params: dict[s
                                 non_books_to_quarantine=params["non_books_to_quarantine"])
         if command == "strip-suffix":
             return strip_suffix(cfg, dry_run, params["path"], out=out)
+        if command == "windows-names":
+            return windows_names(cfg, dry_run, params["path"], out=out)
         if command == "purge-quarantine":
             return purge_quarantine(cfg, params["reasons"], dry_run)
         if command == "move-books":
@@ -7807,7 +8089,8 @@ def run_command(cfg: dict[str, Any], command: str, dry_run: bool, params: dict[s
 
     # purge-quarantine пишет в book_variants общей БД, поэтому боевой запуск берёт scan_lock как остальные изменяющие
     # режимы (карантин — не каталог книг, но база одна). Dry-run только читает и блокировку не берёт.
-    if dry_run or command == "migrate":
+    # check-folders только читает и блокировку не берёт (как dry-run).
+    if dry_run or command in ("migrate", "check-folders"):
         return action()
     with scan_lock():
         return action()
@@ -9786,12 +10069,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("command", nargs="?", choices=("serve", "scan", *FILE_CHANGING, *CLI_COMMANDS), default="serve",
                         help="serve (по умолчанию), scan, fix-encoding, unpack-fb2zip, convert, reconvert-fb2, dedup, dedup-folders, "
                              "zip-books, unzip-books, unpack-collections, merge-authors, sort-underscore, author-variants, "
-                             "misplaced, fix-misplaced, merge-folder (--from A --to B), strip-suffix, move-books (--list ФАЙЛ) "
+                             "misplaced, check-folders (только отчёт), fix-misplaced, merge-folder (--from A --to B), strip-suffix, "
+                             "windows-names, move-books (--list ФАЙЛ) "
                              "или purge-quarantine (--reason R, необратимо)")
     parser.add_argument("--reason", dest="reasons", action="append", default=[],
                         help="purge-quarantine: причина карантина, папка которой удаляется окончательно (можно повторять): "
                              + ", ".join(QUARANTINE_REASONS))
-    parser.add_argument("-p", "--path", help="fix-encoding/unpack-fb2zip/convert/strip-suffix: каталог (по умолчанию каталог книг)")
+    parser.add_argument("-p", "--path", help="fix-encoding/unpack-fb2zip/convert/strip-suffix/windows-names: каталог (по умолчанию каталог книг)")
     parser.add_argument("--from", dest="from_folders", action="append", default=[],
                         help="merge-folder: папка верхнего уровня или папка внутри «_…» (например «_Сборники/Серия/Автор»), "
                              "которую склеить или переименовать (можно повторять)")
@@ -9805,7 +10089,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-mb", type=int, default=200, help="unpack-fb2zip: предел размера записи, МБ")
     parser.add_argument("--limit", type=int,
                         help="sort-underscore: не больше N книг; reconvert-fb2: не больше N сопоставленных книг")
-    parser.add_argument("--to", help="convert: epub|fb2 (по умолчанию epub); merge-folder: папка автора или путь внутри «_разобрать»")
+    parser.add_argument("--to", help="convert: epub|fb2 (по умолчанию epub); merge-folder: папка автора, существующая служебная «_…» "
+                                     "(склейка в неё) или путь внутри «_разобрать»")
     parser.add_argument("--non-books-to-quarantine", action="store_true",
                         help="merge-folder: только с --to «_разобрать/…»; файлы не книг (оглавления, картинки, служебные) "
                              "уходят в карантин not-book/, а не в папку назначения")
@@ -9869,11 +10154,11 @@ def main(argv: list[str] | None = None) -> int:
                 raw = {"path": args.path}
             elif command == "sort-underscore":
                 raw = {"limit": args.limit}
-            elif command in ("author-variants", "misplaced", "fix-misplaced"):
+            elif command in ("author-variants", "misplaced", "check-folders", "fix-misplaced"):
                 raw = {}
             elif command == "merge-folder":
                 raw = {"from": args.from_folders, "to": args.to, "non_books_to_quarantine": args.non_books_to_quarantine}
-            elif command == "strip-suffix":
+            elif command in ("strip-suffix", "windows-names"):
                 raw = {"path": args.path}
             elif command == "purge-quarantine":
                 raw = {"reasons": args.reasons}

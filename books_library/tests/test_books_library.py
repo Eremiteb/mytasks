@@ -2406,6 +2406,22 @@ def test_dedup_folders_similar_copy_gets_own_group(authors_cfg: dict[str, Any]) 
     assert sorted(db_rows(authors_cfg, "SELECT role FROM dup_members")) == [("kept",), ("kept",)]
 
 
+def test_dedup_folders_same_name_similar_copy_is_duplicate(authors_cfg: dict[str, Any]) -> None:
+    folder = Path(authors_cfg["books_dir"]) / "Иванов Иван Иванович"
+    original = folder_text(4000, "слово")
+    # то же имя без «_1», 3600 слов общих: доля около 0.9 — «похожая», но одноимённая → дубль
+    partly = " ".join(original.split()[:3600] + [f"новое{i}" for i in range(400)])
+    make_text_epub(folder / "А - Белка.epub", original, converted=False)
+    make_text_epub(folder / "А - Белка_1.epub", partly, converted=False)
+
+    result = bl.dedup_folders(authors_cfg, out=lambda _line: None)
+
+    assert result["duplicate"] == 1 and result.get("similar", 0) == 0
+    assert (folder / "А - Белка.epub").is_file()
+    assert not (folder / "А - Белка_1.epub").exists()
+    assert (Path(authors_cfg["quarantine_dir"]) / "duplicate" / "Иванов Иван Иванович" / "А - Белка_1.epub").is_file()
+
+
 def test_dedup_folders_skips_section_and_too_large_folder(authors_cfg: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
     root = Path(authors_cfg["books_dir"])
     write_txt(root / "_Раздел" / "A.txt", folder_text(300, "слово"))
@@ -3084,6 +3100,57 @@ def test_merge_folder_dry_run_changes_nothing(tmp_path: Path, monkeypatch: pytes
     assert not (root / "Петров Иван").exists()
 
 
+def test_merge_folder_into_existing_service_folder_always_merges(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "Автор неизвестен/a.txt": "А.\n",
+        "Автор неизвестен/sub/b.txt": "Б.\n",
+        "_1tmp/c.txt": "В.\n",
+    })
+    root = Path(cfg["books_dir"])
+
+    stats = bl.folder_merge(cfg, ["Автор неизвестен"], "_1tmp")
+
+    assert stats["merged"] == 1
+    assert stats.get("renamed", 0) == 0
+    assert not (root / "Автор неизвестен").exists()
+    assert (root / "_1tmp" / "a.txt").read_text(encoding="utf-8") == "А.\n"
+    assert (root / "_1tmp" / "sub" / "b.txt").is_file()
+    assert (root / "_1tmp" / "c.txt").is_file()
+
+
+def test_merge_folder_service_target_must_exist(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {"Иван Петров/a.txt": "А.\n"})
+    root = Path(cfg["books_dir"])
+
+    with pytest.raises(bl.ConfigError):
+        bl.folder_merge(cfg, ["Иван Петров"], "_нет")
+    assert not (root / "_нет").exists()
+    assert (root / "Иван Петров" / "a.txt").is_file()
+
+
+def test_check_folders_categorizes_top_level_folders_read_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "Иванов Иван/a.txt": "А.\n",
+        "Петров Пётр Петрович/a.txt": "А.\n",
+        "Сидоров С/a.txt": "А.\n",
+        "Агриппа/a.txt": "А.\n",
+        "Ильф Илья и Петров Евгений/a.txt": "А.\n",
+        "братья/a.txt": "А.\n",
+        "_служебная/a.txt": "А.\n",
+    })
+    root = Path(cfg["books_dir"])
+    lines: list[str] = []
+
+    stats = bl.check_folders(cfg, out=lines.append)
+
+    assert stats == {"ok": 2, "not-person": 1, "coauthors": 1, "single": 1, "initials": 1}
+    assert any(line.startswith("  initials: 1") for line in lines)
+    assert any("Сидоров С — книг: 1" in line for line in lines)
+    assert len(list((tmp_path / "reports").glob("check-folders-*.json"))) == 1
+    assert (root / "братья" / "a.txt").is_file()  # режим ничего не переносит
+    assert (root / "_служебная" / "a.txt").is_file()
+
+
 NON_BOOK_FILES = {
     "_Сборники/X/a.epub": b"not really epub",  # битый epub: scan оставляет книгу по пути, расширение решает
     "_Сборники/X/index.html": "<html></html>",
@@ -3172,6 +3239,50 @@ def test_strip_suffix_dry_run_changes_nothing(tmp_path: Path, monkeypatch: pytes
     assert stats["renamed"] == 1
     assert (root / "Иванов Иван" / "A_1.txt").is_file()
     assert not (root / "Иванов Иван" / "A.txt").exists()
+
+
+def test_windows_name_error_rules() -> None:
+    assert bl.windows_name_error("a.txt") == ""
+    assert bl.windows_name_error("CONSOLE.txt") == ""
+    for bad in ("a.", "a ", "a:b", "CON", "con.txt", "LPT1.epub", "COM¹.txt", "x" * 256, ""):
+        assert bl.windows_name_error(bad), bad
+    assert bl.windows_name_fix("CON.txt", is_dir=False) == "CON_.txt"
+    assert bl.windows_name_fix("Автор И.", is_dir=True) == "Автор И"
+    assert bl.folder_name("CON") == "CON_"
+
+
+def test_windows_names_renames_folders_and_case_conflicts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "Автор И./Книга2.epub": "А.\n",
+        "Иванов Иван/Книга.epub": "Б.\n",
+        "Иванов Иван/книга.epub": "В.\n",
+    })
+    root = Path(cfg["books_dir"])
+
+    stats = bl.windows_names(cfg, out=lambda _line: None)
+
+    assert stats["renamed"] == 1
+    assert stats["case_conflicts"] == 1
+    assert stats.get("errors", 0) == 0
+    assert (root / "Автор И" / "Книга2.epub").is_file()
+    assert not (root / "Автор И.").exists()
+    assert sorted(os.listdir(root / "Иванов Иван")) == ["Книга.epub", "книга.epub"]
+
+
+def test_windows_names_dry_run_changes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = merge_cfg(tmp_path, monkeypatch, {
+        "Автор И./Книга2.epub": "А.\n",
+        "Иванов Иван/Книга.epub": "Б.\n",
+        "Иванов Иван/книга.epub": "В.\n",
+    })
+    root = Path(cfg["books_dir"])
+
+    stats = bl.windows_names(cfg, dry_run=True, out=lambda _line: None)
+
+    assert stats["renamed"] == 1
+    assert stats["case_conflicts"] == 1
+    assert (root / "Автор И." / "Книга2.epub").is_file()
+    assert sorted(os.listdir(root / "Иванов Иван")) == ["Книга.epub", "книга.epub"]
 
 
 def test_command_params_merge_folder_and_strip_suffix() -> None:
@@ -3686,6 +3797,20 @@ def test_mark_roles_native_epub_wins_over_converted() -> None:
              {**base, "path": "A/Нативный.epub", "words": 250, "converted": False}]
     bl.mark_roles(texts)
     assert {t["path"]: t["role"] for t in texts} == {"A/Конверт.epub": "duplicate", "A/Нативный.epub": "kept"}
+
+
+def test_same_name_key_ignores_suffix_case_and_extension() -> None:
+    assert bl.same_name_key("Автор/Белка.epub") == bl.same_name_key("Автор/белка_1.fb2") == "белка"
+    assert bl.same_name_key("Автор/Белка_100.epub") == "белка_100"
+
+
+def test_better_case_prefers_sentence_case_for_cyrillic_and_title_case_for_latin() -> None:
+    assert bl.better_case(["Чаша и Клинок", "Чаша и клинок"]) == "Чаша и клинок"
+    assert bl.better_case(["Озма из Страны Оз", "Озма из страны Оз"]) == "Озма из страны Оз"
+    assert bl.better_case(["Иванов - Чаша и Клинок", "Иванов - Чаша и клинок"]) == "Иванов - Чаша и клинок"
+    assert bl.better_case(["Чаша и Клинок", "Чаша и клинок"]) == "Чаша и клинок"
+    assert bl.better_case(["the lord of the rings", "The Lord of the Rings"]) == "The Lord of the Rings"
+    assert bl.better_case(["Ancient Tale of the Sea", "Ancient Tale Of The Sea"]) == "Ancient Tale of the Sea"
 
 
 def test_dedup_folders_keeps_native_epub_though_converted_is_larger(authors_cfg: dict[str, Any]) -> None:
