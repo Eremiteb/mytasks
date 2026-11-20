@@ -118,6 +118,12 @@ def books_dir(tmp_path: Path) -> Path:
     return root
 
 
+@pytest.fixture(autouse=True)
+def isolated_public_decisions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Решения из репозитория (books_library/decisions) не попадают в тестовые базы: scan загружает их в пустую базу."""
+    monkeypatch.setattr(bl, "PUBLIC_VARIANTS_PATH", tmp_path / "public-decisions" / "author_variants.json")
+
+
 def make_cfg(tmp_path: Path, books: Path, port: int = 8090) -> dict[str, Any]:
     config = tmp_path / "books_library.json"
     # Карантин и число потоков — во временном каталоге: служебные режимы тестов не трогают /mnt/copy.
