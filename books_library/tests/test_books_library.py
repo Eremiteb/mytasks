@@ -4732,3 +4732,13 @@ def test_apply_rules_touch_only_changed_folders(tmp_path: Path, monkeypatch: pyt
     assert (root / "Петров Пётр" / "B_1.txt").is_file()
     assert set(book_rows(cfg)) == {"Иванов Иван/A.txt", "Петров Пётр/B_1.txt"}
     assert list((tmp_path / "reports").glob("strip-suffix-dry-run-*"))  # перед боевым запуском — dry-run
+    manifest = json.loads(Path(stats["report"]).read_text(encoding="utf-8"))
+    moves = [row for call in manifest["calls"] for row in call["live"]["rows"] if row.get("action") == "move"]
+    assert moves == [{"action": "move", "from": "Иванов Иван/A_1.txt", "to": "Иванов Иван/A.txt", "status": "moved",
+                      "error": ""}]
+    other = tmp_path / "reports" / "manual-run.jsonl"
+    other.write_text("{}\n", encoding="utf-8")
+    assert bl.purge_rule_reports() == 0  # моложе RULES_KEEP_DAYS
+    assert bl.purge_rule_reports(time.time() + (bl.RULES_KEEP_DAYS + 1) * 86400) == len(manifest["deletable"])
+    assert other.is_file() and Path(stats["report"]).is_file()  # чужие журналы и сводка остаются
+    assert json.loads(Path(stats["report"]).read_text(encoding="utf-8"))["purged"]

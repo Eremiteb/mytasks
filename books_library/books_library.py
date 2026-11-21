@@ -1350,6 +1350,8 @@ RULE_STEPS = ("fix-encoding", "convert", "unpack-collections", "sort-underscore"
 RULE_FOLDER_STEPS = ("merge-authors", "author-variants", "fix-misplaced")  # один запуск на набор папок верхнего уровня
 WATCH_RULES_MAX_SCOPES = 50  # больше папок сразу — массовая правка: правила применит ночной конвейер
 _RULES: dict[str, Any] = {"scopes": set(), "changed": 0.0}  # папки, ждущие правил, и время последнего изменения
+RULES_KEEP_DAYS = 90  # файлы журналов проходов правил старше — удаляются, их содержимое остаётся в сводке watch-rules-*.json
+RULES_JOURNAL_ROWS = 20000  # строк боевого журнала в сводке на запуск; больше — файлы журнала не удаляются
 _WATCH_LOCK = threading.Lock()
 _WATCH: list[tuple[threading.Thread, threading.Event]] = []  # не больше одного: поток и событие остановки
 
@@ -1429,34 +1431,115 @@ def rule_calls(cfg: dict[str, Any], step: str, scopes: list[str], authors: set[s
     return [(f"{step} {p}", lambda dry, p=p: calls[step](dry, p)) for p in targets]
 
 
+def report_sizes() -> dict[str, int]:
+    return {p.name: p.stat().st_size for p in REPORTS_DIR.iterdir() if p.is_file()} if REPORTS_DIR.is_dir() else {}
+
+
+def report_delta(before: dict[str, int], rows: bool) -> dict[str, Any]:
+    """Что запуск дописал в reports/: имена файлов, итоговые отчёты (.json) и, если rows, новые строки журналов (.jsonl).
+    Читается только прирост: запуски одного режима в одну секунду пишут в общий журнал."""
+    delta: dict[str, Any] = {"files": [], "reports": [], "rows": [], "complete": True}
+    for name, size in sorted(report_sizes().items()):
+        start = before.get(name, -1)
+        if size == start:
+            continue
+        delta["files"].append(name)
+        path = REPORTS_DIR / name
+        try:
+            if name.endswith(".jsonl") and rows:
+                with path.open("rb") as journal:
+                    journal.seek(max(start, 0))
+                    for line in journal.read().decode("utf-8", "replace").splitlines():
+                        if len(delta["rows"]) >= RULES_JOURNAL_ROWS:
+                            delta["complete"] = False
+                            break
+                        delta["rows"].append(json.loads(line))
+            elif name.endswith(".json"):
+                delta["reports"].append(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, ValueError) as error:
+            delta["complete"] = False
+            delta["reports"].append({"file": name, "error": str(error)})
+    return delta
+
+
+def purge_rule_reports(now: float | None = None) -> int:
+    """Удаляет файлы журналов проходов правил старше RULES_KEEP_DAYS, если их содержимое полностью в сводке
+    watch-rules-*.json (сводка хранится бессрочно, в ней — «purged»). Файлы, дописанные после прохода, не трогаются."""
+    now = time.time() if now is None else now
+    removed = 0
+    for manifest in sorted(REPORTS_DIR.glob("watch-rules-*.json")) if REPORTS_DIR.is_dir() else []:
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        finished = data.get("finished", now)
+        if data.get("purged") or now - finished < RULES_KEEP_DAYS * 86400:
+            continue
+        for name in data.get("deletable", []):
+            path = REPORTS_DIR / name
+            if Path(name).name == name and path.is_file() and path.stat().st_mtime <= finished + 1:
+                path.unlink()
+                removed += 1
+        data["purged"] = datetime.now().isoformat(timespec="seconds")
+        manifest.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    if removed:
+        say(f"правила: удалено старых файлов журналов {removed} (содержимое — в сводках watch-rules)", "rules_purged",
+            detail=str(removed))
+    return removed
+
+
 def apply_rules(cfg: dict[str, Any], scopes: list[str], out: Callable[[str], None] = print) -> dict[str, Any]:
     """Правила библиотеки к изменённым папкам — шаги ночного конвейера по порядку (RULE_STEPS). Каждый запуск: dry-run,
     затем боевой с теми же параметрами; сбой запуска не останавливает остальные (как «-» в rework-юните). Папки авторов,
     куда шаги перенесли книги, добавляются к следующим шагам. Весь проход и итоговый scan — под scan_lock;
-    начавшаяся ночная переделка прерывает проход между шагами."""
+    начавшаяся ночная переделка прерывает проход между шагами. Всё, что сделано, — в сводке reports/watch-rules-*.json:
+    по каждому запуску итоги dry-run и боевого, строки боевого журнала (from/to для отката)."""
     stats: dict[str, Any] = {"scopes": scopes, "runs": 0, "failed": 0, "interrupted": False}
     authors = {scope for scope in scopes if not scope.startswith("_")}
+    runs: list[dict[str, Any]] = []
     with scan_lock():
-        for step in RULE_STEPS:
-            if rework_active():
-                stats["interrupted"] = True
-                out("началась ночная переделка: проход прерван, остальное сделает она")
-                break
-            authors |= new_tops(cfg)
-            for label, call in rule_calls(cfg, step, scopes, authors, out):
-                out(f"правила: {label}")
-                try:
-                    call(True)
-                    call(False)
-                    stats["runs"] += 1
-                except (ConfigError, OSError, ValueError, sqlite3.Error) as error:
-                    stats["failed"] += 1
-                    out(f"правила: {label} — {error}")
-                    say(f"правила: {label} — {error}", "rules_failed", logging.WARNING, detail=label)
+        purge_rule_reports()
+        try:
+            rule_pass(cfg, scopes, authors, stats, runs, out)
+        finally:
+            deletable = sorted({name for run in runs for mode in ("dry_run", "live") if mode in run
+                         and (mode == "dry_run" or run[mode]["complete"]) for name in run[mode]["files"]})
+            manifest = write_report("watch-rules", {"scopes": scopes, "started": stats.get("started"),
+                                                    "finished": time.time(), "calls": runs, "deletable": deletable,
+                                                    **{k: stats[k] for k in ("runs", "failed", "interrupted")}})
+            stats["report"] = str(manifest)
         stats["scan"] = scan(cfg, out=out)
-    say(f"правила к папкам: {len(scopes)}, запусков {stats['runs']}, сбоев {stats['failed']}", "rules_done",
-        detail=json.dumps(scopes[:50], ensure_ascii=False))
+    say(f"правила к папкам: {len(scopes)}, запусков {stats['runs']}, сбоев {stats['failed']}, сводка {stats['report']}",
+        "rules_done", detail=json.dumps(scopes[:50], ensure_ascii=False))
     return stats
+
+
+def rule_pass(cfg: dict[str, Any], scopes: list[str], authors: set[str], stats: dict[str, Any],
+              runs: list[dict[str, Any]], out: Callable[[str], None]) -> None:
+    stats["started"] = time.time()
+    for step in RULE_STEPS:
+        if rework_active():
+            stats["interrupted"] = True
+            out("началась ночная переделка: проход прерван, остальное сделает она")
+            return
+        authors |= new_tops(cfg)
+        for label, call in rule_calls(cfg, step, scopes, authors, out):
+            out(f"правила: {label}")
+            run: dict[str, Any] = {"label": label}
+            runs.append(run)
+            try:
+                for dry in (True, False):
+                    before = report_sizes()
+                    try:
+                        call(dry)
+                    finally:
+                        run["dry_run" if dry else "live"] = report_delta(before, rows=not dry)
+                stats["runs"] += 1
+            except (ConfigError, OSError, ValueError, sqlite3.Error) as error:
+                stats["failed"] += 1
+                run["error"] = str(error)
+                out(f"правила: {label} — {error}")
+                say(f"правила: {label} — {error}", "rules_failed", logging.WARNING, detail=label)
 
 
 def watch_rules(cfg: dict[str, Any]) -> None:
