@@ -4651,8 +4651,8 @@ def test_scan_keeps_history_of_folder_renamed_outside(scanned: dict[str, Any], b
     assert (stats["renamed"], stats["removed"] - stats["renamed"], stats["renamed_folders"]) == (3, 0, 1)
     with closing(bl.connect(scanned["db_path"])) as conn:
         assert conn.execute("SELECT status FROM marks WHERE path=?", (new,)).fetchone()[0] == "read"
-        assert (old, new) in conn.execute("SELECT path, new_path FROM edit_log").fetchall()
-        assert conn.execute("SELECT a, b, status FROM author_variants").fetchall() == [
+        assert (old, new) in [tuple(r) for r in conn.execute("SELECT path, new_path FROM edit_log")]
+        assert [tuple(r) for r in conn.execute("SELECT a, b, status FROM author_variants")] == [
             ("Иванов Иван Иванович", "Сидоров Сергей", "different")]
 
 
@@ -4694,3 +4694,41 @@ def test_watch_pauses_on_mass_removal(scanned: dict[str, Any], books_dir: Path,
     assert bl.watch_tick(scanned, frozenset()) == frozenset()
     assert "исчезло 3" in bl.WATCH_STATE["paused"]
     assert FB2_REL in book_rows(scanned)
+
+
+def test_rule_scopes_pick_author_folders_and_collapse_nested() -> None:
+    assert bl.rule_scopes(["Иванов Иван/а.fb2", "Иванов Иван/Цикл/б.fb2", "корень.fb2", ".trash/в.fb2",
+                           "_Сборники/Серия/г.fb2", "_Сборники/Серия/Том/д.fb2", "_Разбор/е.fb2"]) == [
+        "_Разбор", "_Сборники/Серия", "Иванов Иван"]
+
+
+def test_watch_applies_rules_after_quiet_delay(scanned: dict[str, Any], books_dir: Path,
+                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(bl, "_RULES", {"scopes": set(), "changed": 0.0})
+    monkeypatch.setattr(bl, "apply_rules", lambda _cfg, scopes, _out: calls.append(scopes))
+    (books_dir / "Сидоров Сергей" / "Новая.fb2").write_bytes(make_fb2("Новая", "Сергей", "Сидоров"))
+    first = bl.watch_tick(scanned, frozenset())
+    bl.watch_tick(scanned, first)
+    finish_jobs()
+    assert bl.watch_tick(scanned, frozenset()) == frozenset()
+    assert not calls  # изменения ещё не отстоялись watch_rules_delay секунд
+    bl._RULES["changed"] = time.monotonic() - scanned["watch_rules_delay"] - 1
+    bl.watch_tick(scanned, frozenset())
+    finish_jobs()
+    assert calls == [["Сидоров Сергей"]]
+    assert bl.WATCH_STATE["rules_pending"] == 0
+
+
+def test_apply_rules_touch_only_changed_folders(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    cfg = merge_cfg(tmp_path, monkeypatch, {"Иванов Иван/A_1.txt": "А.\n", "Петров Пётр/B_1.txt": "Б.\n"})
+    root = Path(cfg["books_dir"])
+
+    stats = bl.apply_rules(cfg, ["Иванов Иван"], out=lambda _line: None)
+
+    assert stats["failed"] == 0
+    assert (root / "Иванов Иван" / "A.txt").is_file()
+    assert (root / "Петров Пётр" / "B_1.txt").is_file()
+    assert set(book_rows(cfg)) == {"Иванов Иван/A.txt", "Петров Пётр/B_1.txt"}
+    assert list((tmp_path / "reports").glob("strip-suffix-dry-run-*"))  # перед боевым запуском — dry-run

@@ -88,6 +88,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "convert_timeout": 300,
     "cache_mb": 4096,
     "watch_interval": 30,  # опрос каталога книг в serve, с; 0 — мониторинг выключен
+    "watch_rules_delay": 120,  # правила библиотеки к изменённым папкам через столько секунд без изменений; 0 — только ночью
     # Кэш извлечённого текста для dedup (восстановимый, на быстром диске): пустая строка в text_cache_dir — кэш выключен;
     # text_cache_mb — предел сжатых данных, МБ (0 — кэш выключен). Каталог создаёт администратор, движок его не создаёт.
     "text_cache_dir": "/var/cache/books_library",
@@ -375,7 +376,8 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
                 cfg[key] = value
     for key, low, high in (("port", 1, 65535), ("scan_workers", 1, 64), ("reader_max_mb", 1, 1024), ("page_size", 10, 500),
                             ("convert_timeout", 10, 3600), ("cache_mb", 100, 1_000_000), ("workers", 1, 64),
-                            ("unzip_workers", 1, 64), ("text_cache_mb", 0, 10_000_000), ("watch_interval", 0, 86400)):
+                            ("unzip_workers", 1, 64), ("text_cache_mb", 0, 10_000_000), ("watch_interval", 0, 86400),
+                            ("watch_rules_delay", 0, 86400)):
         if not isinstance(cfg[key], int) or isinstance(cfg[key], bool) or not low <= cfg[key] <= high:
             raise ConfigError(f"{key} должен быть целым от {low} до {high}")
     for key in ("books_dir", "db_path", "host", "quarantine_dir", "decisions_dir"):
@@ -1339,7 +1341,15 @@ REWORK_RUNTIME_DIR = "books-library-rework"
 # каталог сам не чистится, решает человек.
 WATCH_MAX_REMOVED = 1000
 WATCH_STATE: dict[str, Any] = {"interval": 0, "started": None, "last_check": None, "last_scan": None, "pending": 0,
-                               "scans": 0, "errors": 0, "last_error": "", "paused": ""}
+                               "scans": 0, "errors": 0, "last_error": "", "paused": "", "rules_pending": 0,
+                               "rules": 0, "last_rules": None}
+# Правила библиотеки — шаги ночного конвейера (books-library-rework.service), которые можно ограничить папками;
+# check-folders и export-decisions — только ночью (отчёт и выгрузка по всей библиотеке).
+RULE_STEPS = ("fix-encoding", "convert", "unpack-collections", "sort-underscore", "merge-authors", "author-variants",
+              "fix-misplaced", "dedup", "dedup-folders", "enrich-epub", "strip-suffix", "name-variants", "windows-names")
+RULE_FOLDER_STEPS = ("merge-authors", "author-variants", "fix-misplaced")  # один запуск на набор папок верхнего уровня
+WATCH_RULES_MAX_SCOPES = 50  # больше папок сразу — массовая правка: правила применит ночной конвейер
+_RULES: dict[str, Any] = {"scopes": set(), "changed": 0.0}  # папки, ждущие правил, и время последнего изменения
 _WATCH_LOCK = threading.Lock()
 _WATCH: list[tuple[threading.Thread, threading.Event]] = []  # не больше одного: поток и событие остановки
 
@@ -1355,6 +1365,117 @@ def scan_lock_free() -> bool:
             return True
     except ScanBusyError:
         return False
+
+
+def rule_scopes(paths: Iterator[str] | list[str]) -> list[str]:
+    """Папки для правил: папка автора верхнего уровня, в служебных «_…» — папка книги; вложенные поглощаются внешними.
+    Книги в корне каталога и скрытых папках — только ночью."""
+    found: set[str] = set()
+    for rel in paths:
+        top, sep, _rest = rel.partition("/")
+        if sep and not top.startswith("."):
+            found.add(posixpath.dirname(rel) if top.startswith("_") else top)
+    return outer_scopes(found)
+
+
+def outer_scopes(found: set[str]) -> list[str]:
+    """Папки по алфавиту без вложенных в другие из набора."""
+    kept: list[str] = []
+    for scope in sorted(found):
+        if not any(scope.startswith(outer + "/") for outer in kept):
+            kept.append(scope)
+    return kept
+
+
+def new_tops(cfg: dict[str, Any]) -> set[str]:
+    """Папки авторов, где на диске есть книги, которых ещё нет в базе: туда переносили или конвертировали шаги правил."""
+    with closing(connect(cfg["db_path"], readonly=True)) as conn:
+        known = {r[0]: (r[1], r[2]) for r in conn.execute("SELECT path, size, mtime FROM books")}
+    return {rel.partition("/")[0] for rel, *_ in plan_scan(Path(cfg["books_dir"]), known).todo
+            if "/" in rel and not rel.startswith(("_", "."))}
+
+
+def rule_calls(cfg: dict[str, Any], step: str, scopes: list[str], authors: set[str],
+               out: Callable[[str], None]) -> list[tuple[str, Callable[[bool], Any]]]:
+    """Запуски шага правил: (подпись, вызов с dry_run). Только существующие сейчас папки."""
+    root = Path(cfg["books_dir"])
+    folders = {name for name in authors if (root / name).is_dir()}
+    if step in RULE_FOLDER_STEPS:
+        func = {"merge-authors": merge_authors, "author-variants": author_variants, "fix-misplaced": fix_misplaced}[step]
+        return [(step, lambda dry: func(cfg, dry, out=out, folders=folders))] if folders else []
+    paths = sorted({scope for scope in scopes if (root / scope).is_dir()} | folders)
+    if step == "unpack-collections":
+        try:
+            section = collections_section(root).name
+        except ConfigError:
+            return []
+        return [(f"{step} {p}", lambda dry, p=p: unpack_collections(cfg, dry, p, out=out))
+                for p in paths if p == section or p.startswith(section + "/")]
+    if step == "sort-underscore":
+        return [(f"{step} {p}", lambda dry, p=p: unpack_collections(cfg, dry, None, out, kind="sort-underscore",
+                                                                     roots=[root / p], sources=SORT_SOURCES))
+                for p in paths if p.startswith("_")]
+    calls: dict[str, Callable[[bool, str], Any]] = {
+        "fix-encoding": lambda dry, p: fix_encoding(cfg, dry, p, "all", out=out),
+        "convert": lambda dry, p: convert_fb2(cfg, dry, p, None, out=out),
+        "dedup": lambda dry, p: dedup(cfg, dry, p, None, out=out),
+        "dedup-folders": lambda dry, p: dedup_folders(cfg, dry, p, None, out=out),
+        "enrich-epub": lambda dry, p: enrich_epub(cfg, dry, p, out=out),
+        "strip-suffix": lambda dry, p: strip_suffix(cfg, dry, p, out=out),
+        "name-variants": lambda dry, p: name_variants(cfg, dry, p, out=out),
+        "windows-names": lambda dry, p: windows_names(cfg, dry, p, out=out),
+    }
+    targets = sorted(folders) if step == "dedup-folders" else paths  # dedup-folders — только папки авторов
+    return [(f"{step} {p}", lambda dry, p=p: calls[step](dry, p)) for p in targets]
+
+
+def apply_rules(cfg: dict[str, Any], scopes: list[str], out: Callable[[str], None] = print) -> dict[str, Any]:
+    """Правила библиотеки к изменённым папкам — шаги ночного конвейера по порядку (RULE_STEPS). Каждый запуск: dry-run,
+    затем боевой с теми же параметрами; сбой запуска не останавливает остальные (как «-» в rework-юните). Папки авторов,
+    куда шаги перенесли книги, добавляются к следующим шагам. Весь проход и итоговый scan — под scan_lock;
+    начавшаяся ночная переделка прерывает проход между шагами."""
+    stats: dict[str, Any] = {"scopes": scopes, "runs": 0, "failed": 0, "interrupted": False}
+    authors = {scope for scope in scopes if not scope.startswith("_")}
+    with scan_lock():
+        for step in RULE_STEPS:
+            if rework_active():
+                stats["interrupted"] = True
+                out("началась ночная переделка: проход прерван, остальное сделает она")
+                break
+            authors |= new_tops(cfg)
+            for label, call in rule_calls(cfg, step, scopes, authors, out):
+                out(f"правила: {label}")
+                try:
+                    call(True)
+                    call(False)
+                    stats["runs"] += 1
+                except (ConfigError, OSError, ValueError, sqlite3.Error) as error:
+                    stats["failed"] += 1
+                    out(f"правила: {label} — {error}")
+                    say(f"правила: {label} — {error}", "rules_failed", logging.WARNING, detail=label)
+        stats["scan"] = scan(cfg, out=out)
+    say(f"правила к папкам: {len(scopes)}, запусков {stats['runs']}, сбоев {stats['failed']}", "rules_done",
+        detail=json.dumps(scopes[:50], ensure_ascii=False))
+    return stats
+
+
+def watch_rules(cfg: dict[str, Any]) -> None:
+    """Проход правил, когда расхождений нет и с последнего изменения прошло watch_rules_delay секунд."""
+    scopes = sorted(_RULES["scopes"])
+    WATCH_STATE["rules_pending"] = len(scopes)
+    if not scopes or time.monotonic() - _RULES["changed"] < cfg["watch_rules_delay"] or not scan_lock_free():
+        return
+    _RULES["scopes"] = set()
+    WATCH_STATE["rules_pending"] = 0
+    scopes = outer_scopes(set(scopes))
+    if len(scopes) > WATCH_RULES_MAX_SCOPES:
+        say(f"мониторинг: изменено папок {len(scopes)} (больше {WATCH_RULES_MAX_SCOPES}) — правила применит ночной "
+            "конвейер", "watch_rules_skipped", detail=str(len(scopes)))
+        return
+    job = launch_job("watch-rules", {"scopes": scopes}, False, "", lambda out: apply_rules(cfg, scopes, out))
+    WATCH_STATE.update(last_rules=datetime.now().isoformat(timespec="seconds"), rules=WATCH_STATE["rules"] + 1)
+    say(f"мониторинг: правила к папкам {len(scopes)} — задание {job['id']}", "watch_rules",
+        detail=json.dumps(scopes, ensure_ascii=False))
 
 
 def watch_pending(cfg: dict[str, Any]) -> tuple[frozenset[tuple[str, int, float]], ScanPlan]:
@@ -1392,11 +1513,20 @@ def watch_tick(cfg: dict[str, Any], previous: frozenset[tuple[str, int, float]])
                     "затем «Пересканировать»")
         return frozenset()
     WATCH_STATE.update(last_check=datetime.now().isoformat(timespec="seconds"), pending=len(diff), paused="")
-    if not diff or diff != previous:
-        return diff
     with JOBS_LOCK:
-        busy = any(j["command"] == "scan" and j["state"] in ("queued", "running") for j in JOBS.values())
-    if busy or not scan_lock_free():
+        busy = {j["command"] for j in JOBS.values() if j["state"] in ("queued", "running")}
+    if "watch-rules" in busy:
+        return frozenset()  # изменения самого прохода правил не копятся: их индексирует его итоговый scan
+    if diff and cfg["watch_rules_delay"]:
+        _RULES["scopes"].update(rule_scopes([rel for rel, size, _mtime in diff if size >= 0]))
+        _RULES["changed"] = time.monotonic()
+    if not diff:
+        if "scan" not in busy and cfg["watch_rules_delay"]:
+            watch_rules(cfg)
+        return diff
+    if diff != previous:
+        return diff
+    if "scan" in busy or not scan_lock_free():
         return diff
     job = start_job(cfg, "scan", False, {})
     WATCH_STATE.update(last_scan=datetime.now().isoformat(timespec="seconds"), scans=WATCH_STATE["scans"] + 1)
@@ -7641,7 +7771,8 @@ NAME_FIRST_MIN_GIVEN = 10  # этап «Имя Фамилия»: сколько 
 NAME_FIRST_SKIP = frozenset({"Марк Аврелий", "Виктор Поль-Эмиль", "Марк Эдвина"})  # настоящие «Имя Фамилия», не переставлять
 
 
-def merge_initials(run: NightRun, db_path: str, root: Path, pending: list[tuple[str, str]], taken: set[Path]) -> None:
+def merge_initials(run: NightRun, db_path: str, root: Path, pending: list[tuple[str, str]], taken: set[Path],
+                   folders: set[str] | None = None) -> None:
     """Этап «инициалы»: папка «Фамилия И. О» или «Фамилия И» → единственная полная папка того же автора (initials_folder).
     Один инициал — только если папка с той же фамилией среди полных одна; иначе не трогается."""
     index = author_index(root)
@@ -7651,6 +7782,8 @@ def merge_initials(run: NightRun, db_path: str, root: Path, pending: list[tuple[
         if not is_initials(short) or not (root / short).is_dir():
             continue
         target = initials_folder(short, full)
+        if folders is not None and short not in folders and target not in folders:
+            continue
         tokens = [token for token in re.split(r"[\s.]+", short) if token]
         if not target or (len(tokens) - 1 < 2 and surnames[author_norm(tokens[0])] != 1):
             continue
@@ -7659,7 +7792,8 @@ def merge_initials(run: NightRun, db_path: str, root: Path, pending: list[tuple[
         run.count("initials")
 
 
-def merge_name_first(run: NightRun, db_path: str, root: Path, pending: list[tuple[str, str]], taken: set[Path]) -> None:
+def merge_name_first(run: NightRun, db_path: str, root: Path, pending: list[tuple[str, str]], taken: set[Path],
+                     folders: set[str] | None = None) -> None:
     """Этап «Имя Фамилия»: папка из двух слов, где первое слово — имя (часто встречается на втором месте в других
     папках), переставляется в «Фамилия Имя». Если уже есть ровно одна другая папка того же автора (≥ 2 общих слова,
     ключ ⊆ или ⊇), склейка в неё."""
@@ -7688,14 +7822,15 @@ def merge_name_first(run: NightRun, db_path: str, root: Path, pending: list[tupl
         close = [other for known_key, other in index.items()
                  if other != short and len(known_key & key) >= 2 and (known_key <= key or known_key >= key)]
         full = close[0] if len(close) == 1 else f"{last} {first}"
-        if full == short:
+        if full == short or (folders is not None and short not in folders and full not in folders):
             continue
         known = {row["path"] for row in books_under(db_path, short)}
         merge_folder(run, db_path, root, short, full, [full], known, taken, pending)
         run.count("name_first")
 
 
-def merge_authors(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str], None] = print) -> dict[str, Any]:
+def merge_authors(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str], None] = print,
+                  folders: set[str] | None = None) -> dict[str, Any]:
     """Правило: «Фамилия Имя» и «Фамилия Имя Отчество» в одном каталоге — всё из короткой в полную; если полной нет,
     отчество берётся из метаданных книг короткой папки и папка переименовывается. Неоднозначное (несколько полных
     или несколько отчеств) не трогается. Связи переносятся relink по ходу прогона; журнал — построчно (откат).
@@ -7705,17 +7840,18 @@ def merge_authors(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str
     вариант из источников — переименование или склейка; несколько — неоднозначное.
     После отчеств — два этапа, каждый со своим пересчётом author_index: «инициалы» (папка «Фамилия И. О» → полная
     папка того же автора, только однозначная) и «Имя Фамилия» (папка «Иван Петров» → «Петров Иван» или склейка
-    в единственную полную папку; порядок определяется по частотам слов в именах папок)."""
+    в единственную полную папку; порядок определяется по частотам слов в именах папок).
+    folders — только пары, где есть одна из этих папок (правила мониторинга)."""
     cache = TextCache.open(cfg)  # один раз на прогон; None — источник из текста пропускается
     try:
-        return _merge_authors(cfg, dry_run, out, cache)
+        return _merge_authors(cfg, dry_run, out, cache, folders)
     finally:
         if cache is not None:
             cache.close()
 
 
 def _merge_authors(cfg: dict[str, Any], dry_run: bool, out: Callable[[str], None],
-                   cache: TextCache | None) -> dict[str, Any]:
+                   cache: TextCache | None, folders: set[str] | None = None) -> dict[str, Any]:
     root = Path(cfg["books_dir"])
     db_path = cfg["db_path"]
     run = NightRun(cfg, "merge-authors", dry_run, None, out)
@@ -7728,6 +7864,8 @@ def _merge_authors(cfg: dict[str, Any], dry_run: bool, out: Callable[[str], None
         if not (root / short).is_dir():
             continue
         candidates = full_candidates(short, names)
+        if folders is not None and short not in folders and not folders.intersection(candidates):
+            continue
         if len(candidates) > 1:
             run.count("ambiguous")
             journal_row(run, {"action": "ambiguous", "short": short, "full": "", "candidates": candidates, "moved": 0,
@@ -7788,8 +7926,8 @@ def _merge_authors(cfg: dict[str, Any], dry_run: bool, out: Callable[[str], None
         flush_relinks(db_path, pending)
         journal_row(run, {"action": "rename", "short": short, "full": full, "candidates": candidates, "moved": 0,
                           "status": "done", "error": ""})
-    merge_initials(run, db_path, root, pending, taken)
-    merge_name_first(run, db_path, root, pending, taken)
+    merge_initials(run, db_path, root, pending, taken, folders)
+    merge_name_first(run, db_path, root, pending, taken, folders)
     flush_relinks(db_path, pending, force=True)
     s = run.stats
     prefix = "будет " if dry_run else ""
@@ -8111,17 +8249,20 @@ def remove_empty_folder(run: NightRun, folder: Path) -> bool:
     return True
 
 
-def author_variants(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str], None] = print) -> dict[str, Any]:
+def author_variants(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str], None] = print,
+                    folders: set[str] | None = None) -> dict[str, Any]:
     """Пары «одно ФИО — разное написание» (variant_candidates). Пустая папка без файлов удаляется, пара — склеена.
     Общие книги склеиваются в папку с полным ФИО через merge_folder (как merge-authors). Пары manual остаются в очереди
     на решение во вкладке «Авторы». Решённые пары не пересчитываются. Папка, уже ушедшая в другую пару в этом прогоне,
-    пропускается. Журнал построчно: откат по move и rmdir."""
+    пропускается. folders — только пары, где есть одна из этих папок (правила мониторинга); очередь пар обновляется
+    целиком. Журнал построчно: откат по move и rmdir."""
     root = Path(cfg["books_dir"])
     db_path = cfg["db_path"]
     run = NightRun(cfg, "author-variants", dry_run, None, out)
     candidates = variant_candidates(root, db_path)
     statuses = variant_statuses(db_path)
-    todo = [c for c in candidates if statuses.get((c["a"], c["b"]), "pending") == "pending"]
+    todo = [c for c in candidates if statuses.get((c["a"], c["b"]), "pending") == "pending"
+            and (folders is None or c["a"] in folders or c["b"] in folders)]
     if not dry_run:
         migrate_database(db_path, out=out)
         store_variants(db_path, candidates)
@@ -8588,12 +8729,14 @@ def remove_emptied(run: NightRun, root: Path, tops: set[str]) -> None:
             remove_empty_folder(run, base)
 
 
-def fix_misplaced(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str], None] = print) -> dict[str, Any]:
+def fix_misplaced(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str], None] = print,
+                  folders: set[str] | None = None) -> dict[str, Any]:
     """Этап папок (folder_action), затем этап книг (select_moves/move_one), затем удаление опустевших папок.
-    Журнал reports/fix-misplaced-*.jsonl: move/rename с полями from/to для отката."""
+    folders — только книги этих папок верхнего уровня (правила мониторинга). Журнал reports/fix-misplaced-*.jsonl:
+    move/rename с полями from/to для отката."""
     root = Path(cfg["books_dir"])
     db_path = cfg["db_path"]
-    rows = misplaced_books(cfg)
+    rows = [row for row in misplaced_books(cfg) if folders is None or row["folder"] in folders]
     index = author_index(root)
     by_folder: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
@@ -9639,6 +9782,12 @@ def start_job(cfg: dict[str, Any], command: str, dry_run: bool, raw: dict[str, A
         if not proof or not proof["dry_run"] or proof["state"] != "done" or proof["command"] != command \
                 or proof["params"] != params:
             raise ConfirmRequiredError("боевой запуск требует confirm — id успешного dry-run с теми же параметрами")
+    return launch_job(command, params, dry_run, confirm, lambda out: run_command(cfg, command, dry_run, params, out))
+
+
+def launch_job(command: str, params: dict[str, Any], dry_run: bool, confirm: str,
+               work: Callable[[Callable[[str], None]], Any]) -> dict[str, Any]:
+    """Фоновое задание в JOBS (видно в «Задания» и /api/jobs): work получает функцию вывода строк плана."""
     job: dict[str, Any] = {"id": secrets.token_hex(8), "command": command, "params": params, "dry_run": dry_run,
                            "confirm": confirm or None, "state": "queued", "created": datetime.now().isoformat(timespec="seconds"),
                            "started": None, "finished": None, "result": None, "error": None, "output": []}
@@ -9650,7 +9799,7 @@ def start_job(cfg: dict[str, Any], command: str, dry_run: bool, raw: dict[str, A
     def run() -> None:
         job.update(state="running", started=datetime.now().isoformat(timespec="seconds"))
         try:
-            job["result"] = run_command(cfg, command, dry_run, params, out)
+            job["result"] = work(out)
             job["state"] = "done"
         except (ScanBusyError, ConfigError, OSError, ValueError, sqlite3.Error) as error:
             job.update(state="failed", error=str(error))
@@ -10722,6 +10871,9 @@ class Handler(BaseHTTPRequestHandler):
         elif watch["running"]:
             details = [f"опрос каждые {watch['interval']} с", f"последняя проверка: {watch['last_check'] or '—'}",
                        f"ждут scan: {watch['pending']}", f"запущено scan: {watch['scans']}", f"ошибок: {watch['errors']}"]
+            details += ([f"правила через {self.cfg['watch_rules_delay']} с без изменений", f"папок ждут правил: "
+                         f"{watch['rules_pending']}", f"проходов правил: {watch['rules']}"]
+                        if self.cfg["watch_rules_delay"] else ["правила — только ночью (watch_rules_delay = 0)"])
             details += [f"пауза: {watch['paused']}"] if watch["paused"] else []
             details += [f"последняя ошибка: {watch['last_error']}"] if watch["last_error"] else []
             watch_info = (f"<p>Мониторинг включён: {e(' · '.join(details))}.</p><form method='post' action='/watch'>"
@@ -11598,6 +11750,9 @@ def serve(cfg: dict[str, Any], dry_run: bool = False) -> None:
         print(f"[dry-run] будет: открыть веб-интерфейс {url}; каталог книг {cfg['books_dir']} (только чтение); БД {cfg['db_path']}")
         print(f"[dry-run] будет: мониторинг каталога книг каждые {cfg['watch_interval']} с, при изменениях — scan"
               if cfg["watch_interval"] else "[dry-run] будет: мониторинг каталога книг выключен (watch_interval = 0)")
+        if cfg["watch_interval"]:
+            print(f"[dry-run] будет: правила библиотеки к изменённым папкам через {cfg['watch_rules_delay']} с без изменений"
+                  if cfg["watch_rules_delay"] else "[dry-run] будет: правила библиотеки — только ночью (watch_rules_delay = 0)")
         migrate_database(cfg["db_path"], dry_run=True)
         say("план запуска сервера", "dry_serve", detail=url)
         return
