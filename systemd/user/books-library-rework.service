@@ -9,6 +9,10 @@ StartLimitBurst=4
 Type=oneshot
 # Обработка может идти часами (Calibre, сверка дубликатов): не обрывать по умолчанию-тайм-ауту systemd.
 TimeoutStartSec=infinity
+# Пока каталог $XDG_RUNTIME_DIR/books-library-rework есть, мониторинг serve не запускает scan; уже начатый им scan
+# конвейер дожидается, иначе шаги с «-» молча пропустились бы из-за занятой блокировки.
+RuntimeDirectory=books-library-rework
+ExecStartPre=/usr/bin/flock -w 3600 @MYTASKS_DIR@/books_library/.books_library.lock true
 # Порядок конвейера: сначала scan (новые книги попадают в индекс), затем служебные режимы и итоговый scan.
 # «-» — сбой режима не мешает итоговому scan; отдельные файлы режимы и так не останавливают.
 ExecStart=/usr/bin/env python3 -I @MYTASKS_DIR@/books_library/books_library.py scan

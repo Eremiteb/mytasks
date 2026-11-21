@@ -8,6 +8,7 @@ import importlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import struct
 import subprocess
@@ -4580,3 +4581,116 @@ def test_import_into_new_db_matches_moved_book_by_key(cfg: dict[str, Any], books
     assert db_rows(cfg, "SELECT path, status FROM marks ORDER BY path") == before
     assert db_rows(cfg, "SELECT count(*) FROM shelf_items") == [(1,)]
 
+
+
+def finish_jobs(timeout: float = 20.0) -> None:
+    deadline = time.monotonic() + timeout
+    while any(j["state"] in ("queued", "running") for j in bl.JOBS.values()):
+        assert time.monotonic() < deadline, "задания не завершились"
+        time.sleep(0.05)
+
+
+def test_watch_scans_after_changes_settle(scanned: dict[str, Any], books_dir: Path) -> None:
+    assert bl.watch_tick(scanned, frozenset()) == frozenset()
+    (books_dir / "Сидоров Сергей" / "Новая.fb2").write_bytes(make_fb2("Новая", "Сергей", "Сидоров"))
+    (books_dir / TXT_REL).unlink()
+    scans = bl.WATCH_STATE["scans"]
+    first = bl.watch_tick(scanned, frozenset())
+    assert {rel for rel, *_ in first} == {"Сидоров Сергей/Новая.fb2", TXT_REL}
+    assert bl.WATCH_STATE["scans"] == scans  # первое расхождение — ждём, пока копирование закончится
+    bl.watch_tick(scanned, first)
+    finish_jobs()
+    assert bl.WATCH_STATE["scans"] == scans + 1
+    rows = book_rows(scanned)
+    assert "Сидоров Сергей/Новая.fb2" in rows
+    assert TXT_REL not in rows
+    assert bl.watch_tick(scanned, frozenset()) == frozenset()
+
+
+def test_watch_pauses_during_rework(scanned: dict[str, Any], books_dir: Path, tmp_path: Path,
+                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    (tmp_path / bl.REWORK_RUNTIME_DIR).mkdir()
+    (books_dir / TXT_REL).unlink()
+    assert bl.watch_tick(scanned, frozenset()) == frozenset()
+    assert bl.WATCH_STATE["paused"]
+
+
+def test_watch_restart_keeps_single_thread(scanned: dict[str, Any]) -> None:
+    try:
+        assert bl.start_watch(scanned)
+        assert not bl.start_watch(scanned)
+        bl.stop_watch()
+        assert not bl.watch_status()["running"]
+        assert bl.start_watch(scanned)
+        assert [t.name for t in threading.enumerate()].count("watch") == 1
+    finally:
+        bl.stop_watch()
+    finish_jobs()
+
+
+def test_watch_interval_is_validated(tmp_path: Path, books_dir: Path) -> None:
+    config = tmp_path / "watch.json"
+    config.write_text(json.dumps({"watch_interval": -1}), encoding="utf-8")
+    with pytest.raises(bl.ConfigError, match="watch_interval"):
+        bl.load_config(config)
+    cfg = make_cfg(tmp_path, books_dir)
+    cfg["watch_interval"] = 0
+    with pytest.raises(bl.ConfigError, match="watch_interval = 0"):
+        bl.start_watch(cfg)
+
+
+def test_scan_keeps_history_of_folder_renamed_outside(scanned: dict[str, Any], books_dir: Path) -> None:
+    old = FB2_REL
+    new = "Иванов Иван Иванович/" + Path(FB2_REL).name
+    with closing(bl.connect(scanned["db_path"])) as conn, conn:
+        conn.execute("INSERT INTO marks(path, status, updated) VALUES (?, 'read', 0)", (old,))
+        conn.execute("INSERT INTO author_variants VALUES ('Иванов Иван', 'Сидоров Сергей', 'manual', 'different', '', 0)")
+    (books_dir / "Иванов Иван").rename(books_dir / "Иванов Иван Иванович")
+    stats = bl.scan(scanned)
+    assert (stats["renamed"], stats["removed"] - stats["renamed"], stats["renamed_folders"]) == (3, 0, 1)
+    with closing(bl.connect(scanned["db_path"])) as conn:
+        assert conn.execute("SELECT status FROM marks WHERE path=?", (new,)).fetchone()[0] == "read"
+        assert (old, new) in conn.execute("SELECT path, new_path FROM edit_log").fetchall()
+        assert conn.execute("SELECT a, b, status FROM author_variants").fetchall() == [
+            ("Иванов Иван Иванович", "Сидоров Сергей", "different")]
+
+
+def test_scan_matches_copy_with_new_mtime_by_name(scanned: dict[str, Any], books_dir: Path) -> None:
+    (books_dir / "Новая папка").mkdir()
+    target = books_dir / "Новая папка" / Path(FB2_REL).name
+    target.write_bytes((books_dir / FB2_REL).read_bytes())  # cp без -p: mtime другой
+    (books_dir / FB2_REL).unlink()
+    stats = bl.scan(scanned)
+    assert stats["renamed"] == 1
+    assert stats["renamed_folders"] == 0  # остальные книги остались в старой папке
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root читает каталог без прав")
+def test_scan_keeps_books_of_unreadable_dir(scanned: dict[str, Any], books_dir: Path) -> None:
+    folder = books_dir / "Иванов Иван"
+    folder.chmod(0)
+    try:
+        stats = bl.scan(scanned)
+    finally:
+        folder.chmod(0o755)
+    assert stats["removed"] == 0
+    assert stats["unreadable_kept"] == 3
+    assert FB2_REL in book_rows(scanned)
+
+
+def test_scan_refuses_to_empty_catalog_when_root_is_empty(scanned: dict[str, Any], books_dir: Path) -> None:
+    for folder in list(books_dir.iterdir()):
+        shutil.rmtree(folder)
+    with pytest.raises(bl.ConfigError, match="не смонтирован"):
+        bl.scan(scanned)
+    assert FB2_REL in book_rows(scanned)
+
+
+def test_watch_pauses_on_mass_removal(scanned: dict[str, Any], books_dir: Path,
+                                      monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bl, "WATCH_MAX_REMOVED", 1)
+    shutil.rmtree(books_dir / "Иванов Иван")
+    assert bl.watch_tick(scanned, frozenset()) == frozenset()
+    assert "исчезло 3" in bl.WATCH_STATE["paused"]
+    assert FB2_REL in book_rows(scanned)

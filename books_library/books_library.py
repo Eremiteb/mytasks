@@ -87,6 +87,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "page_size": 50,
     "convert_timeout": 300,
     "cache_mb": 4096,
+    "watch_interval": 30,  # опрос каталога книг в serve, с; 0 — мониторинг выключен
     # Кэш извлечённого текста для dedup (восстановимый, на быстром диске): пустая строка в text_cache_dir — кэш выключен;
     # text_cache_mb — предел сжатых данных, МБ (0 — кэш выключен). Каталог создаёт администратор, движок его не создаёт.
     "text_cache_dir": "/var/cache/books_library",
@@ -374,7 +375,7 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
                 cfg[key] = value
     for key, low, high in (("port", 1, 65535), ("scan_workers", 1, 64), ("reader_max_mb", 1, 1024), ("page_size", 10, 500),
                             ("convert_timeout", 10, 3600), ("cache_mb", 100, 1_000_000), ("workers", 1, 64),
-                            ("unzip_workers", 1, 64), ("text_cache_mb", 0, 10_000_000)):
+                            ("unzip_workers", 1, 64), ("text_cache_mb", 0, 10_000_000), ("watch_interval", 0, 86400)):
         if not isinstance(cfg[key], int) or isinstance(cfg[key], bool) or not low <= cfg[key] <= high:
             raise ConfigError(f"{key} должен быть целым от {low} до {high}")
     for key in ("books_dir", "db_path", "host", "quarantine_dir", "decisions_dir"):
@@ -1027,10 +1028,13 @@ def read_book_meta(root: Path, rel: str, size: int = 0, mtime: float = 0.0,
     return meta
 
 
-def iter_book_files(root: Path, errors: list[str]) -> Iterator[tuple[str, int, float]]:
-    """Относительный путь, размер и mtime каждого файла книги; HTML и служебные каталоги пропускаются."""
+def iter_book_files(root: Path, errors: list[str], failed: set[str] | None = None) -> Iterator[tuple[str, int, float]]:
+    """Относительный путь, размер и mtime каждого файла книги; HTML и служебные каталоги пропускаются.
+    failed — относительные пути каталогов и файлов, которые не прочитались ("." — сам корень)."""
     def onerror(error: OSError) -> None:
         errors.append(f"{error.filename}: {error.strerror}")
+        if failed is not None and error.filename:
+            failed.add(os.path.relpath(error.filename, root).replace(os.sep, "/"))
 
     for current, dirs, files in os.walk(root, onerror=onerror):
         dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith(".") and not d.endswith(HTML_SIDECAR_SUFFIXES))
@@ -1042,6 +1046,8 @@ def iter_book_files(root: Path, errors: list[str]) -> Iterator[tuple[str, int, f
                 stat = os.stat(full)
             except OSError as error:
                 errors.append(f"{full}: {error.strerror}")
+                if failed is not None:
+                    failed.add(os.path.relpath(full, root).replace(os.sep, "/"))
                 continue
             yield os.path.relpath(full, root).replace(os.sep, "/"), stat.st_size, stat.st_mtime
 
@@ -1108,6 +1114,105 @@ def apply_override(meta: dict[str, Any], row: sqlite3.Row) -> None:
         meta[key] = [v for v in value.split("; ") if v] if key in ("authors", "genres") else value
 
 
+class ScanPlan(NamedTuple):
+    """Расхождение каталога книг с базой: общее для scan и мониторинга."""
+    files: int
+    todo: list[tuple[str, int, float]]  # новые и изменённые
+    new: int
+    removed: list[str]  # исчезли с диска (книги нечитаемых каталогов сюда не входят)
+    renamed: list[tuple[str, str]]  # старый и новый путь одной книги
+    unreadable: int  # книги базы в нечитаемых каталогах: остаются в каталоге как есть
+    folders: set[str]  # папки верхнего уровня, где сейчас есть книги
+    errors: list[str]
+
+
+def under_any(rel: str, prefixes: set[str]) -> bool:
+    return "." in prefixes or any(rel == p or rel.startswith(p + "/") for p in prefixes)
+
+
+def match_renames(removed: list[str], todo: list[tuple[str, int, float]],
+                  known: dict[str, tuple[int, float]]) -> list[tuple[str, str]]:
+    """Переименование или перенос вне движка (вручную, Syncthing): исчезнувший и новый путь — одна книга, если совпали
+    размер и mtime, а когда mtime сменился при копировании или пара неоднозначна — размер и имя файла.
+    Связываются только однозначные пары: одинаковые копии не склеиваются."""
+    def unique(items: list[tuple[Any, str]]) -> dict[Any, str]:
+        found: dict[Any, str] = {}
+        doubles: set[Any] = set()
+        for key, rel in items:
+            if key in found or key in doubles:
+                found.pop(key, None)
+                doubles.add(key)
+            else:
+                found[key] = rel
+        return found
+
+    gone = list(removed)
+    new = [(rel, size, mtime) for rel, size, mtime in todo if rel not in known]
+    pairs: list[tuple[str, str]] = []
+    for gone_key, new_key in ((lambda rel: known[rel], lambda size, mtime, _rel: (size, mtime)),
+                              (lambda rel: (known[rel][0], posixpath.basename(rel)),
+                               lambda size, _mtime, rel: (size, posixpath.basename(rel)))):
+        olds = unique([(gone_key(rel), rel) for rel in gone])
+        news = unique([(new_key(size, mtime, rel), rel) for rel, size, mtime in new])
+        matched = [(olds[key], news[key]) for key in olds.keys() & news.keys()]
+        pairs += matched
+        used = {rel for pair in matched for rel in pair}
+        gone = [rel for rel in gone if rel not in used]
+        new = [item for item in new if item[0] not in used]
+    return sorted(pairs)
+
+
+def plan_scan(root: Path, known: dict[str, tuple[int, float]], reparse: bool = False) -> ScanPlan:
+    errors: list[str] = []
+    failed: set[str] = set()
+    todo: list[tuple[str, int, float]] = []
+    seen: set[str] = set()
+    new = 0
+    for rel, size, mtime in iter_book_files(root, errors, failed):
+        seen.add(rel)
+        old = known.get(rel)
+        if reparse or old is None or old[0] != size or old[1] != mtime:
+            todo.append((rel, size, mtime))
+            new += old is None
+    missing = [p for p in known if p not in seen]
+    removed = [p for p in missing if not under_any(p, failed)] if failed else missing
+    return ScanPlan(len(seen), todo, new, removed, match_renames(removed, todo, known), len(missing) - len(removed),
+                    {rel.partition("/")[0] for rel in seen if "/" in rel}, errors)
+
+
+def folder_renames(plan: ScanPlan, known: dict[str, tuple[int, float]]) -> dict[str, str]:
+    """Папки верхнего уровня, переименованные целиком: каждая книга папки связана с книгой одной новой папки, которой
+    в базе не было. Перенос части книг в существующую папку — не переименование автора."""
+    def top(rel: str) -> str:
+        return rel.partition("/")[0] if "/" in rel else ""
+
+    counts = Counter(top(rel) for rel in known)
+    targets: dict[str, set[str]] = {}
+    for old, new in plan.renamed:
+        targets.setdefault(top(old), set()).add(top(new))
+    return {old: next(iter(news)) for old, news in targets.items()
+            if old and len(news) == 1 and "" not in news and old not in plan.folders and not counts[next(iter(news))]
+            and sum(top(o) == old for o, _ in plan.renamed) == counts[old]}
+
+
+def move_variant_decisions(conn: sqlite3.Connection, folders: dict[str, str]) -> int:
+    """Решения по вариантам авторов (author_variants, по именам папок) переходят на новое имя папки.
+    Решённая пара не теряется из-за pending-пары с тем же именем; пара папки с самой собой больше не нужна."""
+    moved = 0
+    for old, new in folders.items():
+        conn.execute("UPDATE author_variants SET target=? WHERE target=?", (new, old))
+        for row in conn.execute("SELECT * FROM author_variants WHERE a=? OR b=?", (old, old)).fetchall():
+            a, b = sorted(new if name == old else name for name in (row["a"], row["b"]))
+            conn.execute("DELETE FROM author_variants WHERE a=? AND b=?", (row["a"], row["b"]))
+            if a == b:
+                continue
+            conn.execute("DELETE FROM author_variants WHERE a=? AND b=? AND status='pending'", (a, b))
+            conn.execute("INSERT OR IGNORE INTO author_variants(a, b, tier, status, target, updated) VALUES (?,?,?,?,?,?)",
+                         (a, b, row["tier"], row["status"], row["target"], time.time()))
+            moved += 1
+    return moved
+
+
 def scan(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str], None] = print,
          reparse: bool = False) -> dict[str, int]:
     """Инкрементальное сканирование: новые и изменённые файлы разбираются, исчезнувшие удаляются из каталога.
@@ -1122,20 +1227,20 @@ def scan(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str], None] 
             if conn.execute("PRAGMA user_version").fetchone()[0] >= 1:
                 known = {r[0]: (r[1], r[2]) for r in conn.execute("SELECT path, size, mtime FROM books")}
     SCAN_STATE.update(stage="обход каталога", done=0, total=0)
-    errors: list[str] = []
-    todo: list[tuple[str, int, float]] = []
-    seen: set[str] = set()
-    new = 0
-    for rel, size, mtime in iter_book_files(root, errors):
-        seen.add(rel)
-        old = known.get(rel)
-        if reparse or old is None or old[0] != size or old[1] != mtime:
-            todo.append((rel, size, mtime))
-            new += old is None
-    removed = [p for p in known if p not in seen]
-    stats = {"files": len(seen), "new": new, "changed": len(todo) - new, "removed": len(removed), "walk_errors": len(errors)}
+    plan = plan_scan(root, known, reparse)
+    if known and not plan.files and not plan.unreadable:
+        raise ConfigError(f"в каталоге книг {root} нет ни одной книги, а в базе их {len(known)}: диск не смонтирован "
+                          "или неверный books_dir? Каталог не очищается")
+    todo, removed, renamed, errors = plan.todo, plan.removed, plan.renamed, plan.errors
+    folders = folder_renames(plan, known)
+    stats = {"files": plan.files, "new": plan.new, "changed": len(todo) - plan.new, "removed": len(removed),
+             "renamed": len(renamed), "renamed_folders": len(folders), "unreadable_kept": plan.unreadable,
+             "walk_errors": len(errors)}
     for error in errors[:20]:
         say(f"ошибка обхода: {error}", "walk_error", logging.WARNING, detail=error)
+    if plan.unreadable:
+        say(f"книг в нечитаемых каталогах: {plan.unreadable} — остаются в каталоге до следующего scan", "walk_kept",
+            logging.WARNING, detail=str(plan.unreadable))
     if dry_run:
         out(f"[dry-run] будет: каталог {root} — книг {stats['files']}, добавить {stats['new']}, "
               f"обновить {stats['changed']}, удалить из каталога {stats['removed']} (файлы книг не трогаются)")
@@ -1143,12 +1248,32 @@ def scan(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str], None] 
             out(f"[dry-run] будет: создать БД {db_path} (схема v{DB_LATEST})")
         for rel, *_ in todo[:15]:
             out(f"[dry-run] будет: {'обновить' if rel in known else 'добавить'} {rel}")
+        for old, new_rel in renamed[:15]:
+            out(f"[dry-run] будет: переименование {old} → {new_rel} (отметки, полки, правки, сборники — на новый путь)")
+        for old, new_rel in list(folders.items())[:15]:
+            out(f"[dry-run] будет: папка {old} → {new_rel} (решения по вариантам авторов — на новое имя)")
+        if plan.unreadable:
+            out(f"[dry-run] будет: оставить в каталоге {plan.unreadable} книг нечитаемых каталогов (ошибки обхода)")
         for rel in removed[:15]:
             out(f"[dry-run] будет: удалить из каталога {rel}")
         say("план сканирования", "dry_scan", detail=json.dumps(stats, ensure_ascii=False))
         return stats
 
     migrate_database(db_path, out=out)
+    if renamed:
+        with closing(connect(db_path)) as conn, conn:
+            for old, new_rel in renamed:
+                conn.execute("UPDATE OR IGNORE meta_overrides SET path=? WHERE path=?", (new_rel, old))
+                conn.execute("INSERT INTO edit_log(path, new_path, fields, backup, created) VALUES (?,?,?,?,?)",
+                             (old, new_rel, json.dumps({"rename": "scan"}), "", time.time()))
+        relink(db_path, renamed)
+        say(f"переименования вне движка: {len(renamed)}", "scan_renamed", detail=json.dumps(renamed[:50], ensure_ascii=False))
+    if folders:
+        with closing(connect(db_path)) as conn, conn:
+            if conn.execute("PRAGMA user_version").fetchone()[0] >= VARIANT_SCHEMA:
+                moved = move_variant_decisions(conn, folders)
+                say(f"переименованы папки: {len(folders)}, решений по вариантам перенесено: {moved}", "scan_renamed_folders",
+                    detail=json.dumps(folders, ensure_ascii=False))
     overrides = load_overrides(db_path)
     started = last_report = time.monotonic()
     parse_errors = 0
@@ -1202,6 +1327,140 @@ def scan(cfg: dict[str, Any], dry_run: bool = False, out: Callable[[str], None] 
     stats["parse_errors"] = parse_errors
     say(f"сканирование завершено: {json.dumps(stats, ensure_ascii=False)}", "scan_done", detail=json.dumps(stats))
     return stats
+
+
+# ======================================================================
+# Мониторинг каталога книг (serve)
+# ======================================================================
+
+# RuntimeDirectory= юнита ночной переделки: каталог в $XDG_RUNTIME_DIR есть, пока конвейер работает.
+REWORK_RUNTIME_DIR = "books-library-rework"
+# Столько исчезнувших (не переименованных) книг — уже не ручная правка, а отвал диска или ветка, удалённая по ошибке:
+# каталог сам не чистится, решает человек.
+WATCH_MAX_REMOVED = 1000
+WATCH_STATE: dict[str, Any] = {"interval": 0, "started": None, "last_check": None, "last_scan": None, "pending": 0,
+                               "scans": 0, "errors": 0, "last_error": "", "paused": ""}
+_WATCH_LOCK = threading.Lock()
+_WATCH: list[tuple[threading.Thread, threading.Event]] = []  # не больше одного: поток и событие остановки
+
+
+def rework_active() -> bool:
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "")
+    return bool(runtime) and (Path(runtime) / REWORK_RUNTIME_DIR).is_dir()
+
+
+def scan_lock_free() -> bool:
+    try:
+        with scan_lock():
+            return True
+    except ScanBusyError:
+        return False
+
+
+def watch_pending(cfg: dict[str, Any]) -> tuple[frozenset[tuple[str, int, float]], ScanPlan]:
+    """Расхождение каталога с базой — то, что подхватит scan: новые и изменённые книги и исчезнувшие (size -1)."""
+    with closing(connect(cfg["db_path"], readonly=True)) as conn:
+        known = {r[0]: (r[1], r[2]) for r in conn.execute("SELECT path, size, mtime FROM books")}
+    plan = plan_scan(Path(cfg["books_dir"]), known)
+    return frozenset(plan.todo) | {(rel, -1, 0.0) for rel in plan.removed}, plan
+
+
+def watch_pause(reason: str) -> None:
+    if WATCH_STATE["paused"] != reason:
+        say(f"мониторинг: пауза — {reason}", "watch_paused", detail=reason)
+    WATCH_STATE.update(paused=reason, pending=0)
+
+
+def watch_tick(cfg: dict[str, Any], previous: frozenset[tuple[str, int, float]]) -> frozenset[tuple[str, int, float]]:
+    """Один проход. scan запускается, когда расхождение есть и не менялось с прошлого прохода: копирование закончилось,
+    недописанные файлы не разбираются. Возвращает расхождение для следующего прохода."""
+    if rework_active():
+        watch_pause("идёт ночная переделка библиотеки")
+        return frozenset()
+    if not Path(cfg["books_dir"]).is_dir():
+        watch_pause("каталог книг недоступен")
+        return frozenset()
+    if not Path(cfg["db_path"]).is_file():
+        watch_pause("база не создана, нужен первый scan")
+        return frozenset()
+    diff, plan = watch_pending(cfg)
+    if plan.errors:
+        WATCH_STATE["last_error"] = f"ошибок обхода {len(plan.errors)}, книги там не удаляются: {plan.errors[0]}"
+    lost = len(plan.removed) - len(plan.renamed)
+    if lost > WATCH_MAX_REMOVED:
+        watch_pause(f"с диска исчезло {lost} книг (порог {WATCH_MAX_REMOVED}): проверьте диск и books_dir, "
+                    "затем «Пересканировать»")
+        return frozenset()
+    WATCH_STATE.update(last_check=datetime.now().isoformat(timespec="seconds"), pending=len(diff), paused="")
+    if not diff or diff != previous:
+        return diff
+    with JOBS_LOCK:
+        busy = any(j["command"] == "scan" and j["state"] in ("queued", "running") for j in JOBS.values())
+    if busy or not scan_lock_free():
+        return diff
+    job = start_job(cfg, "scan", False, {})
+    WATCH_STATE.update(last_scan=datetime.now().isoformat(timespec="seconds"), scans=WATCH_STATE["scans"] + 1)
+    say(f"мониторинг: изменений {len(diff)}, scan — задание {job['id']}", "watch_scan", detail=json.dumps({"changes": len(diff)}))
+    return diff
+
+
+def watch_loop(cfg: dict[str, Any], stop: threading.Event) -> None:
+    previous: frozenset[tuple[str, int, float]] = frozenset()
+    while not stop.is_set():
+        try:
+            previous = watch_tick(cfg, previous)
+        except (OSError, sqlite3.Error, ConfigError) as error:
+            previous = frozenset()
+            WATCH_STATE["errors"] += 1
+            if WATCH_STATE["last_error"] != str(error):
+                say(f"мониторинг: {error}", "watch_error", logging.WARNING, detail=str(error))
+            WATCH_STATE["last_error"] = str(error)
+        stop.wait(cfg["watch_interval"])
+
+
+def start_watch(cfg: dict[str, Any]) -> bool:
+    """Запускает поток мониторинга; False — уже работает."""
+    if cfg["watch_interval"] == 0:
+        raise ConfigError("мониторинг выключен в настройках: watch_interval = 0")
+    with _WATCH_LOCK:
+        if _WATCH and _WATCH[0][0].is_alive():
+            return False
+        stop = threading.Event()
+        thread = threading.Thread(target=watch_loop, args=(cfg, stop), name="watch", daemon=True)
+        WATCH_STATE.update(interval=cfg["watch_interval"], started=datetime.now().isoformat(timespec="seconds"),
+                           last_check=None, pending=0, errors=0, last_error="", paused="")
+        _WATCH[:] = [(thread, stop)]
+        thread.start()
+    say(f"мониторинг каталога книг: опрос каждые {cfg['watch_interval']} с", "watch_start")
+    return True
+
+
+def stop_watch(timeout: float | None = None) -> None:
+    """Останавливает мониторинг и ждёт конца текущего прохода (под блокировкой: start не создаст второй поток)."""
+    with _WATCH_LOCK:
+        if not _WATCH or not _WATCH[0][0].is_alive():
+            return
+        thread, stop = _WATCH[0]
+        stop.set()
+        thread.join(timeout)
+    say("мониторинг каталога книг остановлен", "watch_stop")
+
+
+def watch_action(cfg: dict[str, Any], action: object) -> str:
+    """Кнопка интерфейса и POST /api/watch: start, stop или status; до перезапуска serve."""
+    if action == "start":
+        return "мониторинг запущен" if start_watch(cfg) else "мониторинг уже работает"
+    if action == "stop":
+        stop_watch()
+        return "мониторинг остановлен"
+    if action == "status":
+        return "состояние мониторинга"
+    raise ValueError("action: start, stop или status")
+
+
+def watch_status() -> dict[str, Any]:
+    running = bool(_WATCH) and _WATCH[0][0].is_alive() and not _WATCH[0][1].is_set()
+    return {"running": running, **WATCH_STATE}
 
 
 # ======================================================================
@@ -9748,6 +10007,7 @@ var p=parseFloat(r.dataset.progress||'0');if(p>0)window.scrollTo(0,p*(document.d
 var t=null;addEventListener('scroll',function(){clearTimeout(t);t=setTimeout(function(){var h=document.documentElement.scrollHeight-innerHeight;
 var v=h>0?scrollY/h:0;fetch('/api/progress',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
 body:'id='+id+'&ch='+ch+'&p='+v.toFixed(4)})},800)})})();
+
 """
 
 NAV = [("/", "Поиск"), ("/sections", "Разделы"), ("/authors", "Авторы"), ("/series", "Серии"), ("/genres", "Жанры"), ("/browse", "Папки"),
@@ -9991,6 +10251,7 @@ API_HELP = {
     "POST /api/authors/rename": "{old, new} — переименовать автора во всех его книгах (слияние с существующим)",
     "GET /api/authors?variants=1": "варианты написания папок автора: status=pending|merged|different (по умолчанию pending)",
     "POST /api/authors": "{a, b, action: merge-into-a|merge-into-b|different} — решение по паре вариантов; склейка под блокировкой",
+    "POST /api/watch": "{action: start|stop|status} — мониторинг каталога книг до перезапуска serve; состояние — в watch",
 }
 
 
@@ -10143,7 +10404,7 @@ class Handler(BaseHTTPRequestHandler):
             ("GET", "authors"): self.view_authors, ("GET", "sections"): self.view_sections, ("GET", "series"): self.view_series, ("GET", "genres"): self.view_genres,
             ("GET", "browse"): self.view_browse, ("GET", "shelves"): self.view_shelves, ("GET", "recent"): self.view_recent,
             ("GET", "stats"): self.view_stats, ("GET", "opds"): self.view_opds, ("GET", "app.js"): self.view_js,
-            ("POST", "book"): self.post_book, ("POST", "shelves"): self.post_shelves, ("POST", "scan"): self.post_scan,
+            ("POST", "book"): self.post_book, ("POST", "shelves"): self.post_shelves, ("POST", "scan"): self.post_scan, ("POST", "watch"): self.post_watch,
             ("GET", "edit"): self.view_edit, ("POST", "edit"): self.post_edit,
             ("GET", "api"): self.api_get, ("POST", "api"): self.api_post,
         }
@@ -10455,13 +10716,28 @@ class Handler(BaseHTTPRequestHandler):
         job_rows = "".join(f"<tr><td>{e(j['created'])}</td><td><a href='/api/jobs/{e(j['id'])}'>{e(j['command'])}</a>"
                            f"{' (dry-run)' if j['dry_run'] else ''}</td><td>{e(j['state'])}</td>"
                            f"<td class='mut'>{e(json.dumps(j['result'] or j['error'], ensure_ascii=False))}</td></tr>" for j in jobs)
+        watch = watch_status()
+        if not self.cfg["watch_interval"]:
+            watch_info = "<p class='mut'>Мониторинг выключен в настройках (watch_interval = 0).</p>"
+        elif watch["running"]:
+            details = [f"опрос каждые {watch['interval']} с", f"последняя проверка: {watch['last_check'] or '—'}",
+                       f"ждут scan: {watch['pending']}", f"запущено scan: {watch['scans']}", f"ошибок: {watch['errors']}"]
+            details += [f"пауза: {watch['paused']}"] if watch["paused"] else []
+            details += [f"последняя ошибка: {watch['last_error']}"] if watch["last_error"] else []
+            watch_info = (f"<p>Мониторинг включён: {e(' · '.join(details))}.</p><form method='post' action='/watch'>"
+                          "<input type='hidden' name='action' value='stop'><button>Остановить мониторинг</button></form>")
+        else:
+            watch_info = ("<p>Мониторинг остановлен.</p><form method='post' action='/watch'>"
+                          "<input type='hidden' name='action' value='start'><button>Включить мониторинг</button></form>")
         scan_info = (f'{progress}<form method="post" action="/scan"><button{" disabled" if running else ""}>Пересканировать '
                      f'библиотеку</button></form>' + (f"<h3>Задания</h3><table>{job_rows}</table>" if job_rows else ""))
         self.page("Статистика", f"<h2>Статистика</h2><p>Книг: <b>{total[0]}</b> ({human_size(total[1])}), авторов: {authors}. "
                                 f"Каталог: {e(self.cfg['books_dir'])}. Последнее сканирование: {e(last[0] if last else 'не было')}.</p>"
                                 f"<table><tr><th>Формат</th><th>Книг</th><th>Объём</th></tr>{rows}</table>"
                                 f"<h3>Чтение</h3><table>{marks or '<tr><td>отметок пока нет</td></tr>'}</table>"
-                                f"<h3>Каталог</h3>{scan_info}<p class='mut'>OPDS для читалок: /opds · JSON API: <a href='/api'>/api</a></p>")
+                                f"<h3>Каталог</h3>{scan_info}"
+                                f"<h3>Мониторинг</h3>{watch_info}"
+                                f"<p class='mut'>OPDS для читалок: /opds · JSON API: <a href='/api'>/api</a></p>")
 
     # ---- книга -----------------------------------------------------
     def view_book(self, parts: list[str]) -> None:
@@ -10816,6 +11092,13 @@ class Handler(BaseHTTPRequestHandler):
                 create_shelf(conn, form["name"].strip()[:100])
         self.redirect("/shelves")
 
+    def post_watch(self, _parts: list[str]) -> None:
+        try:
+            watch_action(self.cfg, self.form.get("action", [""])[-1])
+        except (ConfigError, ValueError) as error:
+            say(f"мониторинг: {error}", "watch_failed", logging.ERROR)
+        self.redirect("/stats")
+
     def post_scan(self, _parts: list[str]) -> None:
         try:
             start_job(self.cfg, "scan", False, {})
@@ -10926,7 +11209,7 @@ class Handler(BaseHTTPRequestHandler):
                 last = conn.execute("SELECT value FROM meta WHERE key='last_scan'").fetchone()
                 self.send_json({"books": total[0], "bytes": total[1], "last_scan": last[0] if last else None,
                                 "formats": {r[0]: {"books": r[1], "bytes": r[2]} for r in fmts},
-                                "statuses": {r[0]: r[1] for r in statuses}, "scan": SCAN_STATE})
+                                "statuses": {r[0]: r[1] for r in statuses}, "scan": SCAN_STATE, "watch": watch_status()})
             elif name == "fix":
                 reason = self.query.get("reason", "")
                 if reason and reason not in FIX_REASON_TEXT:
@@ -10998,6 +11281,9 @@ class Handler(BaseHTTPRequestHandler):
                 raw = {k: v for k, v in body.items() if k not in ("command", "dry_run", "confirm")}
                 job = start_job(self.cfg, command, dry_run, raw, confirm)
                 self.send_json(job_view(job), HTTPStatus.ACCEPTED)
+                return
+            if name == "watch" and len(parts) == 1:
+                self.send_json({"ok": True, "message": watch_action(self.cfg, body.get("action")), "watch": watch_status()})
                 return
             with closing(self.db()) as conn:
                 if name == "books" and len(parts) == 3 and parts[2] in ("mark", "shelves"):
@@ -11310,6 +11596,8 @@ def serve(cfg: dict[str, Any], dry_run: bool = False) -> None:
     url = f"http://{cfg['host']}:{cfg['port']}/"
     if dry_run:
         print(f"[dry-run] будет: открыть веб-интерфейс {url}; каталог книг {cfg['books_dir']} (только чтение); БД {cfg['db_path']}")
+        print(f"[dry-run] будет: мониторинг каталога книг каждые {cfg['watch_interval']} с, при изменениях — scan"
+              if cfg["watch_interval"] else "[dry-run] будет: мониторинг каталога книг выключен (watch_interval = 0)")
         migrate_database(cfg["db_path"], dry_run=True)
         say("план запуска сервера", "dry_serve", detail=url)
         return
@@ -11319,6 +11607,9 @@ def serve(cfg: dict[str, Any], dry_run: bool = False) -> None:
     Handler.cfg = cfg
     server = ThreadingHTTPServer((cfg["host"], cfg["port"]), Handler)
     server.daemon_threads = True
+
+    if cfg["watch_interval"]:
+        start_watch(cfg)
     say(f"веб-интерфейс: {url}", "serve", detail=url)
     try:
         server.serve_forever()
@@ -11327,6 +11618,7 @@ def serve(cfg: dict[str, Any], dry_run: bool = False) -> None:
     finally:
         server.server_close()
         say("веб-интерфейс остановлен", "serve_stop")
+        stop_watch(timeout=10)
 
 
 def main(argv: list[str] | None = None) -> int:
