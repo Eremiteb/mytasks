@@ -141,6 +141,7 @@ case "\$*" in
     printf 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\trefs/tags/b1000\n'
     printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\trefs/tags/b1000^{}\n'
     printf 'dddddddddddddddddddddddddddddddddddddddd\trefs/tags/b999\n'
+    printf '1111111111111111111111111111111111111111\trefs/tags/v1.0.0\n'
     printf 'ffffffffffffffffffffffffffffffffffffffff\trefs/tags/gguf-v9\n' ;;
   *ls-remote*) printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\tHEAD\n' ;;
   *fetch*|*checkout*) exit 0 ;;
@@ -545,6 +546,15 @@ EOF
   run ctl --dry-run update --ref 1111111111111111111111111111111111111111
   [ "$status" -eq 0 ]
   [[ "$output" == *"ставится коммит 1111111111111111111111111111111111111111: 1111111"* ]]
+}
+
+@test "update: semver-тег собирается как релиз, b-тег — как dev" {
+  run ctl --dry-run update --ref v1.0.0
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"LLAMA_BUILD_IS_DEV=OFF"* ]]
+  run ctl --dry-run update --ref b999
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"LLAMA_BUILD_IS_DEV=ON"* ]]
 }
 
 @test "add: нет sha256 от Hugging Face — отказ, с --no-verify — загрузка" {

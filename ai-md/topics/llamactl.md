@@ -26,7 +26,7 @@
 
 ## Обновление llama.cpp
 
-- `update` без `--ref` ставит последний релизный тег `bNNNN` (`LLAMA_REF="latest-tag"` в конфиге); `--ref ТЕГ|SHA` — явный тег или полный SHA. Сборку, `--version` и `ldd` делает от пользователя.
+- `update` без `--ref` ставит последний тег `bNNNN` (`LLAMA_REF="latest-tag"` в конфиге) как dev-сборку; точный тег `vX.Y.Z` собирается без суффикса `-dev`, остальные теги и SHA — как dev. Сборку, `--version` и `ldd` делает от пользователя.
 - `swap-install` (root): `bin/` и `lib/` → `/opt/llama.cpp.new`, обмен с `/opt/llama.cpp` (прежняя — `/opt/llama.cpp.prev`); откат, если сервисы не ответили за `HEALTH_TIMEOUT_SECS` (90 с).
 
 ## Код

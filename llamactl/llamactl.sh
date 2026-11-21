@@ -970,6 +970,7 @@ resolve_update_ref() {
     UPD_FETCH=""
     UPD_SHA=""
     UPD_LABEL=""
+    UPD_IS_DEV=ON
     if [[ "${ref}" == "latest-tag" ]]; then
         line="$(latest_release_tag)" || die "не удалось получить список тегов origin"
         [[ -n "${line}" ]] || die "в origin нет релизных тегов bNNNN"
@@ -991,6 +992,7 @@ resolve_update_ref() {
         [[ -n "${UPD_SHA}" ]] || die "тега ${ref} нет в origin (--ref: тег или полный SHA коммита)" 2
         UPD_FETCH="refs/tags/${ref}"
         UPD_LABEL="тег ${ref}"
+        [[ "${ref}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && UPD_IS_DEV=OFF
     else
         die "недопустимое --ref «${ref}»: нужен тег (например b4500) или полный SHA коммита из 40 знаков" 2
     fi
@@ -1027,7 +1029,7 @@ cmd_update() {
     local stage="${LLAMA_SRC}/build/llamactl-stage"
     if [[ "${DRY_RUN}" -eq 1 ]]; then
         act "fetch" "git fetch ${UPD_FETCH} и переключить ${LLAMA_SRC} на ${target} (${UPD_LABEL})" || true
-        act "build" "cmake (CUDA, sm_${CUDA_ARCH}, RPATH ${RPATH_LIT}) и сборка в ${BUILD_JOBS} потоков, установка в ${stage} и проверка llama-server --version и ldd от пользователя" || true
+        act "build" "cmake (LLAMA_BUILD_IS_DEV=${UPD_IS_DEV}, CUDA, sm_${CUDA_ARCH}, RPATH ${RPATH_LIT}) и сборка в ${BUILD_JOBS} потоков, установка в ${stage} и проверка llama-server --version и ldd от пользователя" || true
         act "install" "установить в ${LLAMA_PREFIX}.new root-хелпером ${ROOT_HELPER}, заменить ${LLAMA_PREFIX} (старая версия → ${LLAMA_PREFIX}.prev), перезапустить ${SERVER_UNIT} ${FIM_UNIT}; при сбое — откат" || true
         ((bench == 1)) && { act "bench" "замер ${BENCH_MODEL} до и после" || true; }
         return 0
@@ -1048,10 +1050,11 @@ cmd_update() {
     [[ "${got}" == "${UPD_SHA}" ]] || die "получен коммит ${got}, а origin объявил ${UPD_SHA} — обновление прервано"
     info "== [2/4] Сборка (прогресс — проценты cmake)"
     local rpath="${RPATH_LIT}"
-    log_json "INFO" "build" "sm_${CUDA_ARCH} -j${BUILD_JOBS}"
+    log_json "INFO" "build" "LLAMA_BUILD_IS_DEV=${UPD_IS_DEV} sm_${CUDA_ARCH} -j${BUILD_JOBS}"
     cmake -S "${LLAMA_SRC}" -B "${LLAMA_SRC}/build" -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}" \
         -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DCMAKE_INSTALL_LIBDIR=lib \
-        -DCMAKE_INSTALL_PREFIX="${LLAMA_PREFIX}" "-DCMAKE_INSTALL_RPATH=${rpath}" >/dev/null || die "cmake configure не удался"
+        -DCMAKE_INSTALL_PREFIX="${LLAMA_PREFIX}" "-DCMAKE_INSTALL_RPATH=${rpath}" "-DLLAMA_BUILD_IS_DEV=${UPD_IS_DEV}" \
+        >/dev/null || die "cmake configure не удался"
     cmake --build "${LLAMA_SRC}/build" -j "${BUILD_JOBS}" 2>&1 | grep --line-buffered -E '^\[ *[0-9]+%\]' | awk '{ p = $1 " " $2; if (p != last) { print "  " p; last = p } }' | uniq
     [[ -x "${LLAMA_SRC}/build/bin/llama-server" ]] || die "сборка не удалась (cmake --build ${LLAMA_SRC}/build)"
     info "== [3/4] Проверка сборки и установка с заменой (один запрос пароля)"
