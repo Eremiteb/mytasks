@@ -7058,6 +7058,7 @@ COAUTHOR_SPLIT = re.compile(r", | и ")  # соавторы внутри одн�
 INITIALS_WORD = re.compile(r"^((?:[А-ЯЁA-Z]\.)+)([А-ЯЁA-Z][а-яёa-z-]+)$")  # «И.Гарин», «И.О.Гарин» — инициалы у фамилии
 
 
+@functools.lru_cache(maxsize=1 << 18)  # имена папок сравниваются попарно: десятки миллионов вызовов на прогон
 def author_norm(text: str) -> str:
     """Сравнение имён: casefold, ё→е, только буквы, цифры, пробелы и дефис; пустые токены отброшены."""
     kept = "".join(ch for ch in text.casefold().replace("ё", "е") if ch.isalnum() or ch.isspace() or ch == "-")
@@ -7673,16 +7674,20 @@ def author_words(name: str) -> list[str]:
     return author_norm(name).split()
 
 
-def full_candidates(short: str, names: list[str]) -> list[str]:
-    """Папки «Фамилия Имя Отчество» для короткой «Фамилия Имя»: первые два слова совпадают по порядку,
-    третье — не инициал (длина ≥ 3)."""
-    short_words = author_words(short)
-    found = []
+def full_index(names: list[str]) -> dict[tuple[str, ...], list[str]]:
+    """Папки «Фамилия Имя Отчество» (третье слово — не инициал, длина ≥ 3) по первым двум словам: один проход
+    по именам на прогон вместо перебора всех папок для каждой короткой."""
+    index: dict[tuple[str, ...], list[str]] = {}
     for name in names:
         words = author_words(name)
-        if len(words) == 3 and words[:2] == short_words and len(words[2]) >= 3:
-            found.append(name)
-    return sorted(found)
+        if len(words) == 3 and len(words[2]) >= 3:
+            index.setdefault(tuple(words[:2]), []).append(name)
+    return index
+
+
+def full_candidates(short: str, index: dict[tuple[str, ...], list[str]]) -> list[str]:
+    """Папки «Фамилия Имя Отчество» для короткой «Фамилия Имя»: первые два слова совпадают по порядку."""
+    return sorted(index.get(tuple(author_words(short)), []))
 
 
 def patronymic_full(author: str, short_words: list[str]) -> str | None:
@@ -7943,10 +7948,11 @@ def _merge_authors(cfg: dict[str, Any], dry_run: bool, out: Callable[[str], None
         names = sorted(e.name for e in entries if e.is_dir(follow_symlinks=False) and not e.name.startswith(("_", ".")))
     pending: list[tuple[str, str]] = []
     taken: set[Path] = set()
+    fulls_by_short = full_index(names)
     for short in [n for n in names if len(author_words(n)) == 2]:
         if not (root / short).is_dir():
             continue
-        candidates = full_candidates(short, names)
+        candidates = full_candidates(short, fulls_by_short)
         if folders is not None and short not in folders and not folders.intersection(candidates):
             continue
         if len(candidates) > 1:
