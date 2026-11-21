@@ -347,7 +347,7 @@ while IFS= read -r LINE || [ -n "${LINE}" ]; do
   : >"${OUT_TMP}"
   : >"${ERR_TMP}"
 
-  rsync "$@" --itemize-changes --out-format="%i	%n" "${SRC}" "${DST}" >"${OUT_TMP}" 2>"${ERR_TMP}"
+  rsync "$@" --ignore-missing-args --itemize-changes --out-format="%i	%n" "${SRC}" "${DST}" >"${OUT_TMP}" 2>"${ERR_TMP}"
   RC=$?
 
   # Обработка вывода (события written/deleted)
